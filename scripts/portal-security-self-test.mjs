@@ -283,7 +283,23 @@ async function assertPortalRestartReadsLargeExternalLog(temporary) {
   await mkdir(join(oversizedDirectory, 'logs'), { recursive: true });
   const timestamp = new Date().toISOString();
   await writeFile(join(logDirectory, 'coordinator.log'), `${timestamp} [COORDINATOR] sharded-release-started {"runId":"restart-large-log","shardTotal":1,"shardWorkers":"1","tlsPolicy":"strict"}\nx-api-key=${syntheticKey}\n`);
-  await writeFile(join(logDirectory, 'shard-1-of-1.log'), `${timestamp} [SHARD 1/1][stdout] Running 1 test using 1 worker, shard 1 of 1\n${'[AUDIT_TEST_FINISH] passed\n'.repeat(24_000)}`);
+  await writeFile(join(logDirectory, 'shard-1-of-1.log'), `${timestamp} [SHARD 1/1][stdout] Running 24000 tests using 1 worker, shard 1 of 1\n${'[AUDIT_TEST_FINISH] passed\n'.repeat(24_000)}`);
+  await writeFile(join(sharded, 'restart-large-log', 'sharded-heartbeat.json'), `${JSON.stringify({
+    schemaVersion: 1,
+    runId: 'restart-large-log',
+    status: 'running',
+    startedAt: timestamp,
+    updatedAt: timestamp,
+    leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+    activeCommands: 1,
+    progress: {
+      'shard-1-of-1.log': {
+        kind: 'shard', index: 1, total: 24_000, completed: 24_000, auditFinishes: 24_000,
+        passed: null, failed: null, flaky: null, skipped: null, didNotRun: null,
+        finished: false, updatedAt: timestamp,
+      },
+    },
+  })}\n`);
   await writeFile(join(sharded, 'restart-large-log', 'active-content.html'), '<!doctype html><script>fetch("/api/settings/anthropic-key",{method:"DELETE",headers:{"content-type":"application/json"}})</script>');
   await writeFile(join(staleDirectory, 'logs', 'coordinator.log'), `${timestamp} [COORDINATOR] sharded-release-started {"runId":"stale-external-run","shardTotal":1,"shardWorkers":"1","tlsPolicy":"strict"}\n`);
   await writeFile(join(malformedDirectory, 'logs', 'coordinator.log'), `${timestamp} [COORDINATOR] sharded-release-started {"runId":"malformed-external-run","shardTotal":1,"shardWorkers":"1","tlsPolicy":"strict"}\n`);
@@ -433,6 +449,50 @@ async function assertPortalRestartReadsLargeExternalLog(temporary) {
             .runs.find(({ id }) => id === 'oversized-external-run');
           assert.equal(oversizedRun?.status, 'evidence-failed');
           assert.match(oversizedRun.phase, /invalid lifecycle evidence/i);
+
+          const restartedRun = await (await fetch(`http://127.0.0.1:${port}/api/runs/restart-large-log`)).json();
+          assert.equal(restartedRun.progress.completed, 24_000,
+            'The bounded heartbeat sidecar must restore exact progress without rescanning an omitted log prefix.');
+          const diagnosticsBefore = (await (await fetch(`http://127.0.0.1:${port}/api/config`)).json()).externalSync;
+          const coldRunDirectory = join(sharded, 'cold-large-log');
+          await mkdir(join(coldRunDirectory, 'logs'), { recursive: true });
+          await writeFile(join(coldRunDirectory, 'logs', 'coordinator.log'), `${timestamp} [COORDINATOR] sharded-release-started {"runId":"cold-large-log","shardTotal":1,"shardWorkers":"1","tlsPolicy":"strict"}\n`);
+          await writeFile(join(coldRunDirectory, 'logs', 'shard-1-of-1.log'), `${timestamp} [SHARD 1/1][stdout] Running 300000 tests using 1 worker, shard 1 of 1\n${'[AUDIT_TEST_FINISH] passed\n'.repeat(300_000)}`);
+          const coldHeartbeatTimestamp = new Date().toISOString();
+          await writeFile(join(coldRunDirectory, 'sharded-heartbeat.json'), `${JSON.stringify({
+            schemaVersion: 1,
+            runId: 'cold-large-log',
+            status: 'running',
+            startedAt: coldHeartbeatTimestamp,
+            updatedAt: coldHeartbeatTimestamp,
+            leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+            activeCommands: 1,
+          })}\n`);
+          const listStartedAt = performance.now();
+          const listResponse = await fetch(`http://127.0.0.1:${port}/api/runs`);
+          assert.equal(listResponse.status, 200);
+          assert.ok(performance.now() - listStartedAt < 500,
+            'Known-run list reads must return cached state without awaiting cold external-log ingestion.');
+          const detailStartedAt = performance.now();
+          const detailResponses = await Promise.all(Array.from({ length: 8 }, () =>
+            fetch(`http://127.0.0.1:${port}/api/runs/restart-large-log`)));
+          assert.ok(detailResponses.every(({ status }) => status === 200));
+          assert.ok(performance.now() - detailStartedAt < 2_000,
+            'Known-run detail reads must remain responsive while a cold external refresh is active.');
+          const syncDeadline = Date.now() + 5_000;
+          let syncDiagnostics;
+          while (Date.now() < syncDeadline) {
+            syncDiagnostics = (await (await fetch(`http://127.0.0.1:${port}/api/config`)).json()).externalSync;
+            if (syncDiagnostics.status === 'idle'
+              && syncDiagnostics.finishedAt !== diagnosticsBefore.finishedAt
+              && syncDiagnostics.skippedBytes > 0) break;
+            await new Promise((resolve) => setTimeout(resolve, 25));
+          }
+          assert.equal(syncDiagnostics?.status, 'idle');
+          assert.ok(syncDiagnostics?.bytesRead <= 2 * 1024 * 1024,
+            'A refresh must obey its global byte budget.');
+          assert.ok(syncDiagnostics?.skippedBytes > 0,
+            `A cold large log must be tail-seeded without reading its entire omitted prefix: ${JSON.stringify(syncDiagnostics)}`);
 
           const artifacts = await (await fetch(`http://127.0.0.1:${port}/api/runs/restart-large-log/artifacts?limit=500`)).json();
           assert.equal(artifacts.files.some(({ path }) => path.startsWith('logs/') || path.endsWith('.log')), false);

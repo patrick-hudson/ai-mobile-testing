@@ -1,4 +1,4 @@
-import { constants as fsConstants, createReadStream, createWriteStream, promises as fs } from 'node:fs';
+import { constants as fsConstants, createWriteStream, promises as fs } from 'node:fs';
 import { createServer } from 'node:http';
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -71,6 +71,13 @@ const MAX_SSE_REPLAY_BYTES = 512 * 1024;
 const MAX_GALLERY_SSE_REPLAY_BYTES = 64 * 1024;
 const GALLERY_SSE_EVENT_TYPES = new Set(['gallery', 'gallery-flag', 'snapshot', 'stage', 'status']);
 const MAX_EXTERNAL_LOG_INGEST_BYTES = 512 * 1024;
+const MAX_EXTERNAL_REFRESH_BYTES = parseInteger(
+  process.env.PORTAL_EXTERNAL_REFRESH_BYTES,
+  2 * 1024 * 1024,
+  512 * 1024,
+  64 * 1024 * 1024,
+);
+const MAX_EXTERNAL_REFRESH_MS = parseInteger(process.env.PORTAL_EXTERNAL_REFRESH_MS, 250, 50, 5_000);
 const MAX_EXTERNAL_PARTIAL_LINE_CHARS = 64 * 1024;
 const MAX_EXTERNAL_LIFECYCLE_JSON_BYTES = 256 * 1024;
 const MAX_EXTERNAL_HEARTBEAT_JSON_BYTES = 64 * 1024;
@@ -185,6 +192,15 @@ const galleryFlagRateWindows = new Map();
 let secretMasterKey;
 let savedAnthropicCredential = null;
 let externalRunSyncPromise = null;
+let externalRunSyncDiagnostics = {
+  status: 'idle',
+  finishedAt: null,
+  durationMs: null,
+  bytesRead: 0,
+  filesVisited: 0,
+  skippedBytes: 0,
+  budgetExhausted: false,
+};
 let credentialMutationPromise = Promise.resolve();
 
 await fs.mkdir(ARTIFACT_ROOT, { recursive: true });
@@ -275,6 +291,7 @@ async function routeRequest(request, response) {
         candidateIgnoreHTTPSErrors: DEFAULT_CANDIDATE_IGNORE_HTTPS_ERRORS,
       },
       limits: { maxConcurrentRuns: MAX_CONCURRENT_RUNS },
+      externalSync: externalRunSyncDiagnostics,
       aiReview: {
         available: Boolean(currentAnthropicApiKey()) || process.env.AI_REVIEW_DRY_RUN === '1',
         dryRun: process.env.AI_REVIEW_DRY_RUN === '1',
@@ -298,7 +315,7 @@ async function routeRequest(request, response) {
     });
   }
   if (request.method === 'GET' && pathname === '/api/runs') {
-    await syncExternalShardedRuns();
+    triggerExternalShardedRunSync();
     return sendJson(response, 200, { runs: sortedRunSummaries() });
   }
   if (request.method === 'POST' && pathname === '/api/runs') {
@@ -308,8 +325,9 @@ async function routeRequest(request, response) {
 
   const runMatch = pathname.match(/^\/api\/runs\/([^/]+)$/);
   if (request.method === 'GET' && runMatch) {
-    await syncExternalShardedRuns();
-    const run = requireRun(decodeURIComponent(runMatch[1]));
+    const id = decodeURIComponent(runMatch[1]);
+    await syncExternalShardedRunForRead(id);
+    const run = requireRun(id);
     return sendJson(response, 200, publicManifest(run.manifest));
   }
   if (request.method === 'DELETE' && runMatch) {
@@ -340,20 +358,23 @@ async function routeRequest(request, response) {
 
   const eventsMatch = pathname.match(/^\/api\/runs\/([^/]+)\/events$/);
   if (request.method === 'GET' && eventsMatch) {
-    await syncExternalShardedRuns();
-    return streamRunEvents(request, response, requireRun(decodeURIComponent(eventsMatch[1])));
+    const id = decodeURIComponent(eventsMatch[1]);
+    await syncExternalShardedRunForRead(id);
+    return streamRunEvents(request, response, requireRun(id));
   }
 
   const galleryEventsMatch = pathname.match(/^\/api\/runs\/([^/]+)\/gallery\/events$/);
   if (request.method === 'GET' && galleryEventsMatch) {
-    await syncExternalShardedRuns();
-    return streamGalleryEvents(request, response, requireGalleryRun(decodeURIComponent(galleryEventsMatch[1])));
+    const id = decodeURIComponent(galleryEventsMatch[1]);
+    await syncExternalShardedRunForRead(id);
+    return streamGalleryEvents(request, response, requireGalleryRun(id));
   }
 
   const logsMatch = pathname.match(/^\/api\/runs\/([^/]+)\/logs$/);
   if (request.method === 'GET' && logsMatch) {
-    await syncExternalShardedRuns();
-    const run = requireRun(decodeURIComponent(logsMatch[1]));
+    const id = decodeURIComponent(logsMatch[1]);
+    await syncExternalShardedRunForRead(id);
+    const run = requireRun(id);
     const maximumBytes = queryInteger(
       requestUrl.searchParams.get('maxBytes'),
       'maxBytes',
@@ -417,23 +438,26 @@ async function routeRequest(request, response) {
 
   const reportMatch = pathname.match(/^\/api\/runs\/([^/]+)\/report$/);
   if (request.method === 'GET' && reportMatch) {
-    await syncExternalShardedRuns();
-    const run = requireRun(decodeURIComponent(reportMatch[1]));
+    const id = decodeURIComponent(reportMatch[1]);
+    await syncExternalShardedRunForRead(id);
+    const run = requireRun(id);
     const value = await readBoundedReportJson(run, 'summary.json', MAX_REPORT_SUMMARY_BYTES);
     return sendJson(response, 200, value);
   }
 
   const reportAuditsMatch = pathname.match(/^\/api\/runs\/([^/]+)\/report\/audits$/);
   if (request.method === 'GET' && reportAuditsMatch) {
-    await syncExternalShardedRuns();
-    const run = requireRun(decodeURIComponent(reportAuditsMatch[1]));
+    const id = decodeURIComponent(reportAuditsMatch[1]);
+    await syncExternalShardedRunForRead(id);
+    const run = requireRun(id);
     return sendJson(response, 200, await filterReportAudits(run, requestUrl));
   }
 
   const reportAuditMatch = pathname.match(/^\/api\/runs\/([^/]+)\/report\/audits\/([^/]+)$/);
   if (request.method === 'GET' && reportAuditMatch) {
-    await syncExternalShardedRuns();
-    const run = requireRun(decodeURIComponent(reportAuditMatch[1]));
+    const id = decodeURIComponent(reportAuditMatch[1]);
+    await syncExternalShardedRunForRead(id);
+    const run = requireRun(id);
     const auditId = decodeURIComponent(reportAuditMatch[2]);
     if (!/^[A-Z0-9-]{3,160}$/.test(auditId)) throw httpError(404, 'Audit detail not found.');
     const value = await readBoundedReportJson(
@@ -446,8 +470,9 @@ async function routeRequest(request, response) {
 
   const galleryMatch = pathname.match(/^\/api\/runs\/([^/]+)\/gallery$/);
   if (request.method === 'GET' && galleryMatch) {
-    await syncExternalShardedRuns();
-    const run = requireGalleryRun(decodeURIComponent(galleryMatch[1]));
+    const id = decodeURIComponent(galleryMatch[1]);
+    await syncExternalShardedRunForRead(id);
+    const run = requireGalleryRun(id);
     return withGalleryRequest(request, response, async (signal) => {
       return sendJson(response, 200, {
         ...await loadGalleryHead(run, signal),
@@ -458,8 +483,9 @@ async function routeRequest(request, response) {
 
   const galleryFlagsMatch = pathname.match(/^\/api\/runs\/([^/]+)\/gallery\/flags$/);
   if (request.method === 'GET' && galleryFlagsMatch) {
-    await syncExternalShardedRuns();
-    const run = requireGalleryRun(decodeURIComponent(galleryFlagsMatch[1]));
+    const id = decodeURIComponent(galleryFlagsMatch[1]);
+    await syncExternalShardedRunForRead(id);
+    const run = requireGalleryRun(id);
     return withGalleryRequest(request, response, async (signal) => {
       const snapshot = await readGalleryFlags(run, signal);
       const itemId = requestUrl.searchParams.get('itemId');
@@ -541,8 +567,9 @@ async function routeRequest(request, response) {
 
   const galleryItemsMatch = pathname.match(/^\/api\/runs\/([^/]+)\/gallery\/items$/);
   if (request.method === 'GET' && galleryItemsMatch) {
-    await syncExternalShardedRuns();
-    const run = requireGalleryRun(decodeURIComponent(galleryItemsMatch[1]));
+    const id = decodeURIComponent(galleryItemsMatch[1]);
+    await syncExternalShardedRunForRead(id);
+    const run = requireGalleryRun(id);
     return withGalleryRequest(request, response, async (signal) => {
       const snapshot = await gallerySnapshotForRequest(run, requestUrl, signal);
       rememberGallerySnapshot(run, snapshot);
@@ -571,8 +598,9 @@ async function routeRequest(request, response) {
 
   const galleryAvailabilityMatch = pathname.match(/^\/api\/runs\/([^/]+)\/gallery\/items\/([^/]+)\/availability$/);
   if (request.method === 'GET' && galleryAvailabilityMatch) {
-    await syncExternalShardedRuns();
-    const run = requireGalleryRun(decodeURIComponent(galleryAvailabilityMatch[1]));
+    const id = decodeURIComponent(galleryAvailabilityMatch[1]);
+    await syncExternalShardedRunForRead(id);
+    const run = requireGalleryRun(id);
     const itemId = decodeURIComponent(galleryAvailabilityMatch[2]);
     return withGalleryRequest(request, response, async (signal) => {
       const snapshot = await gallerySnapshotForRequest(run, requestUrl, signal, { includeRows: false });
@@ -582,8 +610,9 @@ async function routeRequest(request, response) {
 
   const galleryItemMatch = pathname.match(/^\/api\/runs\/([^/]+)\/gallery\/items\/([^/]+)$/);
   if (request.method === 'GET' && galleryItemMatch) {
-    await syncExternalShardedRuns();
-    const run = requireGalleryRun(decodeURIComponent(galleryItemMatch[1]));
+    const id = decodeURIComponent(galleryItemMatch[1]);
+    await syncExternalShardedRunForRead(id);
+    const run = requireGalleryRun(id);
     const itemId = decodeURIComponent(galleryItemMatch[2]);
     return withGalleryRequest(request, response, async (signal) => {
       const snapshot = await gallerySnapshotForRequest(run, requestUrl, signal, { includeRows: false });
@@ -593,8 +622,9 @@ async function routeRequest(request, response) {
 
   const galleryDeltaMatch = pathname.match(/^\/api\/runs\/([^/]+)\/gallery\/delta$/);
   if (request.method === 'GET' && galleryDeltaMatch) {
-    await syncExternalShardedRuns();
-    const run = requireGalleryRun(decodeURIComponent(galleryDeltaMatch[1]));
+    const id = decodeURIComponent(galleryDeltaMatch[1]);
+    await syncExternalShardedRunForRead(id);
+    const run = requireGalleryRun(id);
     return withGalleryRequest(request, response, async (signal) => {
       const from = galleryDeltaRevisions(requestUrl);
       const snapshot = await loadGallerySnapshot(run, signal);
@@ -2426,36 +2456,80 @@ async function syncExternalShardedRuns() {
   return externalRunSyncPromise;
 }
 
-async function refreshExternalShardedRuns() {
-  let entries;
-  try {
-    entries = await fs.readdir(SHARDED_ARTIFACT_ROOT, { withFileTypes: true });
-  } catch (error) {
-    if (error?.code === 'ENOENT') return;
-    throw error;
+function triggerExternalShardedRunSync() {
+  void syncExternalShardedRuns().catch((error) => {
+    console.error(`Could not refresh externally launched runs: ${error.message}`);
+  });
+}
+
+async function syncExternalShardedRunForRead(id) {
+  const existing = runs.get(id);
+  if (existing) {
+    if (existing.externalManaged) triggerExternalShardedRunSync();
+    return;
   }
-  for (const entry of entries) {
-    if (!entry.isDirectory() || !SAFE_RUN_ID.test(entry.name)) continue;
-    if (purgingRunIds.has(entry.name)) continue;
-    const directory = join(SHARDED_ARTIFACT_ROOT, entry.name);
-    const existing = runs.get(entry.name);
-    if (existing && !existing.externalManaged) continue;
-    const discoverable = await Promise.all([
-      safeStat(join(directory, 'logs', 'coordinator.log')),
-      safeStat(join(directory, 'sharded-run.json')),
-      safeStat(join(directory, 'merge-lifecycle.json')),
-      safeStat(join(directory, 'sharded-heartbeat.json')),
-    ]).then((stats) => stats.some((stat) => stat?.isFile()));
-    if (!discoverable) continue;
-    const run = existing ?? await createExternalRun(entry.name, directory);
-    if (existing && Date.now() < (run.externalState.nextRefreshAt ?? 0)) continue;
-    await refreshExternalRun(run, !existing);
-    run.externalState.nextRefreshAt = Date.now() + (
-      TERMINAL_STATUSES.has(run.manifest.status) && !run.externalState.leaseFailed
-        ? EXTERNAL_TERMINAL_REFRESH_MS
-        : EXTERNAL_RUN_SYNC_MS
-    );
-    if (!existing) runs.set(entry.name, run);
+  // Unknown IDs receive one authoritative discovery pass before returning a
+  // 404. Known runs use their cached manifest immediately while SSE/background
+  // refresh publishes the next snapshot.
+  await syncExternalShardedRuns();
+}
+
+async function refreshExternalShardedRuns() {
+  const startedAt = performance.now();
+  const budget = {
+    remainingBytes: MAX_EXTERNAL_REFRESH_BYTES,
+    deadline: startedAt + MAX_EXTERNAL_REFRESH_MS,
+    bytesRead: 0,
+    filesVisited: 0,
+    skippedBytes: 0,
+  };
+  externalRunSyncDiagnostics = { ...externalRunSyncDiagnostics, status: 'running' };
+  try {
+    let entries;
+    try {
+      entries = await fs.readdir(SHARDED_ARTIFACT_ROOT, { withFileTypes: true });
+    } catch (error) {
+      if (error?.code === 'ENOENT') return;
+      throw error;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !SAFE_RUN_ID.test(entry.name)) continue;
+      if (purgingRunIds.has(entry.name)) continue;
+      const directory = join(SHARDED_ARTIFACT_ROOT, entry.name);
+      const existing = runs.get(entry.name);
+      if (existing && !existing.externalManaged) continue;
+      const discoverable = await Promise.all([
+        safeStat(join(directory, 'logs', 'coordinator.log')),
+        safeStat(join(directory, 'sharded-run.json')),
+        safeStat(join(directory, 'merge-lifecycle.json')),
+        safeStat(join(directory, 'sharded-heartbeat.json')),
+      ]).then((stats) => stats.some((stat) => stat?.isFile()));
+      if (!discoverable) continue;
+      const run = existing ?? await createExternalRun(entry.name, directory);
+      if (existing && Date.now() < (run.externalState.nextRefreshAt ?? 0)) continue;
+      await refreshExternalRun(run, !existing, budget);
+      run.externalState.nextRefreshAt = Date.now() + (
+        TERMINAL_STATUSES.has(run.manifest.status) && !run.externalState.leaseFailed
+          ? EXTERNAL_TERMINAL_REFRESH_MS
+          : EXTERNAL_RUN_SYNC_MS
+      );
+      if (!existing) runs.set(entry.name, run);
+      await new Promise((resolveImmediate) => setImmediate(resolveImmediate));
+    }
+  } finally {
+    const durationMs = Math.round((performance.now() - startedAt) * 10) / 10;
+    externalRunSyncDiagnostics = {
+      status: 'idle',
+      finishedAt: new Date().toISOString(),
+      durationMs,
+      bytesRead: budget.bytesRead,
+      filesVisited: budget.filesVisited,
+      skippedBytes: budget.skippedBytes,
+      budgetExhausted: budget.remainingBytes <= 0 || performance.now() >= budget.deadline,
+    };
+    if (durationMs > MAX_EXTERNAL_REFRESH_MS * 2) {
+      console.warn(`[portal external sync] ${JSON.stringify(externalRunSyncDiagnostics)}`);
+    }
   }
 }
 
@@ -2532,7 +2606,7 @@ async function createExternalRun(id, directory) {
   };
 }
 
-async function refreshExternalRun(run, initial) {
+async function refreshExternalRun(run, initial, budget) {
   const before = JSON.stringify({
     status: run.manifest.status,
     phase: run.manifest.phase,
@@ -2544,7 +2618,9 @@ async function refreshExternalRun(run, initial) {
   const logFiles = await externalLogFiles(run.directory);
   const completedOnDiscovery = initial && Boolean(await safeStat(join(run.directory, 'sharded-run.json')));
   for (const logPath of logFiles) {
-    await consumeExternalLogFile(run, logPath, !initial, completedOnDiscovery);
+    if (budget.remainingBytes <= 0 || performance.now() >= budget.deadline) break;
+    await consumeExternalLogFile(run, logPath, !initial, completedOnDiscovery, budget);
+    await new Promise((resolveImmediate) => setImmediate(resolveImmediate));
   }
   await refreshExternalManifest(run);
   const after = JSON.stringify({
@@ -2587,7 +2663,8 @@ async function externalLogFiles(directory) {
     .sort((left, right) => priority(basename(left)) - priority(basename(right)) || left.localeCompare(right));
 }
 
-async function consumeExternalLogFile(run, path, emit, completedOnDiscovery = false) {
+async function consumeExternalLogFile(run, path, emit, completedOnDiscovery = false, budget) {
+  budget.filesVisited += 1;
   const stat = await safeStat(path);
   if (!stat?.isFile()) return;
   const state = run.externalState;
@@ -2596,11 +2673,13 @@ async function consumeExternalLogFile(run, path, emit, completedOnDiscovery = fa
   // immutable header first so totals, shard identity, and coordinator start
   // metadata survive that restart instead of reverting to an unknown total.
   if (!state.fileOffsets.has(path) && stat.size > MAX_EXTERNAL_LOG_INGEST_BYTES) {
-    await seedExternalLogHead(run, path, Math.min(stat.size, 64 * 1024));
-    const omittedPrefixBytes = stat.size - MAX_EXTERNAL_LOG_INGEST_BYTES;
-    if (basename(path).startsWith('shard-') || basename(path) === 'performance.log') {
-      await seedExternalProgressPrefix(run, path, omittedPrefixBytes);
-    }
+    const headBytes = await seedExternalLogHead(
+      run,
+      path,
+      Math.min(stat.size - MAX_EXTERNAL_LOG_INGEST_BYTES, 64 * 1024, budget.remainingBytes),
+    );
+    budget.bytesRead += headBytes;
+    budget.remainingBytes -= headBytes;
   }
   let offset = state.fileOffsets.get(path) ?? (completedOnDiscovery
     ? Math.max(0, stat.size - (basename(path) === 'coordinator.log' ? 128 * 1024 : 384 * 1024))
@@ -2613,6 +2692,7 @@ async function consumeExternalLogFile(run, path, emit, completedOnDiscovery = fa
   }
   if (stat.size - offset > MAX_EXTERNAL_LOG_INGEST_BYTES) {
     const skippedBytes = stat.size - offset - MAX_EXTERNAL_LOG_INGEST_BYTES;
+    budget.skippedBytes += skippedBytes;
     offset = stat.size - MAX_EXTERNAL_LOG_INGEST_BYTES;
     state.partialLines.set(path, '');
     state.omittedLineCharacters.set(path, 0);
@@ -2628,7 +2708,7 @@ async function consumeExternalLogFile(run, path, emit, completedOnDiscovery = fa
       });
     }
   }
-  if (stat.size === offset) return;
+  if (stat.size === offset || budget.remainingBytes <= 0 || performance.now() >= budget.deadline) return;
   const handle = await fs.open(path, 'r');
   try {
     let partial = state.partialLines.get(path) ?? '';
@@ -2636,11 +2716,14 @@ async function consumeExternalLogFile(run, path, emit, completedOnDiscovery = fa
     const decoder = state.decoders.get(path) ?? new StringDecoder('utf8');
     state.decoders.set(path, decoder);
     const buffer = Buffer.allocUnsafe(256 * 1024);
-    while (offset < stat.size) {
-      const length = Math.min(buffer.length, stat.size - offset);
+    const ingestEnd = Math.min(stat.size, offset + budget.remainingBytes);
+    while (offset < ingestEnd && performance.now() < budget.deadline) {
+      const length = Math.min(buffer.length, ingestEnd - offset);
       const { bytesRead } = await handle.read(buffer, 0, length, offset);
       if (bytesRead === 0) break;
       offset += bytesRead;
+      budget.bytesRead += bytesRead;
+      budget.remainingBytes -= bytesRead;
       const lines = `${partial}${decoder.write(buffer.subarray(0, bytesRead))}`.split(/\r?\n/);
       partial = lines.pop() ?? '';
       for (const [index, line] of lines.entries()) {
@@ -2655,6 +2738,7 @@ async function consumeExternalLogFile(run, path, emit, completedOnDiscovery = fa
         partial = partial.slice(remove);
         omitted += remove;
       }
+      await new Promise((resolveImmediate) => setImmediate(resolveImmediate));
     }
     state.partialLines.set(path, partial);
     state.omittedLineCharacters.set(path, omitted);
@@ -2665,6 +2749,7 @@ async function consumeExternalLogFile(run, path, emit, completedOnDiscovery = fa
 }
 
 async function seedExternalLogHead(run, path, length) {
+  if (length <= 0) return 0;
   const handle = await fs.open(path, 'r');
   try {
     const buffer = Buffer.allocUnsafe(length);
@@ -2674,34 +2759,10 @@ async function seedExternalLogHead(run, path, length) {
     // ingestion will process its complete copy when it falls in retained data.
     lines.pop();
     for (const line of lines) consumeExternalLogLine(run, path, line, false);
+    return bytesRead;
   } finally {
     await handle.close();
   }
-}
-
-async function seedExternalProgressPrefix(run, path, length) {
-  if (length <= 0) return;
-  const marker = '[AUDIT_TEST_FINISH]';
-  let carry = '';
-  let count = 0;
-  const stream = createReadStream(path, { start: 0, end: length - 1, highWaterMark: 256 * 1024 });
-  for await (const chunk of stream) {
-    const value = `${carry}${chunk.toString('utf8')}`;
-    let position = 0;
-    while ((position = value.indexOf(marker, position)) !== -1) {
-      count += 1;
-      position += marker.length;
-    }
-    carry = value.slice(-(marker.length - 1));
-  }
-  const name = basename(path);
-  const shard = run.externalState.shardProgress.get(name);
-  if (!shard) return;
-  shard.auditFinishes = Math.max(shard.auditFinishes, count);
-  shard.completed = shard.finished && shard.total !== null
-    ? shard.total
-    : Math.min(shard.total ?? Number.POSITIVE_INFINITY, shard.auditFinishes);
-  run.externalState.shardProgress.set(name, shard);
 }
 
 function consumeExternalLogLine(run, path, line, emit) {
@@ -2825,6 +2886,10 @@ async function refreshExternalManifest(run) {
     ?? run.manifest.options.candidateUrl;
   run.manifest.options.candidateIgnoreHTTPSErrors = lifecycle?.candidateIgnoreHTTPSErrors
     ?? state.started?.tlsPolicy === 'candidate-development-bypass';
+  const heartbeatIssue = !lifecycle && !mergeLifecycle && heartbeatStat?.isFile()
+    ? malformedExternalHeartbeat(heartbeat, run.manifest.id)
+    : null;
+  if (!heartbeatIssue) applyExternalHeartbeatProgress(state, heartbeat);
   run.manifest.stages = externalStages(state, lifecycle, mergeLifecycle, shardTotal);
   run.manifest.progress = externalProgress(state);
 
@@ -2872,7 +2937,6 @@ async function refreshExternalManifest(run) {
     return;
   }
 
-  const heartbeatIssue = heartbeatStat?.isFile() ? malformedExternalHeartbeat(heartbeat, run.manifest.id) : null;
   if (heartbeatIssue) {
     state.leaseFailed = true;
     const finishedAt = new Date().toISOString();
@@ -2940,7 +3004,62 @@ function malformedExternalHeartbeat(heartbeat, expectedRunId) {
   if (!Number.isSafeInteger(heartbeat.activeCommands) || heartbeat.activeCommands < 0 || heartbeat.activeCommands > 1_000) {
     return 'activeCommands must be a bounded non-negative integer.';
   }
+  if (heartbeat.progress !== undefined) {
+    if (!heartbeat.progress || typeof heartbeat.progress !== 'object' || Array.isArray(heartbeat.progress)) {
+      return 'progress must be an object when supplied.';
+    }
+    const entries = Object.entries(heartbeat.progress);
+    if (entries.length > 17) return 'progress contains too many command records.';
+    for (const [name, value] of entries) {
+      if (!/^(?:shard-\d+-of-\d+|performance)\.log$/.test(name)) return `progress key ${JSON.stringify(name)} is invalid.`;
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return `progress.${name} must be an object.`;
+      if (!['shard', 'performance'].includes(value.kind)) return `progress.${name}.kind is invalid.`;
+      if (value.kind === 'shard' && (!Number.isSafeInteger(value.index) || value.index < 1 || value.index > 16)) {
+        return `progress.${name}.index is invalid.`;
+      }
+      if (value.kind === 'performance' && value.index !== null) return `progress.${name}.index must be null.`;
+      for (const key of ['total', 'passed', 'failed', 'flaky', 'skipped', 'didNotRun']) {
+        if (value[key] !== null && (!Number.isSafeInteger(value[key]) || value[key] < 0 || value[key] > 100_000)) {
+          return `progress.${name}.${key} is invalid.`;
+        }
+      }
+      for (const key of ['completed', 'auditFinishes']) {
+        if (!Number.isSafeInteger(value[key]) || value[key] < 0 || value[key] > 100_000) {
+          return `progress.${name}.${key} is invalid.`;
+        }
+      }
+      if (value.total !== null && value.completed > value.total) return `progress.${name}.completed exceeds total.`;
+      if (typeof value.finished !== 'boolean') return `progress.${name}.finished must be boolean.`;
+      if (!Number.isFinite(Date.parse(String(value.updatedAt ?? '')))) return `progress.${name}.updatedAt is invalid.`;
+    }
+  }
   return null;
+}
+
+function applyExternalHeartbeatProgress(state, heartbeat) {
+  if (!heartbeat?.progress || typeof heartbeat.progress !== 'object' || Array.isArray(heartbeat.progress)) return;
+  for (const [name, reported] of Object.entries(heartbeat.progress)) {
+    const current = state.shardProgress.get(name) ?? {
+      total: null,
+      completed: 0,
+      auditFinishes: 0,
+      passed: null,
+      failed: null,
+      flaky: null,
+      skipped: null,
+      didNotRun: null,
+      finished: false,
+    };
+    if (Number.isSafeInteger(reported.total)) current.total = reported.total;
+    current.auditFinishes = Math.max(current.auditFinishes, reported.auditFinishes);
+    current.completed = Math.max(current.completed, reported.completed);
+    current.finished = current.finished || reported.finished;
+    for (const key of ['passed', 'failed', 'flaky', 'skipped', 'didNotRun']) {
+      if (Number.isSafeInteger(reported[key])) current[key] = reported[key];
+    }
+    if (current.total !== null) current.completed = Math.min(current.completed, current.total);
+    state.shardProgress.set(name, current);
+  }
 }
 
 function applyExternalFinalTruth(run, { pipeline, release, reportedStatus, finishedAt, source }) {

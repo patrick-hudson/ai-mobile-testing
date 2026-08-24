@@ -23,6 +23,7 @@ const containerRunDirectory = `/work/artifacts/sharded/${runId}`;
 const lifecyclePath = join(hostRunDirectory, 'sharded-run.json');
 const heartbeatPath = join(hostRunDirectory, 'sharded-heartbeat.json');
 const activeChildren = new Set();
+const commandProgress = new Map();
 const startedAt = new Date().toISOString();
 let stopRequest = null;
 let coordinatorFailure = null;
@@ -226,6 +227,24 @@ async function runMerge() {
 
 async function runDockerCommand({ kind, index, args, logPath }) {
   const label = kind === 'shard' ? `SHARD ${index}/${shardTotal}` : kind.toUpperCase();
+  const progressName = kind === 'shard' ? `shard-${index}-of-${shardTotal}.log`
+    : kind === 'performance' ? 'performance.log' : null;
+  if (progressName) {
+    commandProgress.set(progressName, {
+      kind,
+      index,
+      total: null,
+      completed: 0,
+      auditFinishes: 0,
+      passed: null,
+      failed: null,
+      flaky: null,
+      skipped: null,
+      didNotRun: null,
+      finished: false,
+      updatedAt: new Date().toISOString(),
+    });
+  }
   const command = ['docker', ...args];
   const commandStartedAt = new Date().toISOString();
   const deadlineMs = commandDeadlineMs(kind);
@@ -300,6 +319,7 @@ async function runDockerCommand({ kind, index, args, logPath }) {
     }
 
     function writeLine(channel, line) {
+      if (progressName) trackCommandProgress(progressName, line);
       const output = `${new Date().toISOString()} [${label}][${channel}] ${line}\n`;
       const accepted = log.write(output);
       if (!accepted && !logBackpressured) {
@@ -322,6 +342,13 @@ async function runDockerCommand({ kind, index, args, logPath }) {
       if (escalationTimer) clearTimeout(escalationTimer);
       if (child.auditStopTimer) clearTimeout(child.auditStopTimer);
       activeChildren.delete(child);
+      if (progressName) {
+        const progress = commandProgress.get(progressName);
+        progress.finished = true;
+        progress.completed = progress.total ?? progress.completed;
+        progress.updatedAt = new Date().toISOString();
+        commandProgress.set(progressName, progress);
+      }
       const result = {
         ...(index === null ? {} : { index }),
         label,
@@ -420,6 +447,7 @@ async function publishHeartbeat(status) {
     updatedAt,
     leaseExpiresAt: new Date(Date.now() + heartbeatLeaseMs).toISOString(),
     activeCommands: activeChildren.size,
+    progress: Object.fromEntries([...commandProgress.entries()].map(([name, value]) => [name, { ...value }])),
     stopRequestedAt: stopRequest?.requestedAt ?? null,
     stopSignal: stopRequest?.signal ?? null,
   };
@@ -433,6 +461,29 @@ async function publishHeartbeat(status) {
       for (const child of activeChildren) signalProcessTree(child, 'SIGTERM');
     }
   }
+}
+
+function trackCommandProgress(name, line) {
+  const progress = commandProgress.get(name);
+  if (!progress) return;
+  const running = line.match(/Running\s+(\d+)\s+tests?/i);
+  if (running) progress.total = Number(running[1]);
+  if (line.includes('[AUDIT_TEST_FINISH]')) progress.auditFinishes += 1;
+  for (const [pattern, key] of [
+    [/\b(\d+)\s+passed(?:\s|\(|$)/i, 'passed'],
+    [/\b(\d+)\s+failed(?:\s|$)/i, 'failed'],
+    [/\b(\d+)\s+flaky(?:\s|$)/i, 'flaky'],
+    [/\b(\d+)\s+skipped(?:\s|$)/i, 'skipped'],
+    [/\b(\d+)\s+did not run(?:\s|$)/i, 'didNotRun'],
+  ]) {
+    const summary = line.match(pattern);
+    if (summary) progress[key] = Number(summary[1]);
+  }
+  progress.completed = progress.finished && progress.total !== null
+    ? progress.total
+    : Math.min(progress.total ?? Number.POSITIVE_INFINITY, progress.auditFinishes);
+  progress.updatedAt = new Date().toISOString();
+  commandProgress.set(name, progress);
 }
 
 function writeCoordinator(event, detail) {
