@@ -25,6 +25,7 @@ import {
 } from '../fixtures/test.js';
 import {
   extractSitemapLocations,
+  extractHtmlTagAttributes,
   inspectHtmlDestination,
   loggedGet,
   mapWithConcurrency,
@@ -35,6 +36,68 @@ const ROUTE_REQUEST_TIMEOUT_MS = 10_000;
 
 function normalizeRoutePath(pathname: string): string {
   return pathname === '/' ? pathname : pathname.replace(/\/+$/, '');
+}
+
+function extractCanonicalHrefs(html: string): string[] {
+  return (html.match(/<link\b[^>]*>/gi) ?? []).flatMap((tag) => {
+    const rel = extractHtmlTagAttributes(tag, 'link', 'rel')[0]?.toLowerCase().split(/\s+/) ?? [];
+    const href = extractHtmlTagAttributes(tag, 'link', 'href')[0];
+    return rel.includes('canonical') && href ? [href] : [];
+  });
+}
+
+function extractCssReferences(css: string, sourceUrl: string): string[] {
+  return [...css.matchAll(/url\(\s*(?:"([^"]+)"|'([^']+)'|([^)'"\s]+))\s*\)/gi)].flatMap((match) => {
+    const raw = match[1] ?? match[2] ?? match[3] ?? '';
+    if (!raw || raw.startsWith('data:') || raw.startsWith('#')) return [];
+    try {
+      return [new URL(raw, sourceUrl).href];
+    } catch {
+      return [];
+    }
+  });
+}
+
+function extractFirstPartyAssetReferences(html: string, documentUrl: string): string[] {
+  const raw: string[] = [];
+  for (const [tag, attribute] of [['script', 'src'], ['img', 'src'], ['source', 'src'], ['video', 'src'], ['video', 'poster'], ['audio', 'src']] as const) {
+    raw.push(...extractHtmlTagAttributes(html, tag, attribute));
+  }
+  for (const tag of ['img', 'source'] as const) {
+    for (const srcset of extractHtmlTagAttributes(html, tag, 'srcset')) {
+      raw.push(...srcset.split(',').map((candidate) => candidate.trim().split(/\s+/)[0] ?? '').filter(Boolean));
+    }
+  }
+  for (const linkTag of html.match(/<link\b[^>]*>/gi) ?? []) {
+    const rel = extractHtmlTagAttributes(linkTag, 'link', 'rel')[0]?.toLowerCase().split(/\s+/) ?? [];
+    if (!rel.some((token) => ['stylesheet', 'icon', 'manifest', 'preload', 'modulepreload'].includes(token))) continue;
+    raw.push(...extractHtmlTagAttributes(linkTag, 'link', 'href'));
+  }
+  for (const style of extractHtmlTagAttributes(html, '[a-z][a-z0-9:-]*', 'style')) raw.push(...extractCssReferences(style, documentUrl));
+  for (const match of html.matchAll(/<style\b[^>]*>([\s\S]*?)<\/style>/gi)) raw.push(...extractCssReferences(match[1] ?? '', documentUrl));
+
+  const expectedOrigin = new URL(documentUrl).origin;
+  return [...new Set(raw.flatMap((value) => {
+    if (!value || value.startsWith('data:') || value.startsWith('blob:') || value.startsWith('#')) return [];
+    try {
+      const resolved = new URL(value, documentUrl);
+      return resolved.origin === expectedOrigin ? [resolved.href] : [];
+    } catch {
+      return [];
+    }
+  }))];
+}
+
+function expectedAssetContentType(assetUrl: string): RegExp | null {
+  const pathname = new URL(assetUrl).pathname.toLowerCase();
+  if (pathname.endsWith('.css')) return /^text\/css\b/i;
+  if (/\.(?:m?js)$/.test(pathname)) return /javascript/i;
+  if (/\.(?:png|jpe?g|gif|webp|avif|svg|ico)$/.test(pathname)) return /^image\//i;
+  if (/\.(?:woff2?|ttf|otf|eot)$/.test(pathname)) return /^(?:font\/|application\/(?:font|x-font|octet-stream))/i;
+  if (/\.(?:json|webmanifest)$/.test(pathname)) return /(?:application|text)\/(?:[^;]+\+)?json|application\/manifest\+json/i;
+  if (/\.(?:mp4|webm|ogv)$/.test(pathname)) return /^video\//i;
+  if (/\.(?:mp3|wav|ogg)$/.test(pathname)) return /^audio\//i;
+  return null;
 }
 
 async function safeInspectHtmlDestination(
@@ -103,9 +166,8 @@ staticTest('[ENV-001] configured origin serves a secure, meaningful HTML documen
   await audit.assertRuntimeHealthy();
 });
 
-staticTest('[ENV-002] static candidate route inventory is complete and internally consistent', staticEvidence('Capture the route inventory totals and the rendered sitemap that represents the published destinations.', 'full-sweep-projects'), async ({ audit }, testInfo) => {
-  const metadata = projectMetadata(testInfo.project.metadata);
-  test.skip(!metadata.fullSweep, 'Inventory validation belongs to full-sweep projects.');
+staticTest('[ENV-002] every declared candidate route serves HTML with its expected canonical', staticEvidence('Capture the complete route probe ledger and the sitemap after every declared route serves HTML with its exact public canonical.', 'candidate-desktop-chromium'), async ({ request, audit }) => {
+  test.setTimeout(180_000);
 
   const paths = CANDIDATE_HTML_ROUTES.map(({ path }) => path);
   const duplicatePaths = paths.filter((path, index) => paths.indexOf(path) !== index);
@@ -122,6 +184,33 @@ staticTest('[ENV-002] static candidate route inventory is complete and internall
   expect(categoryCount).toBe(EXPECTED_CATEGORY_COUNT);
   expect(paths).toHaveLength(EXPECTED_HTML_ROUTE_COUNT);
   expect(paths.every((path) => path.startsWith('/') && (path === '/' || !path.endsWith('/')))).toBe(true);
+
+  const routeEvidence = await mapWithConcurrency(CANDIDATE_HTML_ROUTES, 8, async (route) => {
+    const requestedUrl = new URL(route.path, ENVIRONMENTS.candidate.baseURL).href;
+    const response = await loggedGet(request, audit, requestedUrl, { timeout: ROUTE_REQUEST_TIMEOUT_MS });
+    const contentType = response.headers()['content-type'] ?? '';
+    const html = await response.text();
+    const canonicalHrefs = extractCanonicalHrefs(html);
+    expect(response.status(), `${route.path} must return HTTP 200`).toBe(200);
+    expect(contentType, `${route.path} must serve HTML`).toContain('text/html');
+    expect(canonicalHrefs, `${route.path} must expose exactly one canonical link`).toHaveLength(1);
+    const canonical = new URL(canonicalHrefs[0]!, requestedUrl);
+    expect(canonical.origin, `${route.path} canonical must announce the public origin`).toBe(ENVIRONMENTS.production.baseURL);
+    expect(normalizeRoutePath(canonical.pathname), `${route.path} canonical must retain the reviewed route`).toBe(route.path);
+    expect(canonical.search, `${route.path} canonical must not preserve a query`).toBe('');
+    expect(canonical.hash, `${route.path} canonical must not preserve a fragment`).toBe('');
+    return {
+      path: route.path,
+      kind: route.kind,
+      requestedUrl,
+      finalUrl: response.url(),
+      status: response.status(),
+      contentType,
+      canonical: canonical.href,
+    };
+  });
+  expect(routeEvidence, 'Every declared route must produce one successful canonical probe').toHaveLength(CANDIDATE_HTML_ROUTES.length);
+  await audit.attachJson('candidate-route-http-canonical-ledger', routeEvidence);
   await audit.goto('/sitemap');
   await audit.checkpoint('candidate-route-inventory-sitemap');
 });
@@ -351,7 +440,8 @@ interactionTest('[ENV-007] unknown routes provide working search and recovery na
   await audit.assertRuntimeHealthy();
 });
 
-structuredTest('[ENV-008] static data endpoints expose usable, versioned contracts', structuredEvidence('Retain endpoint status, content type, schema, record totals, and asset response evidence without unrelated media.', 'all-projects'), async ({ request, audit }) => {
+structuredTest('[ENV-008] all referenced first-party assets and data endpoints expose usable contracts', structuredEvidence('Retain every route-discovered first-party asset plus endpoint status, content type, schema, and byte evidence without unrelated media.', 'candidate-desktop-chromium'), async ({ request, audit }) => {
+  test.setTimeout(180_000);
   const endpointEvidence: Record<string, unknown> = {};
 
   for (const endpoint of DATA_ENDPOINTS) {
@@ -375,16 +465,47 @@ structuredTest('[ENV-008] static data endpoints expose usable, versioned contrac
     }
   }
 
-  const manifest = await loggedGet(request, audit, '/favicons/stone/site.webmanifest');
-  const socialCard = await loggedGet(request, audit, '/og-image.png');
-  expect(manifest.status()).toBe(200);
-  expect(manifest.headers()['content-type']).toMatch(/manifest\+json|application\/json/);
-  expect(socialCard.status()).toBe(200);
-  expect(socialCard.headers()['content-type']).toContain('image/png');
-  expect((await socialCard.body()).byteLength, 'The social card should not be an empty placeholder').toBeGreaterThan(10_000);
+  const routeDocuments = await mapWithConcurrency(CANDIDATE_HTML_ROUTES, 8, async (route) => {
+    const url = new URL(route.path, ENVIRONMENTS.candidate.baseURL).href;
+    const response = await loggedGet(request, audit, url, { timeout: ROUTE_REQUEST_TIMEOUT_MS });
+    const contentType = response.headers()['content-type'] ?? '';
+    const html = await response.text();
+    expect(response.status(), `${route.path} must load before its assets can be enumerated`).toBe(200);
+    expect(contentType, `${route.path} must serve an HTML asset graph`).toContain('text/html');
+    return { path: route.path, url: response.url(), assets: extractFirstPartyAssetReferences(html, response.url()) };
+  });
+  const htmlAssets = [...new Set(routeDocuments.flatMap(({ assets }) => assets))];
+  expect(htmlAssets.length, 'The route crawl must discover a non-trivial first-party asset graph').toBeGreaterThan(10);
+
+  const firstPass = await mapWithConcurrency(htmlAssets, 8, async (assetUrl) => {
+    const response = await loggedGet(request, audit, assetUrl, { timeout: ROUTE_REQUEST_TIMEOUT_MS });
+    const contentType = response.headers()['content-type'] ?? '';
+    const body = await response.body();
+    const expectedContentType = expectedAssetContentType(response.url());
+    expect(response.status(), `${assetUrl} must load`).toBe(200);
+    expect(body.byteLength, `${assetUrl} must not be empty`).toBeGreaterThan(0);
+    if (expectedContentType) expect(contentType, `${assetUrl} must use the content type implied by its extension`).toMatch(expectedContentType);
+    const cssReferences = contentType.includes('text/css')
+      ? extractCssReferences(body.toString('utf8'), response.url()).filter((url) => new URL(url).origin === new URL(response.url()).origin)
+      : [];
+    return { assetUrl, finalUrl: response.url(), status: response.status(), contentType, bytes: body.byteLength, cssReferences };
+  });
+  const nestedCssAssets = [...new Set(firstPass.flatMap(({ cssReferences }) => cssReferences).filter((url) => !htmlAssets.includes(url)))];
+  const secondPass = await mapWithConcurrency(nestedCssAssets, 8, async (assetUrl) => {
+    const response = await loggedGet(request, audit, assetUrl, { timeout: ROUTE_REQUEST_TIMEOUT_MS });
+    const contentType = response.headers()['content-type'] ?? '';
+    const body = await response.body();
+    const expectedContentType = expectedAssetContentType(response.url());
+    expect(response.status(), `${assetUrl} referenced by CSS must load`).toBe(200);
+    expect(body.byteLength, `${assetUrl} referenced by CSS must not be empty`).toBeGreaterThan(0);
+    if (expectedContentType) expect(contentType, `${assetUrl} must use the content type implied by its extension`).toMatch(expectedContentType);
+    return { assetUrl, finalUrl: response.url(), status: response.status(), contentType, bytes: body.byteLength };
+  });
 
   audit.observe('Data endpoints checked', DATA_ENDPOINTS.length);
+  audit.observe('First-party assets checked', firstPass.length + secondPass.length);
   await audit.attachJson('endpoint-contract-evidence', endpointEvidence);
+  await audit.attachJson('first-party-asset-contract-evidence', { routeDocuments, firstPass, nestedCssAssets: secondPass });
 });
 
 staticTest('[SEO-001] representative metadata is complete, consistent, and shareable', staticEvidence('Capture representative rendered pages and their title, canonical, Open Graph, and Twitter metadata.', 'all-projects'), async ({ page, audit }, testInfo) => {

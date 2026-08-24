@@ -1,4 +1,5 @@
 import { AxeBuilder } from '@axe-core/playwright';
+import type { Locator, Page } from '@playwright/test';
 import { REPRESENTATIVE_A11Y_ROUTES } from '../audit/routes.js';
 import { expect, interactionEvidence, interactionTest, staticEvidence, staticTest, test, type AuditRun } from '../fixtures/test.js';
 
@@ -13,6 +14,27 @@ interface AxeReviewEntry {
   help: string;
   helpUrl?: string;
   nodes: Array<{ target: unknown; html: string; failureSummary?: string | null }>;
+}
+
+async function tabUntilFocused(page: Page, target: Locator, maximumTabs = 200): Promise<number> {
+  for (let count = 0; count <= maximumTabs; count += 1) {
+    if (await target.evaluate((element) => element === document.activeElement).catch(() => false)) return count;
+    await page.keyboard.press('Tab');
+  }
+  throw new Error(`Keyboard focus did not reach ${await target.evaluate((element) => element.outerHTML.slice(0, 240))} after ${maximumTabs} Tab presses.`);
+}
+
+async function focusAppearance(target: Locator): Promise<string> {
+  return target.evaluate((element) => {
+    const style = getComputedStyle(element);
+    return [style.outlineStyle, style.outlineWidth, style.outlineColor, style.boxShadow, style.borderColor, style.backgroundColor].join('|');
+  });
+}
+
+async function assertKeyboardFocusVisible(target: Locator, unfocusedAppearance: string): Promise<void> {
+  await expect(target).toBeFocused();
+  expect(await target.evaluate((element) => element.matches(':focus-visible')), 'Keyboard focus must use the focus-visible state').toBe(true);
+  expect(await focusAppearance(target), 'Keyboard focus must change a visible outline, ring, border, or background').not.toBe(unfocusedAppearance);
 }
 
 function surfaceIncompleteResults(
@@ -107,7 +129,8 @@ interactionTest('[A11Y-001] opened search dialog has a valid accessible tree', i
   expect(results.violations).toEqual([]);
 });
 
-interactionTest('[A11Y-002] keyboard path skips navigation and completes search-dialog lifecycle', interactionEvidence('Use only the keyboard to activate skip navigation, open and search, then close the dialog with restored focus.', 'candidate-chromium-projects'), async ({ page, audit }) => {
+interactionTest('[A11Y-002] keyboard-only critical journeys expose logical and visible focus', interactionEvidence('Use only the keyboard for navigation, search, calculator input, disclosure expansion, and meeting filters while showing every response and focus state.', 'candidate-chromium-projects'), async ({ page, audit }) => {
+  test.setTimeout(150_000);
   await audit.goto('/start-here/welcome');
   const focusJourney: Array<{ action: string; element: string; label: string }> = [];
   const recordFocus = async (action: string) => {
@@ -136,7 +159,7 @@ interactionTest('[A11Y-002] keyboard path skips navigation and completes search-
     await expect(dialog).toBeVisible();
     const input = dialog.getByRole('combobox', { name: 'Search all pages' });
     await expect(input).toBeFocused();
-    await input.fill('withdrawal sleep');
+    await page.keyboard.type('withdrawal sleep');
     await expect(dialog.getByRole('listbox', { name: 'Search results' })).toBeVisible();
     await expect(dialog.getByRole('option').first()).toBeVisible();
     await recordFocus('Open search and enter a useful query');
@@ -146,8 +169,83 @@ interactionTest('[A11Y-002] keyboard path skips navigation and completes search-
     await recordFocus('Close search with Escape');
   });
 
-  audit.observe('Keyboard checkpoints', focusJourney.length, '4');
+  await audit.step('Operate guide navigation by keyboard', 'The device-appropriate guide control opens or changes navigation state and Escape/Enter restores it.', async () => {
+    await audit.goto('/start-here/what-is-7-oh');
+    const mobileOpener = page.getByRole('button', { name: 'Open guide navigation' });
+    if (await mobileOpener.isVisible()) {
+      const before = await focusAppearance(mobileOpener);
+      await tabUntilFocused(page, mobileOpener);
+      await assertKeyboardFocusVisible(mobileOpener, before);
+      await recordFocus('Reach mobile guide opener');
+      await page.keyboard.press('Enter');
+      const guide = page.getByRole('dialog', { name: 'Guide navigation' });
+      await expect(guide).toBeVisible();
+      expect(await guide.evaluate((element) => element.contains(document.activeElement))).toBe(true);
+      await page.keyboard.press('Escape');
+      await expect(guide).toBeHidden();
+      await expect(mobileOpener).toBeFocused();
+    } else {
+      const collapse = page.getByRole('button', { name: 'Collapse guide navigation' });
+      const before = await focusAppearance(collapse);
+      await tabUntilFocused(page, collapse);
+      await assertKeyboardFocusVisible(collapse, before);
+      await recordFocus('Reach desktop guide control');
+      await page.keyboard.press('Enter');
+      const expand = page.getByRole('button', { name: 'Expand guide navigation' });
+      await expect(expand).toBeVisible();
+      await expect(expand).toBeFocused();
+      await page.keyboard.press('Enter');
+      await expect(collapse).toBeVisible();
+      await expect(collapse).toBeFocused();
+    }
+    await recordFocus('Complete guide navigation response');
+  });
+
+  await audit.step('Edit the taper calculator by keyboard', 'Tab reaches the dose input, its visible focus appears, and typed arithmetic updates the exact daily total.', async () => {
+    await audit.goto('/resources/7-oh-taper-calculator');
+    const dose = page.getByLabel('Per-dose amount (mg)', { exact: true });
+    const before = await focusAppearance(dose);
+    await tabUntilFocused(page, dose);
+    await assertKeyboardFocusVisible(dose, before);
+    await recordFocus('Reach calculator dose');
+    await page.keyboard.press('Control+A');
+    await page.keyboard.type('20');
+    await page.keyboard.press('Tab');
+    await expect(page.getByText('80 mg', { exact: true }).first()).toBeVisible();
+    await recordFocus('Update calculator total');
+  });
+
+  await audit.step('Expand a disclosure by keyboard', 'Tab reaches the summary, visible focus appears, and Enter reveals the exact schedule content.', async () => {
+    await audit.goto('/start-here/7-oh-withdrawal-quickstart');
+    const summary = page.locator('summary').filter({ hasText: 'Exact liposomal vitamin C schedule' });
+    const before = await focusAppearance(summary);
+    await tabUntilFocused(page, summary);
+    await assertKeyboardFocusVisible(summary, before);
+    await recordFocus('Reach vitamin C disclosure');
+    await page.keyboard.press('Enter');
+    await expect(page.locator('details').filter({ has: summary })).toHaveAttribute('open', '');
+    await expect(page.getByText(/Days 1 to 2: 2 grams per day/)).toBeVisible();
+    await recordFocus('Expand vitamin C disclosure');
+  });
+
+  await audit.step('Filter meetings by keyboard', 'Tab reaches the meeting search, visible focus appears, and an impossible query produces explicit empty-state feedback.', async () => {
+    await audit.goto('/virtual-na-meetings-now');
+    const meetingSearch = page.getByRole('searchbox', { name: 'Search meetings' });
+    await expect(meetingSearch).toBeVisible();
+    const before = await focusAppearance(meetingSearch);
+    await tabUntilFocused(page, meetingSearch);
+    await assertKeyboardFocusVisible(meetingSearch, before);
+    await recordFocus('Reach meeting filter');
+    await page.keyboard.type('zzzz-no-meeting-audit');
+    await expect(page.getByRole('button', { name: 'Clear filters' })).toBeVisible();
+    expect(await page.getByText('Nothing in this window matches your filters.', { exact: true }).count(), 'The filter must visibly update at least one meeting pane').toBeGreaterThan(0);
+    await recordFocus('Apply meeting filter');
+  });
+
+  audit.observe('Keyboard checkpoints', focusJourney.length, '12');
+  expect(focusJourney, 'Every critical keyboard task must contribute two recorded focus/response checkpoints').toHaveLength(12);
   await audit.attachJson('keyboard-focus-journey', focusJourney);
+  await audit.assertRuntimeHealthy();
 });
 
 staticTest('[A11Y-005] reduced-motion preference disables decorative animation without removing status text', staticEvidence('Capture the reduced-motion rendered state with computed animation values and equivalent status text.', 'candidate-chromium-projects'), async ({ page, audit }) => {

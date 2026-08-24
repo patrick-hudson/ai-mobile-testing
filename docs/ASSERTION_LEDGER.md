@@ -45,7 +45,7 @@ The repository validation gate separately rejects literal/self-comparing asserti
 
 | Source test | Applicability | Executable browser/device targets |
 | --- | --- | --- |
-| `tests/contracts.spec.ts` | `full-sweep-projects` | `production-mobile-chromium`, `candidate-mobile-chromium`, `candidate-desktop-chromium` |
+| `tests/contracts.spec.ts` | `candidate-desktop-chromium` | `candidate-desktop-chromium`, `candidate-desktop-chromium-edge-compat`, `candidate-desktop-chromium-msedge` |
 
 ### ENV-003 — Production-first migration ledger
 
@@ -135,7 +135,7 @@ The repository validation gate separately rejects literal/self-comparing asserti
 
 | Source test | Applicability | Executable browser/device targets |
 | --- | --- | --- |
-| `tests/contracts.spec.ts` | `all-projects` | `production-mobile-chromium`, `candidate-mobile-chromium`, `production-desktop-chromium`, `candidate-desktop-chromium`, `candidate-mobile-webkit`, `candidate-tablet-webkit`, `candidate-desktop-firefox`, `candidate-mobile-webkit-iphone-17-ios18`, `candidate-mobile-webkit-iphone-15-ios17`, `candidate-mobile-chromium-pixel-10-android16`, `candidate-mobile-chromium-pixel-8-android14`, `candidate-mobile-chromium-galaxy-s24-android14`, `candidate-desktop-chromium-edge-compat`, `candidate-desktop-chromium-msedge` |
+| `tests/contracts.spec.ts` | `candidate-desktop-chromium` | `candidate-desktop-chromium`, `candidate-desktop-chromium-edge-compat`, `candidate-desktop-chromium-msedge` |
 
 ### SHELL-001 — Scheduling notice
 
@@ -585,7 +585,7 @@ The repository validation gate separately rejects literal/self-comparing asserti
 
 | Source test | Applicability | Executable browser/device targets |
 | --- | --- | --- |
-| `tests/smoke.spec.ts` | `all-projects` | `production-mobile-chromium`, `candidate-mobile-chromium`, `production-desktop-chromium`, `candidate-desktop-chromium`, `candidate-mobile-webkit`, `candidate-tablet-webkit`, `candidate-desktop-firefox`, `candidate-mobile-webkit-iphone-17-ios18`, `candidate-mobile-webkit-iphone-15-ios17`, `candidate-mobile-chromium-pixel-10-android16`, `candidate-mobile-chromium-pixel-8-android14`, `candidate-mobile-chromium-galaxy-s24-android14`, `candidate-desktop-chromium-edge-compat`, `candidate-desktop-chromium-msedge` |
+| `tests/smoke.spec.ts` | `candidate-projects` | `candidate-mobile-chromium`, `candidate-desktop-chromium`, `candidate-mobile-webkit`, `candidate-tablet-webkit`, `candidate-desktop-firefox`, `candidate-mobile-webkit-iphone-17-ios18`, `candidate-mobile-webkit-iphone-15-ios17`, `candidate-mobile-chromium-pixel-10-android16`, `candidate-mobile-chromium-pixel-8-android14`, `candidate-mobile-chromium-galaxy-s24-android14`, `candidate-desktop-chromium-edge-compat`, `candidate-desktop-chromium-msedge` |
 
 ### CONTENT-001 — Document structure
 
@@ -827,14 +827,14 @@ The repository validation gate separately rejects literal/self-comparing asserti
 | --- | --- | --- |
 | `tests/calculators.spec.ts` | `candidate-chromium-projects` | `candidate-mobile-chromium`, `candidate-desktop-chromium`, `candidate-mobile-chromium-pixel-10-android16`, `candidate-mobile-chromium-pixel-8-android14`, `candidate-mobile-chromium-galaxy-s24-android14`, `candidate-desktop-chromium-edge-compat`, `candidate-desktop-chromium-msedge` |
 
-### CALC-009 — Calculator arithmetic unit coverage
+### CALC-009 — Calculator arithmetic black-box coverage
 
 - Area: calculators
 - Severity and gate: P0; release blocking
 - Execution: automated; assertion-quality gate required
 - User promise: Interface evidence is backed by deterministic numeric tests.
-- Exact expected behavior: Pure schedule generators pass representative, edge, and invariant-based unit cases.
-- Primary evidence: static-screenshot — Capture the rendered state and structured evidence proving: Pure schedule generators pass representative, edge, and invariant-based unit cases.
+- Exact expected behavior: Independent rendered black-box vectors cover a published schedule, a minimum-duration boundary, an explicit-zero stop boundary, and arithmetic invariants without importing site implementation code.
+- Primary evidence: static-screenshot — Capture the rendered state and structured evidence proving: Independent rendered black-box vectors cover a published schedule, a minimum-duration boundary, an explicit-zero stop boundary, and arithmetic invariants without importing site implementation code.
 - Evidence attachments: `screenshot`, `json`
 - Owning plugins: `calculators-sows`
 

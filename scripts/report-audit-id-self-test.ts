@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { bracketedAuditIds, firstBracketedAuditId } from '../audit/audit-id.js';
 import {
+  AUDIT_APPLICABILITY_ANNOTATION,
   AUDIT_EVIDENCE_POLICY_ANNOTATION,
   AUDIT_STATUS_ANNOTATION,
   serializeEvidencePolicy,
@@ -99,6 +100,9 @@ function evidence(
 
 interface ReportTestOptions {
   annotations?: Array<{ type: string; description?: string }>;
+  applicability?: string;
+  idSuffix?: string;
+  projectName?: string;
   metadata?: ReportTestInput['projectMetadata'];
   record?: AuditEvidenceRecord;
   results?: ReportTestInput['results'];
@@ -113,11 +117,11 @@ function reportTest(
 ): ReportTestInput {
   const record = options.record ?? evidence(definition);
   return {
-    id: `audit-id-self-test-${definition.id}`,
+    id: `audit-id-self-test-${definition.id}${options.idSuffix ? `-${options.idSuffix}` : ''}`,
     title,
     titlePath: [file, ...extraTitlePath, title],
     file,
-    projectName: 'candidate-self-test',
+    projectName: options.projectName ?? 'candidate-self-test',
     projectMetadata: options.metadata ?? {
       environment: 'candidate',
       browserLabel: 'synthetic',
@@ -129,6 +133,7 @@ function reportTest(
     annotations: options.annotations ?? [
       { type: 'audit-id', description: definition.id },
       { type: AUDIT_EVIDENCE_POLICY_ANNOTATION, description: serializeEvidencePolicy(definition.evidencePolicy) },
+      { type: AUDIT_APPLICABILITY_ANNOTATION, description: options.applicability ?? 'candidate-projects' },
     ],
     results: options.results ?? [{
       status: 'passed',
@@ -410,6 +415,137 @@ try {
   assert.equal(coverage.selected.production, 1);
   assert.equal(coverage.skipped.production, 1);
   assert.match(coverageManifest.audits[0]!.baseline.note, /not tested/i);
+
+  const applicableCandidateSkip = reportTest(
+    definitions[0]!,
+    '[A11Y-001] applicable Edge execution is skipped',
+    'tests/accessibility.spec.ts',
+    [],
+    {
+      idSuffix: 'edge-skip',
+      projectName: 'candidate-desktop-chromium-edge-compat',
+      applicability: 'candidate-desktop-chromium',
+      metadata: {
+        environment: 'candidate',
+        browserLabel: 'Chromium / Edge-compatible desktop emulation',
+        deviceClass: 'desktop',
+        fullSweep: false,
+        visual: true,
+        tlsPolicy: 'strict',
+      },
+      results: [{
+        status: 'skipped',
+        expectedStatus: 'skipped',
+        duration: 0,
+        retry: 0,
+        errors: [],
+        attachments: [],
+        stdout: [],
+        stderr: [],
+      }],
+    },
+  );
+  const applicableCandidatePass = reportTest(
+    definitions[0]!,
+    '[A11Y-001] canonical Chromium execution passes',
+    'tests/accessibility.spec.ts',
+    [],
+    {
+      idSuffix: 'chrome-pass',
+      projectName: 'candidate-desktop-chromium',
+      applicability: 'candidate-desktop-chromium',
+      metadata: {
+        environment: 'candidate',
+        browserLabel: 'Chromium / desktop',
+        deviceClass: 'desktop',
+        fullSweep: true,
+        visual: true,
+        tlsPolicy: 'strict',
+      },
+    },
+  );
+  const applicableGapManifest = await buildAuditManifest({
+    outputDir: path.join(root, 'applicable-gap-checklist'),
+    tests: [applicableCandidatePass, applicableCandidateSkip],
+    run: { status: 'passed', source: 'playwright-json', profile: 'self-test' },
+    definitionCatalog: [definitions[0]!],
+  });
+  const applicableGapAudit = applicableGapManifest.audits[0]!;
+  assert.equal(applicableGapAudit.status, 'NOT_RUN', 'An applicable skipped target must prevent a PASS aggregate.');
+  assert.equal(applicableGapAudit.coverage.missingApplicable.candidate, 1);
+  assert.equal(applicableGapManifest.release.blockingIncomplete, 1);
+  assert.equal(applicableGapManifest.release.ready, false);
+
+  const selectedCandidateProjects = [{
+    name: 'candidate-desktop-chromium',
+    metadata: {
+      environment: 'candidate' as const,
+      browserLabel: 'Chromium / desktop',
+      deviceClass: 'desktop' as const,
+      fullSweep: true,
+      visual: true,
+      tlsPolicy: 'strict' as const,
+    },
+  }, {
+    name: 'candidate-desktop-chromium-edge-compat',
+    metadata: {
+      environment: 'candidate' as const,
+      browserLabel: 'Chromium / Edge-compatible desktop emulation',
+      deviceClass: 'desktop' as const,
+      fullSweep: false,
+      visual: true,
+      tlsPolicy: 'strict' as const,
+    },
+  }];
+  const completelyMissingManifest = await buildAuditManifest({
+    outputDir: path.join(root, 'completely-missing-project-checklist'),
+    tests: [applicableCandidatePass],
+    selectedProjects: selectedCandidateProjects,
+    run: { status: 'passed', source: 'playwright-json', profile: 'self-test' },
+    definitionCatalog: [definitions[0]!],
+  });
+  const completelyMissingAudit = completelyMissingManifest.audits[0]!;
+  assert.equal(
+    completelyMissingAudit.status,
+    'NOT_RUN',
+    'A selected applicable project that emits no test row must prevent a PASS aggregate.',
+  );
+  assert.deepEqual(completelyMissingAudit.coverage.plannedApplicableProjects, [
+    'candidate-desktop-chromium',
+    'candidate-desktop-chromium-edge-compat',
+  ]);
+  assert.deepEqual(completelyMissingAudit.coverage.missingApplicableProjects, [
+    'candidate-desktop-chromium-edge-compat',
+  ]);
+  assert.equal(completelyMissingAudit.coverage.missingApplicable.candidate, 1);
+  assert.equal(completelyMissingManifest.release.blockingIncomplete, 1);
+  assert.equal(completelyMissingManifest.release.ready, false);
+
+  const authoritativeSelectionManifest = await buildAuditManifest({
+    outputDir: path.join(root, 'authoritative-project-selection-checklist'),
+    tests: [applicableCandidatePass, {
+      ...applicableCandidateSkip,
+      id: 'manual-evidence-row-outside-playwright-selection',
+      projectName: 'manual · physical phone',
+      projectMetadata: {
+        environment: 'candidate',
+        browserLabel: 'physical phone',
+        deviceClass: 'mobile',
+        fullSweep: false,
+        visual: true,
+        tlsPolicy: 'strict',
+      },
+    }],
+    selectedProjects: [selectedCandidateProjects[0]!],
+    run: { status: 'passed', source: 'playwright-json', profile: 'self-test' },
+    definitionCatalog: [definitions[0]!],
+  });
+  assert.deepEqual(
+    authoritativeSelectionManifest.audits[0]!.coverage.selectedProjects,
+    ['candidate-desktop-chromium'],
+    'Explicit Playwright project metadata must be authoritative; report-only/manual rows cannot expand the matrix.',
+  );
+  assert.deepEqual(authoritativeSelectionManifest.audits[0]!.coverage.missingApplicableProjects, []);
 
   const flakyRecord = evidence(definitions[0]!);
   const flakyTest = reportTest(

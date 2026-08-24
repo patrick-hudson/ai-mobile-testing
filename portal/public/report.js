@@ -224,7 +224,7 @@ function renderMetrics() {
     ['Documented checks', number(summary.total), 'Every expected behavior stays visible'],
     ['Executed checks', `${number(summary.executed)} / ${number(summary.total)}`, percentCopy(summary.executed, summary.total)],
     ['Release blockers', number(release.blockingFailures) + number(release.blockingIncomplete), `${number(release.blockingFailures)} failed or need review · ${number(release.blockingIncomplete)} incomplete`],
-    ['Evidence files', number(summary.artifacts), `${number(summary.videos)} videos · ${number(summary.posters)} poster previews`],
+    ['Evidence files', number(summary.artifacts), `${number(summary.usableInteractionVideos ?? summary.videos)} usable interaction videos · ${number(summary.diagnosticVideos)} diagnostic videos · ${number(summary.posters)} poster previews`],
     ['Structured executions', number(summary.structuredExecutions), 'Observed steps and findings, not just pass/fail'],
     ['Baseline issues', number(summary.baselineIssues), 'Existing production defects kept as context'],
   ];
@@ -348,6 +348,7 @@ async function loadAudits() {
     if (input.value) query.set(name, input.value);
   }
   if (elements.filter_manual.checked) query.set('manual', 'true');
+  if (state.report.publicationRevision) query.set('revision', state.report.publicationRevision);
   try {
     const page = await fetchJson(`/api/runs/${encodeURIComponent(state.runId)}/report/audits?${query}`, { signal: controller.signal });
     if (controller.signal.aborted || requestId !== state.auditRequest) return;
@@ -446,7 +447,10 @@ async function toggleAuditDetail(auditId, button, detail) {
   detail.hidden = false;
   detail.append(statusMessage('Loading observations, findings, and linked evidence…', 'loading'));
   try {
-    const value = await fetchJson(`/api/runs/${encodeURIComponent(state.runId)}/report/audits/${encodeURIComponent(auditId)}`, { signal: controller.signal });
+    const revision = state.report?.publicationRevision
+      ? `?revision=${encodeURIComponent(state.report.publicationRevision)}`
+      : '';
+    const value = await fetchJson(`/api/runs/${encodeURIComponent(state.runId)}/report/audits/${encodeURIComponent(auditId)}${revision}`, { signal: controller.signal });
     if (controller.signal.aborted || state.activeAuditId !== auditId) return;
     renderAuditDetail(detail, value);
     announce(`${auditId} evidence context loaded.`);

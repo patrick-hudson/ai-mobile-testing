@@ -14,6 +14,7 @@ import {
 } from './lib/sharded-evidence.mjs';
 import { commandIntegrityFailures, pipelineDiagnosticsDocument } from './lib/pipeline-diagnostics.mjs';
 import {
+  DEFAULT_RELEASE_SHARD_CONCURRENCY,
   DEFAULT_RELEASE_SHARD_TOTAL,
   DEFAULT_RELEASE_SHARD_WORKERS,
 } from './lib/sharded-defaults.mjs';
@@ -102,7 +103,7 @@ try {
 
   await assertShardedCoordinatorStopsAndTimesOut(temporaryRoot);
 
-  process.stdout.write('Sharded isolation self-test passed: 8x1 release defaults remain aligned, diagnostic exit codes stay non-authoritative, process termination fails integrity, dedicated evidence is required, stale blobs are rejected, run IDs are portal-compatible, existing evidence is never reused, cancellation skips later stages, and command deadlines fail closed.\n');
+  process.stdout.write('Sharded isolation self-test passed: 8x1 partitions use a bounded four-container pool, diagnostic exit codes stay non-authoritative, process termination fails integrity, dedicated evidence is required, stale blobs are rejected, run IDs are portal-compatible, existing evidence is never reused, cancellation skips queued and later stages, and command deadlines fail closed.\n');
 } finally {
   await fs.rm(temporaryRoot, { recursive: true, force: true });
 }
@@ -129,6 +130,7 @@ wait $!
     PATH: `${fakeBin}${delimiter}${process.env.PATH ?? ''}`,
     FAKE_DOCKER_INVOCATIONS: invocations,
     AUDIT_SHARD_TOTAL: '2',
+    AUDIT_SHARD_CONCURRENCY: '1',
     AUDIT_SHARDED_HEARTBEAT_MS: '1000',
     AUDIT_SHARDED_LEASE_MS: '10000',
     AUDIT_COMMAND_STOP_GRACE_MS: '1000',
@@ -157,6 +159,10 @@ wait $!
   assert.equal(cancelledLifecycle.pipeline.status, 'stopped');
   assert.equal(cancelledLifecycle.pipeline.completed, false);
   assert.equal(cancelledLifecycle.shardWorkers, DEFAULT_RELEASE_SHARD_WORKERS);
+  assert.equal(cancelledLifecycle.shardConcurrency, 1);
+  assert.equal(cancelledLifecycle.shards.length, 2);
+  assert.equal(cancelledLifecycle.shards.filter(({ command }) => command.length > 0).length, 1);
+  assert.equal(cancelledLifecycle.shards.filter(({ command }) => command.length === 0).length, 1);
   const cancelledDiagnostics = JSON.parse(await fs.readFile(
     join(repositoryRoot, 'artifacts', 'sharded', cancelledId, 'pipeline-diagnostics.json'),
     'utf8',
@@ -201,6 +207,7 @@ wait $!
 async function assertReleaseDefaults(repositoryRoot) {
   assert.equal(DEFAULT_RELEASE_SHARD_TOTAL, 8);
   assert.equal(DEFAULT_RELEASE_SHARD_WORKERS, 1);
+  assert.equal(DEFAULT_RELEASE_SHARD_CONCURRENCY, 4);
   const [compose, workflow, portal, documentation, readme] = await Promise.all([
     fs.readFile(join(repositoryRoot, 'docker-compose.yml'), 'utf8'),
     fs.readFile(join(repositoryRoot, '.github', 'workflows', 'release-audit.yml'), 'utf8'),
@@ -212,10 +219,13 @@ async function assertReleaseDefaults(repositoryRoot) {
   assert.match(compose, /AUDIT_SHARD_TOTAL: \$\{AUDIT_SHARD_TOTAL:-8\}/);
   assert.match(workflow, /workers:[\s\S]{0,240}?default: '1'/);
   assert.match(workflow, /shards:[\s\S]{0,240}?default: '8'/);
+  assert.match(workflow, /shard_concurrency:[\s\S]{0,240}?default: '4'/);
+  assert.match(workflow, /AUDIT_SHARD_CONCURRENCY: \$\{\{ inputs\.shard_concurrency \}\}/);
   assert.match(portal, /releaseShardTotal: DEFAULT_RELEASE_SHARD_TOTAL/);
   assert.match(portal, /releaseShardWorkers: DEFAULT_RELEASE_SHARD_WORKERS/);
+  assert.match(portal, /releaseShardConcurrency: DEFAULT_RELEASE_SHARD_CONCURRENCY/);
   assert.match(documentation, /default is eight functional shards with one Playwright worker/);
-  assert.match(readme, /default to eight parallel Docker containers with one Playwright worker each/);
+  assert.match(readme, /default to eight functional shards with one Playwright worker each/);
 }
 
 function assertPipelineDiagnosticClassification() {

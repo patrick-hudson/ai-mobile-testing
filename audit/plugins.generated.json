@@ -508,9 +508,9 @@
         {
           "id": "CALC-009",
           "area": "calculators",
-          "title": "Calculator arithmetic unit coverage",
+          "title": "Calculator arithmetic black-box coverage",
           "userPromise": "Interface evidence is backed by deterministic numeric tests.",
-          "expected": "Pure schedule generators pass representative, edge, and invariant-based unit cases.",
+          "expected": "Independent rendered black-box vectors cover a published schedule, a minimum-duration boundary, an explicit-zero stop boundary, and arithmetic invariants without importing site implementation code.",
           "severity": "P0",
           "releaseBlocking": true,
           "evidence": [
@@ -519,7 +519,7 @@
           ],
           "evidencePolicy": {
             "mode": "static-screenshot",
-            "rationale": "Capture the rendered state and structured evidence proving: Pure schedule generators pass representative, edge, and invariant-based unit cases."
+            "rationale": "Capture the rendered state and structured evidence proving: Independent rendered black-box vectors cover a published schedule, a minimum-duration boundary, an explicit-zero stop boundary, and arithmetic invariants without importing site implementation code."
           },
           "manual": false
         },
@@ -1629,11 +1629,9 @@
         {
           "auditId": "CRISIS-002",
           "entrySpec": "tests/smoke.spec.ts",
-          "applicability": "all-projects",
+          "applicability": "candidate-projects",
           "supportedProjects": [
-            "production-mobile-chromium",
             "candidate-mobile-chromium",
-            "production-desktop-chromium",
             "candidate-desktop-chromium",
             "candidate-mobile-webkit",
             "candidate-tablet-webkit",
@@ -1681,11 +1679,11 @@
         {
           "auditId": "ENV-002",
           "entrySpec": "tests/contracts.spec.ts",
-          "applicability": "full-sweep-projects",
+          "applicability": "candidate-desktop-chromium",
           "supportedProjects": [
-            "production-mobile-chromium",
-            "candidate-mobile-chromium",
-            "candidate-desktop-chromium"
+            "candidate-desktop-chromium",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
           ]
         },
         {
@@ -1778,20 +1776,9 @@
         {
           "auditId": "ENV-008",
           "entrySpec": "tests/contracts.spec.ts",
-          "applicability": "all-projects",
+          "applicability": "candidate-desktop-chromium",
           "supportedProjects": [
-            "production-mobile-chromium",
-            "candidate-mobile-chromium",
-            "production-desktop-chromium",
             "candidate-desktop-chromium",
-            "candidate-mobile-webkit",
-            "candidate-tablet-webkit",
-            "candidate-desktop-firefox",
-            "candidate-mobile-webkit-iphone-17-ios18",
-            "candidate-mobile-webkit-iphone-15-ios17",
-            "candidate-mobile-chromium-pixel-10-android16",
-            "candidate-mobile-chromium-pixel-8-android14",
-            "candidate-mobile-chromium-galaxy-s24-android14",
             "candidate-desktop-chromium-edge-compat",
             "candidate-desktop-chromium-msedge"
           ]

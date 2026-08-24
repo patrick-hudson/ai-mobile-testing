@@ -6,7 +6,7 @@ import {
   REPRESENTATIVE_VISUAL_ROUTES,
 } from '../audit/routes.js';
 import { expect, interactionEvidence, interactionTest, staticEvidence, staticTest, structuredEvidence, structuredTest, test } from '../fixtures/test.js';
-import { dismissSchedulingNotice, inspectHtmlDestination, loggedGet, meta, pageHasHorizontalOverflow, waitForSettledUI } from './helpers.js';
+import { dismissSchedulingNotice, extractHtmlElementIds, extractHtmlTagAttributes, inspectHtmlDestination, loggedGet, mapWithConcurrency, meta, pageHasHorizontalOverflow, waitForSettledUI } from './helpers.js';
 
 const REPRESENTATIVE_DOCUMENTS = [
   '/',
@@ -86,14 +86,88 @@ staticTest('[CONTENT-001] representative documents keep valid landmarks and head
 
 structuredTest('[CONTENT-003] every published candidate route resolves without a broken internal destination', structuredEvidence('Retain every resolved internal destination, redirect disposition, status, and content type without unrelated media.', 'candidate-desktop-chromium'), async ({ request, audit }, testInfo) => {
   test.skip(!candidateDesktopChromium(testInfo), 'One candidate project performs the complete internal destination crawl.');
-  const results = [];
-  for (const route of CANDIDATE_HTML_ROUTES) {
-    results.push({ path: route.path, kind: route.kind, ...await inspectHtmlDestination(request, audit, route.path) });
-  }
-  const broken = results.filter(({ valid }) => !valid);
-  audit.observe('Published internal destinations crawled', results.length, String(CANDIDATE_HTML_ROUTES.length));
-  await audit.attachJson('network-internal-link-ledger', { results, broken });
-  expect(broken, 'Every destination in the reviewed route inventory must serve HTML directly').toEqual([]);
+  test.setTimeout(180_000);
+  const candidateOrigin = new URL(ENVIRONMENTS.candidate.baseURL).origin;
+  const productionOrigin = new URL(ENVIRONMENTS.production.baseURL).origin;
+  const sourceDocuments = await mapWithConcurrency(CANDIDATE_HTML_ROUTES, 8, async (route) => {
+    const url = new URL(route.path, ENVIRONMENTS.candidate.baseURL).href;
+    const response = await loggedGet(request, audit, url, { timeout: 10_000 });
+    const contentType = response.headers()['content-type'] ?? '';
+    const html = await response.text();
+    return {
+      path: route.path,
+      kind: route.kind,
+      url,
+      status: response.status(),
+      contentType,
+      html,
+      hrefs: extractHtmlTagAttributes(html, 'a', 'href'),
+    };
+  });
+  const badSources = sourceDocuments.filter(({ status, contentType }) => status !== 200 || !contentType.includes('text/html'));
+  expect(badSources, 'Every source document must load before its rendered anchor contract can be trusted').toEqual([]);
+
+  const malformed: Array<{ sourcePath: string; href: string; issue: string }> = [];
+  const internalReferences = sourceDocuments.flatMap((source) => source.hrefs.flatMap((href) => {
+    if (/^(?:mailto|tel|sms):/i.test(href)) return [];
+    if (/^(?:javascript|data):/i.test(href)) {
+      malformed.push({ sourcePath: source.path, href, issue: 'Executable or embedded URLs are not valid navigation destinations.' });
+      return [];
+    }
+    try {
+      const destination = new URL(href, source.url);
+      if (!['http:', 'https:'].includes(destination.protocol)) return [];
+      if (destination.origin !== candidateOrigin && destination.origin !== productionOrigin) return [];
+      const fragment = destination.hash ? decodeURIComponent(destination.hash.slice(1)) : '';
+      destination.hash = '';
+      return [{ sourcePath: source.path, renderedHref: href, destination: destination.href, fragment }];
+    } catch (error) {
+      malformed.push({ sourcePath: source.path, href, issue: error instanceof Error ? error.message : String(error) });
+      return [];
+    }
+  }));
+  expect(internalReferences.length, 'The crawl must inspect rendered anchors, not merely replay the route registry').toBeGreaterThan(CANDIDATE_HTML_ROUTES.length * 3);
+
+  const uniqueDestinations = [...new Set(internalReferences.map(({ destination }) => destination))];
+  const results = await mapWithConcurrency(uniqueDestinations, 8, async (destination) => ({
+    destination,
+    ...await inspectHtmlDestination(request, audit, destination, { timeoutMs: 10_000 }),
+  }));
+  const resultByDestination = new Map(results.map((result) => [result.destination, result]));
+  const broken = internalReferences.filter(({ destination }) => !resultByDestination.get(destination)?.valid);
+
+  const fragmentDocuments = new Map<string, Promise<{ finalUrl: string; ids: Set<string> }>>();
+  const fragmentChecks = await mapWithConcurrency(internalReferences.filter(({ fragment }) => fragment !== ''), 8, async (reference) => {
+    let document = fragmentDocuments.get(reference.destination);
+    if (!document) {
+      document = (async () => {
+        const inspected = resultByDestination.get(reference.destination);
+        if (!inspected?.valid) return { finalUrl: inspected?.finalUrl ?? reference.destination, ids: new Set<string>() };
+        const response = await loggedGet(request, audit, inspected.finalUrl, { timeout: 10_000 });
+        return { finalUrl: response.url(), ids: new Set(extractHtmlElementIds(await response.text())) };
+      })();
+      fragmentDocuments.set(reference.destination, document);
+    }
+    const resolved = await document;
+    return { ...reference, finalUrl: resolved.finalUrl, exists: resolved.ids.has(reference.fragment) };
+  });
+  const missingFragments = fragmentChecks.filter(({ exists }) => !exists);
+
+  audit.observe('Rendered internal anchor references', internalReferences.length);
+  audit.observe('Unique internal destinations crawled', results.length);
+  audit.observe('Fragment targets checked', fragmentChecks.length);
+  await audit.attachJson('network-internal-link-ledger', {
+    sources: sourceDocuments.map(({ html: _html, ...source }) => source),
+    internalReferences,
+    results,
+    fragmentChecks,
+    malformed,
+    broken,
+    missingFragments,
+  });
+  expect(malformed, 'Rendered anchors must contain parseable, non-executable URLs').toEqual([]);
+  expect(broken, 'Every rendered internal anchor destination must serve HTML directly or through a canonical trailing-slash redirect').toEqual([]);
+  expect(missingFragments, 'Every rendered internal fragment must identify an existing id or legacy named anchor').toEqual([]);
 });
 
 staticTest('[CONTENT-004] internal and external links follow tab-isolation policy', staticEvidence('Capture representative rendered link sets with their target and rel isolation attributes.', 'candidate-desktop-chromium'), async ({ page, audit }, testInfo) => {

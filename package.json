@@ -57,6 +57,8 @@
     "runtime-expectations:self-test": "node --import tsx scripts/runtime-expectation-self-test.ts",
     "video-retention:self-test": "node --import tsx scripts/video-retention-self-test.ts",
     "sharded-isolation:self-test": "node scripts/sharded-isolation-self-test.mjs",
+    "merge-stage-integrity:self-test": "node scripts/merge-stage-integrity-self-test.mjs",
+    "external-evidence:self-test": "node scripts/external-evidence-self-test.mjs",
     "plugins:validate": "node --import tsx scripts/validate-plugins.ts",
     "plugins:check": "node --import tsx scripts/validate-plugins.ts --check",
     "plugins:metadata-self-test": "node --import tsx scripts/validate-plugin-metadata.ts",
@@ -65,7 +67,7 @@
     "targets:self-test": "node --import tsx scripts/target-registry-self-test.ts",
     "tls:check": "node --import tsx scripts/validate-tls-policy.ts",
     "typecheck": "tsc --noEmit",
-    "validate": "npm run plugins:check && npm run plugins:metadata-self-test && npm run targets:check && npm run targets:self-test && npm run evidence-policy:self-test && npm run assertions:self-test && npm run assertions:ledger:check && npm run runtime-expectations:self-test && npm run video-retention:self-test && npm run ai:self-test && npm run release-truth:self-test && npm run report-audit-id:self-test && npm run report-poster:self-test && npm run gallery-catalog:self-test && npm run gallery-archive:self-test && npm run gallery-scale:self-test && npm run gallery-retention:self-test && npm run gallery-flags:self-test && npm run gallery-state:self-test && npm run portal-e2e-output:self-test && npm run portal-security:self-test && npm run portal-gallery-integrity:self-test && npm run sharded-isolation:self-test && npm run typecheck && npm run tls:check",
+    "validate": "npm run plugins:check && npm run plugins:metadata-self-test && npm run targets:check && npm run targets:self-test && npm run evidence-policy:self-test && npm run assertions:self-test && npm run assertions:ledger:check && npm run runtime-expectations:self-test && npm run video-retention:self-test && npm run ai:self-test && npm run release-truth:self-test && npm run report-audit-id:self-test && npm run report-poster:self-test && npm run gallery-catalog:self-test && npm run gallery-archive:self-test && npm run gallery-scale:self-test && npm run gallery-retention:self-test && npm run gallery-flags:self-test && npm run gallery-state:self-test && npm run portal-e2e-output:self-test && npm run portal-security:self-test && npm run portal-gallery-integrity:self-test && npm run sharded-isolation:self-test && npm run merge-stage-integrity:self-test && npm run external-evidence:self-test && npm run typecheck && npm run tls:check",
     "test": "npm run validate && npm run audit:smoke"
   },
   "devDependencies": {

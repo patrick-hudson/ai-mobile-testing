@@ -67,7 +67,8 @@ export async function loadGallerySnapshot(run, signal, options = {}) {
   const sealedHead = join(run.directory, 'checklist', 'gallery', 'current.json');
   const sealedAuthoritative = run.manifest?.stages?.reportRebuild?.status === 'completed'
     || run.manifest?.pipeline?.completed === true;
-  if (sealedAuthoritative && await isFile(sealedHead)) {
+  const sealedReviewable = sealedAuthoritative || Boolean(run.manifest?.finishedAt);
+  if (sealedReviewable && await isFile(sealedHead)) {
     return await withReviewerFlags(
       await loadSealedSnapshot(run, sealedHead, signal, options.includeRows !== false),
       run,
@@ -76,17 +77,6 @@ export async function loadGallerySnapshot(run, signal, options = {}) {
   }
   const live = await loadLiveSnapshot(run, signal);
   if (live) return await withReviewerFlags(live, run, signal);
-  if (await isFile(sealedHead)) {
-    // Legacy completed runs may not have persisted per-stage state. Never use
-    // an early sealed report while its evidence pipeline is still active.
-    if (run.manifest?.finishedAt || run.manifest?.pipeline?.completed === true) {
-      return await withReviewerFlags(
-        await loadSealedSnapshot(run, sealedHead, signal, options.includeRows !== false),
-        run,
-        signal,
-      );
-    }
-  }
   throw new GalleryHttpError(404, 'No finalized gallery evidence is available for this run yet.', {
     code: 'GALLERY_NOT_READY',
   });
@@ -157,7 +147,8 @@ export async function probeGalleryPublication(run, signal) {
   const sealedHead = join(run.directory, 'checklist', 'gallery', 'current.json');
   const sealedAuthoritative = run.manifest?.stages?.reportRebuild?.status === 'completed'
     || run.manifest?.pipeline?.completed === true;
-  if (sealedAuthoritative && await isFile(sealedHead)) {
+  const sealedReviewable = sealedAuthoritative || Boolean(run.manifest?.finishedAt);
+  if (sealedReviewable && await isFile(sealedHead)) {
     const descriptor = assertGalleryArchiveDescriptor(await readJsonBounded(
       sealedHead,
       GALLERY_DESCRIPTOR_MAX_BYTES,

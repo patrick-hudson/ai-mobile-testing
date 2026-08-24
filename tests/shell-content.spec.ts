@@ -1,5 +1,6 @@
 import { test, expect, interactionEvidence, interactionTest, staticEvidence, staticTest } from '../fixtures/test.js';
 import { loggedGet, meta, pageHasHorizontalOverflow } from './helpers.js';
+import { CRISIS_ACTIONS } from './crisis-contract.js';
 
 function candidateChromium(testInfo: Parameters<typeof meta>[0]): boolean {
   return meta(testInfo).environment === 'candidate' && testInfo.project.name.includes('chromium');
@@ -205,13 +206,41 @@ staticTest('[CRISIS-001] crisis fast path keeps urgent actions above unnecessary
   await audit.step('Inspect focused crisis layout', 'The first urgent actions are visible without sidebar or guide-drawer chrome.', async () => {
     await expect(page.getByRole('button', { name: 'Open guide navigation' })).toHaveCount(0);
     await expect(page.getByRole('navigation', { name: 'Guide index' })).toHaveCount(0);
-    const visibleActionCount = await page.locator('main a[href]').evaluateAll((anchors) => anchors.filter((anchor) => {
-      const box = anchor.getBoundingClientRect();
-      return box.top >= 0 && box.top < window.innerHeight && box.height >= 40;
-    }).length);
-    expect(visibleActionCount).toBeGreaterThanOrEqual(2);
+    await expect(page.locator('footer')).toHaveCount(0);
+    const discord = page.getByRole('link', { name: 'Open Discord #sos', exact: true });
+    const meeting = page.locator('main a[href]').filter({ hasText: /7-OH\/kratom meeting|Find the next live meeting/i }).first();
+    for (const urgent of [discord, meeting]) {
+      await expect(urgent).toBeVisible();
+      const geometry = await urgent.evaluate((element) => {
+        const box = element.getBoundingClientRect();
+        return { top: box.top, bottom: box.bottom, left: box.left, right: box.right, height: box.height, viewportWidth: innerWidth, viewportHeight: innerHeight };
+      });
+      expect(geometry.top, 'An immediate human-help action must begin in the first viewport').toBeGreaterThanOrEqual(0);
+      expect(geometry.bottom, 'An immediate human-help action must be fully visible in the first viewport').toBeLessThanOrEqual(geometry.viewportHeight);
+      expect(geometry.height, 'An immediate action must meet a 44px touch target').toBeGreaterThanOrEqual(44);
+      expect(geometry.left).toBeGreaterThanOrEqual(0);
+      expect(geometry.right).toBeLessThanOrEqual(geometry.viewportWidth);
+    }
   });
+
+  const actionEvidence = [];
+  for (const expected of CRISIS_ACTIONS) {
+    const action = page.getByRole('link', { name: expected.name, exact: typeof expected.name === 'string' });
+    await expect(action, `${String(expected.name)} must remain rendered and usable`).toBeVisible();
+    await expect(action).toHaveAttribute('href', expected.href);
+    const geometry = await action.evaluate((element) => {
+      const box = element.getBoundingClientRect();
+      return { width: box.width, height: box.height, left: box.left, right: box.right, viewportWidth: innerWidth };
+    });
+    expect(geometry.height, `${String(expected.name)} must meet a 44px touch target`).toBeGreaterThanOrEqual(44);
+    expect(geometry.width, `${String(expected.name)} must have a usable touch width`).toBeGreaterThanOrEqual(44);
+    expect(geometry.left, `${String(expected.name)} must not clip off the left edge`).toBeGreaterThanOrEqual(0);
+    expect(geometry.right, `${String(expected.name)} must not clip off the right edge`).toBeLessThanOrEqual(geometry.viewportWidth);
+    actionEvidence.push({ name: String(expected.name), href: expected.href, geometry });
+  }
+  await audit.attachJson('crisis-action-geometry', actionEvidence);
   await audit.checkpoint('crisis-first-viewport');
+  await audit.assertRuntimeHealthy();
 });
 
 interactionTest('[SHARE-001] quickstart copy produces a useful Reddit starter block', interactionEvidence('Activate Reddit starter copy and show the clipboard block and accessible confirmation responding.', 'candidate-chromium-projects'), async ({ page, context, audit }, testInfo) => {

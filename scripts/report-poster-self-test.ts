@@ -108,6 +108,8 @@ try {
   assert.equal(mergedWithPoster?.poster?.sourcePath, 'raw/original-video-poster.jpg');
   assert.match(mergedWithPoster?.poster?.href ?? '', /03-blob-resource-poster\.jpg$/);
   assert.equal(manifest.summary.videos, 3);
+  assert.equal(manifest.summary.usableInteractionVideos, 3);
+  assert.equal(manifest.summary.diagnosticVideos, 0);
   assert.equal(manifest.summary.posters, 2);
   assert.equal(manifest.summary.artifacts, 5);
 
@@ -125,6 +127,8 @@ try {
   ]);
   assert.equal(portalSummary.schemaVersion, 1);
   assert.equal(portalSummary.summary.videos, 3);
+  assert.equal(portalSummary.summary.usableInteractionVideos, 3);
+  assert.equal(portalSummary.summary.diagnosticVideos, 0);
   assert.equal(portalIndex.items.length, 1);
   assert.deepEqual(portalIndex.items[0].environments, ['candidate']);
   assert.equal(portalIndex.items[0].evidenceCounts.video, 3);
@@ -161,6 +165,44 @@ try {
   const reportIndex = await readFile(path.join(outputDir, 'index.html'), 'utf8');
   assert.equal(reportIndex.includes('gallery-archive-head'), true);
   assert.match(reportIndex, /href="gallery\.html"[^>]*>Open Visual Gallery/);
+
+  const diagnosticAttemptVideo = path.join(root, 'diagnostic-failed-attempt.webm');
+  const usableFinalVideo = path.join(root, 'usable-final-attempt.webm');
+  await Promise.all([
+    writeFile(diagnosticAttemptVideo, Buffer.from('synthetic failed-attempt diagnostic video')),
+    writeFile(usableFinalVideo, Buffer.from('synthetic final usable interaction video')),
+  ]);
+  const diagnosticManifest = await writeAuditReport({
+    outputDir: path.join(root, 'diagnostic-checklist'),
+    tests: [{
+      ...tests[0]!,
+      id: 'video-summary-diagnostic-self-test',
+      results: [{
+        status: 'failed',
+        expectedStatus: 'passed',
+        duration: 1,
+        retry: 0,
+        errors: [{ message: 'Synthetic failed attempt retained only for diagnosis.' }],
+        attachments: [{ name: 'failed-attempt-video', contentType: 'video/webm', path: diagnosticAttemptVideo }],
+        stdout: [],
+        stderr: [],
+      }, {
+        status: 'passed',
+        expectedStatus: 'passed',
+        duration: 1,
+        retry: 1,
+        errors: [],
+        attachments: [{ name: 'final-attempt-video', contentType: 'video/webm', path: usableFinalVideo }],
+        stdout: [],
+        stderr: [],
+      }],
+    }],
+    run: { status: 'passed', source: 'playwright-json', profile: 'smoke' },
+    definitionCatalog: [definition],
+  });
+  assert.equal(diagnosticManifest.summary.videos, 2, 'Compatibility total must continue to include every available clip.');
+  assert.equal(diagnosticManifest.summary.usableInteractionVideos, 1);
+  assert.equal(diagnosticManifest.summary.diagnosticVideos, 1);
   console.log('Report poster self-test passed.');
 } finally {
   await rm(root, { recursive: true, force: true });

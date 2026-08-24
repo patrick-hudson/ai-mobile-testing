@@ -1,5 +1,6 @@
 import { expect, test, type APIRequestContext } from '@playwright/test';
 import { access, mkdir, open, readFile, readdir, rename, symlink, unlink, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 
 test.describe.configure({ mode: 'serial' });
@@ -61,9 +62,19 @@ test('portal renders the complete launch surface and asynchronous loading state'
   await expect(page.locator('#project-options input[name="targetId"]:disabled')).toHaveCount(5);
   await expect(page.locator('#plugin-options input')).toHaveCount(5);
   await expect(page.locator('#audit-options input')).toHaveCount(81);
+  await expect(page.locator('#runs-panel')).toHaveAttribute('aria-busy', 'false');
+  const refreshedRuns = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return response.request().method() === 'GET' && url.pathname === '/api/runs';
+  });
   await page.locator('#refresh-runs').click();
   await expect(page.locator('#runs-panel')).toHaveAttribute('aria-busy', 'true');
+  await expect(page.locator('#refresh-runs')).toBeDisabled();
+  await expect(page.locator('#refresh-runs')).toHaveText('Refreshing…');
+  await refreshedRuns;
   await expect(page.locator('#runs-panel')).toHaveAttribute('aria-busy', 'false');
+  await expect(page.locator('#refresh-runs')).toBeEnabled();
+  await expect(page.locator('#refresh-runs')).toHaveText('Refresh');
 });
 
 test('reviewer report has bounded loading, empty, and terminal error states without fetching raw evidence', async ({ page }) => {
@@ -81,6 +92,7 @@ test('reviewer report has bounded loading, empty, and terminal error states with
   };
   const report = {
     schemaVersion: 1,
+    publicationRevision: '11111111111111111111111111111111',
     generatedAt: '2026-08-24T12:01:00.000Z',
     run: { profile: 'release', startedAt: run.startedAt, finishedAt: run.finishedAt, durationMs: 60_000 },
     release: { ready: false, decision: 'NOT_READY', blockingFailures: 0, blockingIncomplete: 1, baselineIssues: 0, reason: 'No checks were executed.', decisionBasis: 'Synthetic UI state fixture.' },
@@ -110,6 +122,7 @@ test('reviewer report has bounded loading, empty, and terminal error states with
   await expect(page.locator('#audit-list')).toContainText(/no checks match/i);
   expect(requestedUrls.some((url) => url.endsWith('/checklist/manifest.json'))).toBeFalsy();
   expect(requestedUrls.some((url) => url.includes('/logs'))).toBeFalsy();
+  expect(requestedUrls.some((url) => url.includes('revision=11111111111111111111111111111111'))).toBeTruthy();
 
   await page.route('**/api/runs/ui-state-demo/logs?*', (route) => route.fulfill({
     json: {
@@ -575,6 +588,7 @@ test('externally launched shards are discovered while active and retained with l
     shards: [1, 2].map((index) => ({ index, label: `SHARD ${index}/2`, command: ['docker', 'compose', 'run', `shard-${index}`], startedAt, finishedAt, durationMs: 2, exitCode: index === 1 ? 1 : 0, signal: null })),
     performance: { label: 'PERFORMANCE', command: ['docker', 'compose', 'run', 'performance'], startedAt, finishedAt, durationMs: 2, exitCode: 0, signal: null },
     merge: { label: 'MERGE', command: ['docker', 'compose', 'run', 'merge'], startedAt, finishedAt, durationMs: 3, exitCode: 1, signal: null },
+    mergePipeline: { status: 'completed', completed: true, reason: 'Synthetic merge evidence completed.', finishedAt },
   };
   await writeFile(join(directory, 'sharded-run.json'), `${JSON.stringify({
     ...lifecycleFixture,
@@ -636,28 +650,51 @@ test('externally launched shards are discovered while active and retained with l
     status: 'not-ready',
   }, null, 2)}\n`);
   await writeFile(join(directory, 'checklist', 'index.html'), '<!doctype html><title>External checklist</title>');
+  await writeFile(join(directory, 'checklist', 'manifest.json'), `${JSON.stringify({ schemaVersion: 1, generatedAt: finishedAt, release })}\n`);
+  await writeFile(join(directory, 'results.json'), '{"suites":[]}\n');
   await mkdir(join(directory, 'checklist', 'data', 'audits'), { recursive: true });
-  await writeFile(join(directory, 'checklist', 'data', 'summary.json'), `${JSON.stringify({
+  const reportPublicationRevision = 'abcdef0123456789abcdef0123456789';
+  const compactSummary = {
     schemaVersion: 1,
+    publicationRevision: reportPublicationRevision,
     generatedAt: finishedAt,
     release,
     summary: { total: 2, byStatus: { PASS: 1, MANUAL_REQUIRED: 1 } },
-  })}\n`);
-  await writeFile(join(directory, 'checklist', 'data', 'audits.json'), `${JSON.stringify({
+  };
+  const compactAudits = {
     schemaVersion: 1,
+    publicationRevision: reportPublicationRevision,
     generatedAt: finishedAt,
     items: [
       { id: 'ENV-001', title: 'Environment availability', status: 'PASS', severity: 'P0', area: 'environment', environments: ['candidate'], releaseBlocking: true, manual: false },
       { id: 'DEVICE-001', title: 'Real iPhone acceptance', status: 'MANUAL_REQUIRED', severity: 'P0', area: 'responsive', environments: ['candidate'], releaseBlocking: true, manual: true },
     ],
-  })}\n`);
-  await writeFile(join(directory, 'checklist', 'data', 'audits', 'ENV-001.json'), `${JSON.stringify({
+  };
+  const compactDocuments = new Map([
+    ['summary.json', `${JSON.stringify(compactSummary)}\n`],
+    ['audits.json', `${JSON.stringify(compactAudits)}\n`],
+    ['audits/ENV-001.json', `${JSON.stringify({ schemaVersion: 1, publicationRevision: reportPublicationRevision, generatedAt: finishedAt, id: 'ENV-001', title: 'Environment availability', status: 'PASS', evidence: [] })}\n`],
+    ['audits/DEVICE-001.json', `${JSON.stringify({ schemaVersion: 1, publicationRevision: reportPublicationRevision, generatedAt: finishedAt, id: 'DEVICE-001', title: 'Real iPhone acceptance', status: 'MANUAL_REQUIRED', evidence: [] })}\n`],
+  ]);
+  const compactRevisionDirectory = join(directory, 'checklist', 'data', 'revisions', reportPublicationRevision);
+  await mkdir(join(compactRevisionDirectory, 'audits'), { recursive: true });
+  await Promise.all([...compactDocuments].flatMap(([path, source]) => [
+    writeFile(join(compactRevisionDirectory, path), source),
+    writeFile(join(directory, 'checklist', 'data', path), source),
+  ]));
+  const compactPublication = `${JSON.stringify({
     schemaVersion: 1,
-    id: 'ENV-001',
-    title: 'Environment availability',
-    status: 'PASS',
-    evidence: [],
-  })}\n`);
+    publicationRevision: reportPublicationRevision,
+    generatedAt: finishedAt,
+    files: Object.fromEntries([...compactDocuments].map(([path, source]) => [path, {
+      bytes: Buffer.byteLength(source),
+      sha256: createHash('sha256').update(source).digest('hex'),
+    }])),
+  })}\n`;
+  await Promise.all([
+    writeFile(join(compactRevisionDirectory, 'publication.json'), compactPublication),
+    writeFile(join(directory, 'checklist', 'data', 'current.json'), compactPublication),
+  ]);
 
   const mergeLog = await open(join(logDirectory, 'merge.log'), 'w');
   const sparseLogBytes = 32 * 1024 * 1024;
@@ -668,6 +705,29 @@ test('externally launched shards are discovered while active and retained with l
   const largeVideo = await open(join(directory, 'large-evidence.webm'), 'w');
   await largeVideo.truncate(64 * 1024 * 1024);
   await largeVideo.close();
+  const zeroBlock = Buffer.alloc(1024 * 1024);
+  const largeVideoHash = createHash('sha256');
+  for (let block = 0; block < 64; block += 1) largeVideoHash.update(zeroBlock);
+  await writeFile(join(directory, 'large-evidence-poster.jpg'), 'synthetic poster');
+  await writeFile(join(directory, 'video-manifest.json'), `${JSON.stringify({
+    schemaVersion: 2,
+    videoCount: 1,
+    processedCount: 1,
+    usableInteractionVideoCount: 1,
+    diagnosticVideoCount: 0,
+    failedCount: 0,
+    unavailableCount: 0,
+    retention: { integrityErrors: [] },
+    videos: [{
+      video: 'large-evidence.webm',
+      bytes: 64 * 1024 * 1024,
+      sha256: largeVideoHash.digest('hex'),
+      evidenceRole: 'usable-interaction',
+      poster: 'large-evidence-poster.jpg',
+      posterBytes: Buffer.byteLength('synthetic poster'),
+      processingStatus: 'created',
+    }],
+  })}\n`);
 
   let completed: Record<string, any> | null = null;
   let completionResponse = '';
@@ -704,11 +764,13 @@ test('externally launched shards are discovered while active and retained with l
 
   const reportSummary = await (await request.get(`/api/runs/${encodeURIComponent(id)}/report`)).json();
   expect(reportSummary.release.decision).toBe('NOT_READY');
-  const manualAudits = await (await request.get(`/api/runs/${encodeURIComponent(id)}/report/audits?manual=true&limit=25`)).json();
-  expect(manualAudits).toMatchObject({ total: 1, hasMore: false, filters: { manual: true } });
+  expect(reportSummary.publicationRevision).toBe(reportPublicationRevision);
+  const manualAudits = await (await request.get(`/api/runs/${encodeURIComponent(id)}/report/audits?manual=true&limit=25&revision=${reportPublicationRevision}`)).json();
+  expect(manualAudits).toMatchObject({ publicationRevision: reportPublicationRevision, total: 1, hasMore: false, filters: { manual: true } });
   expect(manualAudits.items[0].id).toBe('DEVICE-001');
-  const auditDetail = await (await request.get(`/api/runs/${encodeURIComponent(id)}/report/audits/ENV-001`)).json();
-  expect(auditDetail).toMatchObject({ id: 'ENV-001', status: 'PASS' });
+  const auditDetail = await (await request.get(`/api/runs/${encodeURIComponent(id)}/report/audits/ENV-001?revision=${reportPublicationRevision}`)).json();
+  expect(auditDetail).toMatchObject({ publicationRevision: reportPublicationRevision, id: 'ENV-001', status: 'PASS' });
+  expect((await request.get(`/api/runs/${encodeURIComponent(id)}/report/audits?revision=wrong`)).status()).toBe(400);
 
   const artifacts = await (await request.get(`/api/runs/${encodeURIComponent(id)}/artifacts`)).json();
   const checklist = artifacts.files.find((file: { kind: string }) => file.kind === 'checklist');

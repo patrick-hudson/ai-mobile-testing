@@ -26,7 +26,7 @@ The portal lets a reviewer:
 
 Run selection, detail loading, artifact enumeration, manual evidence, credential settings, start, and stop operations are asynchronous. Accessible busy states and progress announcements remain visible until each request resolves, and duplicate mutations are disabled while pending. Evidence files are incrementally indexed and server-paged, so a full 1,407-test artifact tree does not force the browser to scan or render tens of thousands of links at once.
 
-The reviewer report is the browser-safe Long Build Checklist. Report generation writes `checklist/data/summary.json`, a compact `checklist/data/audits.json` index, and bounded per-audit detail files. The portal enforces 256 KiB, 2 MiB, and 512 KiB limits for those layers, filters and paginates audits on the server, aborts superseded browser requests, and keeps the DOM bounded to one 25-row page and one audit detail. The 59 MB-class `checklist/manifest.json` is never fetched by the report page; it is offered only as an explicitly large download. Likewise, the recent-log panel is opt-in and capped at 64 KiB while complete persisted log files remain direct evidence downloads.
+The reviewer report is the browser-safe Long Build Checklist. Report generation writes compact summary, audit-index, and bounded per-audit detail documents into `checklist/data/revisions/<revision>/`, hashes every document in that revision's publication manifest, and makes the set authoritative only with the final atomic `checklist/data/current.json` rename. The report page pins filtered and detail requests to the exact revision returned with its summary; external terminal runs fail evidence integrity if any declared document is missing, substituted, or from another generation. Compatibility mirrors remain at `checklist/data/summary.json`, `checklist/data/audits.json`, and `checklist/data/audits/`, but they are not release-authoritative. The portal enforces 256 KiB, 2 MiB, and 512 KiB limits for the three layers, filters and paginates audits on the server, aborts superseded browser requests, and keeps the DOM bounded to one 25-row page and one audit detail. The 59 MB-class `checklist/manifest.json` is never fetched by the report page; it is offered only as an explicitly large download. Likewise, the recent-log panel is opt-in and capped at 64 KiB while complete persisted log files remain direct evidence downloads.
 
 The general run console also stays bounded: its log endpoint defaults to a 256 KiB UTF-8-safe tail with a hard 1 MiB ceiling and reports each source file's complete size and truncation state. SSE replay is capped at 512 KiB, slow clients receive an overflow notice instead of accumulating an unbounded queue, and the browser batches incoming lines before one DOM update. Large media and traces stream with `Content-Length`, `Accept-Ranges`, and HTTP 206 support instead of being buffered in memory.
 
@@ -137,16 +137,17 @@ Run `npm run targets:validate` after extending `audit/targets.ts`; it refreshes 
 
 ### Parallel functional shards with isolated performance audit
 
-The recommended full release command divides the functional and visual project/test matrix across eight Docker containers. After all functional shards stop consuming CPU and memory, it starts `tests/performance.spec.ts` in a separate Docker container with exactly one Playwright worker. Only then does it start the merge container for the authoritative reports and evidence gates:
+The recommended full release command divides the functional and visual project/test matrix across eight shard partitions. A bounded pool runs four single-worker Docker containers at once by default, starting the next partition as each container finishes. After all functional shards stop consuming CPU and memory, it starts `tests/performance.spec.ts` in a separate Docker container with exactly one Playwright worker. Only then does it start the merge container for the authoritative reports and evidence gates:
 
 ```sh
 npm run audit:release:sharded
 ```
 
-The host coordinator only requires Node and Docker Compose. It first builds the current pinned image, then keeps all Playwright, browser, Lighthouse, merge, and evidence work inside that image. The default is eight functional shards with one Playwright worker in each shard. This preserves eight concurrent browser workers while creating finer scheduling units, which reduces idle-container tail time when Playwright's deterministic shard partitions contain unequal browser/project work. Both values remain bounded and configurable; the performance container is intentionally fixed at one worker so scores are not depressed by browser-shard resource contention:
+The host coordinator only requires Node and Docker Compose. It first builds the current pinned image, then keeps all Playwright, browser, Lighthouse, merge, and evidence work inside that image. The default is eight functional shards with one Playwright worker in each shard and at most four shard containers active simultaneously. Finer partitions reduce idle-container tail time, while the separate concurrency limit prevents Docker Desktop memory pressure from crashing browsers. Partition count, pool size, and workers remain bounded and configurable; the performance container is intentionally fixed at one worker so scores are not depressed by browser-shard resource contention:
 
 ```sh
 AUDIT_SHARD_TOTAL=8 \
+AUDIT_SHARD_CONCURRENCY=4 \
 AUDIT_SHARD_WORKERS=1 \
 AUDIT_SHARDED_RUN_ID=release-candidate-2026-08-24 \
 npm run audit:release:sharded
@@ -196,16 +197,16 @@ Candidate TLS remains strict by default (`CANDIDATE_IGNORE_HTTPS_ERRORS=0`), pro
 
 ### Memory-constrained hosts and container boundaries
 
-The default sharded release starts eight functional audit containers with one Playwright worker each, followed by one isolated single-worker performance container. On a memory-constrained Docker host, reduce functional process concurrency before reducing coverage. The performance step remains isolated regardless of the functional settings. A single-container, non-sharded release with one worker executes the same release profile more slowly:
+The default sharded release keeps at most four of its eight single-worker functional shard containers active at once, followed by one isolated single-worker performance container. On a memory-constrained Docker host, reduce `AUDIT_SHARD_CONCURRENCY` before changing the eight-part coverage partition. The performance step remains isolated regardless of the functional settings. A single-container, non-sharded release with one worker executes the same release profile more slowly:
 
 ```sh
 AUDIT_WORKERS=1 docker compose --profile audit run --rm audit-release
 ```
 
-For a lower-peak parallel run, use two single-worker shards:
+For a lower-peak parallel run, keep eight partitions but run only two at once:
 
 ```sh
-AUDIT_SHARD_TOTAL=2 AUDIT_SHARD_WORKERS=1 npm run audit:release:sharded
+AUDIT_SHARD_TOTAL=8 AUDIT_SHARD_CONCURRENCY=2 AUDIT_SHARD_WORKERS=1 npm run audit:release:sharded
 ```
 
 Each running audit container has a 1 GB shared-memory area and its browser processes use additional host memory. More shards and workers primarily trade memory for elapsed time; they do not add audit coverage. Keep `PORTAL_MAX_CONCURRENT_RUNS=1` and `AUDIT_WORKERS=1` when launching from the portal on a constrained machine.
@@ -272,7 +273,8 @@ These optional variables affect the portal container:
 | `PORTAL_EXTERNAL_REFRESH_MS` | `250` | Global wall-time budget for one external-run refresh; allowed range 50–5000 ms. |
 | `AUDIT_WORKERS` | `3` | Playwright worker processes per run. |
 | `AUDIT_TARGET_IDS` | seven default projects | Exact comma-separated Docker-local target selection; unknown, duplicate, provider-only, or unavailable IDs fail before launch. |
-| `AUDIT_SHARD_TOTAL` | `8` | Parallel functional containers in a sharded release; allowed range 1–16. |
+| `AUDIT_SHARD_TOTAL` | `8` | Functional shard partitions in a sharded release; allowed range 1–16. |
+| `AUDIT_SHARD_CONCURRENCY` | `4` | Maximum functional shard containers active at once; allowed range 1 through `AUDIT_SHARD_TOTAL`. Reduce this first on memory-constrained hosts. |
 | `AUDIT_SHARD_WORKERS` | `1` | Playwright workers inside each functional shard; allowed range 1–16. The isolated performance container always uses one. |
 | `AUDIT_SHARDED_RUN_ID` | generated | Optional unique 8–80 character lowercase run directory name; an existing directory is refused without mutation. |
 | `CANDIDATE_IGNORE_HTTPS_ERRORS` | `0` | Explicit development-only candidate bypass; affected evidence requires review. |

@@ -1,5 +1,6 @@
-import { projectMetadata } from '../audit/environments.js';
 import { expect, interactionEvidence, interactionTest, staticEvidence, staticTest } from '../fixtures/test.js';
+import { CRISIS_ACTIONS, CRISIS_MEETING_FALLBACK } from './crisis-contract.js';
+import { loggedGet } from './helpers.js';
 
 interactionTest('[HOME-001] homepage exposes clear starting paths instead of a decorative shell', interactionEvidence('Activate a primary homepage starting path and show its intended guide destination loading successfully.', 'all-projects'), async ({ page, audit }) => {
   await audit.goto('/');
@@ -27,26 +28,38 @@ interactionTest('[HOME-001] homepage exposes clear starting paths instead of a d
   await audit.assertRuntimeHealthy();
 });
 
-staticTest('[CRISIS-002] withdrawal fast path exposes urgent human-help destinations', staticEvidence('Capture the withdrawal fast path with its visible human-help actions and exact destinations.', 'all-projects'), async ({ page, audit }, testInfo) => {
-  const metadata = projectMetadata(testInfo.project.metadata);
+staticTest('[CRISIS-002] withdrawal fast path exposes exact urgent-help destinations', staticEvidence('Capture every reviewed crisis action, its exact destination, and the deterministic live-meeting fallback.', 'candidate-projects'), async ({ page, request, audit }) => {
   await audit.goto('/start-here/7-oh-withdrawal-help');
   await expect(page.locator('h1')).toContainText(/withdrawal|okay|help/i);
   await expect(page.locator('main')).toContainText(/help|support|withdrawal/i);
 
-  const actions = await page.locator('main a[href]').evaluateAll((anchors) => anchors.map((node) => ({
-    href: (node as HTMLAnchorElement).href,
-    label: (node.textContent ?? '').replace(/\s+/g, ' ').trim(),
-  })));
-  const supportActions = actions.filter(({ href, label }) => /discord|meeting|988|full guide|withdrawal guide/i.test(`${href} ${label}`));
-  expect(supportActions.length, 'The fast path must lead to concrete human or clinical support').toBeGreaterThanOrEqual(2);
-
-  if (metadata.environment === 'candidate') {
-    expect(actions.some(({ href }) => href === 'tel:988'), 'The redesigned fast path must provide a direct 988 action').toBe(true);
-    expect(actions.some(({ href }) => /discord\.gg/.test(href)), 'Peer support must remain immediately reachable').toBe(true);
+  for (const expected of CRISIS_ACTIONS) {
+    const action = page.getByRole('link', { name: expected.name, exact: typeof expected.name === 'string' });
+    await expect(action, `${String(expected.name)} must remain a visible crisis action`).toBeVisible();
+    await expect(action, `${String(expected.name)} must retain its reviewed destination`).toHaveAttribute('href', expected.href);
   }
 
-  audit.observe('Urgent support actions', supportActions.length, 'At least 2');
-  await audit.attachJson('urgent-support-actions', supportActions);
+  const renderedMeeting = page.locator('main a[href]').filter({ hasText: /7-OH\/kratom meeting|Find the next live meeting/i }).first();
+  await expect(renderedMeeting, 'The live-meeting action must remain visible after hydration').toBeVisible();
+  const renderedMeetingHref = await renderedMeeting.getAttribute('href');
+  expect(renderedMeetingHref, 'The live-meeting action must have a destination').toBeTruthy();
+  if (renderedMeetingHref !== CRISIS_MEETING_FALLBACK) {
+    expect(new URL(renderedMeetingHref!).protocol, 'A live external meeting must be HTTPS').toBe('https:');
+    await expect(renderedMeeting).toHaveAttribute('target', '_blank');
+    await expect(renderedMeeting).toHaveAttribute('rel', /\bnoopener\b.*\bnoreferrer\b|\bnoreferrer\b.*\bnoopener\b/);
+  }
+
+  const serverDocument = await loggedGet(request, audit, '/start-here/7-oh-withdrawal-help');
+  const serverHtml = await serverDocument.text();
+  expect(serverDocument.status(), 'The deterministic meeting fallback document must load').toBe(200);
+  expect(serverHtml, 'The crisis page must retain an exact same-site meeting fallback before hydration').toContain(`href="${CRISIS_MEETING_FALLBACK}"`);
+
+  const actions = await page.locator('main a[href]').evaluateAll((anchors) => anchors.map((node) => ({
+    href: node.getAttribute('href'),
+    label: (node.textContent ?? '').replace(/\s+/g, ' ').trim(),
+  })));
+  audit.observe('Reviewed urgent support actions', CRISIS_ACTIONS.length + 1, String(CRISIS_ACTIONS.length + 1));
+  await audit.attachJson('urgent-support-actions', { contract: CRISIS_ACTIONS, renderedMeetingHref, actions });
   await audit.checkpoint('withdrawal-fast-path');
   await audit.assertRuntimeHealthy();
 });

@@ -8,6 +8,7 @@ import {
   applyVideoRetentionPlan,
   assessVideoMetrics,
   buildVideoRetentionPlan,
+  MIN_WINDOW_NONBLANK_RATIO,
   normalizeLeadingBlankVideoAsync,
   probeVideoQuality,
   recommendedLeadingBlankTrimSeconds,
@@ -189,6 +190,21 @@ assert.equal(assessVideoMetrics({
   finalNonBlankRatio: 1,
   leadingBlankSeconds: 0,
 }).usable, true);
+assert.deepEqual(
+  assessVideoMetrics({
+    durationSeconds: 4,
+    sampledFrames: 8,
+    maxFrameDifference: 6,
+    changedFrames: 1,
+    postContentChangedFrames: 0,
+    blankFrameRatio: 0,
+    initialNonBlankRatio: 1,
+    finalNonBlankRatio: 1,
+    leadingBlankSeconds: 0,
+  }),
+  { usable: false, reasons: ['no visual response was measured after the page content settled'] },
+  'A page-load transition without a subsequent visual response is not interaction evidence.',
+);
 
 const leadingBlankAssessment = {
   path: path.join(root, 'leading-blank.webm'),
@@ -291,6 +307,7 @@ if (ffmpegAvailable) {
   const lowMotionActionVideo = path.join(root, 'low-motion-action.webm');
   const leadingBlankActionVideo = path.join(root, 'leading-blank-then-action.webm');
   const actionThenBlankVideo = path.join(root, 'action-then-blank.webm');
+  const longActionThenBlankVideo = path.join(root, 'long-action-then-blank.webm');
   const generateWhite = spawnSync('ffmpeg', [
     '-hide_banner', '-loglevel', 'error', '-y',
     '-f', 'lavfi', '-i', 'color=c=white:s=320x240:r=25',
@@ -330,6 +347,13 @@ if (ffmpegAvailable) {
     '-filter_complex', '[0:v][1:v]concat=n=2:v=1:a=0[v]', '-map', '[v]',
     '-an', '-c:v', 'libvpx', '-deadline', 'realtime', actionThenBlankVideo,
   ], { encoding: 'utf8' });
+  const generateLongActionThenBlank = spawnSync('ffmpeg', [
+    '-hide_banner', '-loglevel', 'error', '-y',
+    '-f', 'lavfi', '-i', 'testsrc2=s=160x120:r=1:d=61',
+    '-f', 'lavfi', '-i', 'color=c=white:s=160x120:r=1:d=15',
+    '-filter_complex', '[0:v][1:v]concat=n=2:v=1:a=0[v]', '-map', '[v]',
+    '-an', '-c:v', 'libvpx', '-deadline', 'realtime', '-cpu-used', '8', longActionThenBlankVideo,
+  ], { encoding: 'utf8' });
   assert.equal(generateWhite.status, 0, generateWhite.stderr);
   assert.equal(generateAction.status, 0, generateAction.stderr);
   assert.equal(generateTransientOverlay.status, 0, generateTransientOverlay.stderr);
@@ -337,6 +361,7 @@ if (ffmpegAvailable) {
   assert.equal(generateLowMotionAction.status, 0, generateLowMotionAction.stderr);
   assert.equal(generateLeadingBlankAction.status, 0, generateLeadingBlankAction.stderr);
   assert.equal(generateActionThenBlank.status, 0, generateActionThenBlank.stderr);
+  assert.equal(generateLongActionThenBlank.status, 0, generateLongActionThenBlank.stderr);
   const whiteAssessment = probeVideoQuality(whiteVideo, 'ffmpeg');
   const actionAssessment = probeVideoQuality(actionVideo, 'ffmpeg');
   const transientOverlayAssessment = probeVideoQuality(transientOverlayVideo, 'ffmpeg');
@@ -344,6 +369,7 @@ if (ffmpegAvailable) {
   const lowMotionActionAssessment = probeVideoQuality(lowMotionActionVideo, 'ffmpeg');
   const leadingBlankActionAssessment = probeVideoQuality(leadingBlankActionVideo, 'ffmpeg');
   const actionThenBlankAssessment = probeVideoQuality(actionThenBlankVideo, 'ffmpeg');
+  const longActionThenBlankAssessment = probeVideoQuality(longActionThenBlankVideo, 'ffmpeg');
   assert.equal(whiteAssessment.usable, false, JSON.stringify(whiteAssessment));
   assert.equal(actionAssessment.usable, true, JSON.stringify(actionAssessment));
   assert.equal(
@@ -373,6 +399,10 @@ if (ffmpegAvailable) {
   assert.equal(normalizedLeadingBlank?.assessment.usable, true, JSON.stringify(normalizedLeadingBlank));
   assert.equal(recommendedLeadingBlankTrimSeconds(actionThenBlankAssessment), null,
     'A video whose final response is blank must remain rejected.');
+  assert.equal(longActionThenBlankAssessment.usable, false,
+    `A video that becomes blank after the first 60 seconds must be rejected: ${JSON.stringify(longActionThenBlankAssessment)}`);
+  assert.ok((longActionThenBlankAssessment.finalNonBlankRatio ?? 1) < MIN_WINDOW_NONBLANK_RATIO,
+    'The final-response metric must include the actual video tail, not only the first 60 seconds.');
   assert.equal(recommendedLeadingBlankTrimSeconds(whiteAssessment), null,
     'An all-white video must remain rejected.');
 }

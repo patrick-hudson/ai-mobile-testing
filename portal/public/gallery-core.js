@@ -819,6 +819,12 @@ function renderRegionsForAction(action) {
     return ['status', 'controls', 'queue', 'viewer', 'filmstrip', 'context', 'overview'];
   }
   if (type === 'THUMBNAIL_SUCCEEDED') return ['filmstrip', 'overview'];
+  if (type === 'QUERY_SUCCEEDED' && !action.acceptPending) {
+    // SET_QUERY already rendered the chosen controls. Keep those elements
+    // mounted while the result arrives so a reviewer does not lose focus (or
+    // an immediately-following Escape key) to an unrelated data refresh.
+    return ['status', 'queue', 'viewer', 'filmstrip', 'context', 'overview'];
+  }
   if (type === 'MEDIA_SUCCEEDED' || type === 'AVAILABILITY_SUCCEEDED') return ['status', 'viewer'];
   if (type === 'MEDIA_ELEMENT_LOADED' || type === 'MEDIA_ELEMENT_FAILED' || type === 'POSTER_ELEMENT_FAILED') return ['status', 'viewer'];
   if (type === 'DETAIL_SUCCEEDED' || type === 'SET_MEMBER') return ['status', 'viewer', 'context'];

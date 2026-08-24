@@ -1,20 +1,23 @@
-import { createHash } from 'node:crypto';
-import { copyFile, mkdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { copyFile, mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { ALL_AUDIT_CATALOG } from '../audit/definitions.js';
+import { ALL_AUDIT_CATALOG, INSTALLED_PLUGIN_REGISTRY } from '../audit/definitions.js';
 import {
   evidenceKindsForPolicy,
+  parseAuditApplicabilityAnnotation,
   parseAuditStatusAnnotation,
   parseEvidencePolicyAnnotation,
 } from '../audit/evidence-policy.js';
 import type {
   AuditDefinition,
+  AuditApplicability,
   AuditEnvironment,
   AuditEvidenceRecord,
   AuditFinding,
   AuditProjectMetadata,
 } from '../audit/types.js';
+import { targetMatchesAuditApplicability } from '../shared/target-applicability.mjs';
 import type { GalleryArchiveDescriptor, GalleryCatalog } from '../shared/gallery-contract.mjs';
 import {
   buildGalleryEvidenceModel,
@@ -72,6 +75,12 @@ export interface ReportTestInput {
   tags?: string[];
   annotations?: Array<{ type: string; description?: string }>;
   results: ReportResultInput[];
+}
+
+export interface ReportProjectInput {
+  id?: string;
+  name: string;
+  metadata?: Partial<AuditProjectMetadata>;
 }
 
 export interface ReportRunInput {
@@ -163,6 +172,8 @@ export interface ReportExecution {
   primaryArtifacts: ReportArtifact[];
   diagnosticArtifacts: ReportArtifact[];
   annotations: Array<{ type: string; description?: string }>;
+  applicability: AuditApplicability | null;
+  applicableToProject: boolean | null;
 }
 
 export interface AuditChecklistItem {
@@ -190,9 +201,12 @@ export interface AuditChecklistItem {
     unknown: number;
     projects: string[];
     selectedProjects: string[];
+    plannedApplicableProjects: string[];
+    missingApplicableProjects: string[];
     selected: { production: number; candidate: number; unknown: number; total: number };
     applicable: { production: number; candidate: number; unknown: number; total: number };
     skipped: { production: number; candidate: number; unknown: number; total: number };
+    missingApplicable: { production: number; candidate: number; unknown: number; total: number };
   };
   evidenceCounts: Record<ReportArtifact['kind'], number>;
   findings: AuditFinding[];
@@ -230,6 +244,8 @@ export interface AuditManifest {
     structuredExecutions: number;
     artifacts: number;
     videos: number;
+    usableInteractionVideos: number;
+    diagnosticVideos: number;
     posters: number;
     byStatus: Record<ChecklistStatus, number>;
     byArea: Record<string, number>;
@@ -292,6 +308,8 @@ export interface GenerateReportOptions {
   run: ReportRunInput;
   cwd?: string;
   definitionCatalog?: readonly AuditDefinition[];
+  /** Complete resolved Playwright project selection, including projects that emitted no test rows. */
+  selectedProjects?: readonly ReportProjectInput[];
 }
 
 const STATUS_ORDER: ChecklistStatus[] = [
@@ -304,6 +322,59 @@ const STATUS_ORDER: ChecklistStatus[] = [
   'INTENDED_CHANGE',
   'PASS',
 ];
+
+const REGISTRY_APPLICABILITY_BY_AUDIT = new Map<string, Set<AuditApplicability>>();
+for (const auditCase of INSTALLED_PLUGIN_REGISTRY.plugins.flatMap(({ auditCases }) => auditCases)) {
+  const values = REGISTRY_APPLICABILITY_BY_AUDIT.get(auditCase.auditId) ?? new Set<AuditApplicability>();
+  values.add(auditCase.applicability);
+  REGISTRY_APPLICABILITY_BY_AUDIT.set(auditCase.auditId, values);
+}
+
+function reportProjectEngine(projectName: string): string {
+  if (projectName.includes('webkit')) return 'webkit';
+  if (projectName.includes('firefox')) return 'firefox';
+  if (projectName.includes('chromium') || projectName.includes('msedge')) return 'chromium';
+  return 'unknown';
+}
+
+function resolvedSelectedProjects(options: GenerateReportOptions): ReportProjectInput[] {
+  if (options.selectedProjects !== undefined) {
+    return [...options.selectedProjects].sort((left, right) => left.name.localeCompare(right.name));
+  }
+  const projects = new Map<string, ReportProjectInput>();
+  for (const test of options.tests) {
+    projects.set(test.projectName, {
+      name: test.projectName,
+      metadata: { ...(test.projectMetadata ?? {}) },
+    });
+  }
+  return [...projects.values()].sort((left, right) => left.name.localeCompare(right.name));
+}
+
+function projectMatchesApplicability(project: ReportProjectInput, applicability: AuditApplicability): boolean {
+  const metadata = project.metadata;
+  if (!metadata?.environment || !metadata.deviceClass) return false;
+  return targetMatchesAuditApplicability(applicability, {
+    // Applicability IDs are public project names. Playwright JSON's optional
+    // internal project ID is only useful while resolving result rows.
+    id: project.name,
+    environment: metadata.environment,
+    deviceClass: metadata.deviceClass,
+    engine: reportProjectEngine(project.name),
+    fullSweep: metadata.fullSweep === true,
+  });
+}
+
+function withMissingApplicableProjects(
+  aggregate: { status: ChecklistStatus; reason: string },
+  projects: readonly ReportProjectInput[],
+): { status: ChecklistStatus; reason: string } {
+  if (projects.length === 0 || ['FAIL', 'BLOCKED', 'FLAKY', 'REVIEW'].includes(aggregate.status)) return aggregate;
+  return {
+    status: 'NOT_RUN',
+    reason: `${projects.length} selected applicable project${projects.length === 1 ? '' : 's'} emitted no completed execution for this audit: ${projects.map(({ name }) => name).join(', ')}.`,
+  };
+}
 
 type ReviewedGalleryAttempt = GalleryCatalog['items'][number]['attempt'] & {
   rawStatus: string;
@@ -549,6 +620,17 @@ async function buildExecutions(
       if (status === 'PASS' && failedEarlierAttempt(test)) status = 'FLAKY';
       const definition = definitions.get(auditId)!;
       const evidencePolicy = parseEvidencePolicyAnnotation(test.annotations);
+      const applicability = parseAuditApplicabilityAnnotation(test.annotations);
+      const projectMetadata = test.projectMetadata;
+      const applicableToProject = applicability && projectMetadata?.environment
+        ? targetMatchesAuditApplicability(applicability, {
+            id: test.projectName,
+            environment: projectMetadata.environment,
+            deviceClass: projectMetadata.deviceClass ?? 'desktop',
+            engine: reportProjectEngine(test.projectName),
+            fullSweep: projectMetadata.fullSweep === true,
+          })
+        : null;
       const requiredEvidence = evidencePolicy
         ? evidenceKindsForPolicy(definition.evidence, evidencePolicy)
         : definition.evidence;
@@ -670,6 +752,8 @@ async function buildExecutions(
         primaryArtifacts,
         diagnosticArtifacts,
         annotations: test.annotations ?? [],
+        applicability,
+        applicableToProject,
       };
       const existing = byAuditId.get(auditId) ?? [];
       existing.push(execution);
@@ -714,21 +798,46 @@ export async function buildAuditModels(options: GenerateReportOptions): Promise<
     warnings,
     definitionCatalog,
   );
+  const selectedProjects = resolvedSelectedProjects(options);
 
   const catalogOrder = new Map(definitionCatalog.map((definition, index) => [definition.id, index]));
   const catalogIds = new Set(definitionCatalog.map(({ id }) => id));
   const audits = [...definitions.values()]
     .map((definition): AuditChecklistItem => {
       const executions = byAuditId.get(definition.id) ?? [];
+      const plannedApplicabilities = new Set<AuditApplicability>([
+        ...(REGISTRY_APPLICABILITY_BY_AUDIT.get(definition.id) ?? []),
+        ...executions.flatMap(({ applicability }) => applicability ? [applicability] : []),
+      ]);
+      const plannedApplicableProjects = selectedProjects.filter((project) => (
+        [...plannedApplicabilities].some((applicability) => projectMatchesApplicability(project, applicability))
+      ));
+      const missingApplicableProjects = plannedApplicableProjects.filter((project) => !executions.some((execution) => (
+        execution.project === project.name
+        && execution.status !== 'NOT_RUN'
+        && execution.applicableToProject !== false
+      )));
       const candidateExecutions = executions.filter((execution) => execution.coveredEnvironments.includes('candidate'));
       const productionExecutions = executions.filter((execution) => execution.coveredEnvironments.includes('production'));
       const unknownExecutions = executions.filter((execution) => execution.coveredEnvironments.length === 0);
       const crossEnvironmentGate = CROSS_ENVIRONMENT_GATES.has(definition.id);
       const releaseExecutions = crossEnvironmentGate ? executions : [...candidateExecutions, ...unknownExecutions];
-      let aggregate = aggregateStatus(definition, releaseExecutions);
-      const candidateAggregate = aggregateStatus(definition, candidateExecutions);
-      const productionAggregate = aggregateStatus(definition, productionExecutions);
-      const unknownAggregate = aggregateStatus(definition, unknownExecutions);
+      const releaseMissingProjects = missingApplicableProjects.filter(({ metadata }) => (
+        crossEnvironmentGate || metadata?.environment !== 'production'
+      ));
+      let aggregate = withMissingApplicableProjects(aggregateStatus(definition, releaseExecutions), releaseMissingProjects);
+      const candidateAggregate = withMissingApplicableProjects(
+        aggregateStatus(definition, candidateExecutions),
+        missingApplicableProjects.filter(({ metadata }) => metadata?.environment === 'candidate'),
+      );
+      const productionAggregate = withMissingApplicableProjects(
+        aggregateStatus(definition, productionExecutions),
+        missingApplicableProjects.filter(({ metadata }) => metadata?.environment === 'production'),
+      );
+      const unknownAggregate = withMissingApplicableProjects(
+        aggregateStatus(definition, unknownExecutions),
+        missingApplicableProjects.filter(({ metadata }) => !metadata?.environment),
+      );
       if (
         crossEnvironmentGate
         && !['FAIL', 'BLOCKED', 'FLAKY', 'REVIEW'].includes(aggregate.status)
@@ -774,6 +883,12 @@ export async function buildAuditModels(options: GenerateReportOptions): Promise<
       const selectedCoverage = coverageCounts(executions);
       const applicableCoverage = coverageCounts(applicableExecutions);
       const skippedCoverage = coverageCounts(skippedExecutions);
+      const missingApplicableCoverage = {
+        production: missingApplicableProjects.filter(({ metadata }) => metadata?.environment === 'production').length,
+        candidate: missingApplicableProjects.filter(({ metadata }) => metadata?.environment === 'candidate').length,
+        unknown: missingApplicableProjects.filter(({ metadata }) => !metadata?.environment).length,
+        total: missingApplicableProjects.length,
+      };
       return {
         id: definition.id,
         definition,
@@ -806,10 +921,13 @@ export async function buildAuditModels(options: GenerateReportOptions): Promise<
           candidate: applicableCoverage.candidate,
           unknown: applicableCoverage.unknown,
           projects: [...new Set(applicableExecutions.map((execution) => execution.project))].sort(),
-          selectedProjects: [...new Set(executions.map((execution) => execution.project))].sort(),
+          selectedProjects: selectedProjects.map(({ name }) => name),
+          plannedApplicableProjects: plannedApplicableProjects.map(({ name }) => name),
+          missingApplicableProjects: missingApplicableProjects.map(({ name }) => name),
           selected: selectedCoverage,
           applicable: applicableCoverage,
           skipped: skippedCoverage,
+          missingApplicable: missingApplicableCoverage,
         },
         evidenceCounts,
         findings: executions.flatMap((execution) => execution.evidence?.findings ?? []),
@@ -831,6 +949,17 @@ export async function buildAuditModels(options: GenerateReportOptions): Promise<
     bySeverity[item.definition.severity] = (bySeverity[item.definition.severity] ?? 0) + 1;
   }
   const allExecutions = audits.flatMap((item) => item.executions);
+  const availableVideoArtifacts = allExecutions.flatMap((execution) => (
+    execution.artifacts
+      .filter((artifact) => artifact.kind === 'video' && artifact.available)
+      .map((artifact) => ({ execution, artifact }))
+  ));
+  const usableInteractionVideos = availableVideoArtifacts.filter(({ execution, artifact }) => (
+    execution.evidenceAuthority === 'authoritative'
+    && execution.evidencePolicy?.mode === 'interaction-video'
+    && execution.primaryArtifacts.includes(artifact)
+  )).length;
+  const diagnosticVideos = availableVideoArtifacts.length - usableInteractionVideos;
   const blockingFailures = audits.filter(
     (item) => item.definition.releaseBlocking && ['FAIL', 'BLOCKED', 'FLAKY', 'REVIEW'].includes(item.status),
   ).length;
@@ -900,10 +1029,10 @@ export async function buildAuditModels(options: GenerateReportOptions): Promise<
         (count, execution) => count + execution.artifacts.length + execution.artifacts.filter(({ poster }) => Boolean(poster)).length,
         0,
       ),
-      videos: allExecutions.reduce(
-        (count, execution) => count + execution.artifacts.filter((artifact) => artifact.kind === 'video' && artifact.available).length,
-        0,
-      ),
+      // `videos` is retained for portal schema compatibility and represents all available clips.
+      videos: availableVideoArtifacts.length,
+      usableInteractionVideos,
+      diagnosticVideos,
       posters: allExecutions.reduce(
         (count, execution) => count + execution.artifacts.filter(({ poster }) => Boolean(poster)).length,
         0,
@@ -1178,6 +1307,8 @@ function portalExecution(execution: ReportExecution): Record<string, unknown> {
       type: portalText(annotation.type, 120),
       ...(annotation.description ? { description: portalText(annotation.description, 600) } : {}),
     })),
+    applicability: execution.applicability,
+    applicableToProject: execution.applicableToProject,
     evidence: portalEvidence(execution.evidence),
   };
 }
@@ -1328,8 +1459,6 @@ async function portalAiReview(outputDir: string): Promise<Record<string, unknown
 
 async function writePortalReportData(outputDir: string, manifest: AuditManifest): Promise<void> {
   const dataDir = path.join(outputDir, 'data');
-  const auditDir = path.join(dataDir, 'audits');
-  await mkdir(auditDir, { recursive: true });
   const rows = manifest.audits.map(portalAuditRow);
   const manualAudits = rows.filter(({ manual }) => manual);
   const topFindings = manifest.audits
@@ -1345,8 +1474,10 @@ async function writePortalReportData(outputDir: string, manifest: AuditManifest)
       || ['P0', 'P1', 'P2', 'P3'].indexOf(left.severity) - ['P0', 'P1', 'P2', 'P3'].indexOf(right.severity))
     .slice(0, 20);
   const aiReview = await portalAiReview(outputDir);
+  const publicationRevision = randomUUID().replaceAll('-', '');
   const summary = {
     schemaVersion: 1,
+    publicationRevision,
     generatedAt: manifest.generatedAt,
     run: manifest.run,
     release: manifest.release,
@@ -1374,19 +1505,63 @@ async function writePortalReportData(outputDir: string, manifest: AuditManifest)
     warningCount: manifest.warnings.length,
     unmappedTestCount: manifest.unmappedTests.length,
   };
-  await Promise.all([
-    writeFile(path.join(dataDir, 'summary.json'), `${JSON.stringify(summary)}\n`, 'utf8'),
-    writeFile(path.join(dataDir, 'audits.json'), `${JSON.stringify({
-      schemaVersion: 1,
+  const auditIndex = {
+    schemaVersion: 1,
+    publicationRevision,
+    generatedAt: manifest.generatedAt,
+    items: rows,
+  };
+  const auditDetails = new Map(manifest.audits.map((audit) => [
+    `${safeSegment(audit.id)}.json`,
+    {
+      publicationRevision,
       generatedAt: manifest.generatedAt,
-      items: rows,
-    })}\n`, 'utf8'),
-    ...manifest.audits.map((audit) => writeFile(
-      path.join(auditDir, `${safeSegment(audit.id)}.json`),
-      `${JSON.stringify(portalAuditDetail(audit))}\n`,
+      ...portalAuditDetail(audit),
+    },
+  ]));
+  const revisionDir = path.join(dataDir, 'revisions', publicationRevision);
+  const revisionAuditDir = path.join(revisionDir, 'audits');
+  await mkdir(revisionAuditDir, { recursive: true });
+  const documents = new Map<string, string>([
+    ['summary.json', `${JSON.stringify(summary)}\n`],
+    ['audits.json', `${JSON.stringify(auditIndex)}\n`],
+    ...[...auditDetails].map(([name, detail]) => [`audits/${name}`, `${JSON.stringify(detail)}\n`] as const),
+  ]);
+  await Promise.all([
+    ...[...documents].map(([relativePath, source]) => writeFile(path.join(revisionDir, relativePath), source, 'utf8')),
+  ]);
+  const publication = {
+    schemaVersion: 1,
+    publicationRevision,
+    generatedAt: manifest.generatedAt,
+    files: Object.fromEntries([...documents].map(([relativePath, source]) => [relativePath, {
+      bytes: Buffer.byteLength(source),
+      sha256: createHash('sha256').update(source).digest('hex'),
+    }])),
+  };
+  const publicationSource = `${JSON.stringify(publication)}\n`;
+  await writeFile(path.join(revisionDir, 'publication.json'), publicationSource, 'utf8');
+
+  // Keep the original compact paths as compatibility mirrors for exported
+  // checklists. Portal release authority never reads these mutable aliases;
+  // it pins the immutable revision selected by current.json below.
+  const auditDir = path.join(dataDir, 'audits');
+  await mkdir(auditDir, { recursive: true });
+  await Promise.all([
+    writeFile(path.join(dataDir, 'summary.json'), documents.get('summary.json')!, 'utf8'),
+    writeFile(path.join(dataDir, 'audits.json'), documents.get('audits.json')!, 'utf8'),
+    ...[...auditDetails].map(([name]) => writeFile(
+      path.join(auditDir, name),
+      documents.get(`audits/${name}`)!,
       'utf8',
     )),
   ]);
+
+  // The pointer is the only authoritative publication switch. Every file in
+  // the new immutable revision exists and is hashed before this atomic rename.
+  const temporaryPointer = path.join(dataDir, `.current-${publicationRevision}.tmp`);
+  await writeFile(temporaryPointer, publicationSource, { encoding: 'utf8', flag: 'wx' });
+  await rename(temporaryPointer, path.join(dataDir, 'current.json'));
 }
 
 function inlineJson(value: unknown): string {

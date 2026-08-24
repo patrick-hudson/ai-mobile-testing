@@ -345,6 +345,76 @@ function runEvidenceBackedOracleCanaries(): void {
   const meetingFilters = auditDeclarationSource('tests/meetings.spec.ts', 'MEET-004');
   assert.match(meetingFilters, /setTimeout\(MEET_FILTER_TOTAL_TIMEOUT_MS\)/, 'MEET-004 must retain its explicit end-to-end budget');
   assert.match(meetingFilters, /preparationDurationMs[\s\S]*toBeLessThan\(MEET_FILTER_PREPARATION_BUDGET_MS\)/, 'MEET-004 must preserve a bounded preparation partition');
+
+  const calculatorDefaults = auditDeclarationSource('tests/calculators.spec.ts', 'CALC-001');
+  assert.match(calculatorDefaults, /substanceDefaults[\s\S]*MGM-15[\s\S]*Pseudo/, 'CALC-001 must retain an explicit vector for every offered substance');
+  assert.match(calculatorDefaults, /toHaveCount\(expected\.rows\)/, 'CALC-001 must prove that each selected substance regenerates its expected schedule');
+
+  const calculatorBoundaries = auditDeclarationSource('tests/calculators.spec.ts', 'CALC-002');
+  assert.match(calculatorBoundaries, /not-a-number[\s\S]*toHaveCount\(0\)/, 'CALC-002 must reject malformed input without leaving a stale plan');
+  assert.match(calculatorBoundaries, /Times per day', '12'[\s\S]*checkValidity\(\)/, 'CALC-002 must prove the maximum valid frequency');
+  assert.match(calculatorBoundaries, /validity\.rangeOverflow[\s\S]*toHaveCount\(0\)/, 'CALC-002 must fail closed beyond the maximum frequency');
+
+  const calculatorSchedule = auditDeclarationSource('tests/calculators.spec.ts', 'CALC-003');
+  assert.match(calculatorSchedule, /const golden: TaperScheduleRow\[][\s\S]*day: 10[\s\S]*readTaperSchedule\(page\)\)\.toEqual\(golden\)/, 'CALC-003 must compare every ten-day row with an independent golden vector');
+  assert.match(calculatorSchedule, /233 mg/, 'CALC-003 must preserve the independent exact supply oracle');
+
+  const simpleSr17 = auditDeclarationSource('tests/calculators.spec.ts', 'CALC-007');
+  assert.match(simpleSr17, /goldenProtocols: Record<7 \| 10 \| 14/, 'CALC-007 must retain exact vectors for all three documented protocol lengths');
+  assert.match(simpleSr17, /readSimpleSchedule\(page\)\)\.toEqual\(goldenProtocols\[days\]\.rows\)/, 'CALC-007 must compare every rendered SR-17 row with the golden protocol');
+  assert.match(simpleSr17, /1518\.75 mg[\s\S]*tablets: '31'/, 'CALC-007 must preserve exact total and tablet-supply boundaries');
+
+  const arithmetic = auditDeclarationSource('tests/calculators.spec.ts', 'CALC-009');
+  assert.match(arithmetic, /published buprenorphine table[\s\S]*two-day 7-OH[\s\S]*explicit zero jump-off/, 'CALC-009 must retain representative, minimum-duration, and explicit-zero black-box cases');
+  assert.match(arithmetic, /expect\(rows\)\.toEqual\(golden\)/, 'CALC-009 must compare deployed output to independent constants');
+  assert.match(arithmetic, /schedule-stop-row[\s\S]*Stop\. Taper complete/, 'CALC-009 must prove the explicit-zero stop response');
+
+  const routeInventory = auditDeclarationSource('tests/contracts.spec.ts', 'ENV-002');
+  assert.match(routeInventory, /mapWithConcurrency\(CANDIDATE_HTML_ROUTES/, 'ENV-002 must issue a bounded probe for every declared candidate route');
+  assert.match(routeInventory, /response\.status\(\)[\s\S]*toBe\(200\)/, 'ENV-002 must require successful HTML responses');
+  assert.match(routeInventory, /canonical\.origin[\s\S]*ENVIRONMENTS\.production\.baseURL[\s\S]*canonical\.pathname[\s\S]*route\.path/, 'ENV-002 must prove the exact public canonical origin and route');
+
+  const internalLinks = auditDeclarationSource('tests/content-system.spec.ts', 'CONTENT-003');
+  assert.match(internalLinks, /extractHtmlTagAttributes\(html, 'a', 'href'\)/, 'CONTENT-003 must crawl rendered anchor hrefs instead of replaying only the registry');
+  assert.match(internalLinks, /internalReferences\.length[\s\S]*CANDIDATE_HTML_ROUTES\.length \* 3/, 'CONTENT-003 must fail if anchor extraction silently collapses');
+  assert.match(internalLinks, /missingFragments[\s\S]*toEqual\(\[\]\)/, 'CONTENT-003 must require every rendered fragment target to exist');
+
+  const contentRendering = readFileSync(path.join(repositoryRoot, 'tests/visual-regression.spec.ts'), 'utf8');
+  const contentRenderingDeclaration = auditDeclarationSource('tests/visual-regression.spec.ts', 'CONTENT-002');
+  for (const primitive of ['prose paragraphs', 'ordered or unordered list items', 'medical callout blockquote', 'schedule table', 'inline or block code', 'native disclosure']) {
+    assert.match(contentRendering, new RegExp(primitive), `CONTENT-002 must retain the ${primitive} contract`);
+  }
+  assert.match(contentRendering, /\.open = true/, 'CONTENT-002 must inspect disclosure content in its expanded state');
+  assert.match(contentRendering, /scrollWidth[\s\S]*clientWidth[\s\S]*scrollHeight[\s\S]*clientHeight/, 'CONTENT-002 must measure both horizontal and vertical content clipping');
+  assert.match(contentRendering, /lineClamp[\s\S]*textOverflow/, 'CONTENT-002 must reject truncating line clamps and ellipses on reviewed content');
+  assert.match(contentRendering, /result\.issues[\s\S]*toEqual\(\[\]\)/, 'CONTENT-002 must fail when any primitive has a clipping issue');
+  assert.match(contentRenderingDeclaration, /Inspect critical content primitives[\s\S]*assertRepresentativeContentPrimitives/, 'CONTENT-002 must execute the primitive clipping contract from the browser audit');
+
+  const assets = auditDeclarationSource('tests/contracts.spec.ts', 'ENV-008');
+  assert.match(assets, /extractFirstPartyAssetReferences[\s\S]*htmlAssets\.length/, 'ENV-008 must discover assets from every candidate route document');
+  assert.match(assets, /extractCssReferences[\s\S]*nestedCssAssets/, 'ENV-008 must traverse first-party assets referenced by CSS');
+  assert.match(assets, /expectedContentType[\s\S]*toMatch\(expectedContentType\)/, 'ENV-008 must enforce extension-appropriate response types');
+
+  const crisisLayout = auditDeclarationSource('tests/shell-content.spec.ts', 'CRISIS-001');
+  assert.match(crisisLayout, /for \(const expected of CRISIS_ACTIONS\)[\s\S]*toHaveAttribute\('href', expected\.href\)/, 'CRISIS-001 must validate every reviewed action and exact destination');
+  assert.match(crisisLayout, /geometry\.height[\s\S]*toBeGreaterThanOrEqual\(44\)/, 'CRISIS-001 must preserve touch-target geometry assertions');
+
+  const crisisActions = auditDeclarationSource('tests/smoke.spec.ts', 'CRISIS-002');
+  assert.match(crisisActions, /for \(const expected of CRISIS_ACTIONS\)[\s\S]*expected\.href/, 'CRISIS-002 must retain the complete exact crisis-action matrix');
+  assert.match(crisisActions, /serverHtml[\s\S]*CRISIS_MEETING_FALLBACK/, 'CRISIS-002 must prove the deterministic same-site meeting fallback');
+
+  const keyboard = auditDeclarationSource('tests/accessibility.spec.ts', 'A11Y-002');
+  for (const requiredJourney of ['Operate guide navigation by keyboard', 'Edit the taper calculator by keyboard', 'Expand a disclosure by keyboard', 'Filter meetings by keyboard']) {
+    assert.match(keyboard, new RegExp(requiredJourney), `A11Y-002 must retain: ${requiredJourney}`);
+  }
+  assert.doesNotMatch(keyboard, /\.fill\(/, 'A11Y-002 must not substitute pointer-style direct form filling for keyboard entry');
+  assert.match(keyboard, /toHaveLength\(12\)/, 'A11Y-002 must retain two evidence checkpoints for every critical keyboard task');
+
+  const drawer = auditDeclarationSource('tests/navigation.spec.ts', 'NAV-001');
+  assert.match(drawer, /focusableCount[\s\S]*Shift\+Tab[\s\S]*data-audit-focus-origin/, 'NAV-001 must prove forward and reverse modal focus wrapping');
+  for (const closeMethod of ['Close with Escape', 'Close with the named close control', 'Close with the backdrop']) {
+    assert.match(drawer, new RegExp(closeMethod), `NAV-001 must retain: ${closeMethod}`);
+  }
 }
 
 runEvidenceBackedOracleCanaries();

@@ -10,6 +10,7 @@ import {
 import { readChecklistRelease, releaseOutcome, unavailableRelease } from './lib/release-truth.mjs';
 import { MAX_RELEASE_SHARD_TOTAL } from './lib/sharded-defaults.mjs';
 import { expectedShardedBlobs, inspectShardedBlobs } from './lib/sharded-evidence.mjs';
+import { mergeResultsAreUsable, mergeStageIntegrityFailures } from './lib/merge-stage-integrity.mjs';
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const shardTotal = integerEnvironment('AUDIT_SHARD_TOTAL', 1, MAX_RELEASE_SHARD_TOTAL);
@@ -69,7 +70,9 @@ if (preflightPassed) {
 
 const mergeStage = stages.find(({ name }) => name === 'merge-reports');
 const resultsAreFresh = await isFreshFile(join(artifactRoot, 'results.json'), startedAt);
-if (resultsAreFresh) {
+const mergeIntegrityFailures = mergeStageIntegrityFailures(mergeStage, resultsAreFresh);
+const mergedResultsAreUsable = mergeResultsAreUsable(mergeStage, resultsAreFresh);
+if (mergedResultsAreUsable) {
   stages.push(await runStage(
     'process-media',
     tsx,
@@ -80,7 +83,7 @@ if (resultsAreFresh) {
 }
 
 const mediaStage = stages.find(({ name }) => name === 'process-media');
-const mediaIntegrityFailures = resultsAreFresh && (mediaStage.exitCode !== 0 || mediaStage.signal)
+const mediaIntegrityFailures = mergedResultsAreUsable && (mediaStage.exitCode !== 0 || mediaStage.signal)
   ? [integrityFailure(
       'PROCESS_MEDIA',
       mediaStage.signal
@@ -89,14 +92,18 @@ const mediaIntegrityFailures = resultsAreFresh && (mediaStage.exitCode !== 0 || 
       mediaStage,
     )]
   : [];
-const reportIntegrityFailures = [...coordinatorDiagnostics.failures, ...mediaIntegrityFailures];
+const reportIntegrityFailures = [
+  ...coordinatorDiagnostics.failures,
+  ...mergeIntegrityFailures.map((reason) => integrityFailure('MERGE_REPORTS', reason, mergeStage)),
+  ...mediaIntegrityFailures,
+];
 await atomicWriteJson(pipelineDiagnosticsPath, pipelineDiagnosticsDocument({
   runId,
   source: 'merge',
   failures: reportIntegrityFailures,
 }));
 
-if (resultsAreFresh) {
+if (mergedResultsAreUsable) {
   stages.push(await runStage(
     'rebuild-checklist',
     tsx,
@@ -118,7 +125,6 @@ const pipelineFailures = [];
 pipelineFailures.push(...reportIntegrityFailures.map(({ stage, reason }) => `${stage}: ${reason}`));
 if (missingBlobs.length > 0) pipelineFailures.push(`${missingBlobs.length} required blob report(s) are missing`);
 if (staleBlobs.length > 0) pipelineFailures.push(`${staleBlobs.length} required blob report(s) are stale`);
-if (!resultsAreFresh) pipelineFailures.push('report merge did not produce fresh structured results');
 if (rebuildStage.exitCode !== 0) pipelineFailures.push('checklist rebuild failed');
 if (rebuildStage.exitCode === 0 && !checklistIsFresh) {
   pipelineFailures.push('checklist rebuild did not produce a fresh authoritative manifest');
@@ -137,6 +143,7 @@ release ??= unavailableRelease(`No authoritative release decision is usable beca
 const outcome = releaseOutcome(pipelineStatus, release);
 const lifecycle = {
   schemaVersion: 2,
+  runId,
   startedAt,
   finishedAt: new Date().toISOString(),
   shardTotal,
@@ -152,12 +159,12 @@ const lifecycle = {
     fresh: blobPreflight.present,
   },
   stages,
-  browserTestFailuresObserved: mergeStage.exitCode !== 0 && resultsAreFresh,
+  browserTestFailuresObserved: mergeStage.exitCode === 1 && !mergeStage.signal && resultsAreFresh,
   diagnostics: {
     authoritative: false,
     authoritativeReleaseSource: 'sharded-run.json',
     diagnosticCountsAuthoritative: false,
-    browserTestFailuresObserved: mergeStage.exitCode !== 0 && resultsAreFresh,
+    browserTestFailuresObserved: mergeStage.exitCode === 1 && !mergeStage.signal && resultsAreFresh,
     integrityFailures: reportIntegrityFailures,
   },
   pipeline: {

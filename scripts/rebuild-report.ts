@@ -357,6 +357,11 @@ const pipelineErrors = integrityFailures.map(({ stage, reason }) => ({
 const reportOptions = {
   outputDir,
   tests,
+  selectedProjects: (report.config?.projects ?? []).map((project) => ({
+    ...(project.id ? { id: project.id } : {}),
+    name: project.name,
+    metadata: project.metadata ?? {},
+  })),
   run: {
     status: unexpected > 0 || integrityFailures.length > 0 ? 'failed' as const : 'passed' as const,
     ...(report.stats?.startTime ? { startedAt: report.stats.startTime } : {}),

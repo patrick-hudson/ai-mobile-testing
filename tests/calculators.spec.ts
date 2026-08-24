@@ -23,6 +23,59 @@ interface AdvancedScheduleRow {
   source: string;
 }
 
+interface TaperScheduleRow {
+  day: number;
+  perDose: number;
+  times: number;
+  total: number;
+}
+
+interface SimpleScheduleRow {
+  range: string;
+  phase: string;
+  sevenOhPerDose: number | null;
+  sevenOhDoses: number;
+  sevenOhTotal: number;
+  srPerDose: number;
+  srDoses: number;
+  srTotal: number;
+}
+
+async function readTaperSchedule(page: Page): Promise<TaperScheduleRow[]> {
+  return page.locator('tr.schedule-data-row').evaluateAll((rows) => rows.map((row) => {
+    const read = (label: string) => Number(row.querySelector<HTMLElement>(`[data-label="${label}"]`)?.innerText.trim());
+    return {
+      day: read('Day'),
+      perDose: read('Per dose (mg)'),
+      times: read('Times/day'),
+      total: read('Total daily (mg)'),
+    };
+  }));
+}
+
+async function readSimpleSchedule(page: Page): Promise<SimpleScheduleRow[]> {
+  return page.locator('[data-simple-sr17-step]').evaluateAll((steps) => steps.map((step) => {
+    const range = step.getAttribute('data-simple-sr17-step') ?? '';
+    const phase = step.querySelector(':scope > div:first-child p:nth-child(2)')?.textContent?.trim() ?? '';
+    const columns = step.querySelectorAll(':scope > div:nth-child(2) > div');
+    const sevenOhText = columns[0]?.textContent?.replace(/\s+/g, ' ').trim() ?? '';
+    const srText = columns[1]?.textContent?.replace(/\s+/g, ' ').trim() ?? '';
+    const sevenOh = sevenOhText.match(/7-OH\s+([\d.]+) mg × (\d+) daily\s+([\d.]+) mg\/day/);
+    const sr17 = srText.match(/SR-17\s+([\d.]+) mg × (\d+) daily\s+([\d.]+) mg\/day/);
+    if (!sr17) throw new Error(`Could not parse rendered SR-17 step: ${srText}`);
+    return {
+      range,
+      phase,
+      sevenOhPerDose: sevenOh ? Number(sevenOh[1]) : null,
+      sevenOhDoses: sevenOh ? Number(sevenOh[2]) : 0,
+      sevenOhTotal: sevenOh ? Number(sevenOh[3]) : 0,
+      srPerDose: Number(sr17[1]),
+      srDoses: Number(sr17[2]),
+      srTotal: Number(sr17[3]),
+    };
+  }));
+}
+
 async function readAdvancedSchedule(page: Page): Promise<AdvancedScheduleRow[]> {
   return page.locator('tr.sr-schedule-row').evaluateAll((rows) => rows.map((row) => {
     const read = (label: string) => row.querySelector<HTMLElement>(`[data-label="${label}"]`)?.innerText.replace(/\s+/g, ' ').trim() ?? '';
@@ -44,12 +97,24 @@ interactionTest('[CALC-001] taper defaults and derived totals stay coherent', in
   test.skip(!candidateChromium(testInfo), 'Candidate Chromium calculator audit.');
   await audit.goto(TAPER_PATH);
 
-  await audit.step('Verify documented defaults', '15 mg taken four times produces 60 mg/day and a 30-day schedule.', async () => {
-    await expect(page.getByLabel('Per-dose amount (mg)', { exact: true })).toHaveValue('15');
-    await expect(page.getByLabel('Times per day', { exact: true })).toHaveValue('4');
-    await expect(page.getByText('60 mg', { exact: true }).first()).toBeVisible();
-    await expect(page.getByText('30 days', { exact: true }).first()).toBeVisible();
-  });
+  const substanceDefaults = [
+    { option: '7-OH', perDose: '15', frequency: '4', total: '60 mg', rows: 30 },
+    { option: 'MGM-15 / MIT-A / DHM products', perDose: '10', frequency: '3', total: '30 mg', rows: 30 },
+    { option: 'Pseudo (mitragynine pseudoindoxyl)', perDose: '7', frequency: '3', total: '21 mg', rows: 30 },
+  ] as const;
+
+  for (const expected of substanceDefaults) {
+    await audit.step(`Verify ${expected.option} defaults`, 'The selected substance resets every dose factor and regenerates its documented schedule.', async () => {
+      await chooseSelectOption(page, 'What are you tapering?', expected.option);
+      await expect(page.getByLabel('What are you tapering?', { exact: true })).toContainText(expected.option);
+      await expect(page.getByLabel('Per-dose amount (mg)', { exact: true })).toHaveValue(expected.perDose);
+      await expect(page.getByLabel('Times per day', { exact: true })).toHaveValue(expected.frequency);
+      await expect(page.getByText(expected.total, { exact: true }).first()).toBeVisible();
+      await expect(page.locator('tr.schedule-data-row')).toHaveCount(expected.rows);
+    });
+  }
+
+  await chooseSelectOption(page, 'What are you tapering?', '7-OH');
 
   await audit.step('Recalculate the daily total', 'Changing either factor immediately updates the displayed total.', async () => {
     await replaceNumber(page, 'Per-dose amount (mg)', '20');
@@ -71,18 +136,39 @@ interactionTest('[CALC-002] taper inputs reject unsafe or unusable boundaries', 
     await page.getByLabel('Per-dose amount (mg)', { exact: true }).fill('');
     await page.getByLabel('Per-dose amount (mg)', { exact: true }).blur();
     await expect(page.getByText(/Enter a per-dose amount and times-per-day larger than the jump-off dose/i)).toBeVisible();
+    await expect(page.locator('tr.schedule-data-row')).toHaveCount(0);
   });
 
-  await audit.step('Enter a decimal dose', 'Valid decimal medication amounts generate a schedule without NaN or Infinity.', async () => {
+  await audit.step('Enter a malformed dose', 'Non-numeric text cannot survive in the numeric control or leave a stale schedule visible.', async () => {
+    const dose = page.getByLabel('Per-dose amount (mg)', { exact: true });
+    await dose.fill('not-a-number');
+    await dose.blur();
+    await expect(dose).toHaveValue('');
+    await expect(page.locator('tr.schedule-data-row')).toHaveCount(0);
+    await expect(page.getByText(/Enter a per-dose amount and times-per-day larger than the jump-off dose/i)).toBeVisible();
+  });
+
+  await audit.step('Enter a decimal dose at the minimum frequency', 'A valid decimal medication amount and the minimum frequency produce exact arithmetic.', async () => {
     await replaceNumber(page, 'Per-dose amount (mg)', '12.5');
+    await replaceNumber(page, 'Times per day', '1');
     await expect(page.getByRole('heading', { name: 'Schedule table' })).toBeVisible();
+    await expect(page.getByText('12.5 mg', { exact: true }).first()).toBeVisible();
     await expect(page.getByText(/NaN|Infinity/)).toHaveCount(0);
   });
 
-  await audit.step('Attempt an out-of-range frequency', 'Browser constraints expose the invalid value instead of silently presenting it as valid.', async () => {
+  await audit.step('Use the maximum allowed frequency', 'Twelve daily doses remain valid and the total is recalculated exactly.', async () => {
+    const frequency = page.getByLabel('Times per day', { exact: true });
+    await replaceNumber(page, 'Times per day', '12');
+    expect(await frequency.evaluate((element: HTMLInputElement) => element.checkValidity())).toBe(true);
+    await expect(page.getByText('150 mg', { exact: true }).first()).toBeVisible();
+    await expect(page.locator('tr.schedule-data-row')).toHaveCount(30);
+  });
+
+  await audit.step('Reject an out-of-range frequency', 'An invalid frequency is visibly invalid and cannot leave a misleading generated plan on screen.', async () => {
     const frequency = page.getByLabel('Times per day', { exact: true });
     await frequency.fill('13');
     expect(await frequency.evaluate((element: HTMLInputElement) => element.validity.rangeOverflow)).toBe(true);
+    await expect(page.locator('tr.schedule-data-row')).toHaveCount(0);
   });
 
   await audit.assertRuntimeHealthy();
@@ -100,10 +186,20 @@ interactionTest('[CALC-003] custom taper generates the requested day-by-day sche
 
   await audit.step('Generate a ten-day plan', 'The schedule has exactly ten data days and reaches the 5 mg jump-off.', async () => {
     await replaceNumber(page, 'Total duration', '10');
-    const rows = page.locator('tr.schedule-data-row');
-    await expect(rows).toHaveCount(10);
-    await expect(rows.first().locator('[data-label="Total daily (mg)"]')).toHaveText('60');
-    await expect(rows.last().locator('[data-label="Total daily (mg)"]')).toHaveText('5');
+    const golden: TaperScheduleRow[] = [
+      { day: 1, perDose: 15, times: 4, total: 60 },
+      { day: 2, perDose: 11.5, times: 4, total: 46 },
+      { day: 3, perDose: 11.5, times: 3, total: 34.5 },
+      { day: 4, perDose: 13, times: 2, total: 26 },
+      { day: 5, perDose: 10, times: 2, total: 20 },
+      { day: 6, perDose: 7.5, times: 2, total: 15 },
+      { day: 7, perDose: 5.75, times: 2, total: 11.5 },
+      { day: 8, perDose: 4.25, times: 2, total: 8.5 },
+      { day: 9, perDose: 3.25, times: 2, total: 6.5 },
+      { day: 10, perDose: 2.5, times: 2, total: 5 },
+    ];
+    expect(await readTaperSchedule(page)).toEqual(golden);
+    await expect(page.locator('tr.schedule-total-row td').last()).toHaveText('233 mg');
   });
 
   audit.observe('schedule data rows', await page.locator('tr.schedule-data-row').count(), '10');
@@ -220,17 +316,67 @@ interactionTest('[CALC-007] SR-17 simple mode builds documented 7, 10, and 14-da
     await expect(page.getByText('Starting SR-17 schedule')).toBeVisible();
   });
 
+  const goldenProtocols: Record<7 | 10 | 14, { rows: SimpleScheduleRow[]; totalMg: string; tablets: string; stopDay: string }> = {
+    7: {
+      rows: [
+        { range: '1-1', phase: 'Reduce 7-OH', sevenOhPerDose: 25, sevenOhDoses: 4, sevenOhTotal: 100, srPerDose: 37.5, srDoses: 4, srTotal: 150 },
+        { range: '2-2', phase: 'Reduce 7-OH', sevenOhPerDose: 12.5, sevenOhDoses: 4, sevenOhTotal: 50, srPerDose: 37.5, srDoses: 4, srTotal: 150 },
+        { range: '3-3', phase: 'SR-17 only', sevenOhPerDose: null, sevenOhDoses: 0, sevenOhTotal: 0, srPerDose: 37.5, srDoses: 4, srTotal: 150 },
+        { range: '4-4', phase: 'Reduce SR-17', sevenOhPerDose: null, sevenOhDoses: 0, sevenOhTotal: 0, srPerDose: 37.5, srDoses: 3, srTotal: 112.5 },
+        { range: '5-5', phase: 'Reduce SR-17', sevenOhPerDose: null, sevenOhDoses: 0, sevenOhTotal: 0, srPerDose: 37.5, srDoses: 2, srTotal: 75 },
+        { range: '6-6', phase: 'Reduce SR-17', sevenOhPerDose: null, sevenOhDoses: 0, sevenOhTotal: 0, srPerDose: 37.5, srDoses: 1, srTotal: 37.5 },
+        { range: '7-7', phase: 'Reduce SR-17', sevenOhPerDose: null, sevenOhDoses: 0, sevenOhTotal: 0, srPerDose: 18.75, srDoses: 1, srTotal: 18.75 },
+      ],
+      totalMg: '693.75 mg', tablets: '14', stopDay: '7-OH stops on Day 3',
+    },
+    10: {
+      rows: [
+        { range: '1-1', phase: 'Reduce 7-OH', sevenOhPerDose: 50, sevenOhDoses: 4, sevenOhTotal: 200, srPerDose: 37.5, srDoses: 4, srTotal: 150 },
+        { range: '2-2', phase: 'Reduce 7-OH', sevenOhPerDose: 25, sevenOhDoses: 4, sevenOhTotal: 100, srPerDose: 37.5, srDoses: 4, srTotal: 150 },
+        { range: '3-3', phase: 'Reduce 7-OH', sevenOhPerDose: 12.5, sevenOhDoses: 4, sevenOhTotal: 50, srPerDose: 37.5, srDoses: 4, srTotal: 150 },
+        { range: '4-4', phase: 'Reduce 7-OH', sevenOhPerDose: null, sevenOhDoses: 0, sevenOhTotal: 0, srPerDose: 37.5, srDoses: 4, srTotal: 150 },
+        { range: '5-5', phase: 'SR-17 only', sevenOhPerDose: null, sevenOhDoses: 0, sevenOhTotal: 0, srPerDose: 37.5, srDoses: 4, srTotal: 150 },
+        { range: '6-7', phase: 'Reduce SR-17', sevenOhPerDose: null, sevenOhDoses: 0, sevenOhTotal: 0, srPerDose: 37.5, srDoses: 3, srTotal: 112.5 },
+        { range: '8-8', phase: 'Reduce SR-17', sevenOhPerDose: null, sevenOhDoses: 0, sevenOhTotal: 0, srPerDose: 37.5, srDoses: 2, srTotal: 75 },
+        { range: '9-9', phase: 'Reduce SR-17', sevenOhPerDose: null, sevenOhDoses: 0, sevenOhTotal: 0, srPerDose: 37.5, srDoses: 1, srTotal: 37.5 },
+        { range: '10-10', phase: 'Reduce SR-17', sevenOhPerDose: null, sevenOhDoses: 0, sevenOhTotal: 0, srPerDose: 18.75, srDoses: 1, srTotal: 18.75 },
+      ],
+      totalMg: '1106.25 mg', tablets: '23', stopDay: '7-OH stops on Day 4',
+    },
+    14: {
+      rows: [
+        { range: '1-1', phase: 'Reduce 7-OH', sevenOhPerDose: 50, sevenOhDoses: 4, sevenOhTotal: 200, srPerDose: 37.5, srDoses: 4, srTotal: 150 },
+        { range: '2-2', phase: 'Reduce 7-OH', sevenOhPerDose: 25, sevenOhDoses: 4, sevenOhTotal: 100, srPerDose: 37.5, srDoses: 4, srTotal: 150 },
+        { range: '3-3', phase: 'Reduce 7-OH', sevenOhPerDose: 12.5, sevenOhDoses: 4, sevenOhTotal: 50, srPerDose: 37.5, srDoses: 4, srTotal: 150 },
+        { range: '4-4', phase: 'Reduce 7-OH', sevenOhPerDose: 6.25, sevenOhDoses: 4, sevenOhTotal: 25, srPerDose: 37.5, srDoses: 4, srTotal: 150 },
+        { range: '5-5', phase: 'Reduce 7-OH', sevenOhPerDose: null, sevenOhDoses: 0, sevenOhTotal: 0, srPerDose: 37.5, srDoses: 4, srTotal: 150 },
+        { range: '6-7', phase: 'SR-17 only', sevenOhPerDose: null, sevenOhDoses: 0, sevenOhTotal: 0, srPerDose: 37.5, srDoses: 4, srTotal: 150 },
+        { range: '8-9', phase: 'Reduce SR-17', sevenOhPerDose: null, sevenOhDoses: 0, sevenOhTotal: 0, srPerDose: 37.5, srDoses: 3, srTotal: 112.5 },
+        { range: '10-11', phase: 'Reduce SR-17', sevenOhPerDose: null, sevenOhDoses: 0, sevenOhTotal: 0, srPerDose: 37.5, srDoses: 2, srTotal: 75 },
+        { range: '12-13', phase: 'Reduce SR-17', sevenOhPerDose: null, sevenOhDoses: 0, sevenOhTotal: 0, srPerDose: 37.5, srDoses: 1, srTotal: 37.5 },
+        { range: '14-14', phase: 'Reduce SR-17', sevenOhPerDose: null, sevenOhDoses: 0, sevenOhTotal: 0, srPerDose: 18.75, srDoses: 1, srTotal: 18.75 },
+      ],
+      totalMg: '1518.75 mg', tablets: '31', stopDay: '7-OH stops on Day 5',
+    },
+  };
+
   for (const days of [7, 10, 14] as const) {
     await audit.step(`Generate the ${days}-day simple plan`, `The plan ends on day ${days} and shows medication supply totals.`, async () => {
       await page.getByRole('radio', { name: `${days} days` }).check();
       await expect(page.getByText(`Your ${days}-day plan`)).toBeVisible();
-      await expect(page.getByText(`Stop SR-17 after the final dose on Day ${days}.`)).toHaveCount(0);
-      const lastStep = page.locator('[data-simple-sr17-step]').last();
-      const end = await lastStep.getAttribute('data-simple-sr17-step');
-      expect(Number(end?.split('-')[1])).toBe(days);
-      await expect(page.getByText('50 mg tablets needed')).toBeVisible();
+      expect(await readSimpleSchedule(page)).toEqual(goldenProtocols[days].rows);
+      await expect(page.getByText(goldenProtocols[days].stopDay, { exact: true })).toBeVisible();
+      const totals = page.locator('dl').filter({ hasText: 'Total SR-17' });
+      await expect(totals.locator('dd').nth(0)).toHaveText(goldenProtocols[days].totalMg);
+      await expect(totals.locator('dd').nth(1)).toHaveText(goldenProtocols[days].tablets);
     });
   }
+
+  await audit.attachJson('sr17-simple-golden-contract', {
+    oracle: 'Hard-coded clinical-display vectors reviewed independently from the deployed calculator implementation.',
+    routine: '50 mg 7-OH four times daily; 150 mg/day SR-17 target split into four 37.5 mg doses',
+    protocols: goldenProtocols,
+  });
 
   await audit.assertRuntimeHealthy();
 });
@@ -320,21 +466,9 @@ interactionTest('[CALC-008] SR-17 advanced mode exposes and applies each schedul
   await audit.assertRuntimeHealthy();
 });
 
-staticTest('[CALC-009] taper arithmetic obeys monotonic and total-supply invariants', staticEvidence('Capture the rendered deterministic schedule together with monotonic-dose and total-supply assertions.', 'candidate-desktop-chromium'), async ({ page, audit }, testInfo) => {
+staticTest('[CALC-009] taper arithmetic matches independent representative and boundary vectors', staticEvidence('Capture rendered black-box schedules together with independent representative, edge, and invariant assertions.', 'candidate-desktop-chromium'), async ({ page, audit }, testInfo) => {
   test.skip(!candidateChromium(testInfo) || meta(testInfo).deviceClass !== 'desktop', 'One deterministic candidate desktop arithmetic audit.');
-  await audit.goto(TAPER_PATH);
-
-  await audit.step('Read the generated schedule as structured values', 'Every row contains finite, positive dose arithmetic.', async () => {
-    const rows = await page.locator('tr.schedule-data-row').evaluateAll((elements) => elements.map((row) => {
-      const read = (label: string) => Number(row.querySelector<HTMLElement>(`[data-label="${label}"]`)?.innerText.trim());
-      return {
-        day: read('Day'),
-        perDose: read('Per dose (mg)'),
-        times: read('Times/day'),
-        total: read('Total daily (mg)'),
-      };
-    }));
-    expect(rows).toHaveLength(30);
+  const assertArithmetic = (rows: TaperScheduleRow[]) => {
     for (let index = 0; index < rows.length; index += 1) {
       const row = rows[index]!;
       expect(row.day).toBe(index + 1);
@@ -344,17 +478,53 @@ staticTest('[CALC-009] taper arithmetic obeys monotonic and total-supply invaria
       expect(row.total).toBeCloseTo(row.perDose * row.times, 6);
       if (index > 0) expect(row.total).toBeLessThanOrEqual(rows[index - 1]!.total);
     }
-    expect(rows[0]!.total).toBe(60);
-    expect(rows.at(-1)!.total).toBe(5);
+  };
 
-    const displayedSupply = Number((await page.locator('tr.schedule-total-row td').last().innerText()).match(/[\d.]+/)?.[0]);
-    const computedSupply = rows.reduce((sum, row) => sum + row.total, 0);
-    expect(displayedSupply).toBeCloseTo(computedSupply, 1);
-    audit.observe('computed total medication', computedSupply, String(displayedSupply));
+  await audit.step('Verify the published buprenorphine table', 'The default 8 mg 14-day plan matches the independent established schedule exactly.', async () => {
+    await audit.goto('/resources/suboxone-taper-calculator');
+    const totals = [8, 8, 7, 6, 6, 5, 4, 4, 3, 2, 1.5, 1, 0.5, 0.25];
+    const golden = totals.map((total, index) => ({ day: index + 1, perDose: total, times: 1, total }));
+    const rows = await readTaperSchedule(page);
+    expect(rows).toEqual(golden);
+    assertArithmetic(rows);
+    await expect(page.locator('tr.schedule-total-row td').last()).toHaveText('56.25 mg');
+  });
+
+  await audit.step('Verify a two-day 7-OH boundary', 'A two-day plan retains only the exact start and jump-off values with a correct supply sum.', async () => {
+    await audit.goto(TAPER_PATH);
+    await chooseSelectOption(page, 'Taper duration', 'Custom duration');
+    await replaceNumber(page, 'Total duration', '2');
+    const golden: TaperScheduleRow[] = [
+      { day: 1, perDose: 15, times: 4, total: 60 },
+      { day: 2, perDose: 2.5, times: 2, total: 5 },
+    ];
+    const rows = await readTaperSchedule(page);
+    expect(rows).toEqual(golden);
+    assertArithmetic(rows);
+    await expect(page.locator('tr.schedule-total-row td').last()).toHaveText('65 mg');
+  });
+
+  await audit.step('Verify an explicit zero jump-off boundary', 'A pseudoindoxyl plan reaches its practical floor and appends one explicit zero-dose stop day.', async () => {
+    await chooseSelectOption(page, 'What are you tapering?', 'Pseudo (mitragynine pseudoindoxyl)');
+    await chooseSelectOption(page, 'Taper duration', 'Custom duration');
+    await replaceNumber(page, 'Total duration', '2');
+    await replaceNumber(page, 'Jump-off dose (mg)', '0');
+    const golden: TaperScheduleRow[] = [
+      { day: 1, perDose: 7, times: 3, total: 21 },
+      { day: 2, perDose: 0.5, times: 1, total: 0.5 },
+    ];
+    const rows = await readTaperSchedule(page);
+    expect(rows).toEqual(golden);
+    assertArithmetic(rows);
+    await expect(page.locator('tr.schedule-stop-row [data-label="Day"]')).toHaveText('3');
+    await expect(page.locator('tr.schedule-stop-row')).toContainText('Stop. Taper complete.');
+    await expect(page.locator('tr.schedule-total-row td').last()).toHaveText('21.5 mg');
+    await expect(page.getByText('3 days', { exact: true }).first()).toBeVisible();
   });
 
   await audit.attachJson('calculator-invariants', {
-    scheduleRows: await page.locator('tr.schedule-data-row').count(),
+    oracle: 'Independent black-box vectors; no site schedule generator is imported into the audit harness.',
+    cases: ['published 8 mg buprenorphine 14-day table', 'two-day 7-OH start/jump boundary', 'pseudoindoxyl explicit-zero stop boundary'],
     invariantSet: ['sequential days', 'finite positive doses', 'per-dose × frequency = daily total', 'non-increasing total', 'supply sum'],
   });
   await audit.checkpoint('taper-arithmetic-reviewed-schedule');

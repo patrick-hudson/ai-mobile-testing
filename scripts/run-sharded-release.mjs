@@ -10,6 +10,7 @@ import {
   pipelineDiagnosticsDocument,
 } from './lib/pipeline-diagnostics.mjs';
 import {
+  DEFAULT_RELEASE_SHARD_CONCURRENCY,
   DEFAULT_RELEASE_SHARD_TOTAL,
   DEFAULT_RELEASE_SHARD_WORKERS,
   MAX_RELEASE_SHARD_TOTAL,
@@ -20,6 +21,12 @@ import { createFreshShardedRunDirectory, validatedShardedRunId } from './lib/sha
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const shardTotal = integerEnvironment('AUDIT_SHARD_TOTAL', DEFAULT_RELEASE_SHARD_TOTAL, 1, MAX_RELEASE_SHARD_TOTAL);
 const shardWorkers = integerEnvironment('AUDIT_SHARD_WORKERS', DEFAULT_RELEASE_SHARD_WORKERS, 1, MAX_RELEASE_SHARD_WORKERS);
+const shardConcurrency = integerEnvironment(
+  'AUDIT_SHARD_CONCURRENCY',
+  Math.min(DEFAULT_RELEASE_SHARD_CONCURRENCY, shardTotal),
+  1,
+  shardTotal,
+);
 const performanceExpectedExecutions = integerEnvironment('AUDIT_PERFORMANCE_EXPECTED_EXECUTIONS', 70, 1, 10_000);
 const heartbeatIntervalMs = integerEnvironment('AUDIT_SHARDED_HEARTBEAT_MS', 5_000, 1_000, 60_000);
 const heartbeatLeaseMs = integerEnvironment('AUDIT_SHARDED_LEASE_MS', 30_000, 10_000, 10 * 60_000);
@@ -61,6 +68,7 @@ writeCoordinator('sharded-release-started', {
   hostRunDirectory,
   containerRunDirectory,
   shardWorkers,
+  shardConcurrency,
   performanceWorkers: 1,
   performanceExpectedExecutions,
   performanceIsolation: 'dedicated-container-after-functional-shards',
@@ -78,7 +86,7 @@ let coordinatorIntegrityFailures = [];
 try {
   if (!stopRequest) buildResult = await runBuild();
   if (!stopRequest && buildResult.exitCode === 0) {
-    shardResults = await Promise.all(Array.from({ length: shardTotal }, (_, offset) => runShard(offset + 1)));
+    shardResults = await runFunctionalShards();
   }
   if (!stopRequest && buildResult.exitCode === 0) performanceResult = await runPerformance();
   else if (!stopRequest) performanceResult = skippedResult('PERFORMANCE', 'Docker image build failed; isolated performance checks were not started.');
@@ -144,6 +152,7 @@ const lifecycle = {
   finishedAt: new Date().toISOString(),
   shardTotal,
   shardWorkers,
+  shardConcurrency,
   performanceExpectedExecutions,
   productionUrl: process.env.PRODUCTION_URL ?? 'https://quitting7oh.org',
   candidateUrl: process.env.CANDIDATE_URL ?? 'https://beta.quitting7oh-org.pages.dev',
@@ -212,6 +221,42 @@ async function runShard(index) {
     'audit-release-shard',
   ];
   return runDockerCommand({ kind: 'shard', index, args, logPath });
+}
+
+async function runFunctionalShards() {
+  const results = new Array(shardTotal);
+  let nextIndex = 1;
+  writeCoordinator('functional-shard-pool-started', {
+    shardTotal,
+    shardConcurrency,
+    shardWorkers,
+    maximumConcurrentBrowserWorkers: shardConcurrency * shardWorkers,
+  });
+  await Promise.all(Array.from({ length: shardConcurrency }, async () => {
+    while (!stopRequest) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index > shardTotal) return;
+      results[index - 1] = await runShard(index);
+    }
+  }));
+  for (let offset = 0; offset < shardTotal; offset += 1) {
+    if (results[offset]) continue;
+    results[offset] = {
+      index: offset + 1,
+      ...skippedResult(
+        `SHARD ${offset + 1}/${shardTotal}`,
+        `The coordinator stopped before shard ${offset + 1} entered the bounded execution pool.`,
+      ),
+    };
+  }
+  writeCoordinator('functional-shard-pool-finished', {
+    shardTotal,
+    shardConcurrency,
+    started: results.filter(({ command }) => command.length > 0).length,
+    skippedBeforeStart: results.filter(({ command }) => command.length === 0).length,
+  });
+  return results;
 }
 
 async function runPerformance() {

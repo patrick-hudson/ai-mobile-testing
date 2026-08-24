@@ -362,6 +362,7 @@ async function assertPortalRestartReadsLargeExternalLog(temporary) {
           assert.equal(config.targets.defaultTargetIds.length, 7);
           assert.equal(config.defaults.releaseShardTotal, 8);
           assert.equal(config.defaults.releaseShardWorkers, 1);
+          assert.equal(config.defaults.releaseShardConcurrency, 4);
           assert.ok(config.targets.localTargets.every(({ id, fidelity, qualification, defaultSelected }) => (
             typeof id === 'string' && typeof fidelity === 'string' && typeof qualification === 'string'
             && typeof defaultSelected === 'boolean'

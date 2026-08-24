@@ -1,7 +1,7 @@
 import { test, expect, interactionEvidence, interactionTest } from '../fixtures/test.js';
 import { meta, dismissSchedulingNotice } from './helpers.js';
 
-interactionTest('[NAV-001] mobile guide drawer preserves focus and page position', interactionEvidence('Open, expand, and close the guide drawer and show modal focus plus preserved reading position.', 'candidate-mobile-projects'), async ({ page, audit }, testInfo) => {
+interactionTest('[NAV-001] mobile guide drawer traps focus and closes by every supported method', interactionEvidence('Open the guide drawer, cycle focus, and close it by Escape, close button, and backdrop while showing focus and scroll restoration.', 'candidate-mobile-projects'), async ({ page, audit }, testInfo) => {
   const project = meta(testInfo);
   test.skip(project.environment !== 'candidate' || project.deviceClass !== 'mobile', 'Candidate mobile interaction audit.');
 
@@ -9,13 +9,45 @@ interactionTest('[NAV-001] mobile guide drawer preserves focus and page position
   await dismissSchedulingNotice(page);
   await page.evaluate(() => window.scrollTo(0, 420));
   const initialScroll = await page.evaluate(() => window.scrollY);
+  const opener = page.getByRole('button', { name: 'Open guide navigation' });
+  const dialog = page.getByRole('dialog', { name: 'Guide navigation' });
+
+  const assertClosedAndRestored = async () => {
+    await expect(dialog).toBeHidden();
+    await expect(opener).toBeFocused();
+    expect(Math.abs((await page.evaluate(() => window.scrollY)) - initialScroll)).toBeLessThanOrEqual(2);
+  };
+
+  const openDrawer = async () => {
+    await opener.click();
+    await expect(dialog).toBeVisible();
+    await expect(page.getByRole('navigation', { name: 'Guide index' })).toBeVisible();
+    expect(await dialog.evaluate((element) => element.contains(document.activeElement)), 'Opening the modal must place focus inside it').toBe(true);
+  };
 
   await audit.step('Open the guide drawer', 'A modal guide index opens and receives focus.', async () => {
-    const opener = page.getByRole('button', { name: 'Open guide navigation' });
     await opener.focus();
-    await opener.click();
-    await expect(page.getByRole('dialog', { name: 'Guide navigation' })).toBeVisible();
-    await expect(page.getByRole('navigation', { name: 'Guide index' })).toBeVisible();
+    await openDrawer();
+  });
+
+  await audit.step('Cycle focus in both directions', 'Tab and Shift+Tab remain trapped and wrap to the same starting control.', async () => {
+    const focusableCount = await dialog.locator('a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])').evaluateAll((elements) => elements.filter((element) => {
+      const box = element.getBoundingClientRect();
+      const style = getComputedStyle(element);
+      return box.width > 0 && box.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+    }).length);
+    expect(focusableCount, 'The open guide must expose multiple keyboard destinations').toBeGreaterThan(2);
+    await page.evaluate(() => document.activeElement?.setAttribute('data-audit-focus-origin', 'true'));
+    for (let index = 0; index < focusableCount; index += 1) {
+      await page.keyboard.press('Tab');
+      expect(await dialog.evaluate((element) => element.contains(document.activeElement)), `Tab ${index + 1} must remain in the modal`).toBe(true);
+    }
+    await expect(dialog.locator('[data-audit-focus-origin="true"]')).toBeFocused();
+    for (let index = 0; index < focusableCount; index += 1) {
+      await page.keyboard.press('Shift+Tab');
+      expect(await dialog.evaluate((element) => element.contains(document.activeElement)), `Shift+Tab ${index + 1} must remain in the modal`).toBe(true);
+    }
+    await expect(dialog.locator('[data-audit-focus-origin="true"]')).toBeFocused();
   });
 
   await audit.step('Expand a category', 'The category pages appear inside the drawer.', async () => {
@@ -28,9 +60,22 @@ interactionTest('[NAV-001] mobile guide drawer preserves focus and page position
 
   await audit.step('Close with Escape', 'The drawer closes, focus returns, and page scroll is preserved.', async () => {
     await page.keyboard.press('Escape');
-    await expect(page.getByRole('dialog', { name: 'Guide navigation' })).toBeHidden();
-    await expect(page.getByRole('button', { name: 'Open guide navigation' })).toBeFocused();
-    expect(Math.abs((await page.evaluate(() => window.scrollY)) - initialScroll)).toBeLessThanOrEqual(2);
+    await assertClosedAndRestored();
+  });
+
+  await audit.step('Close with the named close control', 'The visible close button dismisses the drawer and restores the opener and reading position.', async () => {
+    await openDrawer();
+    await dialog.getByRole('button', { name: 'Close', exact: true }).click();
+    await assertClosedAndRestored();
+  });
+
+  await audit.step('Close with the backdrop', 'Activating the unobscured backdrop dismisses the drawer and restores the opener and reading position.', async () => {
+    await openDrawer();
+    const overlay = page.locator('[data-slot="sheet-overlay"]');
+    const box = await overlay.boundingBox();
+    expect(box, 'The drawer backdrop must have measurable geometry').not.toBeNull();
+    await overlay.click({ position: { x: Math.max(1, box!.width - 4), y: Math.max(1, box!.height / 2) } });
+    await assertClosedAndRestored();
   });
   await audit.inspectPage();
   await audit.assertRuntimeHealthy();

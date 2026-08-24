@@ -58,6 +58,33 @@ export function extractSitemapLocations(xml: string): string[] {
   return [...new Set(locations)];
 }
 
+function decodeHtmlAttribute(value: string): string {
+  return value
+    .replace(/&#x([0-9a-f]+);/gi, (_match, hex: string) => String.fromCodePoint(Number.parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_match, decimal: string) => String.fromCodePoint(Number.parseInt(decimal, 10)))
+    .replaceAll('&amp;', '&')
+    .replaceAll('&quot;', '"')
+    .replaceAll('&#39;', "'")
+    .replaceAll('&lt;', '<')
+    .replaceAll('&gt;', '>');
+}
+
+/** Extract one attribute from matching HTML start tags without executing the document. */
+export function extractHtmlTagAttributes(html: string, tagName: string, attributeName: string): string[] {
+  const tags = html.match(new RegExp(`<${tagName}\\b[^>]*>`, 'gi')) ?? [];
+  const attribute = new RegExp('\\b' + attributeName + '\\s*=\\s*(?:"([^"]*)"|\'([^\']*)\'|([^\\s"\'=<>`]+))', 'i');
+  return tags.flatMap((tag) => {
+    const match = tag.match(attribute);
+    const value = match?.[1] ?? match?.[2] ?? match?.[3];
+    return value === undefined ? [] : [decodeHtmlAttribute(value.trim())];
+  });
+}
+
+export function extractHtmlElementIds(html: string): string[] {
+  const values = [...extractHtmlTagAttributes(html, '[a-z][a-z0-9:-]*', 'id'), ...extractHtmlTagAttributes(html, 'a', 'name')];
+  return [...new Set(values.filter(Boolean))];
+}
+
 function reviveAstroValue(value: unknown): unknown {
   if (!Array.isArray(value)) {
     if (!value || typeof value !== 'object') return value;

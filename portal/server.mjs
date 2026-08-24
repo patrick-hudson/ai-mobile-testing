@@ -17,6 +17,9 @@ import {
 import { publishCredentialEnvelope, removeCredentialEnvelope } from './credential-store.mjs';
 import { ByteLruCache } from './byte-lru-cache.mjs';
 import { readBoundedFileTail } from './bounded-file.mjs';
+import { validatePreferredMediaManifest } from './video-manifest.mjs';
+import { validateExternalTerminalEvidence } from './external-evidence.mjs';
+import { loadReportPublication, readPublishedReportJson } from './report-publication.mjs';
 import {
   parseChecklistRelease,
   pendingRelease,
@@ -24,6 +27,7 @@ import {
   unavailableRelease,
 } from '../scripts/lib/release-truth.mjs';
 import {
+  DEFAULT_RELEASE_SHARD_CONCURRENCY,
   DEFAULT_RELEASE_SHARD_TOTAL,
   DEFAULT_RELEASE_SHARD_WORKERS,
 } from '../scripts/lib/sharded-defaults.mjs';
@@ -184,6 +188,7 @@ const PLUGIN_IDS = new Set(plugins.map(({ id }) => id));
 const runs = new Map();
 const sensitiveLogValues = new Set();
 const artifactPathCache = new Map();
+const preferredMediaValidationCache = new Map();
 const reportDataCache = new ByteLruCache(MAX_REPORT_CACHE_ENTRIES, MAX_REPORT_CACHE_BYTES);
 const galleryRevisionCache = new Map();
 const observedGalleryPublications = new Map();
@@ -295,6 +300,7 @@ async function routeRequest(request, response) {
         candidateIgnoreHTTPSErrors: DEFAULT_CANDIDATE_IGNORE_HTTPS_ERRORS,
         releaseShardTotal: DEFAULT_RELEASE_SHARD_TOTAL,
         releaseShardWorkers: DEFAULT_RELEASE_SHARD_WORKERS,
+        releaseShardConcurrency: DEFAULT_RELEASE_SHARD_CONCURRENCY,
       },
       limits: { maxConcurrentRuns: MAX_CONCURRENT_RUNS },
       externalSync: externalRunSyncDiagnostics,
@@ -470,6 +476,7 @@ async function routeRequest(request, response) {
       run,
       join('audits', `${auditId}.json`),
       MAX_REPORT_AUDIT_DETAIL_BYTES,
+      reportRevision(requestUrl),
     );
     return sendJson(response, 200, value);
   }
@@ -2156,12 +2163,14 @@ async function listArtifacts(runDirectory, runId, offset, limit, request) {
     // never advertise it as durable evidence. Empty files are still being
     // written (or are unusable evidence) and are omitted for the same reason.
     if (!stat?.isFile() || stat.size === 0 || ignoredArtifactPath(path)) continue;
+    const mediaRecord = index.validatedMediaRecords?.get(path);
     files.push({
       path,
       bytes: stat.size,
       modifiedAt: stat.mtime.toISOString(),
       kind: artifactKind(path),
       url: `/artifacts/${encodeURIComponent(runId)}/${path.split('/').map(encodeURIComponent).join('/')}`,
+      ...(mediaRecord ? { evidenceRole: mediaRecord.evidenceRole } : {}),
     });
   }
   const nextOffset = offset + selectedPaths.length;
@@ -2186,6 +2195,7 @@ async function artifactIndex(runDirectory, offset) {
       paths: [],
       seen: new Set(),
       validatedMediaPaths: new Set(),
+      validatedMediaRecords: new Map(),
       videoManifestSchemaVersion: null,
       directories: [''],
       directoryOffset: 0,
@@ -2211,6 +2221,7 @@ async function artifactIndex(runDirectory, offset) {
     const preferredMedia = await preferredMediaArtifactPaths(runDirectory);
     index.videoManifestSchemaVersion = preferredMedia.schemaVersion;
     index.validatedMediaPaths = new Set(preferredMedia.paths);
+    index.validatedMediaRecords = preferredMedia.records;
     for (const mediaPath of preferredMedia.paths) {
       addArtifactPath(index, mediaPath);
     }
@@ -2220,35 +2231,38 @@ async function artifactIndex(runDirectory, offset) {
 }
 
 async function preferredMediaArtifactPaths(runDirectory) {
-  const manifestPath = join(runDirectory, 'video-manifest.json');
-  const stat = await safeStat(manifestPath);
-  if (!stat?.isFile() || stat.size > MAX_VIDEO_MANIFEST_BYTES) return { schemaVersion: null, paths: [] };
-  try {
-    const document = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
-    // Schema v1 predates evidence-policy and quality retention. It treated
-    // every Playwright page recording (including blank axe helper pages) as
-    // reviewer evidence, so it must never authorize raw video links.
-    if (document?.schemaVersion !== 2) {
-      return { schemaVersion: Number.isInteger(document?.schemaVersion) ? document.schemaVersion : 0, paths: [] };
-    }
-    if (!Array.isArray(document?.videos)) return { schemaVersion: 2, paths: [] };
-    const paths = [];
-    for (const entry of document.videos) {
-      if (!entry || typeof entry !== 'object') continue;
-      for (const value of [entry.video, entry.poster]) {
-        if (typeof value !== 'string' || paths.length >= MAX_PREFERRED_MEDIA_ARTIFACTS) continue;
-        const absolutePath = safeResolve(runDirectory, value);
-        if (!absolutePath || absolutePath === runDirectory) continue;
-        const verifiedPath = await resolveContainedRealPath(runDirectory, absolutePath);
-        if (!verifiedPath || !(await safeStat(verifiedPath))?.isFile()) continue;
-        paths.push(relative(runDirectory, absolutePath).split(sep).join('/'));
-      }
-      if (paths.length >= MAX_PREFERRED_MEDIA_ARTIFACTS) break;
-    }
-    return { schemaVersion: 2, paths };
-  } catch {
-    return { schemaVersion: 0, paths: [] };
+  const manifestStat = await safeStat(join(runDirectory, 'video-manifest.json'));
+  const cached = preferredMediaValidationCache.get(runDirectory);
+  if (cached
+    && manifestStat?.isFile()
+    && cached.manifestMtimeMs === manifestStat.mtimeMs
+    && cached.manifestBytes === manifestStat.size
+    && await preferredMediaRecordsUnchanged(runDirectory, cached.result.records)) {
+    return cached.result;
   }
+  const result = await validatePreferredMediaManifest(runDirectory, {
+    maximumBytes: MAX_VIDEO_MANIFEST_BYTES,
+    maximumArtifacts: MAX_PREFERRED_MEDIA_ARTIFACTS,
+  });
+  if (manifestStat?.isFile() && result.errors.length === 0) {
+    preferredMediaValidationCache.set(runDirectory, {
+      manifestMtimeMs: manifestStat.mtimeMs,
+      manifestBytes: manifestStat.size,
+      result,
+    });
+  } else {
+    preferredMediaValidationCache.delete(runDirectory);
+  }
+  return result;
+}
+
+async function preferredMediaRecordsUnchanged(runDirectory, records) {
+  for (const record of records.values()) {
+    const path = safeResolve(runDirectory, record.path);
+    const stat = path ? await safeStat(path) : null;
+    if (!stat?.isFile() || stat.size !== record.bytes || stat.mtimeMs !== record.mtimeMs) return false;
+  }
+  return true;
 }
 
 async function extendArtifactIndex(index, targetCount, request) {
@@ -2336,7 +2350,49 @@ function artifactKind(path) {
   return 'file';
 }
 
-async function readBoundedReportJson(run, relativePath, maximumBytes) {
+async function readBoundedReportJson(run, relativePath, maximumBytes, requestedRevision = null) {
+  const dataRoot = join(run.directory, 'checklist', 'data');
+  const currentPointer = await safeStat(join(dataRoot, 'current.json'));
+  if (currentPointer?.isFile() || requestedRevision !== null) {
+    let publication;
+    try {
+      publication = await loadReportPublication(run.directory, requestedRevision, {
+        maximumPointerBytes: 1024 * 1024,
+      });
+    } catch (error) {
+      throw httpError(422, `Compact report publication is invalid: ${error.message}`);
+    }
+    const expected = publication.files[relativePath];
+    const path = safeResolve(publication.revisionDirectory, relativePath);
+    if (!expected || !path) throw httpError(404, 'Compact report data is not part of this publication.');
+    const stat = await safeStat(path);
+    if (!stat?.isFile()) throw httpError(422, 'Compact report publication data is missing.');
+    const cached = reportDataCache.get(path);
+    if (cached?.mtimeMs === stat.mtimeMs
+      && cached.size === stat.size
+      && cached.sha256 === expected.sha256) return structuredClone(cached.value);
+    let published;
+    try {
+      published = await readPublishedReportJson(publication, relativePath, maximumBytes);
+    } catch (error) {
+      throw httpError(422, `Compact report publication is invalid: ${error.message}`);
+    }
+    reportDataCache.delete(path);
+    reportDataCache.set(path, {
+      mtimeMs: published.mtimeMs,
+      size: published.bytes,
+      sha256: published.sha256,
+      value: published.document,
+    }, published.bytes);
+    return structuredClone(published.document);
+  }
+
+  // Compatibility only for historical runs created before revision-bound
+  // publication. New terminal release evidence requires current.json.
+  return readLegacyBoundedReportJson(run, relativePath, maximumBytes);
+}
+
+async function readLegacyBoundedReportJson(run, relativePath, maximumBytes) {
   const path = safeResolve(join(run.directory, 'checklist', 'data'), relativePath);
   if (!path) throw httpError(404, 'Compact report data not found.');
   const stat = await safeStat(path);
@@ -2363,7 +2419,12 @@ async function readBoundedReportJson(run, relativePath, maximumBytes) {
 }
 
 async function filterReportAudits(run, requestUrl) {
-  const document = await readBoundedReportJson(run, 'audits.json', MAX_REPORT_AUDIT_INDEX_BYTES);
+  const document = await readBoundedReportJson(
+    run,
+    'audits.json',
+    MAX_REPORT_AUDIT_INDEX_BYTES,
+    reportRevision(requestUrl),
+  );
   const rows = Array.isArray(document.items) ? document.items : [];
   if (rows.some((row) => !row || typeof row !== 'object' || Array.isArray(row))) {
     throw httpError(422, 'Compact report audit rows are invalid.');
@@ -2416,6 +2477,7 @@ async function filterReportAudits(run, requestUrl) {
   const nextOffset = offset + items.length;
   return {
     schemaVersion: document.schemaVersion ?? 1,
+    publicationRevision: document.publicationRevision ?? null,
     generatedAt: document.generatedAt ?? null,
     items,
     total: matches.length,
@@ -2425,6 +2487,13 @@ async function filterReportAudits(run, requestUrl) {
     hasMore: nextOffset < matches.length,
     filters: { status, severity, area, environment, releaseBlocking, manual, q: query },
   };
+}
+
+function reportRevision(requestUrl) {
+  const value = requestUrl.searchParams.get('revision');
+  if (value === null || value === '') return null;
+  if (!/^[a-f0-9]{32}$/.test(value)) throw httpError(400, 'Report revision is invalid.');
+  return value;
 }
 
 function reportFilter(requestUrl, name, maximumLength) {
@@ -2905,12 +2974,22 @@ async function refreshExternalManifest(run) {
       status: 'failed', completed: false, reason: 'The sharded lifecycle is missing pipeline truth.', finishedAt: lifecycle.finishedAt ?? null,
     };
     const release = lifecycle.release ?? unavailableRelease('The sharded lifecycle is missing release truth.');
+    const terminalEvidence = await validateExternalTerminalEvidence({
+      runDirectory: run.directory,
+      expectedRunId: run.manifest.id,
+      lifecycle,
+      source: 'sharded-run.json',
+      maximumShardTotal: 16,
+      maximumVideoManifestBytes: MAX_VIDEO_MANIFEST_BYTES,
+      maximumPreferredMediaArtifacts: MAX_PREFERRED_MEDIA_ARTIFACTS,
+    });
     applyExternalFinalTruth(run, {
       pipeline,
       release,
       reportedStatus: lifecycle.status,
       finishedAt: lifecycle.finishedAt ?? null,
       source: 'sharded-run.json',
+      evidenceProblems: terminalEvidence.problems,
     });
     return;
   }
@@ -2933,12 +3012,22 @@ async function refreshExternalManifest(run) {
         : 'The externally launched merge pipeline did not complete successfully.',
       finishedAt: mergeLifecycle.finishedAt,
     };
+    const terminalEvidence = await validateExternalTerminalEvidence({
+      runDirectory: run.directory,
+      expectedRunId: run.manifest.id,
+      lifecycle: mergeLifecycle,
+      source: 'merge-lifecycle.json',
+      maximumShardTotal: 16,
+      maximumVideoManifestBytes: MAX_VIDEO_MANIFEST_BYTES,
+      maximumPreferredMediaArtifacts: MAX_PREFERRED_MEDIA_ARTIFACTS,
+    });
     applyExternalFinalTruth(run, {
       pipeline,
       release,
       reportedStatus: mergeLifecycle.status,
       finishedAt: mergeLifecycle.finishedAt,
       source: 'merge-lifecycle.json',
+      evidenceProblems: terminalEvidence.problems,
     });
     return;
   }
@@ -3068,8 +3157,18 @@ function applyExternalHeartbeatProgress(state, heartbeat) {
   }
 }
 
-function applyExternalFinalTruth(run, { pipeline, release, reportedStatus, finishedAt, source }) {
-  if (pipeline?.status === 'stopped' && pipeline?.completed === false && reportedStatus === 'stopped') {
+function applyExternalFinalTruth(run, {
+  pipeline,
+  release,
+  reportedStatus,
+  finishedAt,
+  source,
+  evidenceProblems = [],
+}) {
+  if (evidenceProblems.length === 0
+    && pipeline?.status === 'stopped'
+    && pipeline?.completed === false
+    && reportedStatus === 'stopped') {
     const terminalAt = finishedAt ?? pipeline.finishedAt ?? new Date().toISOString();
     delete run.manifest.lifecycleDiagnostics;
     run.manifest.finishedAt = terminalAt;
@@ -3100,10 +3199,10 @@ function applyExternalFinalTruth(run, { pipeline, release, reportedStatus, finis
   } catch (error) {
     releaseValidationError = error.message;
   }
-  const expectedStatus = pipelineComplete && normalizedRelease
+  const expectedStatus = pipelineComplete && normalizedRelease && evidenceProblems.length === 0
     ? normalizedRelease.decision === 'READY' ? 'ready' : 'not-ready'
     : 'pipeline-failed';
-  const problems = [];
+  const problems = [...evidenceProblems];
   if (!pipelineComplete) problems.push('pipeline.status must be completed and pipeline.completed must be true');
   if (releaseValidationError) problems.push(`release truth is invalid: ${releaseValidationError}`);
   if (reportedStatus !== expectedStatus) {
@@ -3111,13 +3210,21 @@ function applyExternalFinalTruth(run, { pipeline, release, reportedStatus, finis
   }
 
   run.manifest.finishedAt = finishedAt;
-  run.manifest.release = normalizedRelease ?? {
+  run.manifest.release = evidenceProblems.length > 0
+    ? {
+        ...unavailableRelease(
+          `External release evidence in ${source} is incomplete or inconsistent: ${evidenceProblems.join('; ')}`,
+          source,
+        ),
+        evaluatedAt: finishedAt,
+      }
+    : normalizedRelease ?? {
     ...unavailableRelease(
       `External release truth in ${source} is invalid: ${releaseValidationError ?? 'unknown validation error'}`,
       source,
     ),
     evaluatedAt: finishedAt,
-  };
+      };
   if (problems.length > 0) {
     const reason = `External release truth in ${source} is inconsistent: ${problems.join('; ')}.`;
     run.manifest.lifecycleDiagnostics = {
@@ -3547,6 +3654,7 @@ async function purgeRun(run, body, response) {
     await fs.rm(target, { recursive: true, force: false, maxRetries: 2, retryDelay: 100 });
 
     artifactPathCache.delete(target);
+    preferredMediaValidationCache.delete(target);
     galleryRevisionCache.delete(id);
     observedGalleryPublications.delete(id);
     purgedGalleryRunIds.add(id);

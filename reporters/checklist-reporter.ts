@@ -109,6 +109,10 @@ export default class ChecklistReporter implements Reporter {
     const manifest = await writeAuditReport({
       outputDir,
       tests,
+      selectedProjects: (this.config?.projects ?? []).map((project) => ({
+        name: project.name,
+        metadata: (project.metadata ?? {}) as Partial<AuditProjectMetadata>,
+      })),
       run: {
         status: result.status,
         ...(this.startedAt ? { startedAt: this.startedAt.toISOString() } : {}),

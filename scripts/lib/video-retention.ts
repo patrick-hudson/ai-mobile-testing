@@ -75,6 +75,9 @@ export const MIN_ACTION_VIDEO_SECONDS = 2;
 export const MIN_ACTION_FRAME_DIFFERENCE = 0.75;
 export const MAX_BLANK_FRAME_RATIO = 0.5;
 export const MIN_WINDOW_NONBLANK_RATIO = 0.5;
+const PRIMARY_PROBE_FRAMES = 240;
+const TAIL_PROBE_SECONDS = 15;
+const TAIL_PROBE_FRAMES = TAIL_PROBE_SECONDS * 4;
 
 interface SampledVideoFrame {
   timestampSeconds: number | null;
@@ -183,6 +186,11 @@ export function assessVideoMetrics(metrics: VideoQualityMetrics): Pick<VideoQual
   } else if (metrics.changedFrames < 1) {
     reasons.push('no representative page-content transition was measured');
   }
+  if (metrics.postContentChangedFrames == null || !Number.isFinite(metrics.postContentChangedFrames)) {
+    reasons.push('visual change after settled page content could not be measured');
+  } else if (metrics.postContentChangedFrames < 1) {
+    reasons.push('no visual response was measured after the page content settled');
+  }
   if (metrics.blankFrameRatio == null || !Number.isFinite(metrics.blankFrameRatio)) {
     reasons.push('blank-frame ratio could not be measured');
   } else if (metrics.blankFrameRatio > MAX_BLANK_FRAME_RATIO) {
@@ -242,6 +250,23 @@ function isShortDynamicFailure(status: string | undefined, assessment: VideoQual
     && assessment.reasons[0]?.startsWith('duration ') === true;
 }
 
+function frameProbeArgs(file: string, maximumFrames: number, seekSeconds: number | null = null): string[] {
+  return [
+    '-hide_banner', '-loglevel', 'error', '-nostats',
+    ...(seekSeconds === null ? [] : ['-ss', seekSeconds.toFixed(3)]),
+    '-i', file,
+    '-vf', 'crop=iw*0.70:ih*0.70:iw*0.15:ih*0.15,fps=4,scale=160:-2,signalstats,metadata=print:file=-',
+    '-frames:v', String(maximumFrames),
+    '-f', 'null', '-',
+  ];
+}
+
+function tailProbeStart(durationSeconds: number): number | null {
+  return Number.isFinite(durationSeconds) && durationSeconds > PRIMARY_PROBE_FRAMES / 4
+    ? Math.max(0, durationSeconds - TAIL_PROBE_SECONDS)
+    : null;
+}
+
 export function probeVideoQuality(
   file: string,
   ffmpeg: string,
@@ -283,13 +308,7 @@ export function probeVideoQuality(
     };
   }
   const durationSeconds = Number(durationProbe.stdout.trim());
-  const frameArgs = [
-    '-hide_banner', '-loglevel', 'error', '-nostats',
-    '-i', file,
-    '-vf', 'crop=iw*0.70:ih*0.70:iw*0.15:ih*0.15,fps=4,scale=160:-2,signalstats,metadata=print:file=-',
-    '-frames:v', '240',
-    '-f', 'null', '-',
-  ];
+  const frameArgs = frameProbeArgs(file, PRIMARY_PROBE_FRAMES);
   onCommand?.({ event: 'Command started', command: [ffmpeg, ...frameArgs] });
   const frameProbe = spawnSync(ffmpeg, frameArgs, { encoding: 'utf8', maxBuffer: 2 * 1024 * 1024 });
   onCommand?.({
@@ -298,10 +317,28 @@ export function probeVideoQuality(
     exitCode: frameProbe.status,
     signal: frameProbe.signal,
   });
-  const output = `${frameProbe.stdout}\n${frameProbe.stderr}`;
+  const tailStart = tailProbeStart(durationSeconds);
+  const tailArgs = tailStart === null ? null : frameProbeArgs(file, TAIL_PROBE_FRAMES, tailStart);
+  let tailProbe: {
+    status: number | null;
+    signal: NodeJS.Signals | null;
+    stdout: string;
+    stderr: string;
+  } | null = null;
+  if (tailArgs) {
+    onCommand?.({ event: 'Command started', command: [ffmpeg, ...tailArgs] });
+    tailProbe = spawnSync(ffmpeg, tailArgs, { encoding: 'utf8', maxBuffer: 2 * 1024 * 1024 });
+    onCommand?.({
+      event: 'Command finished',
+      command: [ffmpeg, ...tailArgs],
+      exitCode: tailProbe.status,
+      signal: tailProbe.signal,
+    });
+  }
+  const output = `${frameProbe.stdout}\n${frameProbe.stderr}\n${tailProbe?.stdout ?? ''}\n${tailProbe?.stderr ?? ''}`;
   const metrics = metricsFromProbeOutput(durationSeconds, output);
   const assessment = assessVideoMetrics(metrics);
-  if (frameProbe.status !== 0) {
+  if (frameProbe.status !== 0 || (tailProbe && tailProbe.status !== 0)) {
     assessment.usable = false;
     assessment.reasons.push('representative frame decoding failed');
   }
@@ -309,8 +346,8 @@ export function probeVideoQuality(
     path: file,
     ...metrics,
     ...assessment,
-    ...(frameProbe.status !== 0
-      ? { probeError: frameProbe.stderr.trim() || `ffmpeg exited ${frameProbe.status ?? 'without a status'}` }
+    ...(frameProbe.status !== 0 || (tailProbe && tailProbe.status !== 0)
+      ? { probeError: tailProbe?.stderr.trim() || frameProbe.stderr.trim() || `ffmpeg exited ${tailProbe?.status ?? frameProbe.status ?? 'without a status'}` }
       : {}),
   };
 }
@@ -407,13 +444,7 @@ export async function probeVideoQualityAsync(
     };
   }
   const durationSeconds = Number(durationProbe.stdout.trim());
-  const frameArgs = [
-    '-hide_banner', '-loglevel', 'error', '-nostats',
-    '-i', file,
-    '-vf', 'crop=iw*0.70:ih*0.70:iw*0.15:ih*0.15,fps=4,scale=160:-2,signalstats,metadata=print:file=-',
-    '-frames:v', '240',
-    '-f', 'null', '-',
-  ];
+  const frameArgs = frameProbeArgs(file, PRIMARY_PROBE_FRAMES);
   onCommand?.({ event: 'Command started', command: [ffmpeg, ...frameArgs] });
   const frameProbe = await spawnBuffered(ffmpeg, frameArgs);
   onCommand?.({
@@ -422,9 +453,27 @@ export async function probeVideoQualityAsync(
     exitCode: frameProbe.status,
     signal: frameProbe.signal,
   });
-  const metrics = metricsFromProbeOutput(durationSeconds, `${frameProbe.stdout}\n${frameProbe.stderr}`);
+  const tailStart = tailProbeStart(durationSeconds);
+  const tailArgs = tailStart === null ? null : frameProbeArgs(file, TAIL_PROBE_FRAMES, tailStart);
+  let tailProbe: BufferedCommandResult | null = null;
+  if (tailArgs) {
+    onCommand?.({ event: 'Command started', command: [ffmpeg, ...tailArgs] });
+    tailProbe = await spawnBuffered(ffmpeg, tailArgs);
+    onCommand?.({
+      event: 'Command finished',
+      command: [ffmpeg, ...tailArgs],
+      exitCode: tailProbe.status,
+      signal: tailProbe.signal,
+    });
+  }
+  const metrics = metricsFromProbeOutput(
+    durationSeconds,
+    `${frameProbe.stdout}\n${frameProbe.stderr}\n${tailProbe?.stdout ?? ''}\n${tailProbe?.stderr ?? ''}`,
+  );
   const assessment = assessVideoMetrics(metrics);
-  if (frameProbe.status !== 0 || frameProbe.timedOut) {
+  const decodingFailed = frameProbe.status !== 0 || frameProbe.timedOut
+    || Boolean(tailProbe && (tailProbe.status !== 0 || tailProbe.timedOut));
+  if (decodingFailed) {
     assessment.usable = false;
     assessment.reasons.push('representative frame decoding failed');
   }
@@ -432,11 +481,12 @@ export async function probeVideoQualityAsync(
     path: file,
     ...metrics,
     ...assessment,
-    ...(frameProbe.status !== 0 || frameProbe.timedOut
+    ...(decodingFailed
       ? {
-          probeError: frameProbe.timedOut
+          probeError: frameProbe.timedOut || tailProbe?.timedOut
             ? 'ffmpeg exceeded its 60 second deadline'
-            : frameProbe.stderr.trim() || `ffmpeg exited ${frameProbe.status ?? 'without a status'}`,
+            : tailProbe?.stderr.trim() || frameProbe.stderr.trim()
+              || `ffmpeg exited ${tailProbe?.status ?? frameProbe.status ?? 'without a status'}`,
         }
       : {}),
   };

@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises';
 import type { Page } from '@playwright/test';
 import { ENVIRONMENTS, projectMetadata, resolveEnvironmentPath } from '../audit/environments.js';
 import { REPRESENTATIVE_VISUAL_ROUTES } from '../audit/routes.js';
-import { expect, staticEvidence, staticTest, test } from '../fixtures/test.js';
+import { expect, staticEvidence, staticTest, test, type AuditRun } from '../fixtures/test.js';
 
 const FIXED_TIME = new Date('2026-08-17T15:00:00-05:00');
 const LONG_PAGE_SEGMENTS = [
@@ -11,6 +11,44 @@ const LONG_PAGE_SEGMENTS = [
   { fraction: 0.75, suffix: 'segment-75' },
   { fraction: 1, suffix: 'bottom' },
 ] as const;
+const CONTENT_PRIMITIVE_CONTRACTS = [
+  {
+    path: '/start-here/welcome',
+    primitives: [
+      { name: 'prose paragraphs', selector: 'main p', minimum: 8 },
+      { name: 'ordered or unordered list items', selector: 'main li', minimum: 6 },
+    ],
+  },
+  {
+    path: '/resources/7-oh-taper-calculator',
+    primitives: [
+      { name: 'medical callout blockquote', selector: 'main blockquote', minimum: 1 },
+      { name: 'schedule table', selector: 'main table', minimum: 1 },
+      { name: 'inline or block code', selector: 'main code', minimum: 1 },
+    ],
+  },
+  {
+    path: '/start-here/7-oh-withdrawal-quickstart',
+    primitives: [
+      { name: 'native disclosure', selector: 'main details', minimum: 1 },
+    ],
+  },
+] as const;
+
+interface ContentPrimitiveInspection {
+  name: string;
+  selector: string;
+  minimum: number;
+  rendered: number;
+  visible: number;
+  issues: Array<Record<string, unknown>>;
+}
+
+interface ContentPrimitiveContract {
+  name: string;
+  selector: string;
+  minimum: number;
+}
 
 async function waitForStableDocumentHeight(page: Page): Promise<void> {
   let previousHeight = -1;
@@ -30,6 +68,96 @@ async function scrollToDocumentFraction(page: Page, fraction: number): Promise<v
     window.scrollTo(0, Math.round(maximum * position));
   }, fraction);
   await page.waitForTimeout(150);
+}
+
+async function inspectContentPrimitiveClipping(
+  page: Page,
+  primitiveContracts: readonly ContentPrimitiveContract[],
+): Promise<ContentPrimitiveInspection[]> {
+  const serializedContracts = primitiveContracts.map((contract) => ({ ...contract }));
+  return page.evaluate((contracts: ContentPrimitiveContract[]) => {
+    const viewportWidth = document.documentElement.clientWidth;
+    const results: ContentPrimitiveInspection[] = [];
+    for (const contract of contracts) {
+      const elements = [...document.querySelectorAll<HTMLElement>(contract.selector)];
+      const visibleElements = elements.filter((element) => {
+        const style = getComputedStyle(element);
+        const box = element.getBoundingClientRect();
+        return style.display !== 'none' && style.visibility !== 'hidden' && box.width > 0 && box.height > 0;
+      });
+      const issues: Array<Record<string, unknown>> = [];
+      for (const [index, element] of visibleElements.entries()) {
+        const style = getComputedStyle(element);
+        const box = element.getBoundingClientRect();
+        const text = (element.textContent ?? '').replace(/\s+/g, ' ').trim();
+        const scrollOwner = (() => {
+          let ancestor = element.parentElement;
+          while (ancestor) {
+            const ancestorStyle = getComputedStyle(ancestor);
+            if (/(auto|scroll)/.test(ancestorStyle.overflowX) && ancestor.scrollWidth > ancestor.clientWidth + 1) return ancestor;
+            ancestor = ancestor.parentElement;
+          }
+          return null;
+        })();
+        if (!scrollOwner && (box.left < -1 || box.right > viewportWidth + 1)) {
+          issues.push({ index, reason: 'extends outside the viewport without an owning horizontal scroller', box: box.toJSON(), text: text.slice(0, 160) });
+        }
+        if (/(hidden|clip)/.test(style.overflowX) && element.scrollWidth > element.clientWidth + 1) {
+          issues.push({ index, reason: 'clips its own horizontal content', clientWidth: element.clientWidth, scrollWidth: element.scrollWidth, text: text.slice(0, 160) });
+        }
+        if (/(hidden|clip)/.test(style.overflowY) && element.scrollHeight > element.clientHeight + 1) {
+          issues.push({ index, reason: 'clips its own vertical content', clientHeight: element.clientHeight, scrollHeight: element.scrollHeight, text: text.slice(0, 160) });
+        }
+        const lineClamp = style.getPropertyValue('-webkit-line-clamp');
+        if ((lineClamp && lineClamp !== 'none') || style.textOverflow === 'ellipsis') {
+          issues.push({ index, reason: 'uses line clamping or ellipsis on reviewed content', lineClamp, textOverflow: style.textOverflow, text: text.slice(0, 160) });
+        }
+        let ancestor = element.parentElement;
+        while (ancestor && ancestor !== document.body) {
+          const ancestorStyle = getComputedStyle(ancestor);
+          const ancestorBox = ancestor.getBoundingClientRect();
+          if (!scrollOwner && /(hidden|clip)/.test(ancestorStyle.overflowX)
+            && (box.left < ancestorBox.left - 1 || box.right > ancestorBox.right + 1)) {
+            issues.push({ index, reason: 'is horizontally clipped by an ancestor', ancestor: ancestor.tagName.toLowerCase(), text: text.slice(0, 160) });
+            break;
+          }
+          if (/(hidden|clip)/.test(ancestorStyle.overflowY)
+            && (box.top < ancestorBox.top - 1 || box.bottom > ancestorBox.bottom + 1)) {
+            issues.push({ index, reason: 'is vertically clipped by an ancestor', ancestor: ancestor.tagName.toLowerCase(), text: text.slice(0, 160) });
+            break;
+          }
+          ancestor = ancestor.parentElement;
+        }
+      }
+      results.push({
+        name: contract.name,
+        selector: contract.selector,
+        minimum: contract.minimum,
+        rendered: elements.length,
+        visible: visibleElements.length,
+        issues,
+      });
+    }
+    return results;
+  }, serializedContracts);
+}
+
+async function assertRepresentativeContentPrimitives(page: Page, audit: AuditRun): Promise<void> {
+  const evidence = [];
+  for (const contract of CONTENT_PRIMITIVE_CONTRACTS) {
+    await audit.goto(contract.path);
+    await waitForStableDocumentHeight(page);
+    await page.locator('main details').evaluateAll((details) => details.forEach((detail) => { (detail as HTMLDetailsElement).open = true; }));
+    const selected = await inspectContentPrimitiveClipping(page, contract.primitives);
+    for (const primitive of contract.primitives) {
+      const result = selected.find(({ selector }) => selector === primitive.selector)!;
+      expect(result.rendered, `${contract.path} must render ${primitive.name}`).toBeGreaterThanOrEqual(primitive.minimum);
+      expect(result.visible, `${contract.path} must visibly render ${primitive.name}`).toBeGreaterThanOrEqual(primitive.minimum);
+      expect(result.issues, `${contract.path} must not clip ${primitive.name}`).toEqual([]);
+    }
+    evidence.push({ path: contract.path, primitives: selected });
+  }
+  await audit.attachJson('content-primitive-clipping-evidence', evidence);
 }
 
 for (const visualRoute of REPRESENTATIVE_VISUAL_ROUTES) {
@@ -239,6 +367,12 @@ for (const visualRoute of REPRESENTATIVE_VISUAL_ROUTES) {
     audit.observe('Frozen browser time', FIXED_TIME.toISOString());
     audit.observe('Themes captured', 2, '2');
     audit.observe('Long-page viewport samples per theme', fullPageScreenshot ? 1 : LONG_PAGE_SEGMENTS.length + 1, fullPageScreenshot ? '1' : '5');
+    if (visualRoute.label === 'article') {
+      await audit.step('Inspect critical content primitives', 'Representative prose, lists, medical callouts, tables, code, blockquotes, and opened disclosures all exist and have no measured clipping.', async () => {
+        await assertRepresentativeContentPrimitives(page, audit);
+      });
+      audit.observe('Content primitive contracts', CONTENT_PRIMITIVE_CONTRACTS.length, String(CONTENT_PRIMITIVE_CONTRACTS.length));
+    }
     await audit.checkpoint(`${visualRoute.label}-dark-checkpoint`, { fullPage: false });
     await audit.assertRuntimeHealthy();
   });

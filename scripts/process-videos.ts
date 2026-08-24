@@ -15,6 +15,7 @@ interface VideoEvidence {
   video: string;
   bytes: number;
   sha256: string;
+  evidenceRole: 'usable-interaction' | 'diagnostic' | 'unclassified';
   poster: string | null;
   posterBytes: number | null;
   processor: string | null;
@@ -240,10 +241,20 @@ log('Video evidence processing started', {
 const evidence = await mapWithConcurrency(videos, mediaWorkers, async (video): Promise<VideoEvidence> => {
   const videoStat = await fs.stat(video);
   const poster = join(dirname(video), `${basename(video, '.webm')}-poster.jpg`);
+  const sha256 = await sha256File(video);
+  const evidenceRole = retentionPlan.eligiblePaths.has(resolve(video)) || retentionPlan.eligibleHashes.has(sha256)
+    ? 'usable-interaction'
+    : retentionPlan.diagnosticPaths.has(resolve(video)) || retentionPlan.diagnosticHashes.has(sha256)
+      ? 'diagnostic'
+      : 'unclassified';
+  if (evidenceRole === 'unclassified') {
+    retentionPlan.errors.push(`Retained video ${relative(artifactRoot, video)} has no usable-interaction or diagnostic provenance.`);
+  }
   const base: Omit<VideoEvidence, 'processingStatus'> = {
     video: relative(artifactRoot, video),
     bytes: videoStat.size,
-    sha256: await sha256File(video),
+    sha256,
+    evidenceRole,
     poster: null,
     posterBytes: null,
     processor: ffmpeg,
@@ -307,6 +318,8 @@ const manifest = {
   artifactRoot,
   ffmpeg,
   videoCount: evidence.length,
+  usableInteractionVideoCount: evidence.filter(({ evidenceRole }) => evidenceRole === 'usable-interaction').length,
+  diagnosticVideoCount: evidence.filter(({ evidenceRole }) => evidenceRole === 'diagnostic').length,
   processedCount: evidence.filter(({ processingStatus }) => processingStatus === 'created' || processingStatus === 'already-existed').length,
   failedCount: evidence.filter(({ processingStatus }) => processingStatus === 'failed').length,
   unavailableCount: evidence.filter(({ processingStatus }) => processingStatus === 'ffmpeg-unavailable').length,
