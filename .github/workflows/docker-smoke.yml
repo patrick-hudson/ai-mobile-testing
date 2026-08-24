@@ -1,0 +1,49 @@
+name: Docker smoke audit
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-smoke-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build the portable audit image
+        run: docker compose build --pull portal
+
+      - name: Validate plugins, TypeScript, and TLS policy in Docker
+        run: docker compose run --rm --no-deps portal npm run validate
+
+      - name: Run smoke audit in Docker
+        id: audit
+        continue-on-error: true
+        env:
+          AUDIT_ARTIFACT_DIR: /work/artifacts/ci-smoke
+          CANDIDATE_IGNORE_HTTPS_ERRORS: '0'
+        run: docker compose --profile audit run --rm audit-smoke
+
+      - name: Upload smoke evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/ci-smoke
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Validate smoke evidence pipeline (does not certify release)
+        if: always()
+        run: node scripts/assert-release-decision.mjs --pipeline-only --manifest artifacts/ci-smoke/checklist/manifest.json

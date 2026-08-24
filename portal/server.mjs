@@ -1,0 +1,3827 @@
+import { constants as fsConstants, createReadStream, createWriteStream, promises as fs } from 'node:fs';
+import { createServer } from 'node:http';
+import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { spawn } from 'node:child_process';
+import { StringDecoder } from 'node:string_decoder';
+import { fileURLToPath } from 'node:url';
+import { mergePortalCatalog, validatePortalPluginRegistryDocument } from './plugin-registry.mjs';
+import { readBoundedFileTail } from './bounded-file.mjs';
+import {
+  parseChecklistRelease,
+  pendingRelease,
+  readChecklistRelease,
+  unavailableRelease,
+} from '../scripts/lib/release-truth.mjs';
+import {
+  GalleryHttpError,
+  galleryQueryFromUrl,
+  gallerySnapshotFingerprints,
+  loadGalleryHead,
+  loadGallerySnapshot,
+  pageGallerySnapshot,
+  probeGalleryPublication,
+  readGalleryAvailability,
+  readGalleryFlags,
+  readGalleryItem,
+} from './gallery-data.mjs';
+import { mutateGalleryFlag } from '../scripts/gallery-flags.mjs';
+import {
+  GALLERY_RETENTION_LIMITS,
+  galleryRevisionEntryBytes,
+  pruneGalleryRevisionCache,
+} from './gallery-retention.mjs';
+import {
+  applyCompletedReleaseEligibility,
+  canonicalExecutionProvenance,
+  portalExecutionProvenance,
+  releaseReviewReasons,
+} from './release-eligibility.mjs';
+
+const PORTAL_DIR = dirname(fileURLToPath(import.meta.url));
+const REPOSITORY_ROOT = resolve(PORTAL_DIR, '..');
+const STATIC_ROOT = join(PORTAL_DIR, 'public');
+const ARTIFACT_ROOT = resolve(
+  process.env.PORTAL_ARTIFACT_ROOT ?? join(REPOSITORY_ROOT, 'artifacts', 'runs'),
+);
+const SHARDED_ARTIFACT_ROOT = resolve(
+  process.env.PORTAL_SHARDED_ARTIFACT_ROOT ?? join(REPOSITORY_ROOT, 'artifacts', 'sharded'),
+);
+const SECRET_ROOT = resolve(process.env.PORTAL_SECRET_ROOT ?? join(REPOSITORY_ROOT, '.portal-secrets'));
+const SECRET_MASTER_PATH = join(SECRET_ROOT, 'master.key');
+const ANTHROPIC_CREDENTIAL_PATH = join(SECRET_ROOT, 'anthropic-key.json');
+const HOST = process.env.HOST ?? '127.0.0.1';
+const PORT = parseInteger(process.env.PORT, 4173, 1, 65_535);
+const MAX_CONCURRENT_RUNS = parseInteger(process.env.PORTAL_MAX_CONCURRENT_RUNS, 1, 1, 4);
+const MAX_BODY_BYTES = 64 * 1024;
+const MAX_MANUAL_UPLOAD_BYTES = 500 * 1024 * 1024;
+const MAX_LOG_EVENTS = 2_000;
+const MAX_EVENT_BUFFER_BYTES = 2 * 1024 * 1024;
+const MAX_SSE_REPLAY_BYTES = 512 * 1024;
+const MAX_GALLERY_SSE_REPLAY_BYTES = 64 * 1024;
+const GALLERY_SSE_EVENT_TYPES = new Set(['gallery', 'gallery-flag', 'snapshot', 'stage', 'status']);
+const MAX_EXTERNAL_LOG_INGEST_BYTES = 512 * 1024;
+const MAX_EXTERNAL_PARTIAL_LINE_CHARS = 64 * 1024;
+const DEFAULT_LOG_SNAPSHOT_BYTES = 256 * 1024;
+const MIN_LOG_SNAPSHOT_BYTES = 16 * 1024;
+const MAX_LOG_SNAPSHOT_BYTES = 1024 * 1024;
+const DEFAULT_ARTIFACT_PAGE_SIZE = 150;
+const MAX_ARTIFACT_PAGE_SIZE = 500;
+const MAX_PREFERRED_MEDIA_ARTIFACTS = 120;
+const MAX_VIDEO_MANIFEST_BYTES = 8 * 1024 * 1024;
+const STOP_GRACE_MS = 8_000;
+const EXTERNAL_RUN_SYNC_MS = parseInteger(process.env.PORTAL_EXTERNAL_RUN_SYNC_MS, 1_000, 250, 30_000);
+const MAX_REPORT_SUMMARY_BYTES = 256 * 1024;
+const MAX_REPORT_AUDIT_INDEX_BYTES = 2 * 1024 * 1024;
+const MAX_REPORT_AUDIT_DETAIL_BYTES = 512 * 1024;
+const DEFAULT_AI_MODEL = process.env.ANTHROPIC_MODEL ?? 'claude-sonnet-5';
+const ANTHROPIC_KEY_PATTERN = /^sk-ant-[a-zA-Z0-9_-]{20,512}$/;
+const DEFAULT_CANDIDATE_IGNORE_HTTPS_ERRORS = binaryEnvironmentFlag(
+  'CANDIDATE_IGNORE_HTTPS_ERRORS',
+  false,
+);
+const ALLOWED_PORTAL_HOSTS = new Set([
+  '127.0.0.1',
+  'localhost',
+  '::1',
+  ...String(process.env.PORTAL_ALLOWED_HOSTS ?? '')
+    .split(',')
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean),
+]);
+const RESTART_PROGRESS_TAIL_BYTES = 1024 * 1024;
+const MEDIA_VALIDATION_TIMEOUT_MS = 20_000;
+const MAX_MEDIA_VALIDATION_OUTPUT_BYTES = 64 * 1024;
+
+const PROJECTS = Object.freeze([
+  { id: 'production-mobile-chromium', label: 'Production · Pixel 5 · Chromium', environment: 'production' },
+  { id: 'candidate-mobile-chromium', label: 'Candidate · Pixel 5 · Chromium', environment: 'candidate' },
+  { id: 'production-desktop-chromium', label: 'Production · Desktop · Chromium', environment: 'production' },
+  { id: 'candidate-desktop-chromium', label: 'Candidate · Desktop · Chromium', environment: 'candidate' },
+  { id: 'candidate-mobile-webkit', label: 'Candidate · iPhone 13 · WebKit', environment: 'candidate' },
+  { id: 'candidate-tablet-webkit', label: 'Candidate · iPad Mini · WebKit', environment: 'candidate' },
+  { id: 'candidate-desktop-firefox', label: 'Candidate · Desktop · Firefox', environment: 'candidate' },
+]);
+const PROJECT_IDS = new Set(PROJECTS.map(({ id }) => id));
+const PROFILES = new Set(['smoke', 'release']);
+const TERMINAL_STATUSES = new Set(['passed', 'not-ready', 'review-required', 'failed', 'evidence-failed', 'stopped', 'spawn-failed']);
+const PURGE_ELIGIBLE_STATUSES = new Set(TERMINAL_STATUSES);
+const SAFE_RUN_ID = /^[a-z0-9][a-z0-9-]{7,79}$/;
+const MIME_TYPES = Object.freeze({
+  '.css': 'text/css; charset=utf-8',
+  '.gif': 'image/gif',
+  '.html': 'text/html; charset=utf-8',
+  '.jpeg': 'image/jpeg',
+  '.jpg': 'image/jpeg',
+  '.js': 'text/javascript; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.map': 'application/json; charset=utf-8',
+  '.mp4': 'video/mp4',
+  '.png': 'image/png',
+  '.svg': 'image/svg+xml',
+  '.txt': 'text/plain; charset=utf-8',
+  '.webm': 'video/webm',
+  '.webp': 'image/webp',
+  '.xml': 'application/xml; charset=utf-8',
+  '.zip': 'application/zip',
+});
+
+const coreCatalog = await loadCatalog();
+const plugins = await loadPluginRegistry(coreCatalog);
+const catalog = mergePortalCatalog(coreCatalog, plugins);
+const AUDIT_IDS = new Set(catalog.map(({ id }) => id));
+const AUDIT_AREAS = new Set(catalog.map(({ area }) => area));
+const MANUAL_AUDIT_IDS = new Set(catalog.filter(({ manual }) => manual).map(({ id }) => id));
+const PLUGIN_IDS = new Set(plugins.map(({ id }) => id));
+const runs = new Map();
+const sensitiveLogValues = new Set();
+const artifactPathCache = new Map();
+const reportDataCache = new Map();
+const galleryRevisionCache = new Map();
+const observedGalleryPublications = new Map();
+const purgedGalleryRunIds = new Set();
+const purgingRunIds = new Set();
+const manualMutationRunIds = new Set();
+const launchReservations = new Set();
+const galleryFlagRateWindows = new Map();
+let secretMasterKey;
+let savedAnthropicCredential = null;
+let externalRunSyncPromise = null;
+
+await fs.mkdir(ARTIFACT_ROOT, { recursive: true });
+await initializeSecretVault();
+await loadPersistedRuns();
+await syncExternalShardedRuns();
+await refreshAllGalleryPublications(false);
+const externalRunSyncTimer = setInterval(() => {
+  void (async () => {
+    await syncExternalShardedRuns();
+    await refreshAllGalleryPublications(true);
+  })().catch((error) => {
+    console.error(`Could not refresh externally launched runs or gallery heads: ${error.message}`);
+  });
+}, EXTERNAL_RUN_SYNC_MS);
+externalRunSyncTimer.unref();
+
+const server = createServer(async (request, response) => {
+  try {
+    await routeRequest(request, response);
+  } catch (error) {
+    if (error?.name === 'AbortError' && error?.message === 'Gallery request disconnected.') return;
+    if (response.destroyed || response.writableEnded) return;
+    const status = Number.isInteger(error?.statusCode) ? error.statusCode : 500;
+    if (status >= 500) console.error(error);
+    const body = { error: Number.isInteger(error?.statusCode) ? error.message : 'Internal server error.' };
+    if (typeof error?.code === 'string' && /^GALLERY_[A-Z0-9_]+$/.test(error.code)) body.code = error.code;
+    if (error instanceof GalleryHttpError) {
+      if (error.head) body.head = error.head;
+      if (error.recovery) body.recovery = error.recovery;
+    }
+    sendJson(response, status, body);
+  }
+});
+
+server.listen(PORT, HOST, () => {
+  console.log(`Audit portal listening on http://${HOST}:${PORT}`);
+  console.log(`Run evidence will be stored in ${ARTIFACT_ROOT}`);
+  console.log(`Externally launched sharded runs will be tracked from ${SHARDED_ARTIFACT_ROOT}`);
+});
+
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.once(signal, () => {
+    clearInterval(externalRunSyncTimer);
+    for (const run of runs.values()) {
+      if (run.child && !TERMINAL_STATUSES.has(run.manifest.status)) stopChild(run, 'Portal shutting down');
+    }
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(1), 10_000).unref();
+  });
+}
+
+async function routeRequest(request, response) {
+  assertAllowedRequestHost(request);
+  const requestUrl = new URL(request.url ?? '/', 'http://portal.local');
+  const pathname = requestUrl.pathname;
+
+  if (request.method === 'GET' && pathname === '/healthz') {
+    return sendJson(response, 200, { ok: true });
+  }
+  if (request.method === 'GET' && pathname === '/api/settings/anthropic-key') {
+    return sendJson(response, 200, anthropicCredentialState());
+  }
+  if (request.method === 'PUT' && pathname === '/api/settings/anthropic-key') {
+    assertMutationRequest(request);
+    const body = await readJsonBody(request);
+    if (!body || typeof body !== 'object' || Array.isArray(body) || typeof body.apiKey !== 'string') {
+      throw httpError(400, 'Provide an Anthropic API key.');
+    }
+    await saveAnthropicCredential(body.apiKey);
+    return sendJson(response, 200, anthropicCredentialState());
+  }
+  if (request.method === 'DELETE' && pathname === '/api/settings/anthropic-key') {
+    assertMutationRequest(request);
+    await deleteAnthropicCredential();
+    return sendJson(response, 200, anthropicCredentialState());
+  }
+  if (request.method === 'GET' && pathname === '/api/config') {
+    return sendJson(response, 200, {
+      catalog,
+      plugins,
+      projects: PROJECTS,
+      defaults: {
+        productionUrl: process.env.PRODUCTION_URL ?? 'https://quitting7oh.org',
+        candidateUrl: process.env.CANDIDATE_URL ?? 'https://beta.quitting7oh-org.pages.dev',
+        profile: 'smoke',
+        candidateIgnoreHTTPSErrors: DEFAULT_CANDIDATE_IGNORE_HTTPS_ERRORS,
+      },
+      limits: { maxConcurrentRuns: MAX_CONCURRENT_RUNS },
+      aiReview: {
+        available: Boolean(currentAnthropicApiKey()) || process.env.AI_REVIEW_DRY_RUN === '1',
+        dryRun: process.env.AI_REVIEW_DRY_RUN === '1',
+        defaultModel: DEFAULT_AI_MODEL,
+      },
+    });
+  }
+  if (request.method === 'GET' && pathname === '/api/runs') {
+    await syncExternalShardedRuns();
+    return sendJson(response, 200, { runs: sortedRunSummaries() });
+  }
+  if (request.method === 'POST' && pathname === '/api/runs') {
+    assertMutationRequest(request);
+    return createRun(request, response);
+  }
+
+  const runMatch = pathname.match(/^\/api\/runs\/([^/]+)$/);
+  if (request.method === 'GET' && runMatch) {
+    await syncExternalShardedRuns();
+    const run = requireRun(decodeURIComponent(runMatch[1]));
+    return sendJson(response, 200, publicManifest(run.manifest));
+  }
+  if (request.method === 'DELETE' && runMatch) {
+    assertMutationRequest(request);
+    await syncExternalShardedRuns();
+    const id = decodeURIComponent(runMatch[1]);
+    const run = requireRun(id);
+    return purgeRun(run, await readJsonBody(request), response);
+  }
+
+  const stopMatch = pathname.match(/^\/api\/runs\/([^/]+)\/stop$/);
+  if (request.method === 'POST' && stopMatch) {
+    assertMutationRequest(request);
+    const run = requireRun(decodeURIComponent(stopMatch[1]));
+    if (run.externalManaged) {
+      throw httpError(409, 'This run was launched outside the portal and must be stopped from its original terminal.');
+    }
+    if (TERMINAL_STATUSES.has(run.manifest.status)) {
+      throw httpError(409, 'This run is not active.');
+    }
+    run.manifest.stopRequestedAt = new Date().toISOString();
+    run.manifest.phase = 'Stopping active run stage';
+    appendEvent(run, 'status', { status: 'stopping', message: 'Stop requested.' });
+    if (run.child) stopChild(run, 'Stopped from the audit portal');
+    await persistManifest(run);
+    return sendJson(response, 202, publicManifest(run.manifest));
+  }
+
+  const eventsMatch = pathname.match(/^\/api\/runs\/([^/]+)\/events$/);
+  if (request.method === 'GET' && eventsMatch) {
+    await syncExternalShardedRuns();
+    return streamRunEvents(request, response, requireRun(decodeURIComponent(eventsMatch[1])));
+  }
+
+  const galleryEventsMatch = pathname.match(/^\/api\/runs\/([^/]+)\/gallery\/events$/);
+  if (request.method === 'GET' && galleryEventsMatch) {
+    await syncExternalShardedRuns();
+    return streamGalleryEvents(request, response, requireGalleryRun(decodeURIComponent(galleryEventsMatch[1])));
+  }
+
+  const logsMatch = pathname.match(/^\/api\/runs\/([^/]+)\/logs$/);
+  if (request.method === 'GET' && logsMatch) {
+    await syncExternalShardedRuns();
+    const run = requireRun(decodeURIComponent(logsMatch[1]));
+    const maximumBytes = queryInteger(
+      requestUrl.searchParams.get('maxBytes'),
+      'maxBytes',
+      DEFAULT_LOG_SNAPSHOT_BYTES,
+      MIN_LOG_SNAPSHOT_BYTES,
+      MAX_LOG_SNAPSHOT_BYTES,
+    );
+    if (run.externalManaged) {
+      const snapshot = await readExternalLogSnapshot(run, maximumBytes);
+      return sendJson(response, 200, {
+        ...snapshot,
+        sequence: run.sequence,
+      });
+    }
+    const logPath = join(run.directory, 'logs', 'runner.log');
+    const tail = await readBoundedFileTail(logPath, maximumBytes);
+    const redactedLog = redactLogValue(tail.content);
+    const redactedBytes = Buffer.byteLength(redactedLog);
+    return sendJson(response, 200, {
+      log: redactedLog,
+      sequence: run.sequence,
+      bytes: redactedBytes,
+      maxBytes: maximumBytes,
+      truncated: tail.truncated,
+      sources: tail.size === 0 ? [] : [{
+        path: 'logs/runner.log',
+        size: tail.size,
+        returnedBytes: redactedBytes,
+        truncated: tail.truncated,
+      }],
+    });
+  }
+
+  const manualEvidenceMatch = pathname.match(/^\/api\/runs\/([^/]+)\/manual-evidence$/);
+  if (request.method === 'GET' && manualEvidenceMatch) {
+    const run = requireRun(decodeURIComponent(manualEvidenceMatch[1]));
+    return sendJson(response, 200, await readManualEvidence(run));
+  }
+  if (request.method === 'POST' && manualEvidenceMatch) {
+    assertMutationRequest(request);
+    const run = requireRun(decodeURIComponent(manualEvidenceMatch[1]));
+    const evidence = await withManualMutation(run, async () => recordManualEvidence(run, await readJsonBody(request)));
+    return sendJson(response, 201, evidence);
+  }
+
+  const manualUploadMatch = pathname.match(/^\/api\/runs\/([^/]+)\/manual-uploads$/);
+  if (request.method === 'POST' && manualUploadMatch) {
+    assertSameOrigin(request);
+    const run = requireRun(decodeURIComponent(manualUploadMatch[1]));
+    const upload = await withManualMutation(run, () => receiveManualUpload(run, request, requestUrl));
+    return sendJson(response, 201, upload);
+  }
+
+  const artifactListMatch = pathname.match(/^\/api\/runs\/([^/]+)\/artifacts$/);
+  if (request.method === 'GET' && artifactListMatch) {
+    const run = requireRun(decodeURIComponent(artifactListMatch[1]));
+    const offset = queryInteger(requestUrl.searchParams.get('offset'), 'offset', 0, 0, 1_000_000);
+    const limit = queryInteger(requestUrl.searchParams.get('limit'), 'limit', DEFAULT_ARTIFACT_PAGE_SIZE, 1, MAX_ARTIFACT_PAGE_SIZE);
+    return sendJson(response, 200, await listArtifacts(run.directory, run.manifest.id, offset, limit, request));
+  }
+
+  const reportMatch = pathname.match(/^\/api\/runs\/([^/]+)\/report$/);
+  if (request.method === 'GET' && reportMatch) {
+    await syncExternalShardedRuns();
+    const run = requireRun(decodeURIComponent(reportMatch[1]));
+    const value = await readBoundedReportJson(run, 'summary.json', MAX_REPORT_SUMMARY_BYTES);
+    return sendJson(response, 200, value);
+  }
+
+  const reportAuditsMatch = pathname.match(/^\/api\/runs\/([^/]+)\/report\/audits$/);
+  if (request.method === 'GET' && reportAuditsMatch) {
+    await syncExternalShardedRuns();
+    const run = requireRun(decodeURIComponent(reportAuditsMatch[1]));
+    return sendJson(response, 200, await filterReportAudits(run, requestUrl));
+  }
+
+  const reportAuditMatch = pathname.match(/^\/api\/runs\/([^/]+)\/report\/audits\/([^/]+)$/);
+  if (request.method === 'GET' && reportAuditMatch) {
+    await syncExternalShardedRuns();
+    const run = requireRun(decodeURIComponent(reportAuditMatch[1]));
+    const auditId = decodeURIComponent(reportAuditMatch[2]);
+    if (!/^[A-Z0-9-]{3,160}$/.test(auditId)) throw httpError(404, 'Audit detail not found.');
+    const value = await readBoundedReportJson(
+      run,
+      join('audits', `${auditId}.json`),
+      MAX_REPORT_AUDIT_DETAIL_BYTES,
+    );
+    return sendJson(response, 200, value);
+  }
+
+  const galleryMatch = pathname.match(/^\/api\/runs\/([^/]+)\/gallery$/);
+  if (request.method === 'GET' && galleryMatch) {
+    await syncExternalShardedRuns();
+    const run = requireGalleryRun(decodeURIComponent(galleryMatch[1]));
+    return withGalleryRequest(request, response, async (signal) => {
+      return sendJson(response, 200, {
+        ...await loadGalleryHead(run, signal),
+        flagCapability: galleryFlagCapability(request),
+      });
+    });
+  }
+
+  const galleryFlagsMatch = pathname.match(/^\/api\/runs\/([^/]+)\/gallery\/flags$/);
+  if (request.method === 'GET' && galleryFlagsMatch) {
+    await syncExternalShardedRuns();
+    const run = requireGalleryRun(decodeURIComponent(galleryFlagsMatch[1]));
+    return withGalleryRequest(request, response, async (signal) => {
+      const snapshot = await readGalleryFlags(run, signal);
+      const itemId = requestUrl.searchParams.get('itemId');
+      if (itemId !== null && !/^gitem_[a-f0-9]{16}$/.test(itemId)) throw httpError(400, 'Gallery item ID is invalid.');
+      const legacyOffset = requestUrl.searchParams.get('offset');
+      const projectionOffset = queryInteger(requestUrl.searchParams.get('projectionOffset') ?? legacyOffset, 'projectionOffset', 0, 0, 10_000);
+      const eventOffset = queryInteger(requestUrl.searchParams.get('eventOffset') ?? legacyOffset, 'eventOffset', 0, 0, 10_000);
+      const limit = queryInteger(requestUrl.searchParams.get('limit'), 'limit', 50, 1, 50);
+      const flags = snapshot.flags.filter((flag) => !itemId || flag.itemId === itemId);
+      const events = snapshot.events.filter((event) => !itemId || event.itemId === itemId);
+      return sendJson(response, 200, {
+        schemaVersion: 1,
+        throughEvent: snapshot.throughEvent,
+        flagRevision: snapshot.flagRevision,
+        flags: flags.slice(projectionOffset, projectionOffset + limit),
+        flagTotal: flags.length,
+        events: events.slice(eventOffset, eventOffset + limit),
+        eventTotal: events.length,
+        projectionOffset,
+        eventOffset,
+        limit,
+        hasMoreFlags: projectionOffset + limit < flags.length,
+        hasMoreEvents: eventOffset + limit < events.length,
+        capability: galleryFlagCapability(request),
+      });
+    });
+  }
+  if (request.method === 'POST' && galleryFlagsMatch) {
+    assertMutationRequest(request);
+    await syncExternalShardedRuns();
+    const run = requireGalleryRun(decodeURIComponent(galleryFlagsMatch[1]));
+    assertGalleryFlagMutationAllowed(request);
+    const body = await readJsonBody(request);
+    consumeGalleryFlagRate(request, run.manifest.id);
+    const snapshot = await loadGallerySnapshot(run, undefined, { includeRows: false });
+    const detail = await readGalleryItem(snapshot, run.manifest.id, body?.itemId);
+    const result = await mutateGalleryFlag(run.directory, {
+      action: 'open',
+      itemId: detail.item.id,
+      identity: galleryFlagIdentity(detail.item),
+      reviewer: body?.reviewer,
+      note: body?.note,
+      idempotencyKey: body?.idempotencyKey,
+      expectedFlagRevision: body?.expectedFlagRevision,
+      timestamp: new Date().toISOString(),
+      eventId: `gfevent_${randomBytes(16).toString('hex')}`,
+      flagId: `gflag_${randomBytes(16).toString('hex')}`,
+    });
+    logGalleryFlagMutation(run, result, 201);
+    return sendJson(response, result.idempotent ? 200 : 201, result);
+  }
+
+  const galleryFlagTransitionMatch = pathname.match(/^\/api\/runs\/([^/]+)\/gallery\/flags\/([^/]+)\/transitions$/);
+  if (request.method === 'POST' && galleryFlagTransitionMatch) {
+    assertMutationRequest(request);
+    await syncExternalShardedRuns();
+    const run = requireGalleryRun(decodeURIComponent(galleryFlagTransitionMatch[1]));
+    assertGalleryFlagMutationAllowed(request);
+    const flagId = decodeURIComponent(galleryFlagTransitionMatch[2]);
+    if (!/^gflag_[a-f0-9]{16,64}$/.test(flagId)) throw httpError(404, 'Reviewer flag was not found.');
+    const body = await readJsonBody(request);
+    consumeGalleryFlagRate(request, run.manifest.id);
+    const result = await mutateGalleryFlag(run.directory, {
+      action: body?.action,
+      flagId,
+      reviewer: body?.reviewer,
+      note: body?.note,
+      justification: body?.justification,
+      idempotencyKey: body?.idempotencyKey,
+      expectedFlagRevision: body?.expectedFlagRevision,
+      timestamp: new Date().toISOString(),
+      eventId: `gfevent_${randomBytes(16).toString('hex')}`,
+    });
+    logGalleryFlagMutation(run, result, 200);
+    return sendJson(response, 200, result);
+  }
+
+  const galleryItemsMatch = pathname.match(/^\/api\/runs\/([^/]+)\/gallery\/items$/);
+  if (request.method === 'GET' && galleryItemsMatch) {
+    await syncExternalShardedRuns();
+    const run = requireGalleryRun(decodeURIComponent(galleryItemsMatch[1]));
+    return withGalleryRequest(request, response, async (signal) => {
+      const snapshot = await gallerySnapshotForRequest(run, requestUrl, signal);
+      rememberGallerySnapshot(run, snapshot);
+      let value;
+      try {
+        value = await pageGallerySnapshot(snapshot, galleryQueryFromUrl(requestUrl), {
+          cursor: requestUrl.searchParams.get('cursor'),
+          anchorItemId: galleryAnchor(requestUrl.searchParams.get('anchor')),
+          limit: queryInteger(requestUrl.searchParams.get('limit'), 'limit', 50, 1, 100),
+        }, signal);
+      } catch (error) {
+        if (error instanceof GalleryHttpError && error.code === 'GALLERY_CURSOR_STALE' && error.recovery) {
+          error.recovery.href = `/api/runs/${encodeURIComponent(run.manifest.id)}/gallery`;
+        }
+        throw error;
+      }
+      if (value.nextCursor) {
+        const next = new URL(requestUrl);
+        next.searchParams.set('cursor', value.nextCursor);
+        next.searchParams.delete('anchor');
+        value.next = `${next.pathname}${next.search}`;
+      }
+      return sendJson(response, 200, value);
+    });
+  }
+
+  const galleryAvailabilityMatch = pathname.match(/^\/api\/runs\/([^/]+)\/gallery\/items\/([^/]+)\/availability$/);
+  if (request.method === 'GET' && galleryAvailabilityMatch) {
+    await syncExternalShardedRuns();
+    const run = requireGalleryRun(decodeURIComponent(galleryAvailabilityMatch[1]));
+    const itemId = decodeURIComponent(galleryAvailabilityMatch[2]);
+    return withGalleryRequest(request, response, async (signal) => {
+      const snapshot = await gallerySnapshotForRequest(run, requestUrl, signal, { includeRows: false });
+      return sendJson(response, 200, await readGalleryAvailability(snapshot, run.manifest.id, itemId, signal));
+    });
+  }
+
+  const galleryItemMatch = pathname.match(/^\/api\/runs\/([^/]+)\/gallery\/items\/([^/]+)$/);
+  if (request.method === 'GET' && galleryItemMatch) {
+    await syncExternalShardedRuns();
+    const run = requireGalleryRun(decodeURIComponent(galleryItemMatch[1]));
+    const itemId = decodeURIComponent(galleryItemMatch[2]);
+    return withGalleryRequest(request, response, async (signal) => {
+      const snapshot = await gallerySnapshotForRequest(run, requestUrl, signal, { includeRows: false });
+      return sendJson(response, 200, await readGalleryItem(snapshot, run.manifest.id, itemId, signal));
+    });
+  }
+
+  const galleryDeltaMatch = pathname.match(/^\/api\/runs\/([^/]+)\/gallery\/delta$/);
+  if (request.method === 'GET' && galleryDeltaMatch) {
+    await syncExternalShardedRuns();
+    const run = requireGalleryRun(decodeURIComponent(galleryDeltaMatch[1]));
+    return withGalleryRequest(request, response, async (signal) => {
+      const from = galleryDeltaRevisions(requestUrl);
+      const snapshot = await loadGallerySnapshot(run, signal);
+      const current = rememberGallerySnapshot(run, snapshot);
+      return sendJson(response, 200, galleryDeltaPage(run, from, current, requestUrl));
+    });
+  }
+
+  const artifactMatch = pathname.match(/^\/artifacts\/([^/]+)(?:\/(.*))?$/);
+  if ((request.method === 'GET' || request.method === 'HEAD') && artifactMatch) {
+    return serveArtifact(
+      request,
+      response,
+      decodeURIComponent(artifactMatch[1]),
+      artifactMatch[2] ? decodeURIComponent(artifactMatch[2]) : '',
+    );
+  }
+
+  if (request.method === 'GET' || request.method === 'HEAD') {
+    return servePortalAsset(request, response, pathname);
+  }
+  throw httpError(404, 'Not found.');
+}
+
+async function withGalleryRequest(request, response, operation) {
+  const controller = new AbortController();
+  const abort = () => {
+    if (!controller.signal.aborted) controller.abort(new DOMException('Gallery request disconnected.', 'AbortError'));
+  };
+  request.once('aborted', abort);
+  response.once('close', () => {
+    if (!response.writableEnded) abort();
+  });
+  try {
+    return await operation(controller.signal);
+  } finally {
+    request.removeListener('aborted', abort);
+  }
+}
+
+function galleryAnchor(value) {
+  if (value === null || value === '') return null;
+  if (!/^gitem_[a-f0-9]{16}$/.test(value)) throw httpError(400, 'Gallery anchor is invalid.');
+  return value;
+}
+
+function galleryDeltaRevisions(requestUrl) {
+  const from = {
+    contentRevision: requestUrl.searchParams.get('fromContentRevision'),
+    orderRevision: requestUrl.searchParams.get('fromOrderRevision'),
+    flagRevision: requestUrl.searchParams.get('fromFlagRevision'),
+  };
+  if (
+    !/^content_[a-f0-9]{16}$/.test(from.contentRevision ?? '')
+    || !/^order_[a-f0-9]{16}$/.test(from.orderRevision ?? '')
+    || !/^flags_[a-f0-9]{16}$/.test(from.flagRevision ?? '')
+  ) throw httpError(400, 'A complete content/order/flag from-revision triple is required.');
+  return from;
+}
+
+function galleryFlagCapability(request) {
+  const configuredLoopback = ['127.0.0.1', '::1', 'localhost'].includes(HOST)
+    || process.env.PORTAL_LOOPBACK_PUBLISHED === '1';
+  let requestHost = '';
+  try {
+    requestHost = new URL(`http://${String(request.headers.host ?? '')}`).hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  } catch {
+    // An invalid Host header cannot qualify for the loopback trust boundary.
+  }
+  const loopbackRequest = requestHost === '127.0.0.1' || requestHost === 'localhost' || requestHost === '::1';
+  const mutable = configuredLoopback && loopbackRequest;
+  return {
+    mutable,
+    identity: mutable ? 'local-attribution' : 'read-only',
+    authenticated: false,
+    trustBoundary: mutable
+      ? 'Loopback-only single-operator attribution; reviewer labels are not authenticated identities.'
+      : 'Shared access is read-only until authenticated server-side reviewer identity is configured.',
+  };
+}
+
+function assertGalleryFlagMutationAllowed(request) {
+  if (!galleryFlagCapability(request).mutable) {
+    const error = httpError(403, 'Reviewer flag mutations are disabled outside the loopback-only portal.');
+    error.code = 'GALLERY_FLAG_READ_ONLY';
+    throw error;
+  }
+}
+
+function consumeGalleryFlagRate(request, runId) {
+  const now = Date.now();
+  const client = request.socket.remoteAddress ?? 'unknown-client';
+  const key = `${client}\u0000${runId}`;
+  const recent = (galleryFlagRateWindows.get(key) ?? []).filter((timestamp) => now - timestamp < 60_000);
+  if (recent.length >= 30) {
+    const error = httpError(429, 'Reviewer flag mutation rate limit exceeded. Try again in one minute.');
+    error.code = 'GALLERY_FLAG_RATE_LIMIT';
+    throw error;
+  }
+  recent.push(now);
+  galleryFlagRateWindows.set(key, recent);
+  if (galleryFlagRateWindows.size > 1_024) {
+    for (const [candidate, timestamps] of galleryFlagRateWindows) {
+      if (timestamps.every((timestamp) => now - timestamp >= 60_000)) galleryFlagRateWindows.delete(candidate);
+      if (galleryFlagRateWindows.size <= 1_024) break;
+    }
+  }
+}
+
+function galleryFlagIdentity(item) {
+  return {
+    testId: item.test.id,
+    title: item.test.title,
+    project: item.project.name,
+    attempt: item.attempt.ordinal,
+    auditIds: item.auditAssociations.map(({ id }) => id).sort(),
+  };
+}
+
+function logGalleryFlagMutation(run, result, requestedStatus) {
+  const status = result.idempotent ? 200 : requestedStatus;
+  const record = {
+    eventId: result.event.eventId,
+    transition: result.event.action,
+    flagState: result.event.action === 'opened' || result.event.action === 'reopened'
+      ? 'open'
+      : result.event.action,
+    flagRevision: result.flagRevision,
+    responseCode: status,
+    historyBytes: result.historyBytes,
+  };
+  console.log(`[GALLERY_FLAG] ${JSON.stringify(record)}`);
+  appendEvent(run, 'gallery-flag', record);
+}
+
+function galleryRevisionKey(head) {
+  return `${head.contentRevision}\u0000${head.orderRevision}\u0000${head.flagRevision}`;
+}
+
+function requestedGalleryRevisions(requestUrl) {
+  const values = {
+    contentRevision: requestUrl.searchParams.get('contentRevision'),
+    orderRevision: requestUrl.searchParams.get('orderRevision'),
+    flagRevision: requestUrl.searchParams.get('flagRevision'),
+  };
+  if (Object.values(values).every((value) => value === null)) return null;
+  if (
+    !/^content_[a-f0-9]{16}$/.test(values.contentRevision ?? '')
+    || !/^order_[a-f0-9]{16}$/.test(values.orderRevision ?? '')
+    || !/^flags_[a-f0-9]{16}$/.test(values.flagRevision ?? '')
+  ) throw httpError(400, 'Gallery revision parameters are invalid or incomplete.');
+  return values;
+}
+
+async function gallerySnapshotForRequest(run, requestUrl, signal, options = {}) {
+  const expected = requestedGalleryRevisions(requestUrl);
+  if (expected) {
+    const retained = galleryRevisionCache.get(run.manifest.id)?.get(galleryRevisionKey(expected))?.snapshot;
+    if (retained) return retained;
+  }
+  const snapshot = await loadGallerySnapshot(run, signal, options);
+  if (options.includeRows !== false) rememberGallerySnapshot(run, snapshot);
+  if (!expected || galleryRevisionKey(snapshot.head) === galleryRevisionKey(expected)) return snapshot;
+  throw new GalleryHttpError(409, 'The requested gallery snapshot is no longer retained. Apply the current revision and restore the selected item by ID.', {
+    code: 'GALLERY_REVISION_STALE',
+    head: snapshot.head,
+    recovery: {
+      href: `/api/runs/${encodeURIComponent(run.manifest.id)}/gallery`,
+      anchorItemId: galleryAnchor(requestUrl.searchParams.get('anchor')),
+    },
+  });
+}
+
+function rememberGallerySnapshot(run, snapshot) {
+  let revisions = galleryRevisionCache.get(run.manifest.id);
+  if (!revisions) {
+    revisions = new Map();
+  }
+  const revision = galleryRevisionKey(snapshot.head);
+  const fingerprints = gallerySnapshotFingerprints(snapshot);
+  const value = {
+    fingerprints,
+    snapshot,
+  };
+  revisions.delete(revision);
+  if (galleryRevisionEntryBytes(value) <= GALLERY_RETENTION_LIMITS.maximumEntryBytes) revisions.set(revision, value);
+  galleryRevisionCache.delete(run.manifest.id);
+  if (revisions.size > 0) galleryRevisionCache.set(run.manifest.id, revisions);
+  pruneGalleryRevisionCache(galleryRevisionCache);
+  return value;
+}
+
+function galleryDeltaPage(run, from, current, requestUrl) {
+  const revisions = galleryRevisionCache.get(run.manifest.id);
+  const prior = revisions?.get(galleryRevisionKey(from));
+  if (!prior) {
+    throw new GalleryHttpError(409, 'The requested gallery revision is no longer retained. Resnapshot and restore the selected item by ID.', {
+      code: 'GALLERY_DELTA_STALE',
+      head: current.snapshot.head,
+      recovery: {
+        href: `/api/runs/${encodeURIComponent(run.manifest.id)}/gallery`,
+        anchorItemId: galleryAnchor(requestUrl.searchParams.get('anchor')),
+      },
+    });
+  }
+  const changes = [];
+  for (const [id, fingerprint] of current.fingerprints) {
+    const previous = prior.fingerprints.get(id);
+    if (previous === undefined) changes.push({ type: 'added', id });
+    else if (previous !== fingerprint) changes.push({ type: 'changed', id });
+  }
+  for (const id of prior.fingerprints.keys()) {
+    if (!current.fingerprints.has(id)) changes.push({ type: 'tombstone', id });
+  }
+  changes.sort((left, right) => left.id.localeCompare(right.id) || left.type.localeCompare(right.type));
+  const offset = queryInteger(requestUrl.searchParams.get('offset'), 'offset', 0, 0, 1_000_000);
+  const limit = queryInteger(requestUrl.searchParams.get('limit'), 'limit', 100, 1, 100);
+  const page = changes.slice(offset, offset + limit);
+  const ids = (type) => page.filter((entry) => entry.type === type).map(({ id }) => id);
+  return {
+    schemaVersion: 1,
+    fromContentRevision: from.contentRevision,
+    fromFlagRevision: from.flagRevision,
+    fromOrderRevision: from.orderRevision,
+    contentRevision: current.snapshot.head.contentRevision,
+    flagRevision: current.snapshot.head.flagRevision,
+    orderRevision: current.snapshot.head.orderRevision,
+    addedIds: ids('added'),
+    changedIds: ids('changed'),
+    tombstones: ids('tombstone'),
+    total: changes.length,
+    offset,
+    limit,
+    hasMore: offset + page.length < changes.length,
+    nextOffset: offset + page.length,
+  };
+}
+
+async function refreshAllGalleryPublications(emit) {
+  for (const run of runs.values()) {
+    if (purgingRunIds.has(run.manifest.id)) continue;
+    try {
+      const publication = await probeGalleryPublication(run);
+      if (!publication) continue;
+      const prior = observedGalleryPublications.get(run.manifest.id);
+      const token = `${publication.phase}:${publication.contentRevision}:${publication.flagRevision}:${publication.orderRevision}`;
+      observedGalleryPublications.set(run.manifest.id, token);
+      if (emit && prior !== token) {
+        appendEvent(run, 'gallery', {
+          schemaVersion: 1,
+          phase: publication.phase,
+          contentRevision: publication.contentRevision,
+          flagRevision: publication.flagRevision,
+          orderRevision: publication.orderRevision,
+          primaryCounts: publication.primaryCounts,
+          message: publication.phase === 'sealed'
+            ? 'Validated gallery evidence is sealed and ready.'
+            : 'New finalized gallery evidence is available. Your current selection will remain in place.',
+        });
+      }
+    } catch (error) {
+      if (error?.statusCode !== 404) {
+        console.error(`Could not inspect gallery publication for ${run.manifest.id}: ${error.message}`);
+      }
+    }
+  }
+}
+
+async function createRun(request, response) {
+  const options = validateRunRequest(await readJsonBody(request));
+  const reservation = reserveLaunchSlot();
+  const initializationFailpoint = process.env.PORTAL_E2E_FAILURE_INJECTION === '1'
+    ? String(request.headers['x-portal-e2e-launch-failure'] ?? '')
+    : '';
+
+  const aiApiKey = options.aiReview ? currentAnthropicApiKey() : null;
+  if (aiApiKey) sensitiveLogValues.add(aiApiKey);
+  const id = makeRunId();
+  const directory = join(ARTIFACT_ROOT, id);
+  const logDirectory = join(directory, 'logs');
+  try {
+    await fs.mkdir(logDirectory, { recursive: true });
+  } catch (error) {
+    launchReservations.delete(reservation);
+    throw error;
+  }
+
+  const args = ['test'];
+  if (options.entrySpecs.length > 0) args.push(...options.entrySpecs);
+  else if (options.profile === 'smoke') args.push('tests/smoke.spec.ts', 'tests/contracts.spec.ts');
+  for (const project of options.projects) args.push(`--project=${project}`);
+  if (options.auditIds.length > 0) {
+    const pattern = `\\[(?:${options.auditIds.map(escapeRegex).join('|')})\\]`;
+    args.push(`--grep=${pattern}`);
+  }
+
+  const executable = resolvePlaywrightExecutable();
+  const now = new Date().toISOString();
+  const playwrightCommand = ['playwright', ...args];
+  const manifest = {
+    schemaVersion: 1,
+    id,
+    status: 'starting',
+    phase: 'Preparing test runner',
+    createdAt: now,
+    startedAt: null,
+    finishedAt: null,
+    stopRequestedAt: null,
+    exitCode: null,
+    signal: null,
+    options,
+    command: playwrightCommand,
+    artifactPath: relative(REPOSITORY_ROOT, directory),
+    progress: { total: null, completed: 0, passed: null, failed: null, flaky: null, skipped: null },
+    reviewReasons: [],
+    executionProvenance: portalExecutionProvenance(),
+    pipeline: {
+      status: 'running',
+      completed: false,
+      reason: 'The browser and evidence pipeline is running.',
+      finishedAt: null,
+    },
+    release: pendingRelease(),
+    stages: {
+      playwright: stageRecord('pending', playwrightCommand),
+      videoProcessing: stageRecord('pending', ['tsx', 'scripts/process-videos.ts', directory]),
+      aiReview: {
+        ...stageRecord(options.aiReview ? 'pending' : 'skipped', ['tsx', 'scripts/analyze-run.ts', '--run-dir', directory]),
+        enabled: options.aiReview,
+        model: options.aiModel,
+        summary: null,
+      },
+      reportRebuild: stageRecord('pending', [
+        'tsx',
+        'scripts/rebuild-report.ts',
+        join(directory, 'results.json'),
+        join(directory, 'checklist'),
+      ]),
+    },
+  };
+  const runBase = {
+    directory,
+    manifest,
+    child: null,
+    clients: new Set(),
+    events: [],
+    sequence: 0,
+    lineBuffer: { stdout: '', stderr: '' },
+    killTimer: null,
+    aiApiKey,
+  };
+  let logStream = null;
+  let lifecycleStream = null;
+  try {
+    const runnerLogPath = initializationFailpoint === 'stream'
+      ? join(logDirectory, 'missing-parent', 'runner.log')
+      : join(logDirectory, 'runner.log');
+    logStream = await openAppendStream(runnerLogPath, `${id} runner log`);
+    lifecycleStream = await openAppendStream(join(logDirectory, 'lifecycle.jsonl'), `${id} lifecycle log`);
+  } catch (error) {
+    await closeWritableStream(logStream);
+    await closeWritableStream(lifecycleStream);
+    const failedRun = { ...runBase, logStream: null, lifecycleStream: null };
+    runs.set(id, failedRun);
+    await rollbackRunInitialization(failedRun, null, error);
+    launchReservations.delete(reservation);
+    throw httpError(500, 'Audit run initialization failed before log storage could open. The capacity reservation was released and the failure was recorded when storage remained available.');
+  }
+  const run = { ...runBase, logStream, lifecycleStream };
+  runs.set(id, run);
+  let child = null;
+  let earlySpawnError = null;
+  let earlyClose = null;
+  const captureEarlyError = (error) => { earlySpawnError = error; };
+  const captureEarlyClose = (exitCode, signal) => { earlyClose = { exitCode, signal }; };
+  try {
+    if (initializationFailpoint === 'persist') throw new Error('Injected pre-start persistence failure.');
+    await persistManifest(run);
+    appendEvent(run, 'status', { status: 'starting', message: 'Preparing Playwright.' });
+
+    if (initializationFailpoint === 'spawn') throw new Error('Injected synchronous spawn setup failure.');
+    child = spawn(executable, args, {
+      cwd: REPOSITORY_ROOT,
+      detached: process.platform !== 'win32',
+      env: {
+        ...sanitizedProcessEnvironment(),
+        AUDIT_PROFILE: options.profile,
+        AUDIT_ARTIFACT_DIR: directory,
+        AUDIT_OUTPUT_DIR: join(directory, 'checklist'),
+        AUDIT_RUN_ID: id,
+        AUDIT_IDS: options.auditIds.join(','),
+        AUDIT_AREAS: options.areas.join(','),
+        PRODUCTION_URL: options.productionUrl,
+        CANDIDATE_URL: options.candidateUrl,
+        PLAYWRIGHT_HTML_OPEN: 'never',
+        AUDIT_VERBOSE: '1',
+        CANDIDATE_IGNORE_HTTPS_ERRORS: options.candidateIgnoreHTTPSErrors ? '1' : '0',
+      },
+      shell: false,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    child.once('error', captureEarlyError);
+    child.once('close', captureEarlyClose);
+    run.child = child;
+    run.manifest.status = 'running';
+    run.manifest.phase = 'Starting browser projects';
+    run.manifest.startedAt = new Date().toISOString();
+    run.manifest.stages.playwright.status = 'running';
+    run.manifest.stages.playwright.startedAt = run.manifest.startedAt;
+    await persistManifest(run);
+    if (earlySpawnError) throw earlySpawnError;
+    if (earlyClose) throw new Error(`Playwright exited during launch initialization (exit ${earlyClose.exitCode ?? 'null'}, signal ${earlyClose.signal ?? 'none'}).`);
+  } catch (error) {
+    if (child) {
+      child.removeListener('error', captureEarlyError);
+      child.removeListener('close', captureEarlyClose);
+    }
+    await rollbackRunInitialization(run, child, error);
+    throw httpError(500, 'Audit run initialization failed before Playwright could start. The failed initialization was released and recorded when storage remained available.');
+  } finally {
+    launchReservations.delete(reservation);
+  }
+  child.removeListener('error', captureEarlyError);
+  child.removeListener('close', captureEarlyClose);
+  appendEvent(run, 'status', { status: 'running', message: 'Audit is running.' });
+  appendEvent(run, 'stage', {
+    name: 'playwright',
+    status: 'running',
+    label: 'Starting browser projects',
+    stage: structuredClone(run.manifest.stages.playwright),
+  });
+  appendLog(run, 'stdout', `Command started: ${playwrightCommand.join(' ')}`, 'playwright');
+  appendLog(run, 'stdout', `TLS policy: candidate certificate errors ${options.candidateIgnoreHTTPSErrors ? 'ignored for development' : 'enforced'}; production certificate errors enforced.`, 'playwright');
+
+  consumeOutput(run, child.stdout, 'stdout', 'playwright');
+  consumeOutput(run, child.stderr, 'stderr', 'playwright');
+
+  child.once('error', async (error) => {
+    appendLog(run, 'stderr', `Unable to start Playwright: ${error.message}`, 'playwright');
+    run.manifest.status = 'spawn-failed';
+    run.manifest.phase = 'Could not start Playwright';
+    run.manifest.finishedAt = new Date().toISOString();
+    run.manifest.error = error.message;
+    run.manifest.pipeline = {
+      status: 'failed',
+      completed: false,
+      reason: `Playwright could not start: ${error.message}`,
+      finishedAt: run.manifest.finishedAt,
+    };
+    run.manifest.release = unavailableRelease('No authoritative release decision exists because Playwright could not start.');
+    completeStage(run.manifest.stages.playwright, 127, null, error.message);
+    appendLog(run, 'stderr', 'Command finished: exit=127 signal=none', 'playwright');
+    await finishRun(run);
+  });
+  child.once('close', async (code, signal) => {
+    if (TERMINAL_STATUSES.has(run.manifest.status)) return;
+    flushOutput(run, 'playwright');
+    run.manifest.exitCode = code;
+    run.manifest.signal = signal;
+    completeStage(run.manifest.stages.playwright, code, signal);
+    appendLog(
+      run,
+      code === 0 ? 'stdout' : 'stderr',
+      `Command finished: exit=${code ?? 'null'} signal=${signal ?? 'none'} duration=${run.manifest.stages.playwright.durationMs}ms`,
+      'playwright',
+    );
+    appendEvent(run, 'stage', {
+      name: 'playwright',
+      status: run.manifest.stages.playwright.status,
+      label: 'Browser checks finished',
+      stage: structuredClone(run.manifest.stages.playwright),
+    });
+    run.child = null;
+    if (run.manifest.stopRequestedAt) {
+      run.manifest.status = 'stopped';
+      run.manifest.phase = 'Stopped by reviewer';
+      run.manifest.finishedAt = new Date().toISOString();
+      run.manifest.pipeline = {
+        status: 'stopped',
+        completed: false,
+        reason: 'The evidence pipeline was stopped by a reviewer.',
+        finishedAt: run.manifest.finishedAt,
+      };
+      run.manifest.release = unavailableRelease('No authoritative release decision exists because the run was stopped.');
+      return finishRun(run);
+    }
+    await runPostTestStages(run);
+  });
+
+  return sendJson(response, 202, publicManifest(manifest));
+}
+
+async function rollbackRunInitialization(run, child, error) {
+  if (child?.pid) {
+    try {
+      signalChild(child, 'SIGKILL');
+    } catch {
+      // The process may already have exited; the terminal manifest below is the durable outcome.
+    }
+  }
+  run.child = null;
+  const finishedAt = new Date().toISOString();
+  const detail = redactLogValue(error instanceof Error ? error.message : String(error)).slice(0, 1_000);
+  run.manifest.status = 'spawn-failed';
+  run.manifest.phase = 'Run initialization failed before launch';
+  run.manifest.finishedAt = finishedAt;
+  run.manifest.error = detail;
+  run.manifest.pipeline = {
+    status: 'failed',
+    completed: false,
+    reason: `Run initialization failed: ${detail}`,
+    finishedAt,
+  };
+  run.manifest.release = unavailableRelease('No authoritative release decision exists because run initialization failed.');
+  completeStage(run.manifest.stages.playwright, 127, null, detail);
+  appendLog(run, 'stderr', `Run initialization failed: ${detail}`, 'playwright');
+  let persisted = false;
+  try {
+    await persistManifest(run);
+    persisted = true;
+  } catch (persistError) {
+    console.error(`Could not persist failed initialization for ${run.manifest.id}: ${persistError.message}`);
+  }
+  await closeWritableStream(run.logStream);
+  await closeWritableStream(run.lifecycleStream);
+  run.logStream = null;
+  run.lifecycleStream = null;
+  run.aiApiKey = null;
+  if (!persisted) runs.delete(run.manifest.id);
+}
+
+function reserveLaunchSlot() {
+  const activeCount = [...runs.values()].filter(
+    ({ manifest, externalManaged }) => !externalManaged && !TERMINAL_STATUSES.has(manifest.status),
+  ).length;
+  if (activeCount + launchReservations.size >= MAX_CONCURRENT_RUNS) {
+    throw httpError(409, `Only ${MAX_CONCURRENT_RUNS} audit run(s) may be active at once.`);
+  }
+  const reservation = Symbol('portal-launch');
+  launchReservations.add(reservation);
+  return reservation;
+}
+
+function validateRunRequest(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    throw httpError(400, 'Request body must be a JSON object.');
+  }
+  const profile = typeof body.profile === 'string' ? body.profile : '';
+  if (!PROFILES.has(profile)) throw httpError(400, 'Profile must be smoke or release.');
+
+  const projects = uniqueStrings(body.projects);
+  if (projects.length === 0) throw httpError(400, 'Select at least one browser project.');
+  if (projects.length > PROJECTS.length || projects.some((project) => !PROJECT_IDS.has(project))) {
+    throw httpError(400, 'One or more browser projects are not allowed.');
+  }
+
+  const requestedAreas = uniqueStrings(body.areas);
+  if (requestedAreas.some((area) => !AUDIT_AREAS.has(area))) {
+    throw httpError(400, 'One or more audit areas are not in the catalog.');
+  }
+  const requestedIds = uniqueStrings(body.auditIds);
+  if (requestedIds.some((id) => !AUDIT_IDS.has(id))) {
+    throw httpError(400, 'One or more audit IDs are not in the catalog.');
+  }
+  const expandedIds = catalog
+    .filter(({ area }) => requestedAreas.includes(area))
+    .map(({ id }) => id);
+  const requestedPlugins = uniqueStrings(body.pluginIds);
+  if (requestedPlugins.some((id) => !PLUGIN_IDS.has(id))) {
+    throw httpError(400, 'One or more test suite plugins are not installed.');
+  }
+  const pluginAuditIds = plugins
+    .filter(({ id }) => requestedPlugins.includes(id))
+    .flatMap(({ auditDefinitions }) => auditDefinitions.map(({ id }) => id));
+  const auditIds = [...new Set([...requestedIds, ...expandedIds, ...pluginAuditIds])].sort();
+  if (auditIds.length > catalog.length) throw httpError(400, 'Too many audit IDs selected.');
+  if (profile === 'release' && auditIds.length === 0 && projects.length !== PROJECTS.length) {
+    throw httpError(400, 'A full release run requires the complete browser and device matrix. Use targeted scope for a narrower release-evidence run.');
+  }
+  const selectedPlugins = plugins.filter((plugin) =>
+    requestedPlugins.includes(plugin.id)
+      || plugin.auditDefinitions.some(({ id }) => auditIds.includes(id)));
+  for (const plugin of selectedPlugins) {
+    const unsupportedProjects = projects.filter((project) => !plugin.supportedProjects.includes(project));
+    if (unsupportedProjects.length > 0) {
+      throw httpError(400, `${plugin.name} does not support: ${unsupportedProjects.join(', ')}.`);
+    }
+  }
+  const entrySpecs = [...new Set(selectedPlugins.flatMap(({ entrySpecs }) => entrySpecs))].sort();
+
+  if (body.aiReview !== undefined && typeof body.aiReview !== 'boolean') {
+    throw httpError(400, 'AI review must be enabled or disabled.');
+  }
+  const aiReview = body.aiReview === true;
+  const candidateIgnoreHTTPSErrors = body.candidateIgnoreHTTPSErrors === true;
+  if (aiReview && !currentAnthropicApiKey() && process.env.AI_REVIEW_DRY_RUN !== '1') {
+    throw httpError(400, 'AI review is unavailable because the container has no runtime API key.');
+  }
+  const aiModel = body.aiModel === undefined ? DEFAULT_AI_MODEL : body.aiModel;
+  if (typeof aiModel !== 'string' || !/^[a-zA-Z0-9._:-]{1,80}$/.test(aiModel)) {
+    throw httpError(400, 'AI model contains unsupported characters.');
+  }
+
+  const productionUrl = validateTargetUrl(body.productionUrl, 'Production URL');
+  const candidateUrl = validateTargetUrl(body.candidateUrl, 'Candidate URL');
+  if (candidateIgnoreHTTPSErrors) {
+    const production = new URL(productionUrl);
+    const candidate = new URL(candidateUrl);
+    const protectedProductionHosts = new Set(['quitting7oh.org', 'www.quitting7oh.org']);
+    if (candidate.origin === production.origin
+      || candidate.hostname === production.hostname
+      || protectedProductionHosts.has(candidate.hostname)) {
+      throw httpError(400, 'Candidate certificate bypass cannot be used for the production origin. Disable the bypass or choose a development candidate origin.');
+    }
+  }
+
+  return {
+    profile,
+    projects,
+    areas: requestedAreas.sort(),
+    auditIds,
+    pluginIds: requestedPlugins.sort(),
+    entrySpecs,
+    productionUrl,
+    candidateUrl,
+    aiReview,
+    aiModel,
+    candidateIgnoreHTTPSErrors,
+  };
+}
+
+function validateTargetUrl(value, label) {
+  if (typeof value !== 'string' || value.length > 2_048) throw httpError(400, `${label} is invalid.`);
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw httpError(400, `${label} must be a complete HTTP or HTTPS URL.`);
+  }
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) {
+    throw httpError(400, `${label} must be an HTTP or HTTPS URL without credentials.`);
+  }
+  if (url.pathname !== '/' || url.search || url.hash) {
+    throw httpError(400, `${label} must be an origin without a path, query, or fragment.`);
+  }
+  return url.origin;
+}
+
+function consumeOutput(run, stream, channel, stage) {
+  stream.setEncoding('utf8');
+  stream.on('data', (chunk) => {
+    run.lineBuffer[channel] += stripTerminalCodes(chunk);
+    const lines = run.lineBuffer[channel].split(/\r?\n/);
+    run.lineBuffer[channel] = lines.pop() ?? '';
+    for (const line of lines) appendLog(run, channel, line, stage);
+  });
+}
+
+function flushOutput(run, stage) {
+  for (const channel of ['stdout', 'stderr']) {
+    if (run.lineBuffer[channel]) appendLog(run, channel, run.lineBuffer[channel], stage);
+    run.lineBuffer[channel] = '';
+  }
+}
+
+function appendLog(run, channel, line, stage = 'system') {
+  const cleanLine = redactLogValue(line.slice(0, 20_000));
+  const timestamp = new Date().toISOString();
+  run.logStream?.write(`${timestamp} [${stage}:${channel}] ${cleanLine}\n`);
+  if (stage === 'playwright') {
+    if (/Running\s+\d+\s+tests?/i.test(cleanLine)) run.manifest.phase = 'Executing browser checks';
+    if (/Audit checklist:/i.test(cleanLine)) run.manifest.phase = 'Writing initial checklist';
+    updateProgress(run.manifest.progress, cleanLine);
+  }
+  appendEvent(run, 'log', {
+    channel,
+    stage,
+    line: cleanLine,
+    timestamp,
+    phase: run.manifest.phase,
+    progress: run.manifest.progress,
+  });
+}
+
+function updateProgress(progress, line) {
+  const totalMatch = line.match(/Running\s+(\d+)\s+tests?/i);
+  if (totalMatch) progress.total = Number(totalMatch[1]);
+  const ordinalMatch = line.match(/\[\s*(\d+)\s*\/\s*(\d+)\s*\]/);
+  if (ordinalMatch) {
+    progress.completed = Math.max(progress.completed, Number(ordinalMatch[1]));
+    progress.total = Number(ordinalMatch[2]);
+  }
+  const listOrdinalMatch = line.match(/[✓✘-]\s+(\d+)\s+\[/);
+  if (listOrdinalMatch) progress.completed = Math.max(progress.completed, Number(listOrdinalMatch[1]));
+  for (const key of ['passed', 'failed', 'flaky', 'skipped']) {
+    const match = line.match(new RegExp(`(?:^|\\s)(\\d+)\\s+${key}(?:\\s|$)`, 'i'));
+    if (match) progress[key] = Number(match[1]);
+  }
+  const completedFromSummary = ['passed', 'failed', 'flaky', 'skipped']
+    .map((key) => progress[key] ?? 0)
+    .reduce((sum, count) => sum + count, 0);
+  if (completedFromSummary > 0) progress.completed = Math.max(progress.completed, completedFromSummary);
+  if (progress.total !== null) progress.completed = Math.min(progress.completed, progress.total);
+}
+
+async function authoritativeReleaseForRun(run) {
+  return readChecklistRelease(
+    join(run.directory, 'checklist', 'manifest.json'),
+    'checklist/manifest.json',
+  );
+}
+
+function applyCompletedRelease(run, release, context = 'Evidence pipeline complete') {
+  applyCompletedReleaseEligibility(run.manifest, release, context, PROJECTS.length);
+}
+
+function applyPipelineFailure(run, reason) {
+  const finishedAt = new Date().toISOString();
+  run.manifest.pipeline = {
+    status: 'failed',
+    completed: false,
+    reason,
+    finishedAt,
+  };
+  run.manifest.release = unavailableRelease(`No authoritative release decision is usable because ${reason.toLowerCase()}`);
+  run.manifest.status = 'evidence-failed';
+  run.manifest.phase = `Evidence pipeline failed · ${reason}`;
+}
+
+async function runPostTestStages(run) {
+  await executeStage(
+    run,
+    'videoProcessing',
+    'Processing and indexing video evidence',
+    resolveToolExecutable('tsx'),
+    ['scripts/process-videos.ts', run.directory],
+    { AUDIT_ARTIFACT_DIR: run.directory },
+  );
+  if (run.manifest.stopRequestedAt) return finishStoppedRun(run);
+
+  if (run.manifest.options.aiReview) {
+    await executeStage(
+      run,
+      'aiReview',
+      `AI evidence review · ${run.manifest.options.aiModel}`,
+      resolveToolExecutable('tsx'),
+      ['scripts/analyze-run.ts', '--run-dir', run.directory],
+      {
+        AUDIT_ARTIFACT_DIR: run.directory,
+        ANTHROPIC_MODEL: run.manifest.options.aiModel,
+        ANTHROPIC_API_KEY: run.aiApiKey,
+        AI_REVIEW_DRY_RUN: process.env.AI_REVIEW_DRY_RUN,
+      },
+    );
+    run.manifest.stages.aiReview.summary = await readAiReviewSummary(run.directory);
+    appendEvent(run, 'stage', {
+      name: 'aiReview',
+      status: run.manifest.stages.aiReview.status,
+      label: `AI evidence review · ${run.manifest.options.aiModel}`,
+      stage: structuredClone(run.manifest.stages.aiReview),
+    });
+    await persistManifest(run);
+  }
+  if (run.manifest.stopRequestedAt) return finishStoppedRun(run);
+
+  await executeStage(
+    run,
+    'reportRebuild',
+    'Rebuilding checklist with final evidence links',
+    resolveToolExecutable('tsx'),
+    [
+      'scripts/rebuild-report.ts',
+      join(run.directory, 'results.json'),
+      join(run.directory, 'checklist'),
+    ],
+    {
+      AUDIT_ARTIFACT_DIR: run.directory,
+      AUDIT_OUTPUT_DIR: join(run.directory, 'checklist'),
+    },
+  );
+  if (run.manifest.stopRequestedAt) return finishStoppedRun(run);
+
+  const failedStages = ['videoProcessing', 'reportRebuild']
+    .filter((stageName) => run.manifest.stages[stageName].status !== 'completed');
+  if (failedStages.length > 0) {
+    applyPipelineFailure(run, `required stage failure: ${failedStages.join(', ')}`);
+  } else {
+    try {
+      applyCompletedRelease(run, await authoritativeReleaseForRun(run));
+    } catch (error) {
+      applyPipelineFailure(run, error.message);
+    }
+  }
+  run.manifest.finishedAt = new Date().toISOString();
+  await finishRun(run);
+}
+
+async function executeStage(run, stageName, label, executable, args, extraEnv) {
+  const stage = run.manifest.stages[stageName];
+  if (run.manifest.stopRequestedAt) {
+    stage.status = 'skipped';
+    stage.finishedAt = new Date().toISOString();
+    stage.durationMs = 0;
+    stage.error = 'Skipped because a reviewer stopped the run.';
+    await persistManifest(run);
+    return;
+  }
+  const scriptPath = args[0] ? join(REPOSITORY_ROOT, args[0]) : null;
+  if (scriptPath && !(await safeStat(scriptPath))) {
+    stage.status = 'skipped';
+    stage.startedAt = new Date().toISOString();
+    stage.finishedAt = stage.startedAt;
+    stage.durationMs = 0;
+    stage.error = `Stage script is unavailable: ${args[0]}`;
+    appendLog(run, 'stderr', stage.error, stageName);
+    await persistManifest(run);
+    return;
+  }
+
+  run.manifest.phase = label;
+  stage.status = 'running';
+  stage.startedAt = new Date().toISOString();
+  appendEvent(run, 'stage', { name: stageName, status: 'running', label, stage: structuredClone(stage) });
+  appendLog(run, 'stdout', `Command started: ${stage.command.join(' ')}`, stageName);
+  await persistManifest(run);
+
+  const started = performance.now();
+  const result = await new Promise((resolveStage) => {
+    let settled = false;
+    const child = spawn(executable, args, {
+      cwd: REPOSITORY_ROOT,
+      detached: process.platform !== 'win32',
+      env: {
+        ...sanitizedProcessEnvironment(),
+        ...extraEnv,
+        AUDIT_RUN_ID: run.manifest.id,
+        AUDIT_PROFILE: run.manifest.options.profile,
+      },
+      shell: false,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    run.child = child;
+    consumeOutput(run, child.stdout, 'stdout', stageName);
+    consumeOutput(run, child.stderr, 'stderr', stageName);
+    child.once('error', (error) => {
+      if (settled) return;
+      settled = true;
+      resolveStage({ code: 127, signal: null, error: error.message });
+    });
+    child.once('close', (code, signal) => {
+      if (settled) return;
+      settled = true;
+      resolveStage({ code, signal, error: null });
+    });
+  });
+
+  flushOutput(run, stageName);
+  run.child = null;
+  const elapsedMs = Math.round(performance.now() - started);
+  completeStage(stage, result.code, result.signal, result.error, elapsedMs);
+  appendLog(
+    run,
+    result.code === 0 ? 'stdout' : 'stderr',
+    `Command finished: exit=${result.code ?? 'null'} signal=${result.signal ?? 'none'} duration=${elapsedMs}ms`,
+    stageName,
+  );
+  appendEvent(run, 'stage', {
+    name: stageName,
+    status: stage.status,
+    label,
+    stage: structuredClone(stage),
+  });
+  await persistManifest(run);
+}
+
+function stageRecord(status, command) {
+  return {
+    status,
+    command,
+    startedAt: null,
+    finishedAt: null,
+    durationMs: null,
+    exitCode: null,
+    signal: null,
+    error: null,
+  };
+}
+
+function completeStage(stage, exitCode, signal, error = null, durationMs = null) {
+  stage.status = exitCode === 0 ? 'completed' : 'failed';
+  stage.finishedAt = new Date().toISOString();
+  stage.durationMs = durationMs ?? (stage.startedAt
+    ? Math.max(0, new Date(stage.finishedAt).getTime() - new Date(stage.startedAt).getTime())
+    : 0);
+  stage.exitCode = exitCode;
+  stage.signal = signal;
+  stage.error = error;
+}
+
+async function readAiReviewSummary(runDirectory) {
+  try {
+    const review = JSON.parse(await fs.readFile(join(runDirectory, 'ai-review', 'review.json'), 'utf8'));
+    const usage = review.request?.usage ?? review.usage ?? review.api?.usage ?? {};
+    const inputTokens = numberOrNull(usage.inputTokens ?? usage.input_tokens);
+    const outputTokens = numberOrNull(usage.outputTokens ?? usage.output_tokens);
+    return {
+      status: stringOrNull(review.status),
+      model: stringOrNull(review.model),
+      apiStatus: stringOrNull(review.api?.status),
+      httpStatus: numberOrNull(review.request?.responseStatus ?? review.httpStatus ?? review.api?.httpStatus ?? review.api?.status),
+      latencyMs: numberOrNull(review.request?.latencyMs ?? review.latencyMs ?? review.api?.latencyMs),
+      usage: {
+        inputTokens,
+        outputTokens,
+        totalTokens: numberOrNull(usage.totalTokens ?? usage.total_tokens)
+          ?? (inputTokens !== null && outputTokens !== null ? inputTokens + outputTokens : null),
+      },
+    };
+  } catch {
+    return { status: 'unavailable', model: null, apiStatus: null, httpStatus: null, latencyMs: null, usage: null };
+  }
+}
+
+function finishStoppedRun(run) {
+  run.manifest.status = 'stopped';
+  run.manifest.phase = 'Stopped by reviewer';
+  run.manifest.finishedAt = new Date().toISOString();
+  run.manifest.pipeline = {
+    status: 'stopped',
+    completed: false,
+    reason: 'The evidence pipeline was stopped by a reviewer.',
+    finishedAt: run.manifest.finishedAt,
+  };
+  run.manifest.release = unavailableRelease('No authoritative release decision exists because the run was stopped.');
+  return finishRun(run);
+}
+
+async function finishRun(run) {
+  if (run.killTimer) clearTimeout(run.killTimer);
+  run.child = null;
+  appendEvent(run, 'status', {
+    status: run.manifest.status,
+    message: terminalMessage(run.manifest),
+    manifest: publicManifest(run.manifest),
+  });
+  run.logStream?.end();
+  run.lifecycleStream?.end();
+  run.logStream = null;
+  run.lifecycleStream = null;
+  run.aiApiKey = null;
+  await persistManifest(run);
+}
+
+function stopChild(run, reason) {
+  const child = run.child;
+  if (!child?.pid) return;
+  appendLog(run, 'stderr', reason);
+  signalChild(child, 'SIGTERM');
+  run.killTimer = setTimeout(() => {
+    if (run.child) signalChild(run.child, 'SIGKILL');
+  }, STOP_GRACE_MS);
+  run.killTimer.unref();
+}
+
+function signalChild(child, signal) {
+  try {
+    if (process.platform !== 'win32' && child.pid) process.kill(-child.pid, signal);
+    else child.kill(signal);
+  } catch (error) {
+    if (error?.code !== 'ESRCH') throw error;
+  }
+}
+
+function streamRunEvents(request, response, run) {
+  response.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  response.write('retry: 2000\n\n');
+  const streamUrl = new URL(request.url ?? '/', 'http://portal.local');
+  const headerEventId = Number.parseInt(request.headers['last-event-id'] ?? '0', 10) || 0;
+  const queryEventId = Number.parseInt(streamUrl.searchParams.get('after') ?? '0', 10) || 0;
+  const lastEventId = Math.max(headerEventId, queryEventId);
+  const candidates = run.events.filter((event) => event.id > lastEventId);
+  const replay = [];
+  let replayBytes = 0;
+  for (let index = candidates.length - 1; index >= 0; index -= 1) {
+    const event = candidates[index];
+    const bytes = sseEventBytes(event);
+    if (replay.length > 0 && replayBytes + bytes > MAX_SSE_REPLAY_BYTES) break;
+    replay.unshift(event);
+    replayBytes += bytes;
+  }
+  const omitted = candidates.length - replay.length;
+  if (omitted > 0) {
+    writeSse(response, {
+      id: replay[0]?.id ?? run.sequence,
+      type: 'overflow',
+      data: { dropped: omitted, reason: 'Replay is byte-bounded.', reloadLogs: true },
+    });
+  }
+  for (const event of replay) writeSse(response, event);
+  const snapshot = {
+    id: ++run.sequence,
+    type: 'snapshot',
+    data: { manifest: publicManifest(run.manifest) },
+  };
+  if (!writeSse(response, snapshot)) {
+    response.once('drain', () => writeSse(response, snapshot));
+  }
+  run.clients.add(response);
+  const heartbeat = setInterval(() => {
+    if (!response.writableNeedDrain && !response.writableEnded) response.write(': heartbeat\n\n');
+  }, 15_000);
+  response.auditHeartbeat = heartbeat;
+  request.once('close', () => {
+    clearInterval(heartbeat);
+    response.auditHeartbeat = null;
+    run.clients.delete(response);
+  });
+}
+
+function streamGalleryEvents(request, response, run) {
+  response.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  response.write('retry: 2000\n\n');
+  const streamUrl = new URL(request.url ?? '/', 'http://portal.local');
+  const headerEventId = Number.parseInt(request.headers['last-event-id'] ?? '0', 10) || 0;
+  const queryEventId = Number.parseInt(streamUrl.searchParams.get('after') ?? '0', 10) || 0;
+  const lastEventId = Math.max(headerEventId, queryEventId);
+  const candidates = run.events.filter((event) => event.id > lastEventId && GALLERY_SSE_EVENT_TYPES.has(event.type));
+  const replay = [];
+  let replayBytes = 0;
+  for (let index = candidates.length - 1; index >= 0; index -= 1) {
+    const event = candidates[index];
+    const bytes = sseEventBytes(event);
+    if (bytes > MAX_GALLERY_SSE_REPLAY_BYTES) continue;
+    if (replay.length > 0 && replayBytes + bytes > MAX_GALLERY_SSE_REPLAY_BYTES) break;
+    replay.unshift(event);
+    replayBytes += bytes;
+  }
+  const omitted = candidates.length - replay.length;
+  if (omitted > 0) writeSse(response, {
+    id: replay[0]?.id ?? run.sequence,
+    type: 'overflow',
+    data: { dropped: omitted, reason: 'Gallery replay is byte-bounded.', reloadHead: true },
+  });
+  for (const event of replay) writeSse(response, event);
+  const snapshot = {
+    id: ++run.sequence,
+    type: 'snapshot',
+    data: { manifest: galleryStreamManifest(run.manifest), galleryOnly: true },
+  };
+  writeSse(response, snapshot);
+  run.galleryClients ??= new Set();
+  run.galleryClients.add(response);
+  const heartbeat = setInterval(() => {
+    if (!response.writableNeedDrain && !response.writableEnded) response.write(': heartbeat\n\n');
+  }, 15_000);
+  response.auditHeartbeat = heartbeat;
+  request.once('close', () => {
+    clearInterval(heartbeat);
+    response.auditHeartbeat = null;
+    run.galleryClients.delete(response);
+  });
+}
+
+function galleryStreamManifest(manifest) {
+  return {
+    id: manifest.id,
+    status: manifest.status,
+    phase: manifest.phase ?? null,
+    startedAt: manifest.startedAt ?? null,
+    finishedAt: manifest.finishedAt ?? null,
+    progress: {
+      completed: Number(manifest.progress?.completed ?? 0),
+      total: Number(manifest.progress?.total ?? 0),
+    },
+    pipeline: manifest.pipeline ? {
+      status: manifest.pipeline.status ?? null,
+      completed: Boolean(manifest.pipeline.completed),
+    } : null,
+  };
+}
+
+function appendEvent(run, type, data) {
+  const event = { id: ++run.sequence, type, data };
+  run.events.push(event);
+  run.eventBytes = (run.eventBytes ?? 0) + sseEventBytes(event);
+  while (run.events.length > MAX_LOG_EVENTS || run.eventBytes > MAX_EVENT_BUFFER_BYTES) {
+    const removed = run.events.shift();
+    if (!removed) break;
+    run.eventBytes = Math.max(0, run.eventBytes - sseEventBytes(removed));
+  }
+  if (type !== 'log') {
+    run.lifecycleStream?.write(`${JSON.stringify({ timestamp: new Date().toISOString(), ...event })}\n`);
+  }
+  for (const client of run.clients) writeSse(client, event);
+  if (GALLERY_SSE_EVENT_TYPES.has(type)) {
+    for (const client of run.galleryClients ?? []) writeSse(client, event);
+  }
+}
+
+function writeSse(response, event) {
+  if (response.writableEnded || response.destroyed) return false;
+  if (response.writableNeedDrain) {
+    response.auditDroppedEvents = (response.auditDroppedEvents ?? 0) + 1;
+    return false;
+  }
+  const dropped = response.auditDroppedEvents ?? 0;
+  if (dropped > 0) {
+    response.auditDroppedEvents = 0;
+    response.write(`event: overflow\ndata: ${JSON.stringify({ dropped, reason: 'Client backpressure.', reloadLogs: true })}\n\n`);
+    if (response.writableNeedDrain) return false;
+  }
+  return response.write(`id: ${event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event.data)}\n\n`);
+}
+
+function sseEventBytes(event) {
+  return Buffer.byteLength(`id: ${event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event.data)}\n\n`);
+}
+
+async function servePortalAsset(request, response, pathname) {
+  const relativePath = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
+  const file = safeResolve(STATIC_ROOT, relativePath);
+  if (!file) throw httpError(404, 'Not found.');
+  return sendFile(request, response, file, "default-src 'self'; connect-src 'self'; img-src 'self' data:; media-src 'self'; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'");
+}
+
+async function serveArtifact(request, response, runId, requestedPath) {
+  const run = requireRun(runId);
+  let file = safeResolve(run.directory, requestedPath || '.');
+  if (!file) throw httpError(404, 'Artifact not found.');
+  const stat = await safeStat(file);
+  if (!stat) throw httpError(404, 'Artifact not found.');
+  if (stat.isDirectory()) file = join(file, 'index.html');
+  const verifiedFile = await resolveContainedRealPath(run.directory, file);
+  if (!verifiedFile) throw httpError(404, 'Artifact not found.');
+  return sendFile(request, response, verifiedFile, "default-src 'self' data: blob:; connect-src 'self'; img-src 'self' data: blob:; media-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; worker-src 'self' blob:; frame-src 'self' blob:; font-src 'self' data:; base-uri 'self'; frame-ancestors 'self'");
+}
+
+async function sendFile(request, response, file, contentSecurityPolicy) {
+  let handle;
+  try {
+    handle = await fs.open(file, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+  } catch (error) {
+    if (['ENOENT', 'ENOTDIR', 'ELOOP'].includes(error?.code)) throw httpError(404, 'File not found.');
+    throw error;
+  }
+  let stat;
+  try {
+    stat = await handle.stat();
+  } catch (error) {
+    await handle.close().catch(() => undefined);
+    if (['ENOENT', 'ENOTDIR'].includes(error?.code)) throw httpError(404, 'File not found.');
+    throw error;
+  }
+  if (!stat.isFile()) {
+    await handle.close().catch(() => undefined);
+    throw httpError(404, 'File not found.');
+  }
+  let range;
+  try {
+    range = parseByteRange(request.headers.range, stat.size);
+  } catch (error) {
+    await handle.close().catch(() => undefined);
+    throw error;
+  }
+  const headers = {
+    'Content-Type': MIME_TYPES[extname(file).toLowerCase()] ?? 'application/octet-stream',
+    'Content-Length': range ? range.end - range.start + 1 : stat.size,
+    'Cache-Control': 'no-store',
+    'Content-Security-Policy': contentSecurityPolicy,
+    'Accept-Ranges': 'bytes',
+    'X-Content-Type-Options': 'nosniff',
+    'Referrer-Policy': 'no-referrer',
+  };
+  if (range) headers['Content-Range'] = `bytes ${range.start}-${range.end}/${stat.size}`;
+  response.writeHead(range ? 206 : 200, headers);
+  if (request.method === 'HEAD') {
+    await handle.close().catch(() => undefined);
+    return response.end();
+  }
+  const stream = handle.createReadStream({ ...(range ?? {}), autoClose: false });
+  return new Promise((resolveStream) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      stream.destroy();
+      void handle.close().catch(() => undefined).finally(resolveStream);
+    };
+    response.once('finish', finish);
+    response.once('close', finish);
+    stream.once('error', () => {
+      if (!response.destroyed) response.destroy();
+      finish();
+    });
+    stream.pipe(response);
+  });
+}
+
+async function listArtifacts(runDirectory, runId, offset, limit, request) {
+  const index = await artifactIndex(runDirectory, offset);
+  await extendArtifactIndex(index, offset + limit + 1, request);
+  const selectedPaths = index.paths.slice(offset, offset + limit);
+  const files = [];
+  for (const path of selectedPaths) {
+    if (request.destroyed) throw httpError(499, 'Artifact request was cancelled.');
+    const absolutePath = join(runDirectory, ...path.split('/'));
+    const stat = await safeStat(absolutePath);
+    // Playwright writes active recordings into hidden staging directories and
+    // moves them into their final test directory when the attempt finishes.
+    // A staging file can disappear between indexing and a reviewer click, so
+    // never advertise it as durable evidence. Empty files are still being
+    // written (or are unusable evidence) and are omitted for the same reason.
+    if (!stat?.isFile() || stat.size === 0 || ignoredArtifactPath(path)) continue;
+    files.push({
+      path,
+      bytes: stat.size,
+      modifiedAt: stat.mtime.toISOString(),
+      kind: artifactKind(path),
+      url: `/artifacts/${encodeURIComponent(runId)}/${path.split('/').map(encodeURIComponent).join('/')}`,
+    });
+  }
+  const nextOffset = offset + selectedPaths.length;
+  return {
+    files,
+    total: index.paths.length,
+    knownTotal: index.paths.length,
+    totalComplete: index.complete,
+    offset,
+    limit,
+    nextOffset,
+    hasMore: nextOffset < index.paths.length || !index.complete,
+  };
+}
+
+async function artifactIndex(runDirectory, offset) {
+  let index = artifactPathCache.get(runDirectory);
+  const staleFirstPage = offset === 0 && index && Date.now() - index.createdAt > 2_000;
+  if (!index || staleFirstPage) {
+    index = {
+      runDirectory,
+      paths: [],
+      seen: new Set(),
+      validatedMediaPaths: new Set(),
+      videoManifestSchemaVersion: null,
+      directories: [''],
+      directoryOffset: 0,
+      currentEntries: null,
+      currentEntryOffset: 0,
+      complete: false,
+      createdAt: Date.now(),
+    };
+    for (const preferred of [
+      'checklist/index.html',
+      'playwright-html/index.html',
+      'ai-review/index.html',
+      'sharded-run.json',
+      'merge-lifecycle.json',
+      'video-manifest.json',
+      'results.json',
+      'run.json',
+    ]) {
+      if ((await safeStat(join(runDirectory, ...preferred.split('/'))))?.isFile()) {
+        addArtifactPath(index, preferred);
+      }
+    }
+    const preferredMedia = await preferredMediaArtifactPaths(runDirectory);
+    index.videoManifestSchemaVersion = preferredMedia.schemaVersion;
+    index.validatedMediaPaths = new Set(preferredMedia.paths);
+    for (const mediaPath of preferredMedia.paths) {
+      addArtifactPath(index, mediaPath);
+    }
+    artifactPathCache.set(runDirectory, index);
+  }
+  return index;
+}
+
+async function preferredMediaArtifactPaths(runDirectory) {
+  const manifestPath = join(runDirectory, 'video-manifest.json');
+  const stat = await safeStat(manifestPath);
+  if (!stat?.isFile() || stat.size > MAX_VIDEO_MANIFEST_BYTES) return { schemaVersion: null, paths: [] };
+  try {
+    const document = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+    // Schema v1 predates evidence-policy and quality retention. It treated
+    // every Playwright page recording (including blank axe helper pages) as
+    // reviewer evidence, so it must never authorize raw video links.
+    if (document?.schemaVersion !== 2) {
+      return { schemaVersion: Number.isInteger(document?.schemaVersion) ? document.schemaVersion : 0, paths: [] };
+    }
+    if (!Array.isArray(document?.videos)) return { schemaVersion: 2, paths: [] };
+    const paths = [];
+    for (const entry of document.videos) {
+      if (!entry || typeof entry !== 'object') continue;
+      for (const value of [entry.video, entry.poster]) {
+        if (typeof value !== 'string' || paths.length >= MAX_PREFERRED_MEDIA_ARTIFACTS) continue;
+        const absolutePath = safeResolve(runDirectory, value);
+        if (!absolutePath || absolutePath === runDirectory) continue;
+        const verifiedPath = await resolveContainedRealPath(runDirectory, absolutePath);
+        if (!verifiedPath || !(await safeStat(verifiedPath))?.isFile()) continue;
+        paths.push(relative(runDirectory, absolutePath).split(sep).join('/'));
+      }
+      if (paths.length >= MAX_PREFERRED_MEDIA_ARTIFACTS) break;
+    }
+    return { schemaVersion: 2, paths };
+  } catch {
+    return { schemaVersion: 0, paths: [] };
+  }
+}
+
+async function extendArtifactIndex(index, targetCount, request) {
+  while (!index.complete && index.paths.length < targetCount) {
+    if (request.destroyed) throw httpError(499, 'Artifact request was cancelled.');
+    if (!index.currentEntries) {
+      if (index.directoryOffset >= index.directories.length) {
+        index.complete = true;
+        break;
+      }
+      const directory = index.directories[index.directoryOffset++];
+      const absoluteDirectory = directory
+        ? join(index.runDirectory, ...directory.split('/'))
+        : index.runDirectory;
+      try {
+        index.currentEntries = (await fs.readdir(absoluteDirectory, { withFileTypes: true }))
+          .sort((left, right) => left.name.localeCompare(right.name));
+      } catch (error) {
+        if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') throw error;
+        index.currentEntries = [];
+      }
+      index.currentDirectory = directory;
+      index.currentEntryOffset = 0;
+    }
+    if (index.currentEntryOffset >= index.currentEntries.length) {
+      index.currentEntries = null;
+      index.currentDirectory = null;
+      continue;
+    }
+    const entry = index.currentEntries[index.currentEntryOffset++];
+    if (entry.isSymbolicLink()) continue;
+    const path = index.currentDirectory ? `${index.currentDirectory}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) index.directories.push(path);
+    else if (entry.isFile()) addArtifactPath(index, path);
+  }
+}
+
+function addArtifactPath(index, path) {
+  // Files under Playwright's raw result tree are implementation artifacts
+  // until the media processor has accepted them into video-manifest.json.
+  // This prevents helper pages (for example axe's short about:blank page)
+  // and incomplete attempt recordings from appearing as reviewer evidence.
+  if (isUnvalidatedVideoArtifact(index, path)) return;
+  if (index.seen.has(path) || ignoredArtifactPath(path)) return;
+  index.seen.add(path);
+  index.paths.push(path);
+}
+
+function isUnvalidatedVideoArtifact(index, value) {
+  const normalized = String(value);
+  const extension = extname(normalized).toLowerCase();
+  if (extension !== '.webm' && extension !== '.mp4') return false;
+  if (index.videoManifestSchemaVersion !== null) {
+    return index.videoManifestSchemaVersion !== 2 || !index.validatedMediaPaths?.has(normalized);
+  }
+  if (!normalized.split('/').includes('raw')) return false;
+  return !index.validatedMediaPaths?.has(normalized);
+}
+
+function ignoredArtifactPath(value) {
+  const segments = String(value).split('/');
+  return segments.some((segment) =>
+    segment === '.DS_Store'
+    || segment === '.last-run.json'
+    || segment.startsWith('.playwright-artifacts-')
+    || segment.endsWith('.tmp')
+    || segment.endsWith('.partial'));
+}
+
+function artifactKind(path) {
+  const extension = extname(path).toLowerCase();
+  if (extension === '.webm' || extension === '.mp4') return 'video';
+  if (['.png', '.jpg', '.jpeg', '.gif', '.svg'].includes(extension)) return 'image';
+  if (extension === '.zip') return 'trace';
+  if (path.endsWith('checklist/index.html')) return 'checklist';
+  if (path.endsWith('playwright-html/index.html')) return 'playwright-report';
+  if (path.endsWith('ai-review/index.html')) return 'ai-review';
+  if (extension === '.json') return 'data';
+  if (extension === '.html') return 'report';
+  return 'file';
+}
+
+async function readBoundedReportJson(run, relativePath, maximumBytes) {
+  const path = safeResolve(join(run.directory, 'checklist', 'data'), relativePath);
+  if (!path) throw httpError(404, 'Compact report data not found.');
+  const stat = await safeStat(path);
+  if (!stat?.isFile()) throw httpError(404, 'Compact report data is not available for this run.');
+  if (stat.size > maximumBytes) {
+    throw httpError(413, `Compact report data exceeds its ${formatLogBytes(maximumBytes)} safety limit.`);
+  }
+  const verifiedPath = await resolveContainedRealPath(run.directory, path);
+  if (!verifiedPath) throw httpError(404, 'Compact report data not found.');
+  const cached = reportDataCache.get(verifiedPath);
+  if (cached?.mtimeMs === stat.mtimeMs && cached.size === stat.size) return structuredClone(cached.value);
+  let value;
+  try {
+    value = JSON.parse(await fs.readFile(verifiedPath, 'utf8'));
+  } catch (error) {
+    throw httpError(422, `Compact report data is invalid: ${error.message}`);
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw httpError(422, 'Compact report data must be a JSON object.');
+  }
+  reportDataCache.set(verifiedPath, { mtimeMs: stat.mtimeMs, size: stat.size, value });
+  return structuredClone(value);
+}
+
+async function filterReportAudits(run, requestUrl) {
+  const document = await readBoundedReportJson(run, 'audits.json', MAX_REPORT_AUDIT_INDEX_BYTES);
+  const rows = Array.isArray(document.items) ? document.items : [];
+  if (rows.some((row) => !row || typeof row !== 'object' || Array.isArray(row))) {
+    throw httpError(422, 'Compact report audit rows are invalid.');
+  }
+  const offset = queryInteger(requestUrl.searchParams.get('offset'), 'offset', 0, 0, 1_000_000);
+  const limit = queryInteger(requestUrl.searchParams.get('limit'), 'limit', 25, 1, 100);
+  const status = reportFilter(requestUrl, 'status', 40)?.toUpperCase() ?? null;
+  const severity = reportFilter(requestUrl, 'severity', 20)?.toUpperCase() ?? null;
+  const area = reportFilter(requestUrl, 'area', 80)?.toLowerCase() ?? null;
+  const environment = reportFilter(requestUrl, 'environment', 80)?.toLowerCase() ?? null;
+  const query = reportFilter(requestUrl, 'q', 160)?.toLowerCase() ?? null;
+  const releaseBlockingRaw = requestUrl.searchParams.get('releaseBlocking');
+  if (releaseBlockingRaw !== null && !['true', 'false'].includes(releaseBlockingRaw)) {
+    throw httpError(400, 'releaseBlocking must be true or false.');
+  }
+  const releaseBlocking = releaseBlockingRaw === null ? null : releaseBlockingRaw === 'true';
+  const manualRaw = requestUrl.searchParams.get('manual');
+  if (manualRaw !== null && !['true', 'false'].includes(manualRaw)) {
+    throw httpError(400, 'manual must be true or false.');
+  }
+  const manual = manualRaw === null ? null : manualRaw === 'true';
+  const matches = rows.filter((row) => {
+    if (status && String(row.status ?? '').toUpperCase() !== status) return false;
+    if (severity && String(row.severity ?? row.definition?.severity ?? '').toUpperCase() !== severity) return false;
+    if (area && String(row.area ?? row.definition?.area ?? '').toLowerCase() !== area) return false;
+    if (releaseBlocking !== null && Boolean(row.releaseBlocking ?? row.definition?.releaseBlocking) !== releaseBlocking) return false;
+    if (manual !== null && Boolean(row.manual ?? row.definition?.manual) !== manual) return false;
+    if (environment) {
+      const environments = Array.isArray(row.environments)
+        ? row.environments
+        : row.environmentStatus && typeof row.environmentStatus === 'object'
+          ? Object.keys(row.environmentStatus)
+          : [row.environment];
+      if (!environments.some((value) => String(value ?? '').toLowerCase() === environment)) return false;
+    }
+    if (query) {
+      const haystack = [
+        row.id,
+        row.title,
+        row.reason,
+        row.userPromise,
+        row.expected,
+        row.definition?.title,
+      ].filter(Boolean).join(' ').toLowerCase();
+      if (!haystack.includes(query)) return false;
+    }
+    return true;
+  });
+  const items = matches.slice(offset, offset + limit);
+  const nextOffset = offset + items.length;
+  return {
+    schemaVersion: document.schemaVersion ?? 1,
+    generatedAt: document.generatedAt ?? null,
+    items,
+    total: matches.length,
+    offset,
+    limit,
+    nextOffset,
+    hasMore: nextOffset < matches.length,
+    filters: { status, severity, area, environment, releaseBlocking, manual, q: query },
+  };
+}
+
+function reportFilter(requestUrl, name, maximumLength) {
+  const value = requestUrl.searchParams.get(name);
+  if (value === null || value.trim() === '') return null;
+  const normalized = value.trim();
+  if (normalized.length > maximumLength || /[\u0000-\u001f]/.test(normalized)) {
+    throw httpError(400, `${name} filter is invalid.`);
+  }
+  return normalized;
+}
+
+async function loadCatalog() {
+  const source = await fs.readFile(join(REPOSITORY_ROOT, 'audit', 'catalog.ts'), 'utf8');
+  const entries = [];
+  const pattern = /audit\(\s*'([A-Z0-9-]+)'\s*,\s*'([a-z]+)'\s*,\s*'((?:[^'\\]|\\.)*)'/g;
+  for (const match of source.matchAll(pattern)) {
+    const callEnd = source.indexOf('),', match.index ?? 0);
+    const callSource = source.slice(match.index ?? 0, callEnd === -1 ? undefined : callEnd + 1);
+    entries.push({
+      id: match[1],
+      area: match[2],
+      title: match[3].replaceAll("\\'", "'"),
+      manual: /,\s*true\s*\)$/.test(callSource.trim()),
+    });
+  }
+  if (entries.length === 0) throw new Error('The audit catalog could not be loaded.');
+  return entries;
+}
+
+async function loadPluginRegistry(coreDefinitions) {
+  const registryPath = join(REPOSITORY_ROOT, 'audit', 'plugins.generated.json');
+  let document;
+  try {
+    document = JSON.parse(await fs.readFile(registryPath, 'utf8'));
+  } catch (error) {
+    if (error?.code === 'ENOENT') return [];
+    throw new Error(`Installed test plugin registry is invalid: ${error.message}`);
+  }
+  return validatePortalPluginRegistryDocument(document, {
+    coreDefinitions,
+    projectIds: PROJECT_IDS,
+    resolveEntrySpec: (spec) => Boolean(safeResolve(REPOSITORY_ROOT, spec)),
+  });
+}
+
+async function syncExternalShardedRuns() {
+  if (externalRunSyncPromise) return externalRunSyncPromise;
+  externalRunSyncPromise = refreshExternalShardedRuns().finally(() => {
+    externalRunSyncPromise = null;
+  });
+  return externalRunSyncPromise;
+}
+
+async function refreshExternalShardedRuns() {
+  let entries;
+  try {
+    entries = await fs.readdir(SHARDED_ARTIFACT_ROOT, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === 'ENOENT') return;
+    throw error;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !SAFE_RUN_ID.test(entry.name)) continue;
+    if (purgingRunIds.has(entry.name)) continue;
+    const directory = join(SHARDED_ARTIFACT_ROOT, entry.name);
+    const existing = runs.get(entry.name);
+    if (existing && !existing.externalManaged) continue;
+    const discoverable = await Promise.all([
+      safeStat(join(directory, 'logs', 'coordinator.log')),
+      safeStat(join(directory, 'sharded-run.json')),
+      safeStat(join(directory, 'merge-lifecycle.json')),
+    ]).then((stats) => stats.some((stat) => stat?.isFile()));
+    if (!discoverable) continue;
+    const run = existing ?? await createExternalRun(entry.name, directory);
+    await refreshExternalRun(run, !existing);
+    if (!existing) runs.set(entry.name, run);
+  }
+}
+
+async function createExternalRun(id, directory) {
+  const stat = await fs.stat(directory);
+  const createdAt = stat.birthtimeMs > 0 ? stat.birthtime.toISOString() : stat.mtime.toISOString();
+  return {
+    directory,
+    externalManaged: true,
+    manifest: {
+      schemaVersion: 1,
+      id,
+      status: 'running',
+      phase: 'Discovering externally launched sharded run',
+      createdAt,
+      startedAt: null,
+      finishedAt: null,
+      stopRequestedAt: null,
+      exitCode: null,
+      signal: null,
+      externalManaged: true,
+      source: 'external-sharded',
+      options: {
+        profile: 'release',
+        projects: PROJECTS.map(({ id: projectId }) => projectId),
+        pluginIds: plugins.map(({ id: pluginId }) => pluginId),
+        areas: [],
+        auditIds: [],
+        productionUrl: process.env.PRODUCTION_URL ?? 'https://quitting7oh.org',
+        candidateUrl: process.env.CANDIDATE_URL ?? 'https://beta.quitting7oh-org.pages.dev',
+        candidateIgnoreHTTPSErrors: false,
+        aiReview: false,
+        aiModel: DEFAULT_AI_MODEL,
+      },
+      command: ['npm', 'run', 'audit:release:sharded'],
+      artifactPath: relative(REPOSITORY_ROOT, directory),
+      progress: { total: null, completed: 0, passed: null, failed: null, flaky: null, skipped: null },
+      reviewReasons: [],
+      executionProvenance: canonicalExecutionProvenance(),
+      pipeline: {
+        status: 'running',
+        completed: false,
+        reason: 'An externally launched sharded browser and evidence pipeline is running.',
+        finishedAt: null,
+      },
+      release: pendingRelease(),
+      stages: {},
+    },
+    child: null,
+    clients: new Set(),
+    events: [],
+    sequence: 0,
+    logStream: null,
+    lifecycleStream: null,
+    lineBuffer: { stdout: '', stderr: '' },
+    killTimer: null,
+    aiApiKey: null,
+    externalState: {
+      fileOffsets: new Map(),
+      partialLines: new Map(),
+      omittedLineCharacters: new Map(),
+      decoders: new Map(),
+      commands: new Map(),
+      mergeStages: new Map(),
+      shardProgress: new Map(),
+      performanceExpectedExecutions: null,
+      started: null,
+      lifecycleCache: new Map(),
+    },
+  };
+}
+
+async function refreshExternalRun(run, initial) {
+  const before = JSON.stringify({
+    status: run.manifest.status,
+    phase: run.manifest.phase,
+    progress: run.manifest.progress,
+    stages: run.manifest.stages,
+    pipeline: run.manifest.pipeline,
+    release: run.manifest.release,
+  });
+  const logFiles = await externalLogFiles(run.directory);
+  const completedOnDiscovery = initial && Boolean(await safeStat(join(run.directory, 'sharded-run.json')));
+  for (const logPath of logFiles) {
+    await consumeExternalLogFile(run, logPath, !initial, completedOnDiscovery);
+  }
+  await refreshExternalManifest(run);
+  const after = JSON.stringify({
+    status: run.manifest.status,
+    phase: run.manifest.phase,
+    progress: run.manifest.progress,
+    stages: run.manifest.stages,
+    pipeline: run.manifest.pipeline,
+    release: run.manifest.release,
+  });
+  if (!initial && before !== after) {
+    appendEvent(run, 'snapshot', { manifest: publicManifest(run.manifest) });
+    if (TERMINAL_STATUSES.has(run.manifest.status)) {
+      appendEvent(run, 'status', {
+        status: run.manifest.status,
+        message: terminalMessage(run.manifest),
+        manifest: publicManifest(run.manifest),
+      });
+    }
+  }
+}
+
+async function externalLogFiles(directory) {
+  const logDirectory = join(directory, 'logs');
+  let entries;
+  try {
+    entries = await fs.readdir(logDirectory, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === 'ENOENT') return [];
+    throw error;
+  }
+  const priority = (name) => name === 'coordinator.log' ? 0
+    : name === 'build.log' ? 1
+      : name.startsWith('shard-') ? 2
+        : name === 'performance.log' ? 3
+          : name === 'merge.log' ? 4 : 5;
+  return entries
+    .filter((entry) => entry.isFile() && entry.name.endsWith('.log'))
+    .map((entry) => join(logDirectory, entry.name))
+    .sort((left, right) => priority(basename(left)) - priority(basename(right)) || left.localeCompare(right));
+}
+
+async function consumeExternalLogFile(run, path, emit, completedOnDiscovery = false) {
+  const stat = await safeStat(path);
+  if (!stat?.isFile()) return;
+  const state = run.externalState;
+  // A restarted portal normally tails large logs to stay responsive. Seed the
+  // immutable header first so totals, shard identity, and coordinator start
+  // metadata survive that restart instead of reverting to an unknown total.
+  if (!state.fileOffsets.has(path) && stat.size > MAX_EXTERNAL_LOG_INGEST_BYTES) {
+    await seedExternalLogHead(run, path, Math.min(stat.size, 64 * 1024));
+    const omittedPrefixBytes = stat.size - MAX_EXTERNAL_LOG_INGEST_BYTES;
+    if (basename(path).startsWith('shard-') || basename(path) === 'performance.log') {
+      await seedExternalProgressPrefix(run, path, omittedPrefixBytes);
+    }
+  }
+  let offset = state.fileOffsets.get(path) ?? (completedOnDiscovery
+    ? Math.max(0, stat.size - (basename(path) === 'coordinator.log' ? 128 * 1024 : 384 * 1024))
+    : 0);
+  if (stat.size < offset) {
+    offset = 0;
+    state.partialLines.set(path, '');
+    state.omittedLineCharacters.set(path, 0);
+    state.decoders.set(path, new StringDecoder('utf8'));
+  }
+  if (stat.size - offset > MAX_EXTERNAL_LOG_INGEST_BYTES) {
+    const skippedBytes = stat.size - offset - MAX_EXTERNAL_LOG_INGEST_BYTES;
+    offset = stat.size - MAX_EXTERNAL_LOG_INGEST_BYTES;
+    state.partialLines.set(path, '');
+    state.omittedLineCharacters.set(path, 0);
+    state.decoders.set(path, new StringDecoder('utf8'));
+    if (emit) {
+      appendEvent(run, 'log', {
+        channel: 'stdout',
+        stage: externalLogMetadata(basename(path), '').stage,
+        line: `[portal skipped ${skippedBytes} historical log bytes to keep live tracking responsive; use the bounded log-tail view for recent context]`,
+        timestamp: new Date().toISOString(),
+        phase: run.manifest.phase,
+        progress: run.manifest.progress,
+      });
+    }
+  }
+  if (stat.size === offset) return;
+  const handle = await fs.open(path, 'r');
+  try {
+    let partial = state.partialLines.get(path) ?? '';
+    let omitted = state.omittedLineCharacters.get(path) ?? 0;
+    const decoder = state.decoders.get(path) ?? new StringDecoder('utf8');
+    state.decoders.set(path, decoder);
+    const buffer = Buffer.allocUnsafe(256 * 1024);
+    while (offset < stat.size) {
+      const length = Math.min(buffer.length, stat.size - offset);
+      const { bytesRead } = await handle.read(buffer, 0, length, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+      const lines = `${partial}${decoder.write(buffer.subarray(0, bytesRead))}`.split(/\r?\n/);
+      partial = lines.pop() ?? '';
+      for (const [index, line] of lines.entries()) {
+        const value = index === 0 && omitted > 0
+          ? `[portal omitted ${omitted} oversized log characters] ${line}`
+          : line;
+        consumeExternalLogLine(run, path, value, emit);
+        if (index === 0) omitted = 0;
+      }
+      if (partial.length > MAX_EXTERNAL_PARTIAL_LINE_CHARS) {
+        const remove = partial.length - MAX_EXTERNAL_PARTIAL_LINE_CHARS;
+        partial = partial.slice(remove);
+        omitted += remove;
+      }
+    }
+    state.partialLines.set(path, partial);
+    state.omittedLineCharacters.set(path, omitted);
+    state.fileOffsets.set(path, offset);
+  } finally {
+    await handle.close();
+  }
+}
+
+async function seedExternalLogHead(run, path, length) {
+  const handle = await fs.open(path, 'r');
+  try {
+    const buffer = Buffer.allocUnsafe(length);
+    const { bytesRead } = await handle.read(buffer, 0, length, 0);
+    const lines = buffer.subarray(0, bytesRead).toString('utf8').split(/\r?\n/);
+    // The last item may be a line cut at the read boundary. The normal tail
+    // ingestion will process its complete copy when it falls in retained data.
+    lines.pop();
+    for (const line of lines) consumeExternalLogLine(run, path, line, false);
+  } finally {
+    await handle.close();
+  }
+}
+
+async function seedExternalProgressPrefix(run, path, length) {
+  if (length <= 0) return;
+  const marker = '[AUDIT_TEST_FINISH]';
+  let carry = '';
+  let count = 0;
+  const stream = createReadStream(path, { start: 0, end: length - 1, highWaterMark: 256 * 1024 });
+  for await (const chunk of stream) {
+    const value = `${carry}${chunk.toString('utf8')}`;
+    let position = 0;
+    while ((position = value.indexOf(marker, position)) !== -1) {
+      count += 1;
+      position += marker.length;
+    }
+    carry = value.slice(-(marker.length - 1));
+  }
+  const name = basename(path);
+  const shard = run.externalState.shardProgress.get(name);
+  if (!shard) return;
+  shard.auditFinishes = Math.max(shard.auditFinishes, count);
+  shard.completed = shard.finished && shard.total !== null
+    ? shard.total
+    : Math.min(shard.total ?? Number.POSITIVE_INFINITY, shard.auditFinishes);
+  run.externalState.shardProgress.set(name, shard);
+}
+
+function consumeExternalLogLine(run, path, line, emit) {
+  const name = basename(path);
+  const state = run.externalState;
+  if (name === 'coordinator.log') {
+    const match = line.match(/\[COORDINATOR\]\s+([a-z-]+)\s+(\{.*\})$/);
+    if (match) {
+      const detail = parseEmbeddedJson(match[2]);
+      if (detail && match[1] === 'sharded-release-started') {
+        state.started = { ...detail, startedAt: timestampFromLogLine(line) };
+        if (Number.isInteger(detail.performanceExpectedExecutions)) {
+          state.performanceExpectedExecutions = detail.performanceExpectedExecutions;
+        }
+      }
+      if (detail && match[1] === 'performance-isolation-started'
+        && Number.isInteger(detail.expectedExecutions)) {
+        state.performanceExpectedExecutions = detail.expectedExecutions;
+      }
+      if (detail && match[1] === 'command-started') {
+        state.commands.set(detail.label, { ...detail, startedAt: timestampFromLogLine(line) });
+      }
+      if (detail && match[1] === 'command-finished') {
+        state.commands.set(detail.label, { ...(state.commands.get(detail.label) ?? {}), ...detail });
+      }
+    }
+  }
+  if (name === 'merge.log') {
+    const marker = line.lastIndexOf('[MERGE] command-');
+    const match = marker === -1
+      ? null
+      : line.slice(marker).match(/^\[MERGE\]\s+command-(started|finished)\s+(\{.*\})$/);
+    if (match) {
+      const detail = parseEmbeddedJson(match[2]);
+      const stageName = detail?.stage ?? detail?.name;
+      if (detail && stageName) {
+        state.mergeStages.set(stageName, {
+          ...(state.mergeStages.get(stageName) ?? {}),
+          ...detail,
+          ...(match[1] === 'started' ? { startedAt: timestampFromLogLine(line) } : {}),
+        });
+      }
+    }
+  }
+  if (name.startsWith('shard-') || name === 'performance.log') {
+    const isolatedPerformance = name === 'performance.log';
+    const shard = state.shardProgress.get(name) ?? {
+      total: null,
+      completed: 0,
+      auditFinishes: 0,
+      passed: null,
+      failed: null,
+      flaky: null,
+      skipped: null,
+      finished: false,
+    };
+    const running = line.match(isolatedPerformance
+      ? /Running\s+(\d+)\s+tests?/i
+      : /Running\s+(\d+)\s+tests?.*shard\s+\d+\s+of\s+\d+/i);
+    if (running) shard.total = Number(running[1]);
+    if (line.includes('[AUDIT_TEST_FINISH]')) shard.auditFinishes += 1;
+    for (const [pattern, key] of [
+      [/\]\s+(\d+)\s+passed(?:\s|\()/i, 'passed'],
+      [/\]\s+(\d+)\s+failed(?:\s|$)/i, 'failed'],
+      [/\]\s+(\d+)\s+flaky(?:\s|$)/i, 'flaky'],
+      [/\]\s+(\d+)\s+skipped(?:\s|$)/i, 'skipped'],
+      [/\]\s+(\d+)\s+did not run(?:\s|$)/i, 'didNotRun'],
+    ]) {
+      const summary = line.match(pattern);
+      if (summary) shard[key] = Number(summary[1]);
+    }
+    if (isolatedPerformance
+      ? /\[PERFORMANCE\]\s+command-finished\s+\{/.test(line)
+      : /\[SHARD\s+\d+\/\d+\]\s+command-finished\s+\{/.test(line)) shard.finished = true;
+    shard.completed = shard.finished && shard.total !== null
+      ? shard.total
+      : Math.min(shard.total ?? Number.POSITIVE_INFINITY, shard.auditFinishes);
+    state.shardProgress.set(name, shard);
+  }
+  if (!emit || line.length === 0) return;
+  const metadata = externalLogMetadata(name, line);
+  appendEvent(run, 'log', {
+    channel: metadata.channel,
+    stage: metadata.stage,
+    line: redactLogValue(line.slice(0, 20_000)),
+    timestamp: timestampFromLogLine(line),
+    phase: run.manifest.phase,
+    progress: run.manifest.progress,
+  });
+}
+
+async function refreshExternalManifest(run) {
+  const state = run.externalState;
+  const lifecycle = await readCachedExternalJson(run, 'sharded-run.json');
+  const mergeLifecycle = await readCachedExternalJson(run, 'merge-lifecycle.json');
+  const startedAt = lifecycle?.startedAt ?? state.started?.startedAt ?? mergeLifecycle?.startedAt ?? run.manifest.createdAt;
+  const shardTotal = lifecycle?.shardTotal ?? state.started?.shardTotal ?? mergeLifecycle?.shardTotal
+    ?? state.shardProgress.size;
+  run.manifest.startedAt = startedAt;
+  run.manifest.createdAt = startedAt;
+  run.manifest.options.productionUrl = lifecycle?.productionUrl ?? state.started?.productionUrl
+    ?? run.manifest.options.productionUrl;
+  run.manifest.options.candidateUrl = lifecycle?.candidateUrl ?? state.started?.candidateUrl
+    ?? run.manifest.options.candidateUrl;
+  run.manifest.options.candidateIgnoreHTTPSErrors = lifecycle?.candidateIgnoreHTTPSErrors
+    ?? state.started?.tlsPolicy === 'candidate-development-bypass';
+  run.manifest.stages = externalStages(state, lifecycle, mergeLifecycle, shardTotal);
+  run.manifest.progress = externalProgress(state);
+
+  if (lifecycle) {
+    const pipeline = lifecycle.pipeline ?? {
+      status: 'failed', completed: false, reason: 'The sharded lifecycle is missing pipeline truth.', finishedAt: lifecycle.finishedAt ?? null,
+    };
+    const release = lifecycle.release ?? unavailableRelease('The sharded lifecycle is missing release truth.');
+    applyExternalFinalTruth(run, {
+      pipeline,
+      release,
+      reportedStatus: lifecycle.status,
+      finishedAt: lifecycle.finishedAt ?? null,
+      source: 'sharded-run.json',
+    });
+    return;
+  }
+
+  if (mergeLifecycle?.finishedAt) {
+    let release = mergeLifecycle.release ?? null;
+    if (!release) {
+      try {
+        release = await readChecklistRelease(join(run.directory, 'checklist', 'manifest.json'));
+      } catch (error) {
+        release = unavailableRelease(error.message);
+      }
+    }
+    const pipeline = mergeLifecycle.pipeline ?? {
+      status: mergeLifecycle.status === 'passed' ? 'completed' : 'failed',
+      completed: mergeLifecycle.status === 'passed',
+      reason: mergeLifecycle.status === 'passed'
+        ? 'Shard evidence was merged, media was processed, and the checklist was rebuilt.'
+        : 'The externally launched merge pipeline did not complete successfully.',
+      finishedAt: mergeLifecycle.finishedAt,
+    };
+    applyExternalFinalTruth(run, {
+      pipeline,
+      release,
+      reportedStatus: mergeLifecycle.status,
+      finishedAt: mergeLifecycle.finishedAt,
+      source: 'merge-lifecycle.json',
+    });
+    return;
+  }
+
+  run.manifest.status = 'running';
+  run.manifest.finishedAt = null;
+  run.manifest.exitCode = null;
+  run.manifest.pipeline = {
+    status: 'running',
+    completed: false,
+    reason: 'An externally launched sharded browser and evidence pipeline is running.',
+    finishedAt: null,
+  };
+  run.manifest.release = pendingRelease();
+  const merge = state.commands.get('MERGE');
+  const performance = state.commands.get('PERFORMANCE');
+  const completedShards = [...state.shardProgress.values()].filter(({ finished }) => finished).length;
+  const activeMergeStage = [...state.mergeStages.entries()].find(([, stage]) => !stage.finishedAt)?.[0];
+  run.manifest.phase = activeMergeStage === 'process-media' ? 'Processing and indexing video evidence'
+    : activeMergeStage === 'rebuild-checklist' ? 'Rebuilding checklist with final evidence links'
+      : activeMergeStage === 'merge-reports' || (merge && !merge.finishedAt) ? 'Merging shard reports'
+        : performance && !performance.finishedAt ? 'Executing isolated Lighthouse and performance checks · one worker'
+          : completedShards < shardTotal ? `Executing browser checks · ${completedShards}/${shardTotal} functional shards complete`
+            : performance?.finishedAt ? 'Preparing unified evidence merge'
+              : 'Preparing isolated performance container';
+}
+
+function applyExternalFinalTruth(run, { pipeline, release, reportedStatus, finishedAt, source }) {
+  const pipelineComplete = pipeline?.status === 'completed' && pipeline?.completed === true;
+  let normalizedRelease = null;
+  let releaseValidationError = null;
+  try {
+    normalizedRelease = {
+      ...parseChecklistRelease({ release }, source),
+      evaluatedAt: typeof release?.evaluatedAt === 'string' ? release.evaluatedAt : finishedAt,
+    };
+  } catch (error) {
+    releaseValidationError = error.message;
+  }
+  const expectedStatus = pipelineComplete && normalizedRelease
+    ? normalizedRelease.decision === 'READY' ? 'ready' : 'not-ready'
+    : 'pipeline-failed';
+  const problems = [];
+  if (!pipelineComplete) problems.push('pipeline.status must be completed and pipeline.completed must be true');
+  if (releaseValidationError) problems.push(`release truth is invalid: ${releaseValidationError}`);
+  if (reportedStatus !== expectedStatus) {
+    problems.push(`reported lifecycle status ${JSON.stringify(reportedStatus)} contradicts derived status ${JSON.stringify(expectedStatus)}`);
+  }
+
+  run.manifest.finishedAt = finishedAt;
+  run.manifest.release = normalizedRelease ?? {
+    ...unavailableRelease(
+      `External release truth in ${source} is invalid: ${releaseValidationError ?? 'unknown validation error'}`,
+      source,
+    ),
+    evaluatedAt: finishedAt,
+  };
+  if (problems.length > 0) {
+    const reason = `External release truth in ${source} is inconsistent: ${problems.join('; ')}.`;
+    run.manifest.lifecycleDiagnostics = {
+      source,
+      reportedStatus: reportedStatus ?? null,
+      reportedPipeline: structuredClone(pipeline ?? null),
+      reportedReleaseDecision: release?.decision ?? null,
+      reportedRelease: structuredClone(release ?? null),
+      releaseValidationError,
+      derivedStatus: expectedStatus,
+      problems,
+    };
+    run.manifest.pipeline = {
+      status: 'failed',
+      completed: false,
+      reason: `${reason} Reported pipeline: ${pipeline?.reason ?? 'no reason supplied'}`,
+      finishedAt: finishedAt ?? pipeline?.finishedAt ?? new Date().toISOString(),
+    };
+    run.manifest.reviewReasons = [];
+    run.manifest.status = 'evidence-failed';
+    run.manifest.exitCode = 1;
+    run.manifest.phase = `Sharded evidence pipeline failed · ${reason}`;
+    return;
+  }
+
+  delete run.manifest.lifecycleDiagnostics;
+  run.manifest.pipeline = pipeline;
+  const reviews = releaseReviewReasons(run.manifest, PROJECTS.length);
+  run.manifest.reviewReasons = reviews;
+  run.manifest.status = normalizedRelease.decision === 'NOT_READY'
+    ? 'not-ready'
+    : reviews.length > 0
+      ? 'review-required'
+      : 'passed';
+  run.manifest.exitCode = run.manifest.status === 'passed' ? 0 : 1;
+  run.manifest.phase = reviews.length > 0 && normalizedRelease.decision === 'READY'
+    ? `Sharded checklist READY · release signoff withheld: ${reviews.join('; ')}`
+    : `Sharded evidence pipeline complete · release ${normalizedRelease.decision.replace('_', ' ')}`;
+}
+
+function externalStages(state, lifecycle, mergeLifecycle, shardTotal) {
+  const stages = {};
+  stages.build = externalCommandStage(state.commands.get('BUILD'), 'pending', { tolerateNonzero: false });
+  const shardCommands = Array.from({ length: shardTotal }, (_, offset) => state.commands.get(`SHARD ${offset + 1}/${shardTotal}`));
+  stages.browserShards = externalAggregateStage(shardCommands, ['docker', 'compose', 'run', `${shardTotal} parallel audit shards`]);
+  for (const [offset, command] of shardCommands.entries()) {
+    stages[`shard${offset + 1}`] = externalCommandStage(command, 'pending', { tolerateNonzero: true });
+  }
+  stages.performanceIsolation = externalCommandStage(state.commands.get('PERFORMANCE'), 'pending', { tolerateNonzero: true });
+  stages.merge = externalCommandStage(state.commands.get('MERGE'), 'pending', { tolerateNonzero: false });
+  const lifecycleStages = new Map((mergeLifecycle?.stages ?? []).map((stage) => [stage.name, stage]));
+  const namedStage = (name) => state.mergeStages.get(name) ?? lifecycleStages.get(name);
+  stages.mergeReports = externalCommandStage(namedStage('merge-reports'), 'pending', { tolerateNonzero: false });
+  stages.videoProcessing = externalCommandStage(namedStage('process-media'), 'pending', { tolerateNonzero: false });
+  stages.reportRebuild = externalCommandStage(namedStage('rebuild-checklist'), 'pending', { tolerateNonzero: false });
+  stages.aiReview = { ...stageRecord('skipped', ['AI review is not enabled for this external sharded run']) };
+  if (lifecycle?.build) stages.build = externalCommandStage(lifecycle.build, stages.build.status, { tolerateNonzero: false });
+  if (Array.isArray(lifecycle?.shards)) {
+    stages.browserShards = externalAggregateStage(lifecycle.shards, stages.browserShards.command);
+    for (const shard of lifecycle.shards) {
+      if (Number.isInteger(shard.index)) stages[`shard${shard.index}`] = externalCommandStage(shard, 'completed', { tolerateNonzero: true });
+    }
+  }
+  if (lifecycle?.performance) {
+    stages.performanceIsolation = externalCommandStage(lifecycle.performance, stages.performanceIsolation.status, { tolerateNonzero: true });
+  } else if (lifecycle?.finishedAt) {
+    stages.performanceIsolation = {
+      ...stageRecord('skipped', ['legacy sharded run did not isolate performance']),
+      error: 'This run predates dedicated performance isolation.',
+    };
+  }
+  if (lifecycle?.merge) {
+    stages.merge = externalCommandStage(lifecycle.merge, stages.merge.status, {
+      tolerateNonzero: lifecycle.pipeline?.completed === true,
+    });
+    if (lifecycle.pipeline?.completed === true && stages.merge.exitCode !== 0) {
+      stages.merge.error = 'The evidence pipeline completed; this nonzero exit records a NOT READY release decision.';
+    }
+  }
+  return stages;
+}
+
+function externalCommandStage(command, fallbackStatus, { tolerateNonzero }) {
+  if (!command) return stageRecord(fallbackStatus, []);
+  const finishedAt = command.finishedAt ?? null;
+  const startedAt = command.startedAt ?? null;
+  const exitCode = Number.isInteger(command.exitCode) ? command.exitCode : null;
+  const status = finishedAt
+    ? exitCode === 0 || tolerateNonzero ? 'completed' : 'failed'
+    : startedAt ? 'running' : fallbackStatus;
+  return {
+    status,
+    command: Array.isArray(command.command) ? command.command : [],
+    startedAt,
+    finishedAt,
+    durationMs: command.durationMs ?? (startedAt && finishedAt
+      ? Math.max(0, Date.parse(finishedAt) - Date.parse(startedAt)) : null),
+    exitCode,
+    signal: command.signal ?? null,
+    error: command.error ?? (tolerateNonzero && exitCode ? 'Browser findings were recorded; evidence collection continued.' : null),
+  };
+}
+
+function externalAggregateStage(commands, fallbackCommand) {
+  const available = commands.filter(Boolean);
+  if (available.length === 0) return stageRecord('pending', fallbackCommand);
+  const startedAt = available.map(({ startedAt }) => startedAt).filter(Boolean).sort()[0] ?? null;
+  const finished = available.filter(({ finishedAt }) => Boolean(finishedAt));
+  const finishedAt = finished.length === commands.length
+    ? finished.map(({ finishedAt: value }) => value).filter(Boolean).sort().at(-1) ?? null
+    : null;
+  return {
+    status: finishedAt ? 'completed' : 'running',
+    command: fallbackCommand,
+    startedAt,
+    finishedAt,
+    durationMs: startedAt && finishedAt ? Math.max(0, Date.parse(finishedAt) - Date.parse(startedAt)) : null,
+    exitCode: finishedAt ? Math.max(...finished.map(({ exitCode }) => Number(exitCode) || 0)) : null,
+    signal: finished.find(({ signal }) => signal)?.signal ?? null,
+    error: finishedAt && finished.some(({ exitCode }) => exitCode !== 0)
+      ? 'One or more shards recorded browser findings; merge and release evaluation continued.' : null,
+  };
+}
+
+function externalProgress(state) {
+  const performance = state.shardProgress.get('performance.log');
+  if (performance && performance.total === null && Number.isInteger(state.performanceExpectedExecutions)) {
+    performance.total = state.performanceExpectedExecutions;
+  }
+  const shards = [...state.shardProgress.values()];
+  const inferredShardTotal = (shard) => shard.total ?? (
+    shard.finished
+      ? ['passed', 'failed', 'flaky', 'skipped', 'didNotRun']
+        .map((key) => shard[key] ?? 0)
+        .reduce((sum, value) => sum + value, 0)
+      : null
+  );
+  const totals = shards.map(inferredShardTotal).filter(Number.isInteger);
+  const total = totals.length === shards.length && shards.length > 0
+    ? totals.reduce((sum, value) => sum + value, 0) : null;
+  const completed = shards.reduce((sum, shard) => sum + (
+    shard.finished ? inferredShardTotal(shard) ?? shard.completed ?? 0 : shard.completed ?? 0
+  ), 0);
+  const summary = (key) => {
+    const values = shards.map((shard) => shard[key]).filter(Number.isInteger);
+    return values.length > 0 ? values.reduce((sum, value) => sum + value, 0) : null;
+  };
+  const skipped = summary('skipped');
+  const didNotRun = summary('didNotRun');
+  return {
+    total,
+    completed: total === null ? completed : Math.min(completed, total),
+    passed: summary('passed'),
+    failed: summary('failed'),
+    flaky: summary('flaky'),
+    skipped: skipped === null && didNotRun === null ? null : (skipped ?? 0) + (didNotRun ?? 0),
+  };
+}
+
+async function readCachedExternalJson(run, relativePath) {
+  const path = join(run.directory, relativePath);
+  const stat = await safeStat(path);
+  if (!stat?.isFile()) return null;
+  const cached = run.externalState.lifecycleCache.get(path);
+  if (cached?.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.value;
+  try {
+    const value = JSON.parse(await fs.readFile(path, 'utf8'));
+    run.externalState.lifecycleCache.set(path, { mtimeMs: stat.mtimeMs, size: stat.size, value });
+    return value;
+  } catch {
+    return null;
+  }
+}
+
+async function readExternalLogSnapshot(run, maximumBytes) {
+  const files = await externalLogFiles(run.directory);
+  if (files.length === 0) {
+    return {
+      log: 'No external coordinator log output was captured for this sharded run.',
+      bytes: 0,
+      maxBytes: maximumBytes,
+      truncated: false,
+      sources: [],
+    };
+  }
+  const contentBudget = Math.max(MIN_LOG_SNAPSHOT_BYTES, maximumBytes - 8 * 1024);
+  const weights = files.map((path) => {
+    const name = basename(path);
+    return name === 'coordinator.log' ? 3
+      : name === 'merge.log' ? 8
+        : name === 'performance.log' ? 4
+          : name.startsWith('shard-') ? 2 : 1;
+  });
+  const totalWeight = weights.reduce((sum, weight) => sum + weight, 0);
+  const sections = [];
+  const sources = [];
+  for (const [index, path] of files.entries()) {
+    const name = basename(path);
+    const budget = Math.max(4 * 1024, Math.floor(contentBudget * (weights[index] / totalWeight)));
+    const tail = await readBoundedFileTail(path, budget);
+    if (!tail.content) continue;
+    const redactedContent = redactLogValue(tail.content);
+    const redactedBytes = Buffer.byteLength(redactedContent);
+    sections.push(`===== ${name} · latest ${formatLogBytes(redactedBytes)} displayed of ${formatLogBytes(tail.size)} stored =====\n${redactedContent}`);
+    sources.push({
+      path: `logs/${name}`,
+      size: tail.size,
+      returnedBytes: redactedBytes,
+      truncated: tail.truncated,
+    });
+  }
+  let log = sections.join('\n\n');
+  if (Buffer.byteLength(log) > maximumBytes) log = utf8Tail(log, maximumBytes);
+  return {
+    log,
+    bytes: Buffer.byteLength(log),
+    maxBytes: maximumBytes,
+    truncated: sources.some(({ truncated }) => truncated),
+    sources,
+  };
+}
+
+function decodeUtf8Boundary(buffer) {
+  let start = 0;
+  while (start < Math.min(4, buffer.length) && (buffer[start] & 0xc0) === 0x80) start += 1;
+  return buffer.subarray(start).toString('utf8');
+}
+
+function utf8Tail(value, maximumBytes) {
+  const buffer = Buffer.from(value, 'utf8');
+  if (buffer.length <= maximumBytes) return value;
+  return decodeUtf8Boundary(buffer.subarray(buffer.length - maximumBytes));
+}
+
+function externalLogMetadata(name, line) {
+  return {
+    channel: line.includes('[stderr]') ? 'stderr' : 'stdout',
+    stage: name === 'coordinator.log' ? 'coordinator'
+      : name === 'build.log' ? 'build'
+        : name === 'merge.log' ? 'merge'
+          : name === 'performance.log' ? 'performanceIsolation'
+          : name.replace(/\.log$/, ''),
+  };
+}
+
+function timestampFromLogLine(line) {
+  const timestamp = line.match(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z/)?.[0];
+  return timestamp ?? new Date().toISOString();
+}
+
+function parseEmbeddedJson(value) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+function formatLogBytes(bytes) {
+  return bytes >= 1024 ? `${Math.round(bytes / 1024)} KiB` : `${bytes} bytes`;
+}
+
+async function loadPersistedRuns() {
+  for (const entry of await fs.readdir(ARTIFACT_ROOT, { withFileTypes: true })) {
+    if (!entry.isDirectory() || !SAFE_RUN_ID.test(entry.name)) continue;
+    const directory = join(ARTIFACT_ROOT, entry.name);
+    try {
+      const manifest = JSON.parse(await fs.readFile(join(directory, 'run.json'), 'utf8'));
+      if (manifest.id !== entry.name) continue;
+      manifest.executionProvenance ??= portalExecutionProvenance();
+      const interrupted = !TERMINAL_STATUSES.has(manifest.status);
+      if (interrupted) {
+        manifest.status = 'failed';
+        manifest.phase = 'Portal restarted before completion';
+        manifest.finishedAt = new Date().toISOString();
+        manifest.error = 'Portal restarted before the run completed.';
+        manifest.pipeline = {
+          status: 'failed',
+          completed: false,
+          reason: manifest.error,
+          finishedAt: manifest.finishedAt,
+        };
+        manifest.release = unavailableRelease('No authoritative release decision exists because the portal restarted before the evidence pipeline completed.');
+      }
+      const replayedProgress = { total: null, completed: 0, passed: null, failed: null, flaky: null, skipped: null };
+      const persistedLog = await readBoundedFileTail(join(directory, 'logs', 'runner.log'), RESTART_PROGRESS_TAIL_BYTES)
+        .catch(() => ({ content: '', truncated: false }));
+      for (const line of persistedLog.content.split('\n')) {
+        if (line.includes('[playwright:')) updateProgress(replayedProgress, line);
+      }
+      if (replayedProgress.total !== null) {
+        manifest.progress = replayedProgress;
+      } else {
+        manifest.progress = {
+          total: manifest.progress?.total ?? null,
+          completed: manifest.progress?.completed ?? 0,
+          passed: manifest.progress?.passed ?? null,
+          failed: manifest.progress?.failed ?? null,
+          flaky: manifest.progress?.flaky ?? null,
+          skipped: manifest.progress?.skipped ?? null,
+        };
+        if (manifest.progress.total !== null) {
+          manifest.progress.completed = Math.min(manifest.progress.completed, manifest.progress.total);
+        }
+      }
+      const requiredEvidenceCompleted = manifest.stages?.videoProcessing?.status === 'completed'
+        && manifest.stages?.reportRebuild?.status === 'completed'
+        && (!manifest.stages?.manualEvidenceRebuild
+          || manifest.stages.manualEvidenceRebuild.status === 'completed');
+      const mayReconcileRelease = !interrupted
+        && !['stopped', 'spawn-failed'].includes(manifest.status)
+        && requiredEvidenceCompleted;
+      if (mayReconcileRelease) {
+        try {
+          applyCompletedRelease(
+            { directory, manifest },
+            await readChecklistRelease(join(directory, 'checklist', 'manifest.json')),
+            'Persisted evidence pipeline complete',
+          );
+        } catch (error) {
+          applyPipelineFailure({ manifest }, error.message);
+        }
+      } else if (!manifest.pipeline) {
+        const reason = manifest.status === 'stopped'
+          ? 'The evidence pipeline was stopped by a reviewer.'
+          : manifest.status === 'spawn-failed'
+            ? 'Playwright could not start.'
+            : 'Required evidence stages did not complete.';
+        manifest.pipeline = {
+          status: manifest.status === 'stopped' ? 'stopped' : 'failed',
+          completed: false,
+          reason,
+          finishedAt: manifest.finishedAt ?? new Date().toISOString(),
+        };
+        manifest.release = unavailableRelease(`No authoritative release decision is usable because ${reason.toLowerCase()}`);
+      }
+      if (!manifest.release) {
+        manifest.release = unavailableRelease('No authoritative release decision was recorded for this legacy run.');
+      }
+      await atomicWriteJson(join(directory, 'run.json'), manifest);
+      runs.set(entry.name, {
+        directory,
+        manifest,
+        child: null,
+        clients: new Set(),
+        events: [],
+        sequence: 0,
+        logStream: null,
+        lifecycleStream: null,
+        lineBuffer: { stdout: '', stderr: '' },
+        killTimer: null,
+        aiApiKey: null,
+      });
+    } catch {
+      // A directory without a valid run manifest is not portal-managed evidence.
+    }
+  }
+}
+
+function sortedRunSummaries() {
+  return [...runs.values()]
+    .map(({ manifest }) => publicManifest(manifest))
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+}
+
+function publicManifest(manifest) {
+  return {
+    ...structuredClone(manifest),
+    purge: {
+      eligible: PURGE_ELIGIBLE_STATUSES.has(manifest.status),
+      confirmation: `PURGE ${manifest.id}`,
+    },
+  };
+}
+
+function requireRun(id) {
+  if (!SAFE_RUN_ID.test(id)) throw httpError(404, 'Run not found.');
+  const run = runs.get(id);
+  if (!run) throw httpError(404, 'Run not found.');
+  return run;
+}
+
+function requireGalleryRun(id) {
+  if (!SAFE_RUN_ID.test(id)) throw new GalleryHttpError(404, 'Gallery run not found.', { code: 'GALLERY_RUN_NOT_FOUND' });
+  const run = runs.get(id);
+  if (run) return run;
+  if (purgedGalleryRunIds.has(id)) {
+    throw new GalleryHttpError(410, 'This run and its gallery evidence were permanently purged.', {
+      code: 'GALLERY_RUN_PURGED',
+    });
+  }
+  throw new GalleryHttpError(404, 'Gallery run not found.', { code: 'GALLERY_RUN_NOT_FOUND' });
+}
+
+async function purgeRun(run, body, response) {
+  const id = run.manifest.id;
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    throw httpError(400, 'Run purge confirmation is required.');
+  }
+  if (!PURGE_ELIGIBLE_STATUSES.has(run.manifest.status)) {
+    throw httpError(409, 'Active runs cannot be purged. Stop the run and wait for it to finish first.');
+  }
+  if (body.confirmation !== `PURGE ${id}`) {
+    throw httpError(400, `Type PURGE ${id} exactly to confirm permanent deletion.`);
+  }
+  if (purgingRunIds.has(id)) throw httpError(409, 'This run is already being purged.');
+  if (manualMutationRunIds.has(id)) throw httpError(409, 'Manual evidence is being saved for this run. Wait for it to finish before purging.');
+
+  purgingRunIds.add(id);
+  try {
+    const configuredRoot = run.externalManaged ? SHARDED_ARTIFACT_ROOT : ARTIFACT_ROOT;
+    const target = await verifiedPurgeTarget(configuredRoot, run.directory, id);
+    const reclaimed = await measureRunEvidence(target);
+    await fs.rm(target, { recursive: true, force: false, maxRetries: 2, retryDelay: 100 });
+
+    artifactPathCache.delete(target);
+    galleryRevisionCache.delete(id);
+    observedGalleryPublications.delete(id);
+    purgedGalleryRunIds.add(id);
+    while (purgedGalleryRunIds.size > 256) purgedGalleryRunIds.delete(purgedGalleryRunIds.values().next().value);
+    for (const cachedPath of reportDataCache.keys()) {
+      if (isDirectlyContained(target, cachedPath)) reportDataCache.delete(cachedPath);
+    }
+    runs.delete(id);
+    closePurgedRunStreams(run, id);
+    console.log(`Purged ${run.externalManaged ? 'external sharded' : 'portal-managed'} run ${id}: ${reclaimed.files} files, ${reclaimed.bytes} allocated bytes reclaimed, ${reclaimed.logicalBytes} logical bytes removed.`);
+    return sendJson(response, 200, {
+      id,
+      purged: true,
+      source: run.externalManaged ? 'external-sharded' : 'portal-managed',
+      filesReclaimed: reclaimed.files,
+      bytesReclaimed: reclaimed.bytes,
+      logicalBytesRemoved: reclaimed.logicalBytes,
+    });
+  } catch (error) {
+    if (Number.isInteger(error?.statusCode)) throw error;
+    console.error(`Run purge failed for ${id}:`, error);
+    throw httpError(500, 'The run could not be completely purged. Its portal record was retained; inspect the portal service log and evidence directory before retrying.');
+  } finally {
+    purgingRunIds.delete(id);
+  }
+}
+
+function closePurgedRunStreams(run, id) {
+  const clients = new Set([...(run.clients ?? []), ...(run.galleryClients ?? [])]);
+  const event = {
+    id: ++run.sequence,
+    type: 'purged',
+    data: { id, message: 'This run and its stored evidence were permanently deleted.' },
+  };
+  for (const client of clients) {
+    if (client.auditHeartbeat) clearInterval(client.auditHeartbeat);
+    client.auditHeartbeat = null;
+    if (!client.writableEnded && !client.destroyed) {
+      writeSse(client, event);
+      client.end();
+    }
+  }
+  run.clients?.clear();
+  run.galleryClients?.clear();
+}
+
+async function verifiedPurgeTarget(configuredRoot, runDirectory, id) {
+  const root = resolve(configuredRoot);
+  const target = resolve(runDirectory);
+  const expected = resolve(root, id);
+  const relativeTarget = relative(root, target);
+  const rootDepth = root.split(sep).filter(Boolean).length;
+  if (root === resolve(sep) || rootDepth < 2 || target === root || target !== expected || relativeTarget !== id) {
+    throw httpError(409, 'Purge refused because the run evidence path failed containment checks.');
+  }
+
+  const [rootStat, targetStat] = await Promise.all([
+    fs.lstat(root).catch(() => null),
+    fs.lstat(target).catch(() => null),
+  ]);
+  if (!rootStat?.isDirectory() || rootStat.isSymbolicLink()) {
+    throw httpError(409, 'Purge refused because the configured artifact root is not a real directory.');
+  }
+  if (!targetStat?.isDirectory() || targetStat.isSymbolicLink()) {
+    throw httpError(409, 'Purge refused because this run is missing or its evidence path is not a real directory.');
+  }
+
+  const [realRoot, realTarget] = await Promise.all([fs.realpath(root), fs.realpath(target)]);
+  if (relative(realRoot, realTarget) !== id || dirname(realTarget) !== realRoot) {
+    throw httpError(409, 'Purge refused because the run evidence resolves outside its configured artifact root.');
+  }
+  return target;
+}
+
+async function measureRunEvidence(root) {
+  const pending = [root];
+  let files = 0;
+  let bytes = allocatedBytes(await fs.lstat(root));
+  let logicalBytes = 0;
+  while (pending.length > 0) {
+    const directory = pending.pop();
+    let entries;
+    try {
+      entries = await fs.readdir(directory, { withFileTypes: true });
+    } catch (error) {
+      if (error?.code === 'ENOENT') {
+        throw httpError(409, 'Run evidence changed while the purge was being prepared. Refresh the run list and retry.');
+      }
+      throw error;
+    }
+    for (const entry of entries) {
+      const path = join(directory, entry.name);
+      const stat = await fs.lstat(path);
+      bytes += allocatedBytes(stat);
+      if (stat.isDirectory() && !stat.isSymbolicLink()) {
+        pending.push(path);
+        continue;
+      }
+      files += 1;
+      logicalBytes += stat.size;
+    }
+  }
+  return { files, bytes, logicalBytes };
+}
+
+function allocatedBytes(stat) {
+  return Number.isFinite(stat.blocks) && stat.blocks >= 0 ? stat.blocks * 512 : stat.size;
+}
+
+function isDirectlyContained(root, path) {
+  const candidate = relative(root, path);
+  return candidate !== '' && candidate !== '..' && !candidate.startsWith(`..${sep}`) && !isAbsolute(candidate);
+}
+
+async function persistManifest(run) {
+  if (run.externalManaged) {
+    throw new Error('Externally launched sharded evidence is read-only in the portal.');
+  }
+  await atomicWriteJson(join(run.directory, 'run.json'), run.manifest);
+}
+
+function openAppendStream(path, label) {
+  return new Promise((resolveStream, rejectStream) => {
+    const stream = createWriteStream(path, { flags: 'a' });
+    const onInitialError = (error) => {
+      stream.removeListener('open', onOpen);
+      rejectStream(error);
+    };
+    const onOpen = () => {
+      stream.removeListener('error', onInitialError);
+      stream.on('error', (error) => {
+        stream.auditWriteError = error;
+        console.error(`Write stream failed for ${label}: ${error.message}`);
+      });
+      resolveStream(stream);
+    };
+    stream.once('error', onInitialError);
+    stream.once('open', onOpen);
+  });
+}
+
+function closeWritableStream(stream) {
+  if (!stream || stream.destroyed || stream.closed) return Promise.resolve();
+  return new Promise((resolveClose) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolveClose();
+    };
+    stream.once('close', finish);
+    stream.end(finish);
+  });
+}
+
+async function atomicWriteJson(path, value) {
+  const temporary = `${path}.${randomBytes(4).toString('hex')}.tmp`;
+  try {
+    await fs.writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: 'utf8', mode: 0o640 });
+    await fs.rename(temporary, path);
+  } finally {
+    await fs.unlink(temporary).catch((error) => {
+      if (error?.code !== 'ENOENT') throw error;
+    });
+  }
+}
+
+function resolvePlaywrightExecutable() {
+  const suffix = process.platform === 'win32' ? '.cmd' : '';
+  const executable = join(REPOSITORY_ROOT, 'node_modules', '.bin', `playwright${suffix}`);
+  if (!isAbsolute(executable)) throw new Error('Playwright executable path is invalid.');
+  return executable;
+}
+
+function resolveToolExecutable(name) {
+  const suffix = process.platform === 'win32' ? '.cmd' : '';
+  return join(REPOSITORY_ROOT, 'node_modules', '.bin', `${name}${suffix}`);
+}
+
+async function initializeSecretVault() {
+  await fs.mkdir(SECRET_ROOT, { recursive: true, mode: 0o700 });
+  await fs.chmod(SECRET_ROOT, 0o700);
+  try {
+    secretMasterKey = await fs.readFile(SECRET_MASTER_PATH);
+    if (secretMasterKey.length !== 32) throw new Error('Portal secret master key has an invalid length.');
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+    secretMasterKey = randomBytes(32);
+    try {
+      await fs.writeFile(SECRET_MASTER_PATH, secretMasterKey, { flag: 'wx', mode: 0o600 });
+    } catch (writeError) {
+      if (writeError?.code !== 'EEXIST') throw writeError;
+      secretMasterKey = await fs.readFile(SECRET_MASTER_PATH);
+    }
+  }
+  await fs.chmod(SECRET_MASTER_PATH, 0o600);
+
+  const environmentKey = process.env.ANTHROPIC_API_KEY;
+  if (environmentKey) sensitiveLogValues.add(environmentKey);
+  try {
+    const envelope = JSON.parse(await fs.readFile(ANTHROPIC_CREDENTIAL_PATH, 'utf8'));
+    const apiKey = decryptCredentialEnvelope(envelope);
+    savedAnthropicCredential = {
+      apiKey,
+      updatedAt: typeof envelope.updatedAt === 'string' ? envelope.updatedAt : null,
+      fingerprint: credentialFingerprint(apiKey),
+    };
+    sensitiveLogValues.add(apiKey);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') {
+      throw new Error(`Saved Anthropic credential could not be loaded: ${error.message}`);
+    }
+  }
+}
+
+function currentAnthropicApiKey() {
+  return savedAnthropicCredential?.apiKey ?? process.env.ANTHROPIC_API_KEY ?? null;
+}
+
+function anthropicCredentialState() {
+  const apiKey = currentAnthropicApiKey();
+  return {
+    configured: Boolean(apiKey),
+    fingerprint: apiKey ? credentialFingerprint(apiKey) : null,
+  };
+}
+
+async function saveAnthropicCredential(input) {
+  const apiKey = input.trim();
+  if (!ANTHROPIC_KEY_PATTERN.test(apiKey)) {
+    throw httpError(400, 'The Anthropic API key format is invalid. Use a newly rotated sk-ant key.');
+  }
+  const updatedAt = new Date().toISOString();
+  const envelope = encryptCredentialEnvelope(apiKey, updatedAt);
+  const temporaryPath = `${ANTHROPIC_CREDENTIAL_PATH}.${randomBytes(4).toString('hex')}.tmp`;
+  await fs.writeFile(temporaryPath, `${JSON.stringify(envelope, null, 2)}\n`, { mode: 0o600 });
+  await fs.rename(temporaryPath, ANTHROPIC_CREDENTIAL_PATH);
+  await fs.chmod(ANTHROPIC_CREDENTIAL_PATH, 0o600);
+  savedAnthropicCredential = { apiKey, updatedAt, fingerprint: credentialFingerprint(apiKey) };
+  sensitiveLogValues.add(apiKey);
+  console.log(`Anthropic credential saved in the portal vault (${savedAnthropicCredential.fingerprint}).`);
+}
+
+async function deleteAnthropicCredential() {
+  if (!savedAnthropicCredential && process.env.ANTHROPIC_API_KEY) {
+    throw httpError(409, 'The configured Anthropic key is managed by the runtime environment and cannot be deleted in the portal. Restart the container without ANTHROPIC_API_KEY to remove it.');
+  }
+  if (savedAnthropicCredential?.apiKey) sensitiveLogValues.add(savedAnthropicCredential.apiKey);
+  savedAnthropicCredential = null;
+  try {
+    await fs.unlink(ANTHROPIC_CREDENTIAL_PATH);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+  console.log('Portal-saved Anthropic credential deleted.');
+}
+
+function encryptCredentialEnvelope(apiKey, updatedAt) {
+  const initializationVector = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', secretMasterKey, initializationVector);
+  cipher.setAAD(Buffer.from('ai-mobile-testing:anthropic-key:v1'));
+  const ciphertext = Buffer.concat([cipher.update(apiKey, 'utf8'), cipher.final()]);
+  return {
+    schemaVersion: 1,
+    algorithm: 'aes-256-gcm',
+    initializationVector: initializationVector.toString('base64'),
+    authenticationTag: cipher.getAuthTag().toString('base64'),
+    ciphertext: ciphertext.toString('base64'),
+    fingerprint: credentialFingerprint(apiKey),
+    updatedAt,
+  };
+}
+
+function decryptCredentialEnvelope(envelope) {
+  if (!envelope || envelope.schemaVersion !== 1 || envelope.algorithm !== 'aes-256-gcm') {
+    throw new Error('Credential envelope version is unsupported.');
+  }
+  const initializationVector = Buffer.from(envelope.initializationVector ?? '', 'base64');
+  const authenticationTag = Buffer.from(envelope.authenticationTag ?? '', 'base64');
+  const ciphertext = Buffer.from(envelope.ciphertext ?? '', 'base64');
+  if (initializationVector.length !== 12 || authenticationTag.length !== 16 || ciphertext.length === 0) {
+    throw new Error('Credential envelope is incomplete.');
+  }
+  const decipher = createDecipheriv('aes-256-gcm', secretMasterKey, initializationVector);
+  decipher.setAAD(Buffer.from('ai-mobile-testing:anthropic-key:v1'));
+  decipher.setAuthTag(authenticationTag);
+  const apiKey = Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString('utf8');
+  if (!ANTHROPIC_KEY_PATTERN.test(apiKey)) throw new Error('Decrypted credential format is invalid.');
+  return apiKey;
+}
+
+function credentialFingerprint(apiKey) {
+  return `sha256:${createHash('sha256').update(apiKey).digest('hex').slice(0, 12)}`;
+}
+
+function sanitizedProcessEnvironment() {
+  const environment = { ...process.env };
+  delete environment.ANTHROPIC_API_KEY;
+  return environment;
+}
+
+function redactLogValue(value) {
+  let redacted = value;
+  for (const secret of sensitiveLogValues) redacted = redacted.split(secret).join('[REDACTED]');
+  return redacted
+    .replace(/sk-ant-[a-zA-Z0-9_-]+/g, '[REDACTED]')
+    .replace(/\b(authorization|x-api-key)\s*[:=]\s*\S+/gi, '$1=[REDACTED]');
+}
+
+function safeResolve(root, requestedPath) {
+  if (requestedPath.includes('\0')) return null;
+  const destination = resolve(root, requestedPath);
+  return destination === root || destination.startsWith(`${root}${sep}`) ? destination : null;
+}
+
+async function resolveContainedRealPath(root, requestedPath) {
+  try {
+    const [realRoot, realFile] = await Promise.all([fs.realpath(root), fs.realpath(requestedPath)]);
+    return realFile === realRoot || realFile.startsWith(`${realRoot}${sep}`) ? realFile : null;
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return null;
+    throw error;
+  }
+}
+
+async function safeStat(path) {
+  try {
+    return await fs.stat(path);
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return null;
+    throw error;
+  }
+}
+
+function assertManualRunReady(run) {
+  if (run.externalManaged) {
+    throw httpError(409, 'Manual evidence for an externally launched run must be managed from its original workflow.');
+  }
+  if (!TERMINAL_STATUSES.has(run.manifest.status) || run.child) {
+    throw httpError(409, 'Manual evidence can be added only after the automated run and evidence pipeline finish.');
+  }
+  if (run.manifest.status === 'stopped' || run.manifest.status === 'spawn-failed') {
+    throw httpError(409, 'Start a complete automated run before attaching manual acceptance evidence.');
+  }
+}
+
+async function withManualMutation(run, operation) {
+  const id = run.manifest.id;
+  if (manualMutationRunIds.has(id)) {
+    throw httpError(409, 'Another manual evidence upload or attestation rebuild is already running for this run.');
+  }
+  manualMutationRunIds.add(id);
+  try {
+    return await operation();
+  } finally {
+    manualMutationRunIds.delete(id);
+  }
+}
+
+async function readManualEvidence(run) {
+  try {
+    const document = JSON.parse(await fs.readFile(join(run.directory, 'manual-evidence.json'), 'utf8'));
+    return document?.schemaVersion === 1 && Array.isArray(document.uploads) && Array.isArray(document.entries)
+      ? document
+      : { schemaVersion: 1, uploads: [], entries: [], updatedAt: null };
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { schemaVersion: 1, uploads: [], entries: [], updatedAt: null };
+    throw error;
+  }
+}
+
+async function receiveManualUpload(run, request, requestUrl) {
+  assertManualRunReady(run);
+  const auditId = requestUrl.searchParams.get('auditId') ?? '';
+  if (!MANUAL_AUDIT_IDS.has(auditId)) throw httpError(400, 'Choose a catalogued manual audit.');
+  const contentType = String(request.headers['content-type'] ?? '').split(';')[0].toLowerCase();
+  const allowedTypes = new Set(['video/webm', 'video/mp4', 'image/png', 'image/jpeg']);
+  if (!allowedTypes.has(contentType)) throw httpError(415, 'Manual evidence must be WebM, MP4, PNG, or JPEG.');
+  const declaredBytes = Number(request.headers['content-length'] ?? 0);
+  if (declaredBytes > MAX_MANUAL_UPLOAD_BYTES) throw httpError(413, 'Manual evidence exceeds the 500 MB upload limit.');
+  const suppliedName = basename(requestUrl.searchParams.get('filename') ?? 'manual-evidence')
+    .replace(/[^a-zA-Z0-9._-]+/g, '-')
+    .slice(0, 120);
+  const extension = contentType === 'video/webm' ? '.webm'
+    : contentType === 'video/mp4' ? '.mp4'
+      : contentType === 'image/png' ? '.png' : '.jpg';
+  const normalizedName = suppliedName.toLowerCase().endsWith(extension) ? suppliedName : `${suppliedName}${extension}`;
+  const uploadId = `${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`;
+  const directory = join(run.directory, 'manual-evidence', auditId);
+  const target = join(directory, `${uploadId}-${normalizedName}`);
+  const temporary = `${target}.uploading`;
+  await fs.mkdir(directory, { recursive: true });
+  const handle = await fs.open(temporary, 'wx', 0o640);
+  const hash = createHash('sha256');
+  let bytes = 0;
+  try {
+    for await (const chunk of request) {
+      bytes += chunk.length;
+      if (bytes > MAX_MANUAL_UPLOAD_BYTES) throw httpError(413, 'Manual evidence exceeds the 500 MB upload limit.');
+      hash.update(chunk);
+      let offset = 0;
+      while (offset < chunk.length) {
+        const { bytesWritten } = await handle.write(chunk, offset, chunk.length - offset);
+        if (bytesWritten < 1) throw new Error('Manual evidence upload stopped making write progress.');
+        offset += bytesWritten;
+      }
+    }
+  } catch (error) {
+    await handle.close();
+    await fs.unlink(temporary).catch(() => undefined);
+    throw error;
+  }
+  await handle.close();
+  if (bytes === 0) {
+    await fs.unlink(temporary).catch(() => undefined);
+    throw httpError(400, 'Manual evidence upload is empty.');
+  }
+  let committed = false;
+  try {
+    const validation = await validateUploadedMedia(temporary, contentType);
+    await fs.rename(temporary, target);
+    committed = true;
+    const document = await readManualEvidence(run);
+    const upload = {
+      id: uploadId,
+      auditId,
+      name: normalizedName,
+      contentType,
+      bytes,
+      sha256: hash.digest('hex'),
+      path: relative(run.directory, target).split(sep).join('/'),
+      uploadedAt: new Date().toISOString(),
+      validation,
+    };
+    document.uploads.push(upload);
+    document.updatedAt = upload.uploadedAt;
+    await atomicWriteJson(join(run.directory, 'manual-evidence.json'), document);
+    return upload;
+  } catch (error) {
+    await fs.unlink(temporary).catch(() => undefined);
+    if (committed) await fs.unlink(target).catch(() => undefined);
+    throw error;
+  }
+}
+
+async function validateUploadedMedia(path, contentType) {
+  const signatureHandle = await fs.open(path, 'r');
+  const signature = Buffer.alloc(16);
+  let signatureBytes = 0;
+  try {
+    ({ bytesRead: signatureBytes } = await signatureHandle.read(signature, 0, signature.length, 0));
+  } finally {
+    await signatureHandle.close();
+  }
+  if (!matchesMediaSignature(signature.subarray(0, signatureBytes), contentType)) {
+    throw httpError(422, `The uploaded bytes do not match ${contentType}.`);
+  }
+
+  const ffmpeg = process.env.FFMPEG_PATH ?? 'ffmpeg';
+  const configuredProbe = process.env.FFPROBE_PATH;
+  const ffprobe = configuredProbe ?? (basename(ffmpeg).startsWith('ffmpeg')
+    ? join(dirname(ffmpeg), basename(ffmpeg).replace(/^ffmpeg/, 'ffprobe'))
+    : 'ffprobe');
+  const probe = await runBoundedMediaCommand(ffprobe, [
+    '-v', 'error',
+    '-select_streams', 'v:0',
+    '-show_entries', 'stream=codec_type,codec_name,width,height',
+    '-of', 'json',
+    path,
+  ]);
+  if (probe.spawnError) throw httpError(503, 'Media validation is unavailable because ffprobe could not start.');
+  if (probe.timedOut || probe.exitCode !== 0) {
+    throw httpError(422, 'Manual evidence could not be decoded as the declared visual media type.');
+  }
+  let stream;
+  try {
+    stream = JSON.parse(probe.stdout)?.streams?.[0];
+  } catch {
+    // The uniform invalid-media error below keeps tool output out of responses.
+  }
+  if (stream?.codec_type !== 'video' || !Number.isInteger(stream.width) || stream.width < 1
+    || !Number.isInteger(stream.height) || stream.height < 1) {
+    throw httpError(422, 'Manual evidence must contain a decodable visual stream with valid dimensions.');
+  }
+
+  const decode = await runBoundedMediaCommand(ffmpeg, [
+    '-v', 'error', '-xerror', '-i', path,
+    '-map', '0:v:0', '-frames:v', '1', '-f', 'null', '-',
+  ]);
+  if (decode.spawnError) throw httpError(503, 'Media validation is unavailable because ffmpeg could not start.');
+  if (decode.timedOut || decode.exitCode !== 0) {
+    throw httpError(422, 'Manual evidence does not contain a decodable visual frame.');
+  }
+  return {
+    valid: true,
+    method: 'signature+ffprobe+ffmpeg-first-frame',
+    codec: String(stream.codec_name ?? 'unknown').slice(0, 40),
+    width: stream.width,
+    height: stream.height,
+    validatedAt: new Date().toISOString(),
+  };
+}
+
+function matchesMediaSignature(bytes, contentType) {
+  if (contentType === 'image/png') {
+    return bytes.length >= 8 && bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  }
+  if (contentType === 'image/jpeg') {
+    return bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
+  }
+  if (contentType === 'video/webm') {
+    return bytes.length >= 4 && bytes.subarray(0, 4).equals(Buffer.from([0x1a, 0x45, 0xdf, 0xa3]));
+  }
+  if (contentType === 'video/mp4') {
+    return bytes.length >= 12 && bytes.subarray(4, 8).toString('ascii') === 'ftyp';
+  }
+  return false;
+}
+
+function runBoundedMediaCommand(executable, args) {
+  return new Promise((resolveCommand) => {
+    const child = spawn(executable, args, { cwd: REPOSITORY_ROOT, shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
+    const output = { stdout: '', stderr: '' };
+    let settled = false;
+    let timedOut = false;
+    const append = (key, chunk) => {
+      const remaining = MAX_MEDIA_VALIDATION_OUTPUT_BYTES - Buffer.byteLength(output[key]);
+      if (remaining > 0) output[key] += chunk.toString('utf8', 0, remaining);
+    };
+    child.stdout?.on('data', (chunk) => append('stdout', chunk));
+    child.stderr?.on('data', (chunk) => append('stderr', chunk));
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolveCommand({ ...output, timedOut, ...result });
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGKILL');
+    }, MEDIA_VALIDATION_TIMEOUT_MS);
+    timer.unref();
+    child.once('error', (error) => finish({ exitCode: null, spawnError: error.message }));
+    child.once('close', (exitCode, signal) => finish({ exitCode, signal, spawnError: null }));
+  });
+}
+
+async function recordManualEvidence(run, body) {
+  assertManualRunReady(run);
+  if (!body || typeof body !== 'object' || Array.isArray(body) || body.confirmed !== true) {
+    throw httpError(400, 'Confirm the manual attestation before saving it.');
+  }
+  const auditId = typeof body.auditId === 'string' ? body.auditId : '';
+  if (!MANUAL_AUDIT_IDS.has(auditId)) throw httpError(400, 'Choose a catalogued manual audit.');
+  const outcome = typeof body.outcome === 'string' ? body.outcome : '';
+  if (!['pass', 'fail', 'blocked'].includes(outcome)) throw httpError(400, 'Manual outcome must be pass, fail, or blocked.');
+  const reviewer = typeof body.reviewer === 'string' ? body.reviewer.trim().slice(0, 120) : '';
+  const device = typeof body.device === 'string' ? body.device.trim().slice(0, 200) : '';
+  const notes = typeof body.notes === 'string' ? body.notes.trim().slice(0, 4_000) : '';
+  if (reviewer.length < 2 || device.length < 2 || notes.length < 10) {
+    throw httpError(400, 'Reviewer, device/browser, and detailed notes are required.');
+  }
+  const uploadIds = uniqueStrings(body.uploadIds);
+  const document = await readManualEvidence(run);
+  const attachments = document.uploads.filter((upload) => upload.auditId === auditId
+    && uploadIds.includes(upload.id)
+    && upload.validation?.valid === true);
+  if (attachments.length !== uploadIds.length) {
+    throw httpError(400, 'Every selected attachment must be a validated upload for this audit.');
+  }
+  if (outcome === 'pass' && !attachments.some(({ contentType }) => contentType.startsWith('video/'))) {
+    throw httpError(400, 'A passing manual acceptance requires an attached video.');
+  }
+  const screenshotRequired = new Set(['A11Y-003', 'DEVICE-001', 'DEVICE-002', 'DEVICE-003']).has(auditId);
+  if (outcome === 'pass' && screenshotRequired && !attachments.some(({ contentType }) => contentType.startsWith('image/'))) {
+    throw httpError(400, 'This passing manual acceptance also requires a screenshot.');
+  }
+  const attestation = {
+    auditId,
+    outcome,
+    reviewer,
+    device,
+    notes,
+    attestedAt: new Date().toISOString(),
+    attachments,
+  };
+  document.entries = document.entries.filter((entry) => entry.auditId !== auditId);
+  document.entries.push(attestation);
+  document.updatedAt = attestation.attestedAt;
+  await atomicWriteJson(join(run.directory, 'manual-evidence.json'), document);
+  await rebuildAfterManualEvidence(run, auditId);
+  return attestation;
+}
+
+async function rebuildAfterManualEvidence(run, auditId) {
+  const logDirectory = join(run.directory, 'logs');
+  let logStream = null;
+  let lifecycleStream = null;
+  try {
+    logStream = await openAppendStream(join(logDirectory, 'runner.log'), `${run.manifest.id} manual rebuild runner log`);
+    lifecycleStream = await openAppendStream(join(logDirectory, 'lifecycle.jsonl'), `${run.manifest.id} manual rebuild lifecycle log`);
+  } catch (error) {
+    await closeWritableStream(logStream);
+    await closeWritableStream(lifecycleStream);
+    applyPipelineFailure(run, `manual evidence rebuild log initialization failed: ${error.message}`);
+    run.manifest.finishedAt = new Date().toISOString();
+    await persistManifest(run);
+    appendEvent(run, 'status', {
+      status: run.manifest.status,
+      message: terminalMessage(run.manifest),
+      manifest: publicManifest(run.manifest),
+    });
+    throw httpError(500, 'Manual evidence was recorded, but its checklist rebuild could not open the required logs. The run is marked evidence-failed.');
+  }
+  run.logStream = logStream;
+  run.lifecycleStream = lifecycleStream;
+  run.manifest.stages.manualEvidenceRebuild = stageRecord('pending', [
+    'tsx', 'scripts/rebuild-report.ts', '--run-dir', run.directory,
+  ]);
+  run.manifest.status = 'running';
+  run.manifest.phase = `Rebuilding checklist after ${auditId} manual attestation`;
+  run.manifest.pipeline = {
+    status: 'running',
+    completed: false,
+    reason: `Recalculating release truth after ${auditId} manual evidence.`,
+    finishedAt: null,
+  };
+  run.manifest.release = pendingRelease();
+  await persistManifest(run);
+  appendEvent(run, 'status', {
+    status: run.manifest.status,
+    message: run.manifest.phase,
+    manifest: publicManifest(run.manifest),
+  });
+  let unexpectedError = null;
+  try {
+    await executeStage(
+      run,
+      'manualEvidenceRebuild',
+      run.manifest.phase,
+      resolveToolExecutable('tsx'),
+      ['scripts/rebuild-report.ts', '--run-dir', run.directory],
+      { AUDIT_ARTIFACT_DIR: run.directory, AUDIT_OUTPUT_DIR: join(run.directory, 'checklist') },
+    );
+    if (run.manifest.stages.manualEvidenceRebuild.status !== 'completed') {
+      applyPipelineFailure(run, `manual evidence checklist rebuild failed for ${auditId}`);
+    } else {
+      try {
+        applyCompletedRelease(
+          run,
+          await authoritativeReleaseForRun(run),
+          `Manual evidence saved · checklist rebuilt for ${auditId}`,
+        );
+      } catch (error) {
+        applyPipelineFailure(run, error.message);
+      }
+    }
+    run.manifest.finishedAt = new Date().toISOString();
+    await persistManifest(run);
+    appendEvent(run, 'status', {
+      status: run.manifest.status,
+      message: terminalMessage(run.manifest),
+      manifest: publicManifest(run.manifest),
+    });
+  } catch (error) {
+    unexpectedError = error;
+    applyPipelineFailure(run, `manual evidence rebuild crashed: ${error.message}`);
+    run.manifest.finishedAt = new Date().toISOString();
+    await persistManifest(run);
+    appendEvent(run, 'status', {
+      status: run.manifest.status,
+      message: terminalMessage(run.manifest),
+      manifest: publicManifest(run.manifest),
+    });
+  } finally {
+    await closeWritableStream(run.logStream);
+    await closeWritableStream(run.lifecycleStream);
+    run.logStream = null;
+    run.lifecycleStream = null;
+  }
+  if (unexpectedError) throw unexpectedError;
+}
+
+async function readJsonBody(request) {
+  const chunks = [];
+  let bytes = 0;
+  for await (const chunk of request) {
+    bytes += chunk.length;
+    if (bytes > MAX_BODY_BYTES) throw httpError(413, 'Request body is too large.');
+    chunks.push(chunk);
+  }
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  } catch {
+    throw httpError(400, 'Request body must contain valid JSON.');
+  }
+}
+
+function sendJson(response, status, value) {
+  if (response.headersSent || response.destroyed || response.writableEnded) return;
+  const body = `${JSON.stringify(value)}\n`;
+  response.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': Buffer.byteLength(body),
+    'Cache-Control': 'no-store',
+    'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'",
+    'X-Content-Type-Options': 'nosniff',
+  });
+  response.end(body);
+}
+
+function uniqueStrings(value) {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.some((item) => typeof item !== 'string')) {
+    throw httpError(400, 'Selections must be arrays of strings.');
+  }
+  return [...new Set(value)];
+}
+
+function queryInteger(value, name, defaultValue, minimum, maximum) {
+  if (value === null || value === '') return defaultValue;
+  if (!/^\d+$/.test(value)) throw httpError(400, `${name} must be an integer.`);
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < minimum || parsed > maximum) {
+    throw httpError(400, `${name} must be from ${minimum} to ${maximum}.`);
+  }
+  return parsed;
+}
+
+function assertMutationRequest(request) {
+  const contentType = request.headers['content-type'] ?? '';
+  if (!contentType.toLowerCase().startsWith('application/json')) {
+    throw httpError(415, 'Mutation requests must use application/json.');
+  }
+  assertSameOrigin(request);
+}
+
+function assertSameOrigin(request) {
+  const authority = assertAllowedRequestHost(request);
+  const fetchSite = request.headers['sec-fetch-site'];
+  if (fetchSite && fetchSite !== 'same-origin') {
+    throw httpError(403, 'Cross-origin mutation requests are not allowed.');
+  }
+  const origin = request.headers.origin;
+  // Browser mutations always carry Origin/Sec-Fetch-Site. Origin-less direct
+  // API calls remain available only across the independently enforced local
+  // socket + Host boundary above.
+  if (!origin) return;
+  const expectedOrigin = `http://${authority}`;
+  if (origin !== expectedOrigin) throw httpError(403, 'Cross-origin mutation requests are not allowed.');
+}
+
+function assertAllowedRequestHost(request) {
+  const rawHost = String(request.headers.host ?? '').trim();
+  let parsed;
+  try {
+    parsed = new URL(`http://${rawHost}`);
+  } catch {
+    throw httpError(403, 'Portal requests require an allowed local Host.');
+  }
+  const hostname = parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  if (!rawHost || parsed.username || parsed.password || parsed.pathname !== '/'
+    || parsed.search || parsed.hash || !ALLOWED_PORTAL_HOSTS.has(hostname)) {
+    throw httpError(403, 'Portal requests require an allowed local Host.');
+  }
+  const remoteAddress = String(request.socket.remoteAddress ?? '').toLowerCase();
+  const loopbackSocket = remoteAddress === '::1'
+    || remoteAddress === '127.0.0.1'
+    || remoteAddress.startsWith('::ffff:127.');
+  if (!loopbackSocket && process.env.PORTAL_LOOPBACK_PUBLISHED !== '1') {
+    throw httpError(403, 'Portal requests are available only through the loopback-published service.');
+  }
+  return parsed.host;
+}
+
+function escapeRegex(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function stripTerminalCodes(value) {
+  return value.replace(/[\u001B\u009B][[\]()#;?]*(?:(?:(?:;[-a-zA-Z\d\/#&.:=?%@~_]+)*|[a-zA-Z\d]+(?:;[-a-zA-Z\d\/#&.:=?%@~_]*)*)?\u0007|(?:(?:\d{1,4}(?:;\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]))/g, '');
+}
+
+function makeRunId() {
+  const timestamp = new Date().toISOString().replace(/\.\d{3}Z$/, 'z').replaceAll(':', '-').toLowerCase();
+  return `${timestamp}-${randomBytes(3).toString('hex')}`;
+}
+
+function terminalMessage(manifest) {
+  if (manifest.status === 'passed') {
+    return `Evidence pipeline completed; checklist release decision: READY. ${manifest.release?.reason ?? ''}`.trim();
+  }
+  if (manifest.status === 'not-ready') {
+    const reviews = Array.isArray(manifest.reviewReasons) && manifest.reviewReasons.length > 0
+      ? ` Additional review requirements: ${manifest.reviewReasons.join('; ')}.`
+      : '';
+    return `Evidence pipeline completed; checklist release decision: NOT READY. ${manifest.release?.reason ?? ''}${reviews}`.replace(/\s+/g, ' ').trim();
+  }
+  if (manifest.status === 'review-required') {
+    const reasons = Array.isArray(manifest.reviewReasons) && manifest.reviewReasons.length > 0
+      ? manifest.reviewReasons.join('; ')
+      : 'the run is not eligible for an automatic release decision';
+    const checklistDecision = manifest.release?.decision?.replace('_', ' ') ?? 'UNAVAILABLE';
+    return `Evidence pipeline completed; checklist decision: ${checklistDecision}. Release signoff is withheld. ${manifest.release?.reason ?? ''} Review requirements: ${reasons}.`.replace(/\s+/g, ' ').trim();
+  }
+  if (manifest.status === 'evidence-failed') {
+    return `Evidence pipeline failed; no authoritative release decision is available. ${manifest.pipeline?.reason ?? ''}`.trim();
+  }
+  if (manifest.status === 'stopped') return 'Audit was stopped.';
+  if (manifest.status === 'spawn-failed') return 'Playwright could not be started.';
+  return `Evidence pipeline failed${manifest.exitCode === null ? '' : `; browser process exit code ${manifest.exitCode}`}.`;
+}
+
+function parseInteger(value, fallback, minimum, maximum) {
+  const parsed = Number.parseInt(value ?? '', 10);
+  return Number.isInteger(parsed) && parsed >= minimum && parsed <= maximum ? parsed : fallback;
+}
+
+function stringOrNull(value) {
+  return typeof value === 'string' ? value.slice(0, 200) : null;
+}
+
+function binaryEnvironmentFlag(name, defaultValue) {
+  const value = process.env[name];
+  if (value === undefined) return defaultValue;
+  if (value === '1') return true;
+  if (value === '0') return false;
+  throw new Error(`${name} must be exactly 0 or 1.`);
+}
+
+function numberOrNull(value) {
+  const number = typeof value === 'number'
+    ? value
+    : typeof value === 'string' && /^\d+(?:\.\d+)?$/.test(value)
+      ? Number(value)
+      : Number.NaN;
+  return Number.isFinite(number) ? number : null;
+}
+
+function parseByteRange(header, size) {
+  if (!header) return null;
+  const match = header.match(/^bytes=(\d*)-(\d*)$/);
+  if (!match || size === 0) throw httpError(416, 'Requested byte range is not satisfiable.');
+  let start;
+  let end;
+  if (match[1] === '') {
+    const suffixLength = Number(match[2]);
+    if (!Number.isInteger(suffixLength) || suffixLength <= 0) throw httpError(416, 'Requested byte range is not satisfiable.');
+    start = Math.max(0, size - suffixLength);
+    end = size - 1;
+  } else {
+    start = Number(match[1]);
+    end = match[2] === '' ? size - 1 : Number(match[2]);
+  }
+  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || start >= size || end < start) {
+    throw httpError(416, 'Requested byte range is not satisfiable.');
+  }
+  return { start, end: Math.min(end, size - 1) };
+}
+
+function httpError(statusCode, message) {
+  return Object.assign(new Error(message), { statusCode });
+}

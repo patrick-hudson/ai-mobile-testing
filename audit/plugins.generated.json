@@ -1,0 +1,1621 @@
+{
+  "schemaVersion": 1,
+  "plugins": [
+    {
+      "id": "accessibility-responsive-performance-reliability",
+      "version": "1.0.0",
+      "name": "Accessibility, responsive, performance, and reliability",
+      "description": "WCAG scans and keyboard journeys, reduced motion, browser performance evidence, layout stability, resilient dependencies, and manual real-device acceptance gates.",
+      "tags": [
+        "core",
+        "accessibility",
+        "responsive",
+        "performance",
+        "reliability"
+      ],
+      "auditDefinitions": [
+        {
+          "id": "A11Y-001",
+          "area": "accessibility",
+          "title": "Automated WCAG scan",
+          "userPromise": "Common accessibility barriers are caught before release.",
+          "expected": "Representative pages and every opened overlay have no unapproved WCAG A/AA axe violations.",
+          "severity": "P0",
+          "releaseBlocking": true,
+          "evidence": [
+            "screenshot",
+            "axe",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "static-screenshot",
+            "rationale": "Capture the rendered state and structured evidence proving: Representative pages and every opened overlay have no unapproved WCAG A/AA axe violations."
+          },
+          "manual": false
+        },
+        {
+          "id": "A11Y-002",
+          "area": "accessibility",
+          "title": "Keyboard-only journeys",
+          "userPromise": "Critical tasks can be completed without a pointer.",
+          "expected": "Navigation, search, calculators, disclosures, and meeting filters have logical focus order and visible focus.",
+          "severity": "P0",
+          "releaseBlocking": true,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Complete the critical keyboard journey and show focus, dialog, search, and Escape responses."
+          },
+          "manual": false
+        },
+        {
+          "id": "A11Y-003",
+          "area": "accessibility",
+          "title": "Zoom and text reflow",
+          "userPromise": "Low-vision readers retain all content and controls.",
+          "expected": "Critical pages work at 200% and 400% zoom without two-dimensional page scrolling.",
+          "severity": "P0",
+          "releaseBlocking": true,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Change browser zoom and show critical controls and content reflowing without loss."
+          },
+          "manual": true
+        },
+        {
+          "id": "A11Y-004",
+          "area": "accessibility",
+          "title": "Screen-reader acceptance",
+          "userPromise": "Live updates and controls make sense without sight.",
+          "expected": "VoiceOver announces dialogs, search results, copy feedback, scores, and live meeting changes.",
+          "severity": "P0",
+          "releaseBlocking": true,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Operate critical controls with a screen reader and capture their spoken state changes."
+          },
+          "manual": true
+        },
+        {
+          "id": "A11Y-005",
+          "area": "accessibility",
+          "title": "Reduced motion and non-color cues",
+          "userPromise": "Motion-sensitive and color-impaired readers receive equivalent information.",
+          "expected": "Motion is reduced and status remains understandable without relying on color.",
+          "severity": "P1",
+          "releaseBlocking": true,
+          "evidence": [
+            "screenshot",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "static-screenshot",
+            "rationale": "Capture the rendered state and structured evidence proving: Motion is reduced and status remains understandable without relying on color."
+          },
+          "manual": false
+        },
+        {
+          "id": "REL-002",
+          "area": "reliability",
+          "title": "Blocked browser storage",
+          "userPromise": "Privacy settings do not make core controls unusable.",
+          "expected": "Theme, sidebar, calculator, and history controls still work for the current page when storage is unavailable.",
+          "severity": "P1",
+          "releaseBlocking": true,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Operate theme and calculator controls with storage blocked and show current-page behavior surviving."
+          },
+          "manual": false
+        },
+        {
+          "id": "REL-003",
+          "area": "reliability",
+          "title": "Slow and failed dependencies",
+          "userPromise": "Third-party outages do not block urgent site content.",
+          "expected": "Analytics, Discord, and meeting dependency failures degrade locally and visibly where needed.",
+          "severity": "P1",
+          "releaseBlocking": true,
+          "evidence": [
+            "screenshot",
+            "network",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "static-screenshot",
+            "rationale": "Capture the rendered state and structured evidence proving: Analytics, Discord, and meeting dependency failures degrade locally and visibly where needed."
+          },
+          "manual": false
+        },
+        {
+          "id": "PERF-001",
+          "area": "performance",
+          "title": "Page performance budgets",
+          "userPromise": "Core guidance appears quickly on ordinary mobile connections.",
+          "expected": "Representative templates meet agreed Lighthouse and resource budgets without regression.",
+          "severity": "P1",
+          "releaseBlocking": true,
+          "evidence": [
+            "screenshot",
+            "lighthouse",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "static-screenshot",
+            "rationale": "Capture the rendered state and structured evidence proving: Representative templates meet agreed Lighthouse and resource budgets without regression."
+          },
+          "manual": false
+        },
+        {
+          "id": "PERF-002",
+          "area": "performance",
+          "title": "Layout stability",
+          "userPromise": "Late hydration does not move controls out from under the reader.",
+          "expected": "Observed layout shift and post-load geometry remain within the configured budget.",
+          "severity": "P1",
+          "releaseBlocking": true,
+          "evidence": [
+            "screenshot",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "static-screenshot",
+            "rationale": "Capture the rendered state and structured evidence proving: Observed layout shift and post-load geometry remain within the configured budget."
+          },
+          "manual": false
+        },
+        {
+          "id": "DEVICE-001",
+          "area": "responsive",
+          "title": "Real iPhone Safari acceptance",
+          "userPromise": "The launch works in the browser used by many mobile readers.",
+          "expected": "Critical journeys pass on current and small-screen physical iPhones.",
+          "severity": "P0",
+          "releaseBlocking": true,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Complete critical tap, navigation, form, and scroll journeys on physical iPhone Safari."
+          },
+          "manual": true
+        },
+        {
+          "id": "DEVICE-002",
+          "area": "responsive",
+          "title": "Real Android Chrome acceptance",
+          "userPromise": "The launch works on representative physical Android hardware.",
+          "expected": "Critical journeys pass on a current physical Pixel or Samsung device.",
+          "severity": "P0",
+          "releaseBlocking": true,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Complete critical tap, navigation, form, and scroll journeys on physical Android Chrome."
+          },
+          "manual": true
+        },
+        {
+          "id": "DEVICE-003",
+          "area": "responsive",
+          "title": "Real iPad Safari acceptance",
+          "userPromise": "Tablet readers receive a deliberate layout rather than a stretched phone page.",
+          "expected": "Critical journeys pass in portrait and landscape on a physical iPad.",
+          "severity": "P1",
+          "releaseBlocking": true,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Complete critical touch and rotation journeys on a physical iPad in both orientations."
+          },
+          "manual": true
+        }
+      ],
+      "entrySpecs": [
+        "tests/accessibility.spec.ts",
+        "tests/performance.spec.ts",
+        "tests/shell-content.spec.ts"
+      ],
+      "supportedProjects": [
+        "production-mobile-chromium",
+        "candidate-mobile-chromium",
+        "production-desktop-chromium",
+        "candidate-desktop-chromium",
+        "candidate-mobile-webkit",
+        "candidate-tablet-webkit",
+        "candidate-desktop-firefox"
+      ]
+    },
+    {
+      "id": "calculators-sows",
+      "version": "1.0.0",
+      "name": "Calculators and SOWS",
+      "description": "Taper arithmetic, calculator persistence and export, SR-17 protocols, SOWS scoring and interpretation, and related clipboard flows.",
+      "tags": [
+        "core",
+        "calculators",
+        "sows",
+        "medical-tools"
+      ],
+      "auditDefinitions": [
+        {
+          "id": "CALC-001",
+          "area": "calculators",
+          "title": "Taper defaults and derived totals",
+          "userPromise": "Calculator defaults produce an internally coherent plan.",
+          "expected": "Defaults and total-daily math match each selected substance.",
+          "severity": "P0",
+          "releaseBlocking": true,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Select calculator inputs and show derived dose totals updating coherently."
+          },
+          "manual": false
+        },
+        {
+          "id": "CALC-002",
+          "area": "calculators",
+          "title": "Taper input boundaries",
+          "userPromise": "Unexpected input cannot create a misleading or broken plan.",
+          "expected": "Blank, decimal, minimum, maximum, and malformed input are handled visibly and safely.",
+          "severity": "P0",
+          "releaseBlocking": true,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Enter boundary and malformed calculator values and show visible safe handling."
+          },
+          "manual": false
+        },
+        {
+          "id": "CALC-003",
+          "area": "calculators",
+          "title": "Taper schedule generation",
+          "userPromise": "A reader receives mathematically correct day-by-day output.",
+          "expected": "Preset and custom schedules reach the requested jump-off with correct totals and frequency transitions.",
+          "severity": "P0",
+          "releaseBlocking": true,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Configure a custom taper and show the generated day-by-day schedule responding."
+          },
+          "manual": false
+        },
+        {
+          "id": "CALC-004",
+          "area": "calculators",
+          "title": "Calculator responsive output",
+          "userPromise": "Charts and schedules remain readable on a phone.",
+          "expected": "Chart, summary cards, tables, and touch hints render without page-level overflow.",
+          "severity": "P1",
+          "releaseBlocking": true,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Change calculator inputs at a mobile viewport and show responsive output remaining usable."
+          },
+          "manual": false
+        },
+        {
+          "id": "CALC-005",
+          "area": "calculators",
+          "title": "Calculator persistence and reset",
+          "userPromise": "Work survives an accidental reload and can be deliberately cleared.",
+          "expected": "Inputs persist per calculator, do not leak between tools, and reset to documented defaults.",
+          "severity": "P1",
+          "releaseBlocking": true,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Change, reload, and reset calculator inputs and show persistence followed by deliberate clearing."
+          },
+          "manual": false
+        },
+        {
+          "id": "CALC-006",
+          "area": "calculators",
+          "title": "Calculator export actions",
+          "userPromise": "A plan can be copied or printed with understandable confirmation.",
+          "expected": "Schedule copy, AI-prompt copy, print window, and popup-blocked fallback behave correctly.",
+          "severity": "P1",
+          "releaseBlocking": true,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Use calculator copy and print actions and show the exported plan and confirmations."
+          },
+          "manual": false
+        },
+        {
+          "id": "CALC-007",
+          "area": "calculators",
+          "title": "SR-17 simple protocol",
+          "userPromise": "Simple mode produces the documented 7, 10, and 14-day protocols.",
+          "expected": "Dose tiers, schedule phases, totals, and 50 mg tablet supply calculations are correct.",
+          "severity": "P0",
+          "releaseBlocking": true,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Choose SR-17 simple protocol controls and show each documented schedule being generated."
+          },
+          "manual": false
+        },
+        {
+          "id": "CALC-008",
+          "area": "calculators",
+          "title": "SR-17 advanced protocol",
+          "userPromise": "Advanced controls produce a coherent cross-taper.",
+          "expected": "Allergy, preload, source reduction, hold, and SR step-down modes update the schedule correctly.",
+          "severity": "P0",
+          "releaseBlocking": true,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Change SR-17 advanced controls and show each cross-taper phase updating."
+          },
+          "manual": false
+        },
+        {
+          "id": "CALC-009",
+          "area": "calculators",
+          "title": "Calculator arithmetic unit coverage",
+          "userPromise": "Interface evidence is backed by deterministic numeric tests.",
+          "expected": "Pure schedule generators pass representative, edge, and invariant-based unit cases.",
+          "severity": "P0",
+          "releaseBlocking": true,
+          "evidence": [
+            "screenshot",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "static-screenshot",
+            "rationale": "Capture the rendered state and structured evidence proving: Pure schedule generators pass representative, edge, and invariant-based unit cases."
+          },
+          "manual": false
+        },
+        {
+          "id": "SOWS-001",
+          "area": "sows",
+          "title": "SOWS scoring interaction",
+          "userPromise": "A reader can score every withdrawal symptom accurately.",
+          "expected": "All 16 items accept values zero through four and totals update after each answer.",
+          "severity": "P0",
+          "releaseBlocking": true,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Answer all withdrawal items and show the visible total updating after each choice."
+          },
+          "manual": false
+        },
+        {
+          "id": "SOWS-002",
+          "area": "sows",
+          "title": "SOWS interpretation",
+          "userPromise": "Score guidance changes at the documented thresholds.",
+          "expected": "Partial, moderate, induction-window, and high-score states display the correct interpretation.",
+          "severity": "P0",
+          "releaseBlocking": true,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Change SOWS answers across thresholds and show the interpretation responding."
+          },
+          "manual": false
+        },
+        {
+          "id": "SOWS-003",
+          "area": "sows",
+          "title": "SOWS logging and reset",
+          "userPromise": "A reader can preserve or clear a score without ambiguity.",
+          "expected": "Copy produces the visible score and timestamp; reset returns every item to zero.",
+          "severity": "P1",
+          "releaseBlocking": true,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Copy, collapse, reopen, and reset a SOWS score and show each state transition."
+          },
+          "manual": false
+        },
+        {
+          "id": "SHARE-001",
+          "area": "content",
+          "title": "Quickstart disclosures and copy",
+          "userPromise": "Compact setup information can be expanded and shared.",
+          "expected": "Disclosure, Reddit starter copy, and clipboard feedback work with denied-clipboard fallback.",
+          "severity": "P2",
+          "releaseBlocking": false,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Activate the quickstart copy action and show clipboard contents and visible confirmation."
+          },
+          "manual": false
+        }
+      ],
+      "entrySpecs": [
+        "tests/calculators.spec.ts",
+        "tests/shell-content.spec.ts",
+        "tests/sows.spec.ts"
+      ],
+      "supportedProjects": [
+        "production-mobile-chromium",
+        "candidate-mobile-chromium",
+        "production-desktop-chromium",
+        "candidate-desktop-chromium",
+        "candidate-mobile-webkit",
+        "candidate-tablet-webkit",
+        "candidate-desktop-firefox"
+      ]
+    },
+    {
+      "id": "meetings",
+      "version": "1.0.0",
+      "name": "Meeting discovery and timing",
+      "description": "Deterministic meeting states, timezone conversion, history, directory filters, join links, copy actions, and dependency failure behavior.",
+      "tags": [
+        "core",
+        "meetings",
+        "timezones",
+        "reliability"
+      ],
+      "auditDefinitions": [
+        {
+          "id": "MEET-001",
+          "area": "meetings",
+          "title": "Meeting state transitions",
+          "userPromise": "Live and upcoming meeting labels are time-accurate.",
+          "expected": "Frozen pre-live, live, end-boundary, and no-specific-meeting states are correct.",
+          "severity": "P0",
+          "releaseBlocking": true,
+          "evidence": [
+            "screenshot",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "static-screenshot",
+            "rationale": "Capture the rendered state and structured evidence proving: Frozen pre-live, live, end-boundary, and no-specific-meeting states are correct."
+          },
+          "manual": false
+        },
+        {
+          "id": "MEET-002",
+          "area": "meetings",
+          "title": "Meeting timezone conversion",
+          "userPromise": "Readers see times in their own timezone.",
+          "expected": "Times remain correct across US zones, Europe, India, and daylight-saving boundaries.",
+          "severity": "P0",
+          "releaseBlocking": true,
+          "evidence": [
+            "screenshot",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "static-screenshot",
+            "rationale": "Capture the rendered state and structured evidence proving: Times remain correct across US zones, Europe, India, and daylight-saving boundaries."
+          },
+          "manual": false
+        },
+        {
+          "id": "MEET-003",
+          "area": "meetings",
+          "title": "Meeting history",
+          "userPromise": "Recently joined rooms remain easy to find and can be removed.",
+          "expected": "Join actions persist, update across pages, and support individual and full clearing.",
+          "severity": "P1",
+          "releaseBlocking": true,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Join a meeting, navigate to history, and clear it while showing persistence and removal."
+          },
+          "manual": false
+        },
+        {
+          "id": "MEET-004",
+          "area": "meetings",
+          "title": "NA meeting discovery",
+          "userPromise": "A reader can narrow the large NA directory.",
+          "expected": "Search, tag, platform, access, and expansion filters combine and clear correctly.",
+          "severity": "P1",
+          "releaseBlocking": true,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Combine and clear NA meeting filters and show empty and restored result states."
+          },
+          "manual": false
+        },
+        {
+          "id": "MEET-005",
+          "area": "meetings",
+          "title": "SMART meeting discovery",
+          "userPromise": "A reader can narrow the SMART directory.",
+          "expected": "Search, program, audience, and history filters combine and clear correctly.",
+          "severity": "P1",
+          "releaseBlocking": true,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Combine and clear SMART meeting filters and show empty and restored result states."
+          },
+          "manual": false
+        },
+        {
+          "id": "MEET-006",
+          "area": "meetings",
+          "title": "Meeting copy and join links",
+          "userPromise": "Meeting details can be copied and opened accurately.",
+          "expected": "Copy text, platform labels, phone links, and external join destinations match displayed details.",
+          "severity": "P0",
+          "releaseBlocking": true,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Activate meeting copy and join controls and show clipboard data matching the displayed destination."
+          },
+          "manual": false
+        },
+        {
+          "id": "MEET-007",
+          "area": "reliability",
+          "title": "Meeting data failure",
+          "userPromise": "A temporary data problem does not create false availability.",
+          "expected": "Failure and empty states are explicit, usable, and free of indefinite loading.",
+          "severity": "P1",
+          "releaseBlocking": true,
+          "evidence": [
+            "screenshot",
+            "network",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "static-screenshot",
+            "rationale": "Capture the rendered state and structured evidence proving: Failure and empty states are explicit, usable, and free of indefinite loading."
+          },
+          "manual": false
+        }
+      ],
+      "entrySpecs": [
+        "tests/meetings.spec.ts"
+      ],
+      "supportedProjects": [
+        "production-mobile-chromium",
+        "candidate-mobile-chromium",
+        "production-desktop-chromium",
+        "candidate-desktop-chromium",
+        "candidate-mobile-webkit",
+        "candidate-tablet-webkit",
+        "candidate-desktop-firefox"
+      ]
+    },
+    {
+      "id": "platform-routes-content",
+      "version": "1.0.0",
+      "name": "Platform, routes, content, and SEO",
+      "description": "Environment contracts, the complete route inventory, content semantics, metadata, redirects, visual baselines, and launch-critical home and crisis paths.",
+      "tags": [
+        "core",
+        "routes",
+        "content",
+        "seo",
+        "visual"
+      ],
+      "auditDefinitions": [
+        {
+          "id": "ENV-001",
+          "area": "environment",
+          "title": "Environment availability",
+          "userPromise": "Readers can reach the site securely.",
+          "expected": "Both configured origins return usable HTML over HTTPS.",
+          "severity": "P0",
+          "releaseBlocking": true,
+          "evidence": [
+            "screenshot",
+            "network",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "static-screenshot",
+            "rationale": "Capture the rendered state and structured evidence proving: Both configured origins return usable HTML over HTTPS."
+          },
+          "manual": false
+        },
+        {
+          "id": "ENV-002",
+          "area": "routes",
+          "title": "Candidate route inventory",
+          "userPromise": "Every published guide remains reachable.",
+          "expected": "Every candidate route returns successful HTML with the expected canonical route.",
+          "severity": "P0",
+          "releaseBlocking": true,
+          "evidence": [
+            "screenshot",
+            "network",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "static-screenshot",
+            "rationale": "Capture the rendered state and structured evidence proving: Every candidate route returns successful HTML with the expected canonical route."
+          },
+          "manual": false
+        },
+        {
+          "id": "ENV-003",
+          "area": "routes",
+          "title": "Production route mapping",
+          "userPromise": "Renamed pages keep working after launch.",
+          "expected": "Every legacy production route maps to a candidate destination or an approved removal.",
+          "severity": "P0",
+          "releaseBlocking": true,
+          "evidence": [
+            "network",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "structured-data",
+            "rationale": "Retain machine-readable request and assertion evidence proving: Every legacy production route maps to a candidate destination or an approved removal."
+          },
+          "manual": false
+        },
+        {
+          "id": "ENV-004",
+          "area": "routes",
+          "title": "Redirect integrity",
+          "userPromise": "Bookmarks and search results do not break.",
+          "expected": "Legacy routes use a single permanent redirect without loops or chains.",
+          "severity": "P1",
+          "releaseBlocking": true,
+          "evidence": [
+            "network",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "structured-data",
+            "rationale": "Retain machine-readable request and assertion evidence proving: Legacy routes use a single permanent redirect without loops or chains."
+          },
+          "manual": false
+        },
+        {
+          "id": "ENV-005",
+          "area": "seo",
+          "title": "Preview indexing controls",
+          "userPromise": "The beta environment does not compete with production in search.",
+          "expected": "Preview indexing policy is explicit and candidate canonical metadata is internally consistent.",
+          "severity": "P1",
+          "releaseBlocking": true,
+          "evidence": [
+            "screenshot",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "static-screenshot",
+            "rationale": "Capture the rendered state and structured evidence proving: Preview indexing policy is explicit and candidate canonical metadata is internally consistent."
+          },
+          "manual": false
+        },
+        {
+          "id": "ENV-006",
+          "area": "environment",
+          "title": "Security and cache headers",
+          "userPromise": "Readers receive secure, correctly cached assets.",
+          "expected": "Required security headers exist and immutable assets use long-lived caching.",
+          "severity": "P1",
+          "releaseBlocking": true,
+          "evidence": [
+            "screenshot",
+            "network",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "static-screenshot",
+            "rationale": "Capture the rendered state and structured evidence proving: Required security headers exist and immutable assets use long-lived caching."
+          },
+          "manual": false
+        },
+        {
+          "id": "ENV-007",
+          "area": "routes",
+          "title": "Custom not-found page",
+          "userPromise": "A bad link gives the reader a useful recovery path.",
+          "expected": "Unknown URLs return the intended status and render search plus recovery destinations.",
+          "severity": "P1",
+          "releaseBlocking": true,
+          "evidence": [
+            "screenshot",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "static-screenshot",
+            "rationale": "Capture the rendered state and structured evidence proving: Unknown URLs return the intended status and render search plus recovery destinations."
+          },
+          "manual": false
+        },
+        {
+          "id": "ENV-008",
+          "area": "environment",
+          "title": "Static assets and data endpoints",
+          "userPromise": "The interface loads without missing fonts, images, icons, or data.",
+          "expected": "All first-party assets and JSON endpoints load with correct status and content type.",
+          "severity": "P0",
+          "releaseBlocking": true,
+          "evidence": [
+            "network",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "structured-data",
+            "rationale": "Retain machine-readable request and assertion evidence proving: All first-party assets and JSON endpoints load with correct status and content type."
+          },
+          "manual": false
+        },
+        {
+          "id": "HOME-001",
+          "area": "homepage",
+          "title": "Homepage starting paths",
+          "userPromise": "A reader in distress can quickly choose the right next step.",
+          "expected": "Primary calls to action and common starting points are present and navigate correctly.",
+          "severity": "P0",
+          "releaseBlocking": true,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Activate a primary homepage starting path and show the intended guide destination loading."
+          },
+          "manual": false
+        },
+        {
+          "id": "HOME-002",
+          "area": "homepage",
+          "title": "Support-right-now panel",
+          "userPromise": "Current peer support is visible and understandable.",
+          "expected": "Live, upcoming, and fallback states show accurate labels and working destinations.",
+          "severity": "P0",
+          "releaseBlocking": true,
+          "evidence": [
+            "screenshot",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "static-screenshot",
+            "rationale": "Capture the rendered state and structured evidence proving: Live, upcoming, and fallback states show accurate labels and working destinations."
+          },
+          "manual": false
+        },
+        {
+          "id": "HOME-003",
+          "area": "homepage",
+          "title": "Guide directory",
+          "userPromise": "Every guide category is discoverable from the homepage.",
+          "expected": "Category counts and destinations agree with the published inventory.",
+          "severity": "P1",
+          "releaseBlocking": true,
+          "evidence": [
+            "screenshot",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "static-screenshot",
+            "rationale": "Capture the rendered state and structured evidence proving: Category counts and destinations agree with the published inventory."
+          },
+          "manual": false
+        },
+        {
+          "id": "HOME-004",
+          "area": "homepage",
+          "title": "Community status",
+          "userPromise": "Discord availability never breaks the page.",
+          "expected": "Live count renders when available and fails quietly with a usable Discord link.",
+          "severity": "P2",
+          "releaseBlocking": false,
+          "evidence": [
+            "screenshot",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "static-screenshot",
+            "rationale": "Capture the rendered state and structured evidence proving: Live count renders when available and fails quietly with a usable Discord link."
+          },
+          "manual": false
+        },
+        {
+          "id": "CRISIS-001",
+          "area": "crisis",
+          "title": "Crisis fast path",
+          "userPromise": "A reader in active withdrawal receives focused immediate actions.",
+          "expected": "The minimal layout excludes nonessential chrome and keeps every action visible and usable.",
+          "severity": "P0",
+          "releaseBlocking": true,
+          "evidence": [
+            "screenshot",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "static-screenshot",
+            "rationale": "Capture the rendered state and structured evidence proving: The minimal layout excludes nonessential chrome and keeps every action visible and usable."
+          },
+          "manual": false
+        },
+        {
+          "id": "CRISIS-002",
+          "area": "crisis",
+          "title": "Urgent contact actions",
+          "userPromise": "Emergency destinations can be reached without ambiguity.",
+          "expected": "Discord, live meeting, 988, symptom, and full-guide actions have correct destinations.",
+          "severity": "P0",
+          "releaseBlocking": true,
+          "evidence": [
+            "screenshot",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "static-screenshot",
+            "rationale": "Capture the rendered state and structured evidence proving: Discord, live meeting, 988, symptom, and full-guide actions have correct destinations."
+          },
+          "manual": false
+        },
+        {
+          "id": "CONTENT-001",
+          "area": "content",
+          "title": "Document structure",
+          "userPromise": "Every guide has a coherent, navigable document outline.",
+          "expected": "There is one visible H1, valid heading order, landmarks, description, and canonical metadata.",
+          "severity": "P1",
+          "releaseBlocking": true,
+          "evidence": [
+            "screenshot",
+            "axe",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "static-screenshot",
+            "rationale": "Capture the rendered state and structured evidence proving: There is one visible H1, valid heading order, landmarks, description, and canonical metadata."
+          },
+          "manual": false
+        },
+        {
+          "id": "CONTENT-002",
+          "area": "content",
+          "title": "Content rendering",
+          "userPromise": "No medically important text is hidden by a layout defect.",
+          "expected": "Text, lists, callouts, tables, code, blockquotes, and disclosures render without clipping.",
+          "severity": "P0",
+          "releaseBlocking": true,
+          "evidence": [
+            "screenshot",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "static-screenshot",
+            "rationale": "Capture the rendered state and structured evidence proving: Text, lists, callouts, tables, code, blockquotes, and disclosures render without clipping."
+          },
+          "manual": false
+        },
+        {
+          "id": "CONTENT-003",
+          "area": "content",
+          "title": "Internal links",
+          "userPromise": "Readers do not hit broken paths while seeking help.",
+          "expected": "All internal links resolve and fragments identify existing targets.",
+          "severity": "P0",
+          "releaseBlocking": true,
+          "evidence": [
+            "network",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "structured-data",
+            "rationale": "Retain machine-readable request and assertion evidence proving: All internal links resolve and fragments identify existing targets."
+          },
+          "manual": false
+        },
+        {
+          "id": "CONTENT-004",
+          "area": "content",
+          "title": "External-link safety",
+          "userPromise": "Third-party destinations open without exposing the source tab.",
+          "expected": "External links use a new tab with noopener and noreferrer; internal links do not.",
+          "severity": "P1",
+          "releaseBlocking": true,
+          "evidence": [
+            "screenshot",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "static-screenshot",
+            "rationale": "Capture the rendered state and structured evidence proving: External links use a new tab with noopener and noreferrer; internal links do not."
+          },
+          "manual": false
+        },
+        {
+          "id": "CONTENT-005",
+          "area": "content",
+          "title": "Images and diagrams",
+          "userPromise": "Reference visuals remain legible and meaningful.",
+          "expected": "All images load, have alternative text, fit the viewport, and work in both themes.",
+          "severity": "P1",
+          "releaseBlocking": true,
+          "evidence": [
+            "screenshot",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "static-screenshot",
+            "rationale": "Capture the rendered state and structured evidence proving: All images load, have alternative text, fit the viewport, and work in both themes."
+          },
+          "manual": false
+        },
+        {
+          "id": "CONTENT-006",
+          "area": "content",
+          "title": "Wide reference pages",
+          "userPromise": "Dense calculators and diagrams remain usable on narrow and wide screens.",
+          "expected": "Wide layout, responsive grids, and intentional table scrollers behave correctly.",
+          "severity": "P1",
+          "releaseBlocking": true,
+          "evidence": [
+            "screenshot",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "static-screenshot",
+            "rationale": "Capture the rendered state and structured evidence proving: Wide layout, responsive grids, and intentional table scrollers behave correctly."
+          },
+          "manual": false
+        },
+        {
+          "id": "CONTENT-007",
+          "area": "content",
+          "title": "Long-page stability",
+          "userPromise": "Very long references remain responsive and navigable.",
+          "expected": "The changelog and long medical guides load, scroll, and update TOC state without lockups.",
+          "severity": "P2",
+          "releaseBlocking": false,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Scroll progressively through long references and show that reading and navigation remain responsive."
+          },
+          "manual": false
+        },
+        {
+          "id": "CONTENT-008",
+          "area": "content",
+          "title": "Content parity ledger",
+          "userPromise": "Intentional redesign edits are distinguished from accidental omissions.",
+          "expected": "Critical headings and calls to action are present or documented as approved differences.",
+          "severity": "P0",
+          "releaseBlocking": true,
+          "evidence": [
+            "screenshot",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "static-screenshot",
+            "rationale": "Capture the rendered state and structured evidence proving: Critical headings and calls to action are present or documented as approved differences."
+          },
+          "manual": false
+        },
+        {
+          "id": "REL-001",
+          "area": "reliability",
+          "title": "Runtime error guard",
+          "userPromise": "Pages do not silently break in a reader’s browser.",
+          "expected": "No unexpected page errors, console errors, failed first-party requests, or bad first-party responses occur.",
+          "severity": "P0",
+          "releaseBlocking": true,
+          "evidence": [
+            "screenshot",
+            "network",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "static-screenshot",
+            "rationale": "Capture the rendered state and structured evidence proving: No unexpected page errors, console errors, failed first-party requests, or bad first-party responses occur."
+          },
+          "manual": false
+        },
+        {
+          "id": "SEO-001",
+          "area": "seo",
+          "title": "Metadata completeness",
+          "userPromise": "Search and sharing previews identify every page correctly.",
+          "expected": "Title, description, canonical, robots, Open Graph, and Twitter metadata are complete and valid.",
+          "severity": "P1",
+          "releaseBlocking": true,
+          "evidence": [
+            "screenshot",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "static-screenshot",
+            "rationale": "Capture the rendered state and structured evidence proving: Title, description, canonical, robots, Open Graph, and Twitter metadata are complete and valid."
+          },
+          "manual": false
+        },
+        {
+          "id": "SEO-002",
+          "area": "seo",
+          "title": "Sitemap integrity",
+          "userPromise": "Search engines receive only valid canonical pages.",
+          "expected": "Sitemap entries resolve, are canonical, and exclude drafts, aliases, and error pages.",
+          "severity": "P1",
+          "releaseBlocking": true,
+          "evidence": [
+            "network",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "structured-data",
+            "rationale": "Retain machine-readable request and assertion evidence proving: Sitemap entries resolve, are canonical, and exclude drafts, aliases, and error pages."
+          },
+          "manual": false
+        }
+      ],
+      "entrySpecs": [
+        "tests/contracts.spec.ts",
+        "tests/content-system.spec.ts",
+        "plugins/platform-routes-content/tests/runtime.spec.ts",
+        "tests/page-audit.spec.ts",
+        "tests/shell-content.spec.ts",
+        "tests/smoke.spec.ts",
+        "tests/visual-regression.spec.ts"
+      ],
+      "supportedProjects": [
+        "production-mobile-chromium",
+        "candidate-mobile-chromium",
+        "production-desktop-chromium",
+        "candidate-desktop-chromium",
+        "candidate-mobile-webkit",
+        "candidate-tablet-webkit",
+        "candidate-desktop-firefox"
+      ]
+    },
+    {
+      "id": "shell-navigation-theme-search",
+      "version": "1.0.0",
+      "name": "Shell, navigation, theme, and search",
+      "description": "Responsive global chrome, keyboard and drawer navigation, reading appearance, search quality, search failure behavior, and breakpoint transitions.",
+      "tags": [
+        "core",
+        "shell",
+        "navigation",
+        "theme",
+        "search"
+      ],
+      "auditDefinitions": [
+        {
+          "id": "SHELL-001",
+          "area": "shell",
+          "title": "Scheduling notice",
+          "userPromise": "Readers see current scheduling information without losing access to the page.",
+          "expected": "The notice renders, links correctly, dismisses, and remains dismissed after reload.",
+          "severity": "P1",
+          "releaseBlocking": true,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Dismiss the scheduling notice, reload, and show that the notice remains dismissed."
+          },
+          "manual": false
+        },
+        {
+          "id": "SHELL-002",
+          "area": "shell",
+          "title": "Responsive header",
+          "userPromise": "Primary actions remain reachable at every supported width.",
+          "expected": "Header controls follow their documented breakpoint behavior without clipping or overlap.",
+          "severity": "P0",
+          "releaseBlocking": true,
+          "evidence": [
+            "screenshot",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "static-screenshot",
+            "rationale": "Capture the rendered state and structured evidence proving: Header controls follow their documented breakpoint behavior without clipping or overlap."
+          },
+          "manual": false
+        },
+        {
+          "id": "SHELL-003",
+          "area": "shell",
+          "title": "Skip link",
+          "userPromise": "Keyboard users can bypass repeated navigation.",
+          "expected": "The skip link becomes visible on focus and moves focus to main content.",
+          "severity": "P1",
+          "releaseBlocking": true,
+          "evidence": [
+            "video",
+            "axe",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Move keyboard focus to the skip link, activate it, and show focus reaching main content."
+          },
+          "manual": false
+        },
+        {
+          "id": "SHELL-004",
+          "area": "shell",
+          "title": "Footer navigation",
+          "userPromise": "Readers can reach urgent help, site information, and community destinations.",
+          "expected": "Footer links, labels, and external-link behavior are correct on mobile and desktop.",
+          "severity": "P1",
+          "releaseBlocking": true,
+          "evidence": [
+            "screenshot",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "static-screenshot",
+            "rationale": "Capture the rendered state and structured evidence proving: Footer links, labels, and external-link behavior are correct on mobile and desktop."
+          },
+          "manual": false
+        },
+        {
+          "id": "SHELL-005",
+          "area": "shell",
+          "title": "Back to top",
+          "userPromise": "Long articles provide a reliable escape back to the beginning.",
+          "expected": "The control appears after meaningful scroll, returns to the top, and respects reduced motion.",
+          "severity": "P2",
+          "releaseBlocking": false,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Scroll a long page, activate Back to top, and show the viewport returning to the beginning."
+          },
+          "manual": false
+        },
+        {
+          "id": "SHELL-006",
+          "area": "responsive",
+          "title": "Horizontal overflow guard",
+          "userPromise": "No reader must pan sideways to read ordinary pages.",
+          "expected": "Document width never exceeds viewport width except inside intentional scroll containers.",
+          "severity": "P0",
+          "releaseBlocking": true,
+          "evidence": [
+            "screenshot",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "static-screenshot",
+            "rationale": "Capture the rendered state and structured evidence proving: Document width never exceeds viewport width except inside intentional scroll containers."
+          },
+          "manual": false
+        },
+        {
+          "id": "NAV-001",
+          "area": "navigation",
+          "title": "Mobile guide drawer",
+          "userPromise": "Mobile readers can browse the complete guide without losing their place.",
+          "expected": "Drawer opens, traps focus, closes by all expected methods, restores focus, and preserves scroll.",
+          "severity": "P0",
+          "releaseBlocking": true,
+          "evidence": [
+            "video",
+            "axe",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Open, operate, and close the mobile guide drawer while showing focus and scroll restoration."
+          },
+          "manual": false
+        },
+        {
+          "id": "NAV-002",
+          "area": "navigation",
+          "title": "Mobile category expansion",
+          "userPromise": "All category pages remain discoverable on a phone.",
+          "expected": "Category groups expand and collapse, current location is exposed, and links navigate correctly.",
+          "severity": "P1",
+          "releaseBlocking": true,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Expand and collapse mobile guide categories and show their links and current-page state responding."
+          },
+          "manual": false
+        },
+        {
+          "id": "NAV-003",
+          "area": "navigation",
+          "title": "Desktop sidebar persistence",
+          "userPromise": "Desktop readers can control reading space without layout jumps.",
+          "expected": "Collapse state persists and toggling does not move document scroll or focus unexpectedly.",
+          "severity": "P1",
+          "releaseBlocking": true,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Collapse, reload, and expand the desktop sidebar while showing persistence and stable reading position."
+          },
+          "manual": false
+        },
+        {
+          "id": "NAV-004",
+          "area": "navigation",
+          "title": "Breadcrumb navigation and sharing",
+          "userPromise": "Readers know where they are and can copy a stable link.",
+          "expected": "Breadcrumb links navigate and copy produces the canonical page URL with confirmation.",
+          "severity": "P1",
+          "releaseBlocking": true,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Activate breadcrumb sharing and show the canonical page URL copied to the clipboard."
+          },
+          "manual": false
+        },
+        {
+          "id": "NAV-005",
+          "area": "navigation",
+          "title": "Table of contents",
+          "userPromise": "Readers can navigate long medical references reliably.",
+          "expected": "TOC links align headings below sticky chrome and active state tracks reading position.",
+          "severity": "P1",
+          "releaseBlocking": true,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Activate a table-of-contents link and show hash, heading alignment, and active reading position."
+          },
+          "manual": false
+        },
+        {
+          "id": "NAV-006",
+          "area": "navigation",
+          "title": "Heading permalinks",
+          "userPromise": "Readers can share a precise section.",
+          "expected": "Heading links update the hash, copy the URL, and announce success without a scroll jump.",
+          "severity": "P2",
+          "releaseBlocking": false,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Activate a heading permalink and show its hash, clipboard confirmation, and stable scroll position."
+          },
+          "manual": false
+        },
+        {
+          "id": "NAV-007",
+          "area": "navigation",
+          "title": "Previous and next pages",
+          "userPromise": "Sequential reading follows the configured guide order.",
+          "expected": "Previous and next destinations match category ordering and never point to drafts.",
+          "severity": "P2",
+          "releaseBlocking": false,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Activate previous and next reading controls and show both intended guide destinations loading."
+          },
+          "manual": false
+        },
+        {
+          "id": "NAV-008",
+          "area": "navigation",
+          "title": "Category indexes",
+          "userPromise": "Category landing pages accurately describe and enumerate their guides.",
+          "expected": "Grouping, page counts, update dates, and destinations agree with the route inventory.",
+          "severity": "P1",
+          "releaseBlocking": true,
+          "evidence": [
+            "screenshot",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "static-screenshot",
+            "rationale": "Capture the rendered state and structured evidence proving: Grouping, page counts, update dates, and destinations agree with the route inventory."
+          },
+          "manual": false
+        },
+        {
+          "id": "THEME-001",
+          "area": "theme",
+          "title": "Theme selection",
+          "userPromise": "Readers can choose system, light, or dark appearance.",
+          "expected": "All modes apply immediately and the chosen explicit mode persists.",
+          "severity": "P1",
+          "releaseBlocking": true,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Choose light and dark modes and show the selected appearance applying and persisting."
+          },
+          "manual": false
+        },
+        {
+          "id": "THEME-002",
+          "area": "theme",
+          "title": "System theme changes",
+          "userPromise": "System-mode readers follow operating-system appearance changes.",
+          "expected": "System mode updates live while explicit modes remain unchanged.",
+          "severity": "P2",
+          "releaseBlocking": false,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Choose system appearance, change the emulated system scheme, and show the page following it."
+          },
+          "manual": false
+        },
+        {
+          "id": "THEME-003",
+          "area": "theme",
+          "title": "First-paint theme stability",
+          "userPromise": "Readers do not see a flash of the wrong theme.",
+          "expected": "The correct class is applied before first meaningful paint.",
+          "severity": "P1",
+          "releaseBlocking": true,
+          "evidence": [
+            "screenshot",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "static-screenshot",
+            "rationale": "Capture the rendered state and structured evidence proving: The correct class is applied before first meaningful paint."
+          },
+          "manual": false
+        },
+        {
+          "id": "THEME-004",
+          "area": "responsive",
+          "title": "Breakpoint transitions",
+          "userPromise": "Controls neither disappear accidentally nor collide at layout thresholds.",
+          "expected": "Both sides of every custom breakpoint render without overlap, clipping, or unreachable actions.",
+          "severity": "P0",
+          "releaseBlocking": true,
+          "evidence": [
+            "screenshot",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "static-screenshot",
+            "rationale": "Capture the rendered state and structured evidence proving: Both sides of every custom breakpoint render without overlap, clipping, or unreachable actions."
+          },
+          "manual": false
+        },
+        {
+          "id": "SEARCH-001",
+          "area": "search",
+          "title": "Header search dialog",
+          "userPromise": "Search is immediately available from any standard page.",
+          "expected": "Click and keyboard shortcut open the dialog, focus the input, and close predictably.",
+          "severity": "P0",
+          "releaseBlocking": true,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Open and close search with pointer and keyboard controls and show predictable focus movement."
+          },
+          "manual": false
+        },
+        {
+          "id": "SEARCH-002",
+          "area": "search",
+          "title": "Search result quality",
+          "userPromise": "Queries return relevant, understandable destinations.",
+          "expected": "Known terms return expected pages, highlights, categories, and excerpts.",
+          "severity": "P0",
+          "releaseBlocking": true,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Enter a known query and show relevant search results and excerpts responding."
+          },
+          "manual": false
+        },
+        {
+          "id": "SEARCH-003",
+          "area": "search",
+          "title": "Search keyboard navigation",
+          "userPromise": "Search can be completed without a pointer.",
+          "expected": "Arrow keys move through results, Enter opens the active result, and Escape behaves by context.",
+          "severity": "P1",
+          "releaseBlocking": true,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Use keyboard result navigation and show Enter opening the active destination."
+          },
+          "manual": false
+        },
+        {
+          "id": "SEARCH-004",
+          "area": "search",
+          "title": "Search page filters",
+          "userPromise": "Readers can narrow a broad result set.",
+          "expected": "Topic and result-type filters combine correctly and persist in the URL.",
+          "severity": "P1",
+          "releaseBlocking": true,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Apply search filters and show the result set and URL state updating together."
+          },
+          "manual": false
+        },
+        {
+          "id": "SEARCH-005",
+          "area": "search",
+          "title": "No-result guidance",
+          "userPromise": "A failed query does not become a dead end.",
+          "expected": "No-result copy and suggestions appear and suggested searches are usable.",
+          "severity": "P2",
+          "releaseBlocking": false,
+          "evidence": [
+            "video",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Enter a query with no results and use the recovery suggestions that appear."
+          },
+          "manual": false
+        },
+        {
+          "id": "SEARCH-006",
+          "area": "reliability",
+          "title": "Search failure fallback",
+          "userPromise": "A data-loading problem still leaves a route to content.",
+          "expected": "A failed index request shows the sitemap fallback and no indefinite spinner.",
+          "severity": "P1",
+          "releaseBlocking": true,
+          "evidence": [
+            "video",
+            "network",
+            "json"
+          ],
+          "evidencePolicy": {
+            "mode": "interaction-video",
+            "rationale": "Enter a search while its index request fails and show the usable sitemap fallback."
+          },
+          "manual": false
+        }
+      ],
+      "entrySpecs": [
+        "tests/navigation.spec.ts",
+        "tests/search.spec.ts",
+        "tests/shell-content.spec.ts",
+        "tests/theme-responsive.spec.ts"
+      ],
+      "supportedProjects": [
+        "production-mobile-chromium",
+        "candidate-mobile-chromium",
+        "production-desktop-chromium",
+        "candidate-desktop-chromium",
+        "candidate-mobile-webkit",
+        "candidate-tablet-webkit",
+        "candidate-desktop-firefox"
+      ]
+    }
+  ]
+}

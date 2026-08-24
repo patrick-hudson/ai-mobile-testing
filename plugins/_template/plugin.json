@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "id": "starter-template",
+  "version": "0.1.0",
+  "name": "Disabled plugin starter",
+  "description": "Copy this directory, rename it to the plugin id, replace the sample audit, and enable it only after validation succeeds.",
+  "enabled": false,
+  "tags": ["starter"],
+  "auditDefinitions": [
+    {
+      "id": "STARTER-001",
+      "area": "content",
+      "title": "Replace this sample audit",
+      "userPromise": "Describe the user-facing behavior protected by the plugin.",
+      "severity": "P2",
+      "releaseBlocking": false,
+      "expected": "Replace this with an observable result, not a status-only assertion.",
+      "evidence": ["screenshot", "json"],
+      "evidencePolicy": {
+        "mode": "static-screenshot",
+        "rationale": "Capture the rendered sample state and its structured audit observations."
+      }
+    }
+  ],
+  "entrySpecs": ["plugins/_template/tests/starter.spec.ts"],
+  "supportedProjects": ["candidate-mobile-chromium"]
+}

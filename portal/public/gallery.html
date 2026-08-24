@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>Quitting 7-OH · Visual evidence gallery</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/gallery.css" />
+    <script src="/gallery.js" type="module"></script>
+  </head>
+  <body class="gallery-page">
+    <a class="skip-link" href="#gallery-main">Skip to visual evidence</a>
+    <header class="gallery-page-nav">
+      <a id="gallery-back" class="report-back" href="/">← Release audit console</a>
+      <div class="gallery-page-status">
+        <span id="gallery-connection" role="status" aria-live="polite">Connecting…</span>
+        <button id="gallery-refresh" class="secondary-button" type="button">Refresh status</button>
+      </div>
+    </header>
+
+    <main id="gallery-main" class="gallery-page-shell">
+      <section class="gallery-page-hero" aria-labelledby="gallery-title">
+        <div>
+          <p class="eyebrow">RUN VISUAL EVIDENCE</p>
+          <h1 id="gallery-title">Test-first visual review</h1>
+          <p id="gallery-lifecycle" class="lede">Checking the run lifecycle and available evidence…</p>
+        </div>
+        <dl class="gallery-revision-card">
+          <div><dt>Run</dt><dd id="gallery-run-id"></dd></div>
+          <div><dt>Catalog</dt><dd id="gallery-phase">Loading</dd></div>
+          <div><dt>Logical evidence</dt><dd id="gallery-counts">Loading</dd></div>
+          <div><dt>Accepted revision</dt><dd id="gallery-revision">Not loaded</dd></div>
+        </dl>
+      </section>
+
+      <section id="gallery-fatal" class="report-state-card" hidden>
+        <p class="eyebrow">GALLERY UNAVAILABLE</p>
+        <h2 id="gallery-fatal-title">This gallery could not be loaded</h2>
+        <p id="gallery-fatal-message" class="lede"></p>
+        <button id="gallery-retry" class="primary-button" type="button">Retry from current status</button>
+      </section>
+
+      <section id="gallery-loading" class="gallery-page-loading" aria-label="Loading visual gallery" aria-busy="true">
+        <div class="gallery-page-skeleton" aria-hidden="true"><span></span><span></span><span></span></div>
+        <p>Loading a bounded evidence window and its selected test context…</p>
+      </section>
+      <div id="gallery-workbench" aria-busy="false"></div>
+
+      <section class="gallery-observability" aria-labelledby="activity-title">
+        <div class="gallery-section-heading">
+          <div><p class="step-label">LIVE DIAGNOSTICS</p><h2 id="activity-title">Gallery activity</h2></div>
+          <span id="gallery-activity-count" class="muted">0 events</span>
+        </div>
+        <p class="muted">Bounded, sanitized request and lifecycle events. Search text, reviewer notes, credentials, cursors, and query values are never logged.</p>
+        <ol id="gallery-activity" class="gallery-activity" aria-label="Gallery activity log"></ol>
+      </section>
+
+      <details id="execution-drawer" class="gallery-drawer">
+        <summary>Execution logs (loaded only when opened)</summary>
+        <div class="gallery-drawer-body">
+          <div class="gallery-drawer-actions"><span id="execution-state" class="muted">Not loaded</span><button id="reload-execution" class="secondary-button" type="button">Reload bounded log</button></div>
+          <pre id="execution-log" class="live-log" tabindex="0">Open this drawer to load the latest 64 KiB.</pre>
+        </div>
+      </details>
+
+      <details id="raw-drawer" class="gallery-drawer">
+        <summary>Advanced raw files (separate from logical evidence)</summary>
+        <div class="gallery-drawer-body">
+          <p class="muted">Storage files may include duplicates, posters, traces, and report assets. They do not change gallery counts.</p>
+          <div class="gallery-drawer-actions"><span id="raw-state" class="muted">Not loaded</span><span><button id="previous-raw" class="secondary-button" type="button" disabled>Previous page</button> <button id="load-more-raw" class="secondary-button" type="button">Load files</button></span></div>
+          <div id="raw-files" class="artifact-list"></div>
+        </div>
+      </details>
+    </main>
+
+    <dialog id="gallery-flag-dialog" class="run-dialog gallery-flag-dialog" aria-labelledby="gallery-flag-title">
+      <form id="gallery-flag-form">
+        <div class="dialog-header"><div><p class="step-label">LOCAL REVIEW</p><h2 id="gallery-flag-title">Flag a visual issue</h2></div><button id="gallery-flag-close" class="icon-button" type="button" aria-label="Close reviewer flag form">×</button></div>
+        <p class="muted">Your display label is saved only in this browser and is not an authenticated identity. Notes and justifications are never stored locally.</p>
+        <label class="field"><span>Local reviewer label</span><input id="gallery-reviewer" required minlength="2" maxlength="120" autocomplete="name" /></label>
+        <label class="field"><span>Action</span><select id="gallery-flag-action"><option value="open">Open a visual issue</option><option value="resolved">Resolve selected issue</option><option value="dismissed">Dismiss selected issue</option><option value="reopened">Reopen selected issue</option></select></label>
+        <label id="gallery-flag-id-field" class="field" hidden><span>Issue</span><select id="gallery-flag-id"></select></label>
+        <label class="field"><span id="gallery-flag-copy">Detailed observation</span><textarea id="gallery-flag-note" required minlength="3" maxlength="4000" rows="5"></textarea></label>
+        <p id="gallery-flag-state" class="form-message" role="status" aria-live="polite"></p>
+        <div class="dialog-actions"><button id="gallery-flag-cancel" class="secondary-button" type="button">Cancel</button><button id="gallery-flag-submit" class="primary-button" type="submit">Save reviewer flag</button></div>
+      </form>
+    </dialog>
+
+    <div id="gallery-announcer" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+  </body>
+</html>

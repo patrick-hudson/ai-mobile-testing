@@ -1,0 +1,76 @@
+name: Full release audit
+
+on:
+  workflow_dispatch:
+    inputs:
+      production_url:
+        description: Production baseline origin
+        required: true
+        default: https://quitting7oh.org
+        type: string
+      candidate_url:
+        description: Release candidate origin
+        required: true
+        default: https://beta.quitting7oh-org.pages.dev
+        type: string
+      workers:
+        description: Playwright workers in each shard
+        required: true
+        default: '3'
+        type: choice
+        options: ['1', '2', '3', '4']
+      shards:
+        description: Parallel Docker shard containers
+        required: true
+        default: '4'
+        type: choice
+        options: ['2', '3', '4', '6', '8']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: full-release-audit
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build the portable audit image
+        run: docker compose build --pull portal
+
+      - name: Validate plugins, TypeScript, and TLS policy in Docker
+        run: docker compose run --rm --no-deps portal npm run validate
+
+      - name: Run sharded release evidence audit
+        id: audit
+        continue-on-error: true
+        env:
+          PRODUCTION_URL: ${{ inputs.production_url }}
+          CANDIDATE_URL: ${{ inputs.candidate_url }}
+          AUDIT_SHARD_WORKERS: ${{ inputs.workers }}
+          AUDIT_SHARD_TOTAL: ${{ inputs.shards }}
+          AUDIT_SHARDED_RUN_ID: release-${{ github.run_id }}-${{ github.run_attempt }}
+          CANDIDATE_IGNORE_HTTPS_ERRORS: '0'
+        run: node scripts/run-sharded-release.mjs
+
+      - name: Upload complete release evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-audit-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/sharded/release-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Enforce authoritative checklist decision
+        if: always()
+        run: >-
+          node scripts/assert-release-decision.mjs
+          --manifest artifacts/sharded/release-${{ github.run_id }}-${{ github.run_attempt }}/checklist/manifest.json
+          --pipeline-manifest artifacts/sharded/release-${{ github.run_id }}-${{ github.run_attempt }}/sharded-run.json

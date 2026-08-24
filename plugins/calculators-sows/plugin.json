@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "id": "calculators-sows",
+  "version": "1.0.0",
+  "name": "Calculators and SOWS",
+  "description": "Taper arithmetic, calculator persistence and export, SR-17 protocols, SOWS scoring and interpretation, and related clipboard flows.",
+  "enabled": true,
+  "tags": ["core", "calculators", "sows", "medical-tools"],
+  "auditDefinitions": [
+    { "id": "CALC-001", "source": "core" },
+    { "id": "CALC-002", "source": "core" },
+    { "id": "CALC-003", "source": "core" },
+    { "id": "CALC-004", "source": "core" },
+    { "id": "CALC-005", "source": "core" },
+    { "id": "CALC-006", "source": "core" },
+    { "id": "CALC-007", "source": "core" },
+    { "id": "CALC-008", "source": "core" },
+    { "id": "CALC-009", "source": "core" },
+    { "id": "SOWS-001", "source": "core" },
+    { "id": "SOWS-002", "source": "core" },
+    { "id": "SOWS-003", "source": "core" },
+    { "id": "SHARE-001", "source": "core" }
+  ],
+  "entrySpecs": [
+    "tests/calculators.spec.ts",
+    "tests/shell-content.spec.ts",
+    "tests/sows.spec.ts"
+  ],
+  "supportedProjects": [
+    "production-mobile-chromium",
+    "candidate-mobile-chromium",
+    "production-desktop-chromium",
+    "candidate-desktop-chromium",
+    "candidate-mobile-webkit",
+    "candidate-tablet-webkit",
+    "candidate-desktop-firefox"
+  ]
+}

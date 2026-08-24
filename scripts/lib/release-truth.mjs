@@ -1,0 +1,118 @@
+import { readFile } from 'node:fs/promises';
+
+export const RELEASE_DECISIONS = Object.freeze(['READY', 'NOT_READY']);
+export const PIPELINE_STATUSES = Object.freeze(['pending', 'running', 'completed', 'failed', 'stopped']);
+
+export function pendingRelease(source = 'checklist/manifest.json') {
+  return {
+    decision: 'PENDING',
+    ready: null,
+    reason: 'The authoritative checklist has not been evaluated yet.',
+    decisionBasis: null,
+    blockingFailures: null,
+    blockingIncomplete: null,
+    baselineIssues: null,
+    runIntegrityFailure: null,
+    source,
+    evaluatedAt: null,
+  };
+}
+
+export function unavailableRelease(reason, source = 'checklist/manifest.json') {
+  return {
+    ...pendingRelease(source),
+    decision: 'UNAVAILABLE',
+    reason,
+    evaluatedAt: new Date().toISOString(),
+  };
+}
+
+export function parseChecklistRelease(document, source = 'checklist/manifest.json') {
+  if (!document || typeof document !== 'object' || Array.isArray(document)) {
+    throw new Error('Checklist manifest must be a JSON object.');
+  }
+  const release = document.release;
+  if (!release || typeof release !== 'object' || Array.isArray(release)) {
+    throw new Error('Checklist manifest is missing release truth.');
+  }
+  if (!RELEASE_DECISIONS.includes(release.decision)) {
+    throw new Error('Checklist release.decision must be READY or NOT_READY.');
+  }
+  const ready = release.decision === 'READY';
+  if (typeof release.ready !== 'boolean' || release.ready !== ready) {
+    throw new Error('Checklist release.ready contradicts release.decision.');
+  }
+  if (typeof release.reason !== 'string' || release.reason.trim().length === 0) {
+    throw new Error('Checklist release.reason must explain the decision.');
+  }
+  const blockingFailures = optionalNonnegativeInteger(release.blockingFailures, 'release.blockingFailures');
+  const blockingIncomplete = optionalNonnegativeInteger(release.blockingIncomplete, 'release.blockingIncomplete');
+  const baselineIssues = optionalNonnegativeInteger(release.baselineIssues, 'release.baselineIssues');
+  const runIntegrityFailure = release.runIntegrityFailure === undefined
+    ? null
+    : typeof release.runIntegrityFailure === 'boolean'
+      ? release.runIntegrityFailure
+      : (() => { throw new Error('Checklist release.runIntegrityFailure must be boolean.'); })();
+  const decisionBasis = typeof release.decisionBasis === 'string' && release.decisionBasis.trim().length > 0
+    ? release.decisionBasis.trim()
+    : null;
+  if (ready && ((blockingFailures ?? 0) > 0 || (blockingIncomplete ?? 0) > 0 || runIntegrityFailure === true)) {
+    throw new Error('Checklist READY decision contradicts its blocking or run-integrity counts.');
+  }
+  return {
+    decision: release.decision,
+    ready,
+    reason: release.reason.trim(),
+    decisionBasis,
+    blockingFailures,
+    blockingIncomplete,
+    baselineIssues,
+    runIntegrityFailure,
+    source,
+    evaluatedAt: new Date().toISOString(),
+  };
+}
+
+export async function readChecklistRelease(manifestPath, source = 'checklist/manifest.json') {
+  let document;
+  try {
+    document = JSON.parse(await readFile(manifestPath, 'utf8'));
+  } catch (error) {
+    const detail = error?.code === 'ENOENT' ? 'file is missing' : error.message;
+    throw new Error(`Authoritative checklist manifest could not be read: ${detail}`);
+  }
+  return parseChecklistRelease(document, source);
+}
+
+export function releaseOutcome(pipelineStatus, release) {
+  if (pipelineStatus !== 'completed' || !RELEASE_DECISIONS.includes(release?.decision)) {
+    return { status: 'pipeline-failed', exitCode: 1 };
+  }
+  return release.decision === 'READY'
+    ? { status: 'ready', exitCode: 0 }
+    : { status: 'not-ready', exitCode: 1 };
+}
+
+export function pipelineOnlyOutcome(pipelineStatus, release) {
+  if (pipelineStatus !== 'completed' || !RELEASE_DECISIONS.includes(release?.decision)) {
+    return { status: 'pipeline-failed', exitCode: 1 };
+  }
+  if (release.blockingFailures === null || release.runIntegrityFailure === null) {
+    return { status: 'integrity-unknown', exitCode: 1 };
+  }
+  if (release.runIntegrityFailure || release.blockingFailures > 0) {
+    return { status: 'smoke-checks-failed', exitCode: 1 };
+  }
+  return {
+    status: release.decision === 'READY' ? 'ready' : 'completed-not-ready',
+    exitCode: 0,
+  };
+}
+
+function optionalNonnegativeInteger(value, path) {
+  if (value === undefined) return null;
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(`Checklist ${path} must be a nonnegative integer.`);
+  }
+  return value;
+}

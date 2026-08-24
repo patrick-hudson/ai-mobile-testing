@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "id": "shell-navigation-theme-search",
+  "version": "1.0.0",
+  "name": "Shell, navigation, theme, and search",
+  "description": "Responsive global chrome, keyboard and drawer navigation, reading appearance, search quality, search failure behavior, and breakpoint transitions.",
+  "enabled": true,
+  "tags": ["core", "shell", "navigation", "theme", "search"],
+  "auditDefinitions": [
+    { "id": "SHELL-001", "source": "core" },
+    { "id": "SHELL-002", "source": "core" },
+    { "id": "SHELL-003", "source": "core" },
+    { "id": "SHELL-004", "source": "core" },
+    { "id": "SHELL-005", "source": "core" },
+    { "id": "SHELL-006", "source": "core" },
+    { "id": "NAV-001", "source": "core" },
+    { "id": "NAV-002", "source": "core" },
+    { "id": "NAV-003", "source": "core" },
+    { "id": "NAV-004", "source": "core" },
+    { "id": "NAV-005", "source": "core" },
+    { "id": "NAV-006", "source": "core" },
+    { "id": "NAV-007", "source": "core" },
+    { "id": "NAV-008", "source": "core" },
+    { "id": "THEME-001", "source": "core" },
+    { "id": "THEME-002", "source": "core" },
+    { "id": "THEME-003", "source": "core" },
+    { "id": "THEME-004", "source": "core" },
+    { "id": "SEARCH-001", "source": "core" },
+    { "id": "SEARCH-002", "source": "core" },
+    { "id": "SEARCH-003", "source": "core" },
+    { "id": "SEARCH-004", "source": "core" },
+    { "id": "SEARCH-005", "source": "core" },
+    { "id": "SEARCH-006", "source": "core" }
+  ],
+  "entrySpecs": [
+    "tests/navigation.spec.ts",
+    "tests/search.spec.ts",
+    "tests/shell-content.spec.ts",
+    "tests/theme-responsive.spec.ts"
+  ],
+  "supportedProjects": [
+    "production-mobile-chromium",
+    "candidate-mobile-chromium",
+    "production-desktop-chromium",
+    "candidate-desktop-chromium",
+    "candidate-mobile-webkit",
+    "candidate-tablet-webkit",
+    "candidate-desktop-firefox"
+  ]
+}

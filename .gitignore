@@ -1,0 +1,12 @@
+node_modules/
+artifacts/
+playwright-report/
+blob-report/
+test-results/
+.lighthouseci/
+.DS_Store
+*.log
+.env
+.env.*
+!.env.example
+.portal-secrets/

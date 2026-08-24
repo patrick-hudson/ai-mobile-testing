@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>Quitting 7-OH · Run report</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/report.css" />
+    <script src="/report.js" type="module"></script>
+  </head>
+  <body class="report-page">
+    <a class="skip-link" href="#report-main">Skip to report</a>
+    <header class="report-nav">
+      <a class="report-back" href="/">← Release audit console</a>
+      <div class="report-nav-actions">
+        <a id="visual-gallery-link" class="secondary-button">Visual gallery</a>
+        <span id="report-connection" class="report-connection" role="status" aria-live="polite">Loading report…</span>
+        <button id="refresh-report" class="secondary-button" type="button">Refresh</button>
+      </div>
+    </header>
+
+    <main id="report-main" class="report-shell">
+      <section id="report-loading" class="report-loading" aria-label="Loading run report" aria-busy="true">
+        <div class="report-skeleton report-skeleton-hero"></div>
+        <div class="report-skeleton-grid" aria-hidden="true">
+          <span></span><span></span><span></span><span></span>
+        </div>
+        <p>Loading the release decision and compact evidence index…</p>
+      </section>
+
+      <section id="report-error" class="report-state-card" hidden>
+        <p class="eyebrow">REPORT UNAVAILABLE</p>
+        <h1 id="report-error-title">This report could not be loaded</h1>
+        <p id="report-error-message" class="lede"></p>
+        <div class="report-state-actions">
+          <button id="retry-report" class="primary-button" type="button">Try again</button>
+          <a class="secondary-button" href="/">Return to runs</a>
+        </div>
+      </section>
+
+      <div id="report-content" hidden>
+        <section id="decision-hero" class="decision-hero">
+          <div class="decision-copy">
+            <p class="eyebrow">RELEASE EVIDENCE REPORT</p>
+            <div class="decision-heading-row">
+              <h1 id="decision-title">Reviewing this run</h1>
+              <span id="decision-badge" class="decision-badge">Loading</span>
+            </div>
+            <p id="decision-summary" class="decision-summary"></p>
+            <p id="decision-basis" class="decision-basis"></p>
+            <div class="report-state-actions">
+              <a id="full-checklist-link" class="primary-button" target="_blank" rel="noopener">Open Long Build Checklist</a>
+              <a id="manifest-download-link" class="secondary-button" download>Download raw checklist JSON (large)</a>
+            </div>
+          </div>
+          <dl class="run-context-card">
+            <div><dt>Run</dt><dd id="context-run-id"></dd></div>
+            <div><dt>Test depth</dt><dd id="context-profile"></dd></div>
+            <div><dt>Scope</dt><dd id="context-scope"></dd></div>
+            <div><dt>Started</dt><dd id="context-started"></dd></div>
+            <div><dt>Elapsed</dt><dd id="context-elapsed"></dd></div>
+            <div><dt>Evidence pipeline</dt><dd id="context-pipeline"></dd></div>
+            <div class="context-wide"><dt>Current site</dt><dd><a id="context-production" target="_blank" rel="noopener"></a></dd></div>
+            <div class="context-wide"><dt>Redesign candidate</dt><dd><a id="context-candidate" target="_blank" rel="noopener"></a></dd></div>
+          </dl>
+        </section>
+
+        <section aria-labelledby="summary-title" class="report-section">
+          <div class="report-section-heading">
+            <div><p class="step-label">01 · AT A GLANCE</p><h2 id="summary-title">What this run tells us</h2></div>
+            <p id="summary-generated" class="muted"></p>
+          </div>
+          <div id="metric-grid" class="metric-grid"></div>
+          <div class="coverage-grid">
+            <article class="report-card">
+              <div class="card-heading"><h3>Audit outcomes</h3><span id="status-total" class="muted"></span></div>
+              <div id="status-bars" class="bar-list"></div>
+            </article>
+            <article class="report-card">
+              <div class="card-heading"><h3>Risk coverage</h3><span class="muted">Documented checks</span></div>
+              <div id="severity-bars" class="bar-list"></div>
+            </article>
+          </div>
+        </section>
+
+        <section aria-labelledby="attention-title" class="report-section">
+          <div class="report-section-heading">
+            <div><p class="step-label">02 · PRIORITIES</p><h2 id="attention-title">What needs attention</h2></div>
+            <span id="finding-total" class="muted"></span>
+          </div>
+          <div id="top-findings" class="finding-grid"></div>
+        </section>
+
+        <section aria-labelledby="audits-title" class="report-section audit-browser">
+          <div class="report-section-heading">
+            <div><p class="step-label">03 · EVERY CHECK</p><h2 id="audits-title">Audit results and evidence</h2></div>
+            <span id="audit-result-count" class="muted" role="status" aria-live="polite"></span>
+          </div>
+          <form id="audit-filters" class="audit-filter-bar" role="search">
+            <label class="filter-search"><span>Find a check</span><input id="filter-query" type="search" placeholder="Search by ID, title, or promise" /></label>
+            <label><span>Status</span><select id="filter-status"><option value="">All outcomes</option></select></label>
+            <label><span>Severity</span><select id="filter-severity"><option value="">All severities</option></select></label>
+            <label><span>Area</span><select id="filter-area"><option value="">All feature areas</option></select></label>
+            <label><span>Environment</span><select id="filter-environment"><option value="">Both sites</option></select></label>
+            <label><span>Release impact</span><select id="filter-blocking"><option value="">All checks</option><option value="true">Release-blocking only</option><option value="false">Advisory only</option></select></label>
+            <label class="filter-checkbox"><input id="filter-manual" type="checkbox" /> Manual checks only</label>
+            <button id="clear-filters" class="text-button" type="button">Clear filters</button>
+          </form>
+          <div id="audit-loading" class="audit-loading" hidden aria-live="polite">Loading matching checks…</div>
+          <div id="audit-error" class="inline-error" hidden></div>
+          <div id="audit-list" class="report-audit-list"></div>
+          <nav class="pagination" aria-label="Audit result pages">
+            <button id="audit-previous" class="secondary-button" type="button">Previous</button>
+            <span id="audit-page-label" class="muted"></span>
+            <button id="audit-next" class="secondary-button" type="button">Next</button>
+          </nav>
+        </section>
+
+        <section aria-labelledby="manual-title" class="report-section split-section">
+          <article class="report-card" id="manual-card">
+            <p class="step-label">04 · HUMAN ACCEPTANCE</p>
+            <h2 id="manual-title">Manual evidence</h2>
+            <div id="manual-summary"></div>
+            <a class="secondary-button" href="/">Open the run console to add evidence</a>
+          </article>
+          <article class="report-card" id="ai-card">
+            <p class="step-label">05 · ADVISORY REVIEW</p>
+            <h2>AI evidence review</h2>
+            <div id="ai-summary"></div>
+            <a id="ai-review-link" class="secondary-button" target="_blank" rel="noopener" hidden>Open complete AI review</a>
+          </article>
+        </section>
+
+        <section aria-labelledby="evidence-title" class="report-section">
+          <div class="report-section-heading">
+            <div><p class="step-label">06 · SOURCE MATERIAL</p><h2 id="evidence-title">Reports, videos, and files</h2></div>
+            <span id="artifact-count" class="muted"></span>
+          </div>
+          <div id="report-links" class="quick-link-grid"></div>
+          <p class="bounded-note">This page keeps the browser responsive by showing a bounded evidence index. Open the full checklist or a specific audit above for complete context.</p>
+        </section>
+
+        <section aria-labelledby="logs-title" class="report-section log-section">
+          <div class="report-section-heading">
+            <div><p class="step-label">07 · RUN RECORD</p><h2 id="logs-title">Recent execution log</h2></div>
+            <button id="load-log" class="secondary-button" type="button">Load recent log excerpt</button>
+          </div>
+          <p class="muted">Logs load only when requested and are capped at 64 KB here. Complete source logs remain available as evidence links.</p>
+          <div id="log-state" class="log-state">No log data has been loaded.</div>
+          <pre id="report-log" class="live-log report-log" hidden></pre>
+          <div id="log-links" class="log-links"></div>
+        </section>
+      </div>
+    </main>
+
+    <div id="report-announcer" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+  </body>
+</html>

@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "id": "accessibility-responsive-performance-reliability",
+  "version": "1.0.0",
+  "name": "Accessibility, responsive, performance, and reliability",
+  "description": "WCAG scans and keyboard journeys, reduced motion, browser performance evidence, layout stability, resilient dependencies, and manual real-device acceptance gates.",
+  "enabled": true,
+  "tags": ["core", "accessibility", "responsive", "performance", "reliability"],
+  "auditDefinitions": [
+    { "id": "A11Y-001", "source": "core" },
+    { "id": "A11Y-002", "source": "core" },
+    { "id": "A11Y-003", "source": "core" },
+    { "id": "A11Y-004", "source": "core" },
+    { "id": "A11Y-005", "source": "core" },
+    { "id": "REL-002", "source": "core" },
+    { "id": "REL-003", "source": "core" },
+    { "id": "PERF-001", "source": "core" },
+    { "id": "PERF-002", "source": "core" },
+    { "id": "DEVICE-001", "source": "core" },
+    { "id": "DEVICE-002", "source": "core" },
+    { "id": "DEVICE-003", "source": "core" }
+  ],
+  "entrySpecs": [
+    "tests/accessibility.spec.ts",
+    "tests/performance.spec.ts",
+    "tests/shell-content.spec.ts"
+  ],
+  "supportedProjects": [
+    "production-mobile-chromium",
+    "candidate-mobile-chromium",
+    "production-desktop-chromium",
+    "candidate-desktop-chromium",
+    "candidate-mobile-webkit",
+    "candidate-tablet-webkit",
+    "candidate-desktop-firefox"
+  ]
+}

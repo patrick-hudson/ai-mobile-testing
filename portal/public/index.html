@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>Quitting 7-OH · Release audit</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <script src="/app.js" type="module"></script>
+  </head>
+  <body>
+    <header class="masthead">
+      <div>
+        <p class="eyebrow">QUITTING 7-OH</p>
+        <h1>Release audit console</h1>
+        <p class="lede">Launch focused browser tests, follow every step, and inspect the evidence behind each result.</p>
+      </div>
+      <div class="system-status" role="status" aria-live="polite"><span class="status-dot"></span><span id="system-status">Connecting</span></div>
+    </header>
+
+    <main>
+      <section class="panel launch-panel" aria-labelledby="launch-title">
+        <div class="section-heading">
+          <div>
+            <p class="step-label">01 · Configure</p>
+            <h2 id="launch-title">Launch a test run</h2>
+          </div>
+          <p id="catalog-summary" class="muted"></p>
+        </div>
+
+        <form id="launch-form" aria-busy="false">
+          <fieldset>
+            <legend>Depth</legend>
+            <div class="choice-grid two-up">
+              <label class="choice-card"><input type="radio" name="profile" value="smoke" checked /><span><strong>Smoke check</strong><small>Fast, launch-critical confidence. Videos are retained when a test fails.</small></span></label>
+              <label class="choice-card"><input type="radio" name="profile" value="release" /><span><strong>Release evidence (review run)</strong><small>Full single-container suite with action videos and static screenshots. Final signoff still requires a new-ID sharded run with isolated performance.</small></span></label>
+            </div>
+            <label class="tls-option"><input id="candidate-ignore-tls" type="checkbox" /> Ignore beta certificate errors <small>Development only. Production TLS remains strict, and the choice is recorded in the run.</small></label>
+          </fieldset>
+
+          <fieldset>
+            <legend>Sites</legend>
+            <div class="choice-grid two-up">
+              <label class="field"><span>Production baseline</span><input id="production-url" type="url" required /></label>
+              <label class="field"><span>Release candidate</span><input id="candidate-url" type="url" required /></label>
+            </div>
+          </fieldset>
+
+          <fieldset>
+            <legend>Browsers and devices</legend>
+            <div id="project-options" class="choice-grid project-grid"></div>
+          </fieldset>
+
+          <fieldset>
+            <legend>Test scope</legend>
+            <div class="scope-toggle">
+              <label><input type="radio" name="scope" value="all" checked /> All tests in this profile</label>
+              <label><input type="radio" name="scope" value="targeted" /> Target selected audit areas or IDs</label>
+            </div>
+            <div id="target-controls" class="target-controls" hidden>
+              <div class="plugin-selector">
+                <div class="subheading"><h3>Installed test suites</h3><span class="muted">Validated plugins</span></div>
+                <div id="plugin-options" class="choice-grid plugin-grid"></div>
+              </div>
+              <div>
+                <div class="subheading"><h3>Audit areas</h3><button type="button" class="text-button" id="clear-areas">Clear</button></div>
+                <div id="area-options" class="pill-grid"></div>
+              </div>
+              <div>
+                <div class="subheading"><h3>Individual checks</h3><span id="selected-count" class="muted">0 selected</span></div>
+                <label class="search-field"><span class="sr-only">Filter audit checks</span><input id="audit-filter" type="search" placeholder="Filter by ID or title…" /></label>
+                <div id="audit-options" class="audit-options"></div>
+              </div>
+            </div>
+          </fieldset>
+
+          <fieldset>
+            <legend>Evidence analysis</legend>
+            <div class="choice-grid two-up">
+              <label class="choice-card" id="ai-review-card"><input id="ai-review" type="checkbox" /><span><strong>AI evidence review</strong><small id="ai-review-help">Analyze screenshots, findings, and video metadata after testing. Advisory only; browser results remain authoritative.</small></span></label>
+              <label class="field"><span>Review model</span><input id="ai-model" type="text" autocomplete="off" spellcheck="false" /></label>
+            </div>
+            <p class="secret-note">A submitted key is sent directly to the portal service, then this field is cleared. The browser receives only configured state and a non-secret fingerprint.</p>
+            <div id="anthropic-key-settings" class="key-settings" aria-busy="true">
+              <div class="subheading">
+                <div><h3>Anthropic API access</h3><p class="muted">Stored by the portal service; never returned to or remembered by this browser.</p></div>
+                <span id="anthropic-key-state" class="settings-state">Checking…</span>
+              </div>
+              <div class="key-controls">
+                <label class="field"><span>New or replacement API key</span><input id="anthropic-key-input" type="password" autocomplete="new-password" spellcheck="false" placeholder="Paste once; it will not be shown again" /></label>
+                <button id="save-anthropic-key" class="secondary-button" type="button">Save key</button>
+                <button id="delete-anthropic-key" class="danger-button" type="button" disabled>Delete key</button>
+              </div>
+              <p id="anthropic-key-message" class="form-message" role="status" aria-live="polite" aria-atomic="true"></p>
+            </div>
+          </fieldset>
+
+          <div class="launch-footer">
+            <p id="form-message" class="form-message" role="status" aria-live="polite" aria-atomic="true"></p>
+            <button id="launch-run" class="primary-button" type="submit">Launch audit</button>
+          </div>
+        </form>
+      </section>
+
+      <section id="runs-panel" class="panel" aria-labelledby="runs-title" aria-busy="true">
+        <div class="section-heading">
+          <div>
+            <p class="step-label">02 · Observe</p>
+            <h2 id="runs-title">Runs and evidence</h2>
+          </div>
+          <div class="refresh-actions"><span id="runs-status" class="muted" role="status" aria-live="polite"></span><button type="button" id="refresh-runs" class="secondary-button">Refresh</button></div>
+        </div>
+        <div id="run-list" class="run-list"><div class="skeleton-list" aria-hidden="true"><span></span><span></span><span></span></div></div>
+      </section>
+    </main>
+
+    <dialog id="run-dialog" class="run-dialog" aria-labelledby="dialog-title" aria-describedby="dialog-status" aria-busy="false">
+      <div class="dialog-header">
+        <div><p class="step-label">LIVE RUN</p><h2 id="dialog-title">Audit run</h2></div>
+        <button type="button" id="close-dialog" class="icon-button" aria-label="Close run details">×</button>
+      </div>
+      <div id="dialog-status" class="dialog-status" role="status" aria-live="polite" aria-atomic="true"></div>
+      <div id="progress-track" class="progress-track" role="progressbar" aria-label="Audit progress" aria-valuemin="0" aria-valuemax="100"><span id="progress-bar"></span></div>
+      <dl id="run-details" class="run-details" aria-busy="false">
+        <div><dt>Scope</dt><dd id="detail-scope"></dd></div>
+        <div><dt>Projects</dt><dd id="detail-projects"></dd></div>
+        <div><dt>Production</dt><dd><a id="detail-production" target="_blank" rel="noopener"></a></dd></div>
+        <div><dt>Candidate</dt><dd><a id="detail-candidate" target="_blank" rel="noopener"></a></dd></div>
+        <div><dt>TLS policy</dt><dd id="detail-tls"></dd></div>
+        <div><dt>Started</dt><dd id="detail-started"></dd></div>
+        <div><dt>Elapsed</dt><dd id="detail-elapsed"></dd></div>
+        <div><dt>Browser exit (diagnostic)</dt><dd id="detail-exit"></dd></div>
+        <div><dt>Evidence pipeline</dt><dd id="detail-pipeline"></dd></div>
+        <div><dt>Release decision</dt><dd id="detail-release"></dd></div>
+        <div class="command-detail"><dt>Execution</dt><dd><code id="detail-command"></code></dd></div>
+      </dl>
+      <div class="dialog-actions">
+        <button type="button" id="stop-run" class="danger-button">Stop run</button>
+        <button type="button" id="purge-run" class="danger-button" hidden>Purge run and evidence</button>
+        <a id="open-run-gallery" class="primary-button" hidden>Open visual evidence gallery</a>
+        <a id="open-run-report" class="primary-button" hidden>View reviewer report</a>
+        <a id="open-checklist" class="secondary-button" hidden>Download raw checklist JSON (large)</a>
+        <a id="open-report" class="secondary-button" hidden>Open Playwright report</a>
+        <a id="open-ai-review" class="secondary-button" hidden>Open AI review</a>
+      </div>
+      <section id="purge-confirmation" class="purge-confirmation" aria-busy="false" hidden>
+        <h3>Permanently delete this run?</h3>
+        <p>This removes the complete report, videos, screenshots, traces, and logs. It cannot be undone.</p>
+        <label class="field"><span>Type <code id="purge-expected"></code> to confirm</span><input id="purge-confirmation-input" autocomplete="off" autocapitalize="off" spellcheck="false" /></label>
+        <div class="purge-confirmation-actions">
+          <button type="button" id="cancel-purge" class="secondary-button">Keep run</button>
+          <button type="button" id="confirm-purge" class="danger-button" disabled>Delete everything for this run</button>
+        </div>
+        <p id="purge-message" class="form-message" role="status" aria-live="polite" aria-atomic="true"></p>
+      </section>
+      <section class="stage-section"><h3>Run stages</h3><div id="stage-list" class="stage-list" aria-live="polite"></div></section>
+      <section id="manual-evidence-section" class="manual-evidence-section" aria-busy="false" hidden>
+        <div class="subheading"><h3>Manual device and screen-reader evidence</h3><span id="manual-load-status" class="muted" role="status" aria-live="polite">Signed evidence only</span></div>
+        <p class="muted">Attach the real recording and screenshot, identify the exact device/browser, and record what you observed. Passing evidence is rejected without its required files.</p>
+        <form id="manual-evidence-form" class="manual-evidence-form">
+          <label class="field"><span>Manual audit</span><select id="manual-audit" required></select></label>
+          <label class="field"><span>Outcome</span><select id="manual-outcome" required><option value="pass">Pass</option><option value="fail">Fail</option><option value="blocked">Blocked</option></select></label>
+          <label class="field"><span>Reviewer</span><input id="manual-reviewer" required minlength="2" autocomplete="name" /></label>
+          <label class="field"><span>Device and browser</span><input id="manual-device" required minlength="2" placeholder="iPhone 15 Pro · iOS 19 · Safari" /></label>
+          <label class="field manual-notes"><span>Detailed observations</span><textarea id="manual-notes" required minlength="10" rows="4" placeholder="Journeys performed, states checked, assistive technology, and anything unexpected…"></textarea></label>
+          <label class="field manual-files"><span>Video and screenshot evidence</span><input id="manual-files" type="file" multiple accept="video/webm,video/mp4,image/png,image/jpeg" /><small>Pass requires video; zoom/reflow and physical-device checks also require a screenshot. 500 MB per file.</small></label>
+          <label class="manual-confirm"><input id="manual-confirm" type="checkbox" required /> I performed this check on the named device and attest that the result and notes are accurate.</label>
+          <div class="manual-submit"><p id="manual-message" class="form-message" role="status" aria-live="polite" aria-atomic="true"></p><button id="save-manual-evidence" class="secondary-button" type="submit">Save manual evidence</button></div>
+        </form>
+        <div id="manual-evidence-summary" class="manual-evidence-summary" aria-busy="false"></div>
+      </section>
+      <div class="evidence-layout">
+        <section><h3>Live output</h3><pre id="live-log" class="live-log" aria-live="polite"></pre></section>
+        <section><div class="subheading"><h3>Evidence files</h3><span id="artifact-status" class="muted" role="status" aria-live="polite"></span></div><div id="artifact-list" class="artifact-list" aria-busy="false"><p class="muted">Evidence appears as the run progresses.</p></div><button id="load-more-artifacts" class="secondary-button artifact-more" type="button" hidden>Load more evidence</button></section>
+      </div>
+    </dialog>
+
+    <div id="global-announcer" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+
+    <template id="run-card-template">
+      <article class="run-card">
+        <button type="button" class="run-card-button">
+          <span class="run-state"></span>
+          <span class="run-copy"><strong class="run-title"></strong><small class="run-meta"></small></span>
+          <span class="run-result"></span>
+        </button>
+        <a class="run-gallery-link">Visual evidence gallery</a>
+      </article>
+    </template>
+  </body>
+</html>

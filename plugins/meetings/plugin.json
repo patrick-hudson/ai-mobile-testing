@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "id": "meetings",
+  "version": "1.0.0",
+  "name": "Meeting discovery and timing",
+  "description": "Deterministic meeting states, timezone conversion, history, directory filters, join links, copy actions, and dependency failure behavior.",
+  "enabled": true,
+  "tags": ["core", "meetings", "timezones", "reliability"],
+  "auditDefinitions": [
+    { "id": "MEET-001", "source": "core" },
+    { "id": "MEET-002", "source": "core" },
+    { "id": "MEET-003", "source": "core" },
+    { "id": "MEET-004", "source": "core" },
+    { "id": "MEET-005", "source": "core" },
+    { "id": "MEET-006", "source": "core" },
+    { "id": "MEET-007", "source": "core" }
+  ],
+  "entrySpecs": ["tests/meetings.spec.ts"],
+  "supportedProjects": [
+    "production-mobile-chromium",
+    "candidate-mobile-chromium",
+    "production-desktop-chromium",
+    "candidate-desktop-chromium",
+    "candidate-mobile-webkit",
+    "candidate-tablet-webkit",
+    "candidate-desktop-firefox"
+  ]
+}
+
