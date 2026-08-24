@@ -33,7 +33,7 @@ async function scrollToDocumentFraction(page: Page, fraction: number): Promise<v
 }
 
 for (const visualRoute of REPRESENTATIVE_VISUAL_ROUTES) {
-  staticTest(`[CONTENT-002] candidate visual baseline for ${visualRoute.label}`, staticEvidence(`Capture paired production and candidate screenshots for the ${visualRoute.label} visual baseline in light and dark themes.`), async ({ browser, page, audit }, testInfo) => {
+  staticTest(`[CONTENT-002] candidate visual baseline for ${visualRoute.label}`, staticEvidence(`Capture paired production and candidate screenshots for the ${visualRoute.label} visual baseline in light and dark themes.`, 'candidate-projects'), async ({ browser, page, audit }, testInfo) => {
     test.setTimeout(240_000);
     const metadata = projectMetadata(testInfo.project.metadata);
     test.skip(metadata.environment !== 'candidate' || !metadata.visual, 'Visual baselines are candidate-only; production is an outcome reference, not a pixel reference.');

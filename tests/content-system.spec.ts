@@ -1,5 +1,10 @@
 import { ENVIRONMENTS, resolveEnvironmentPath } from '../audit/environments.js';
-import { CANDIDATE_HTML_ROUTES, REPRESENTATIVE_VISUAL_ROUTES } from '../audit/routes.js';
+import {
+  CANDIDATE_HTML_ROUTES,
+  CRITICAL_CONTENT_CONTRACTS,
+  DECLARED_ROUTE_VISUALS,
+  REPRESENTATIVE_VISUAL_ROUTES,
+} from '../audit/routes.js';
 import { expect, interactionEvidence, interactionTest, staticEvidence, staticTest, structuredEvidence, structuredTest, test } from '../fixtures/test.js';
 import { dismissSchedulingNotice, inspectHtmlDestination, loggedGet, meta, pageHasHorizontalOverflow, waitForSettledUI } from './helpers.js';
 
@@ -16,7 +21,7 @@ function candidateDesktopChromium(testInfo: Parameters<typeof meta>[0]): boolean
   return testInfo.project.name === 'candidate-desktop-chromium';
 }
 
-staticTest('[HOME-002] support-right-now panel exposes live, upcoming, and fallback help paths', staticEvidence('Capture the hydrated support panel, its current state labels, and every urgent-help destination.'), async ({ page, audit }, testInfo) => {
+staticTest('[HOME-002] support-right-now panel exposes live, upcoming, and fallback help paths', staticEvidence('Capture the hydrated support panel, its current state labels, and every urgent-help destination.', 'candidate-desktop-chromium'), async ({ page, audit }, testInfo) => {
   test.skip(!candidateDesktopChromium(testInfo), 'One candidate Chromium project validates the hydrated support panel.');
   await audit.goto('/');
   const panel = page.locator('section[aria-labelledby="right-now-title"]');
@@ -39,7 +44,7 @@ staticTest('[HOME-002] support-right-now panel exposes live, upcoming, and fallb
   await audit.assertRuntimeHealthy();
 });
 
-staticTest('[CONTENT-001] representative documents keep valid landmarks and heading order', staticEvidence('Capture representative document outlines with their landmarks, headings, descriptions, and canonical metadata.'), async ({ page, audit }, testInfo) => {
+staticTest('[CONTENT-001] representative documents keep valid landmarks and heading order', staticEvidence('Capture representative document outlines with their landmarks, headings, descriptions, and canonical metadata.', 'candidate-desktop-chromium'), async ({ page, audit }, testInfo) => {
   test.skip(!candidateDesktopChromium(testInfo), 'The complete route audit covers every page; this check validates representative outlines.');
   const evidence = [];
   for (const route of REPRESENTATIVE_DOCUMENTS) {
@@ -72,11 +77,14 @@ staticTest('[CONTENT-001] representative documents keep valid landmarks and head
     expect(structure.canonical, `${route} needs a canonical URL`).toMatch(/^https:\/\//);
     evidence.push({ route, ...structure });
   }
+  expect(REPRESENTATIVE_DOCUMENTS, 'The representative document contract must retain all six reviewed routes').toHaveLength(6);
+  expect(evidence.map(({ route }) => route), 'Every declared representative document must produce one inspected record').toEqual([...REPRESENTATIVE_DOCUMENTS]);
   await audit.attachJson('document-structure-ledger', evidence);
   audit.observe('Representative outlines inspected', evidence.length, String(REPRESENTATIVE_DOCUMENTS.length));
+  await audit.checkpoint('representative-document-outline');
 });
 
-structuredTest('[CONTENT-003] every published candidate route resolves without a broken internal destination', structuredEvidence('Retain every resolved internal destination, redirect disposition, status, and content type without unrelated media.'), async ({ request, audit }, testInfo) => {
+structuredTest('[CONTENT-003] every published candidate route resolves without a broken internal destination', structuredEvidence('Retain every resolved internal destination, redirect disposition, status, and content type without unrelated media.', 'candidate-desktop-chromium'), async ({ request, audit }, testInfo) => {
   test.skip(!candidateDesktopChromium(testInfo), 'One candidate project performs the complete internal destination crawl.');
   const results = [];
   for (const route of CANDIDATE_HTML_ROUTES) {
@@ -88,7 +96,7 @@ structuredTest('[CONTENT-003] every published candidate route resolves without a
   expect(broken, 'Every destination in the reviewed route inventory must serve HTML directly').toEqual([]);
 });
 
-staticTest('[CONTENT-004] internal and external links follow tab-isolation policy', staticEvidence('Capture representative rendered link sets with their target and rel isolation attributes.'), async ({ page, audit }, testInfo) => {
+staticTest('[CONTENT-004] internal and external links follow tab-isolation policy', staticEvidence('Capture representative rendered link sets with their target and rel isolation attributes.', 'candidate-desktop-chromium'), async ({ page, audit }, testInfo) => {
   test.skip(!candidateDesktopChromium(testInfo), 'The full page audit checks every route; this check summarizes link policy across templates.');
   const evidence = [];
   for (const route of REPRESENTATIVE_DOCUMENTS) {
@@ -113,44 +121,100 @@ staticTest('[CONTENT-004] internal and external links follow tab-isolation polic
   audit.observe('Links inspected across templates', links.length);
   expect(unsafeExternal, 'External links must use isolated new tabs').toEqual([]);
   expect(internalNewTabs, 'Internal navigation should stay in the current tab').toEqual([]);
+  await audit.checkpoint('reviewed-link-policy-page');
 });
 
-staticTest('[CONTENT-005] images and diagrams remain loaded, labeled, and viewport-safe in both themes', staticEvidence('Capture reference images and diagrams in both visual themes with load, label, and viewport geometry.'), async ({ page, audit }, testInfo) => {
+staticTest('[CONTENT-005] images and diagrams remain loaded, labeled, and viewport-safe in both themes', staticEvidence('Capture reference images and diagrams in both visual themes with load, label, and viewport geometry.', 'candidate-desktop-chromium'), async ({ page, audit }, testInfo) => {
   test.skip(!candidateDesktopChromium(testInfo), 'One resizable Chromium project validates the visual reference assets.');
-  const routes = ['/brand', '/compounds/chemical-structures', '/about/site-architecture'] as const;
-  const evidence = [];
-  for (const route of routes) {
+  expect(DECLARED_ROUTE_VISUALS.length, 'At least one reviewed route visual contract is required').toBeGreaterThan(0);
+  const evidence: unknown[] = [];
+  for (const contract of DECLARED_ROUTE_VISUALS) {
     await page.setViewportSize({ width: 390, height: 844 });
-    await audit.goto(route);
+    await audit.goto(contract.path);
+    expect(contract.items.length, `${contract.path} must declare every release-relevant visual`).toBeGreaterThan(0);
     for (const theme of ['light', 'dark'] as const) {
       await page.evaluate((nextTheme) => {
         document.documentElement.classList.toggle('dark', nextTheme === 'dark');
         document.documentElement.dataset.themeMode = nextTheme;
       }, theme);
-      const images = await page.locator('img').evaluateAll((nodes) => nodes.map((node) => ({
-        src: (node as HTMLImageElement).currentSrc || (node as HTMLImageElement).src,
-        alt: node.getAttribute('alt'),
-        naturalWidth: (node as HTMLImageElement).naturalWidth,
-        box: node.getBoundingClientRect().toJSON(),
-        viewportWidth: document.documentElement.clientWidth,
-      })));
-      const broken = images.filter(({ naturalWidth }) => naturalWidth === 0);
-      const unlabeled = images.filter(({ alt }) => alt === null);
-      const clipped = images.filter(({ box, viewportWidth }) => box.left < -1 || box.right > viewportWidth + 1);
-      expect(broken, `${route} ${theme} images must load`).toEqual([]);
-      expect(unlabeled, `${route} ${theme} images must declare alt text`).toEqual([]);
-      expect(clipped, `${route} ${theme} images must fit their viewport`).toEqual([]);
-      evidence.push({ route, theme, images, broken, unlabeled, clipped });
+      const inspectedItems = [];
+      for (const item of contract.items) {
+        const locator = page.locator(item.selector);
+        await expect(locator, `${contract.path}: ${item.name} must not disappear in ${theme} mode`).toHaveCount(item.exactCount);
+        for (let index = 0; index < item.exactCount; index += 1) {
+          const visual = locator.nth(index);
+          await visual.scrollIntoViewIfNeeded();
+          if (item.kind === 'img' || item.kind === 'picture') {
+            const image = item.kind === 'picture' ? visual.locator('img') : visual;
+            await expect.poll(async () => image.evaluate((node) => {
+              const rendered = node as HTMLImageElement;
+              return rendered.complete && rendered.naturalWidth > 0 && rendered.naturalHeight > 0;
+            }), {
+              message: `${contract.path} ${item.name} #${index + 1} must load after entering the viewport`,
+              timeout: 8_000,
+            }).toBe(true);
+          }
+        }
+        const nodes = await locator.evaluateAll((elements, visualKind) => elements.map((element) => {
+          const box = element.getBoundingClientRect();
+          const image = visualKind === 'picture'
+            ? element.querySelector('img')
+            : element instanceof HTMLImageElement ? element : null;
+          const svg = element instanceof SVGElement ? element : null;
+          const title = element.querySelector('title')?.textContent?.replace(/\s+/g, ' ').trim() ?? '';
+          return {
+            tag: element.tagName.toLowerCase(),
+            box: box.toJSON(),
+            viewportWidth: document.documentElement.clientWidth,
+            textCharacters: element.textContent?.replace(/\s+/g, ' ').trim().length ?? 0,
+            ariaHidden: element.getAttribute('aria-hidden'),
+            accessibleLabel: element.getAttribute('aria-label') ?? title,
+            image: image ? {
+              src: image.currentSrc || image.src,
+              alt: image.getAttribute('alt'),
+              complete: image.complete,
+              naturalWidth: image.naturalWidth,
+              naturalHeight: image.naturalHeight,
+            } : null,
+            svg: svg ? {
+              viewBox: svg.getAttribute('viewBox'),
+              width: svg.getAttribute('width'),
+              height: svg.getAttribute('height'),
+            } : null,
+          };
+        }), item.kind);
+        for (const [index, node] of nodes.entries()) {
+          expect(node.box.width, `${contract.path} ${item.name} #${index + 1} must render with width`).toBeGreaterThan(0);
+          expect(node.box.height, `${contract.path} ${item.name} #${index + 1} must render with height`).toBeGreaterThan(0);
+          expect(node.box.left, `${contract.path} ${item.name} #${index + 1} must not clip left`).toBeGreaterThanOrEqual(-1);
+          expect(node.box.right, `${contract.path} ${item.name} #${index + 1} must not clip right`).toBeLessThanOrEqual(node.viewportWidth + 1);
+          if (item.kind === 'img' || item.kind === 'picture') {
+            expect(node.image, `${contract.path} ${item.name} #${index + 1} must contain an image`).not.toBeNull();
+            expect(node.image?.complete, `${contract.path} ${item.name} #${index + 1} must finish loading`).toBe(true);
+            expect(node.image?.naturalWidth ?? 0, `${contract.path} ${item.name} #${index + 1} needs intrinsic width`).toBeGreaterThan(0);
+            expect(node.image?.naturalHeight ?? 0, `${contract.path} ${item.name} #${index + 1} needs intrinsic height`).toBeGreaterThan(0);
+            expect(node.image?.alt, `${contract.path} ${item.name} #${index + 1} must declare alt text`).not.toBeNull();
+          } else if (item.kind === 'svg') {
+            expect(node.svg, `${contract.path} ${item.name} #${index + 1} must remain an SVG`).not.toBeNull();
+            expect(Boolean(node.svg?.viewBox || (node.svg?.width && node.svg.height)), `${contract.path} ${item.name} #${index + 1} needs intrinsic SVG geometry`).toBe(true);
+            expect(node.ariaHidden === 'true' || node.accessibleLabel.length > 0, `${contract.path} ${item.name} #${index + 1} must be decorative or labeled`).toBe(true);
+          } else {
+            expect(node.textCharacters, `${contract.path} ${item.name} #${index + 1} must contain meaningful diagram content`).toBeGreaterThan(20);
+          }
+        }
+        inspectedItems.push({ ...item, nodes });
+      }
+      evidence.push({ route: contract.path, theme, items: inspectedItems });
+      await audit.checkpoint(`declared-visual-${contract.path.replace(/^\/+|\/+$/g, '').replaceAll('/', '-')}-${theme}`);
     }
   }
-  await audit.attachJson('image-theme-ledger', evidence);
-  audit.observe('Image/theme combinations inspected', evidence.length, String(routes.length * 2));
-  await audit.checkpoint('reference-images-dark');
+  await audit.attachJson('declared-route-visual-contract-ledger', evidence);
+  audit.observe('Declared visual/theme combinations inspected', evidence.length, String(DECLARED_ROUTE_VISUALS.length * 2));
 });
 
-staticTest('[CONTENT-006] dense reference and tool layouts remain usable across widths', staticEvidence('Capture dense reference and tool layouts at narrow, tablet, and desktop widths with overflow geometry.'), async ({ page, audit }, testInfo) => {
+staticTest('[CONTENT-006] dense reference and tool layouts remain usable across widths', staticEvidence('Capture dense reference and tool layouts at narrow, tablet, and desktop widths with overflow geometry.', 'candidate-desktop-chromium'), async ({ page, audit }, testInfo) => {
   test.skip(!candidateDesktopChromium(testInfo), 'One resizable Chromium project probes narrow, tablet, and desktop geometry.');
-  const routes = ['/resources/7-oh-taper-calculator', '/compounds/chemical-structures', '/virtual-na-meetings-now', '/about/changelog'] as const;
+  const routes = ['/resources/7-oh-taper-calculator', '/pharmacology/chemical-structures', '/virtual-na-meetings-now', '/about/changelog'] as const;
   const widths = [320, 768, 1440] as const;
   const evidence = [];
   for (const route of routes) {
@@ -165,6 +229,9 @@ staticTest('[CONTENT-006] dense reference and tool layouts remain usable across 
       expect(controls, `${route} must retain a usable action at ${width}px`).toBeGreaterThan(0);
     }
   }
+  const expectedCoverage = routes.flatMap((route) => widths.map((width) => ({ route, width })));
+  expect(expectedCoverage, 'The responsive matrix must retain four routes at three reviewed widths').toHaveLength(12);
+  expect(evidence.map(({ route, width }) => ({ route, width })), 'Every declared route/width pair must produce one inspected record').toEqual(expectedCoverage);
   await audit.attachJson('wide-reference-responsive-ledger', evidence);
   await audit.checkpoint('wide-reference-desktop');
 });
@@ -194,55 +261,123 @@ interactionTest('[CONTENT-007] long references scroll without lockups and retain
     expect(result.height, `${route} should exercise a genuinely long page`).toBeGreaterThan(2_000);
     expect(result.elapsedMs, `${route} should remain responsive during progressive scrolling`).toBeLessThan(2_000);
     expect(result.finalScrollY, `${route} should reach the lower document`).toBeGreaterThan(500);
+    expect(result.mainVisible, `${route} must retain its primary content landmark`).toBe(true);
     expect(result.navigationLinks, `${route} should retain navigation`).toBeGreaterThan(0);
     evidence.push({ route, ...result });
   }
+  expect(routes, 'The long-page contract must retain all three reviewed references').toHaveLength(3);
+  expect(evidence.map(({ route }) => route), 'Every declared long reference must complete the scroll exercise').toEqual([...routes]);
   await audit.attachJson('long-page-stability-ledger', evidence);
   audit.observe('Long references exercised', evidence.length, String(routes.length));
 });
 
-staticTest('[CONTENT-008] production-to-candidate content parity ledger protects critical recovery paths', staticEvidence('Capture the paired production and candidate content ledger for critical headings and recovery actions.'), async ({ browser, audit }, testInfo) => {
+staticTest('[CONTENT-008] production-to-candidate content parity ledger protects critical recovery paths', staticEvidence('Capture the paired production and candidate content ledger for critical headings and recovery actions.', 'candidate-desktop-chromium'), async ({ browser, page: candidate, audit }, testInfo) => {
   test.skip(!candidateDesktopChromium(testInfo), 'One candidate project produces the paired content ledger.');
-  const routes = ['/', '/start-here/welcome', '/compounds/7-oh', '/resources/7-oh-taper-calculator', '/virtual-na-meetings-now'] as const;
-  const candidate = await browser.newPage({ viewport: { width: 1440, height: 900 } });
   const production = await browser.newPage({ viewport: { width: 1440, height: 900 } });
-  const ledger = [];
-  for (const route of routes) {
-    const productionPath = resolveEnvironmentPath('production', route);
-    expect(productionPath, `${route} needs an approved production counterpart`).not.toBeNull();
-    if (productionPath === null) continue;
-    await Promise.all([
-      candidate.goto(new URL(route, ENVIRONMENTS.candidate.baseURL).href, { waitUntil: 'load' }),
-      production.goto(new URL(productionPath, ENVIRONMENTS.production.baseURL).href, { waitUntil: 'load' }),
-    ]);
-    const inspect = (page: typeof candidate) => page.evaluate(() => ({
-      h1: document.querySelector('h1')?.textContent?.replace(/\s+/g, ' ').trim() ?? '',
-      headings: [...document.querySelectorAll('main h2, main h3')].map((heading) => heading.textContent?.replace(/\s+/g, ' ').trim() ?? '').filter(Boolean),
-      mainCharacters: document.querySelector('main')?.textContent?.replace(/\s+/g, ' ').trim().length ?? 0,
-      internalActions: [...document.querySelectorAll<HTMLAnchorElement>('main a[href^="/"]')].map((anchor) => anchor.getAttribute('href')).filter(Boolean),
-    }));
-    const [candidateValues, productionValues] = await Promise.all([inspect(candidate), inspect(production)]);
-    const normalizedCandidateHeadings = new Set(candidateValues.headings.map((heading) => heading.toLowerCase()));
-    const missingProductionHeadings = productionValues.headings.filter((heading) => !normalizedCandidateHeadings.has(heading.toLowerCase()));
-    const characterRatio = productionValues.mainCharacters > 0 ? candidateValues.mainCharacters / productionValues.mainCharacters : null;
-    ledger.push({ route, productionPath, candidate: candidateValues, production: productionValues, characterRatio, missingProductionHeadings });
-    expect(candidateValues.h1, `${route} candidate H1 must remain present`).not.toBe('');
-    expect(productionValues.h1, `${productionPath} production H1 must be available for comparison`).not.toBe('');
-    expect(characterRatio ?? 0, `${route} candidate content must retain at least 60% of baseline text volume`).toBeGreaterThanOrEqual(0.6);
-    expect(candidateValues.internalActions.length, `${route} must retain internal next actions`).toBeGreaterThan(0);
+  const normalize = (value: string) => value.replace(/\s+/g, ' ').trim().toLocaleLowerCase('en-US');
+  const normalizeHeading = (value: string) => normalize(value).replace(/\s*\([\d,]+\)$/, ' (#)');
+  const ledger: Array<{
+    contract: (typeof CRITICAL_CONTENT_CONTRACTS)[number];
+    productionPath: string | null;
+    candidateStatus: number | null;
+    productionStatus: number | null;
+    candidate: { headings: string[]; mainText: string; internalActions: string[] };
+    production: { headings: string[]; mainText: string; internalActions: string[] };
+    missingRequiredHeadings: string[];
+    missingWarnings: string[];
+    missingDestinations: string[];
+    missingProductionHeadings: string[];
+    unexpectedMissingProductionHeadings: string[];
+    staleApprovedDifferences: string[];
+  }> = [];
+  try {
+    for (const contract of CRITICAL_CONTENT_CONTRACTS) {
+      const productionPath = resolveEnvironmentPath('production', contract.path);
+      const [candidateResponse, productionResponse] = await Promise.all([
+        candidate.goto(new URL(contract.path, ENVIRONMENTS.candidate.baseURL).href, { waitUntil: 'load' }),
+        productionPath === null ? null : production.goto(new URL(productionPath, ENVIRONMENTS.production.baseURL).href, { waitUntil: 'load' }),
+      ]);
+      const inspect = (page: typeof candidate) => page.evaluate(() => ({
+        headings: [...document.querySelectorAll('main h1, main h2, main h3')]
+          .map((heading) => heading.textContent?.replace(/\s+/g, ' ').trim() ?? '')
+          .filter(Boolean),
+        mainText: document.querySelector('main')?.textContent?.replace(/\s+/g, ' ').trim() ?? '',
+        internalActions: [...document.querySelectorAll<HTMLAnchorElement>('main a[href]')]
+          .map((anchor) => {
+            const destination = new URL(anchor.href, location.href);
+            return destination.origin === location.origin ? destination.pathname.replace(/\/$/, '') || '/' : null;
+          })
+          .filter((path): path is string => path !== null),
+      }));
+      const [candidateValues, productionValues] = await Promise.all([
+        inspect(candidate),
+        productionPath === null ? { headings: [], mainText: '', internalActions: [] } : inspect(production),
+      ]);
+      const candidateHeadings = new Set(candidateValues.headings.map(normalizeHeading));
+      const candidateText = normalize(candidateValues.mainText);
+      const candidateDestinations = new Set(candidateValues.internalActions);
+      const missingRequiredHeadings = contract.requiredHeadings.filter((heading) => !candidateHeadings.has(normalizeHeading(heading)));
+      const missingWarnings = contract.requiredWarningFragments.filter((warning) => !candidateText.includes(normalize(warning)));
+      const missingDestinations = contract.requiredCandidateDestinations.filter((path) => !candidateDestinations.has(path));
+      const missingProductionHeadings = productionValues.headings.filter((heading) => !candidateHeadings.has(normalizeHeading(heading)));
+      const approved = new Set(contract.approvedMissingProductionHeadings.map(normalizeHeading));
+      const actualMissing = new Set(missingProductionHeadings.map(normalizeHeading));
+      const unexpectedMissingProductionHeadings = missingProductionHeadings.filter((heading) => !approved.has(normalizeHeading(heading)));
+      const staleApprovedDifferences = contract.approvedMissingProductionHeadings.filter((heading) => !actualMissing.has(normalizeHeading(heading)));
+      const entry = {
+        contract,
+        productionPath,
+        candidateStatus: candidateResponse?.status() ?? null,
+        productionStatus: productionResponse?.status() ?? null,
+        candidate: candidateValues,
+        production: productionValues,
+        missingRequiredHeadings,
+        missingWarnings,
+        missingDestinations,
+        missingProductionHeadings,
+        unexpectedMissingProductionHeadings,
+        staleApprovedDifferences,
+      };
+      ledger.push(entry);
+
+      const hasReviewIssue = candidateResponse?.status() !== 200
+        || productionResponse?.status() !== 200
+        || missingRequiredHeadings.length > 0
+        || missingWarnings.length > 0
+        || missingDestinations.length > 0
+        || unexpectedMissingProductionHeadings.length > 0
+        || staleApprovedDifferences.length > 0;
+      if (hasReviewIssue || contract.path === '/') {
+        const slug = contract.path === '/' ? 'home' : contract.path.replace(/^\/+|\/+$/g, '').replaceAll('/', '-');
+        const candidateShot = testInfo.outputPath(`content-contract-${slug}-candidate.png`);
+        const productionShot = testInfo.outputPath(`content-contract-${slug}-production.png`);
+        await Promise.all([
+          candidate.screenshot({ path: candidateShot, fullPage: false }),
+          production.screenshot({ path: productionShot, fullPage: false }),
+        ]);
+        await Promise.all([
+          testInfo.attach(`content-contract-${slug}-candidate`, { path: candidateShot, contentType: 'image/png' }),
+          testInfo.attach(`content-contract-${slug}-production`, { path: productionShot, contentType: 'image/png' }),
+        ]);
+      }
+    }
+  } finally {
+    await production.close();
   }
-  const home = ledger.find(({ route }) => route === '/');
-  expect(home?.candidate.internalActions).toContain('/start-here/7-oh-withdrawal-help');
-  expect(home?.candidate.internalActions.some((href) => href?.includes('meeting'))).toBe(true);
   await audit.attachJson('production-candidate-content-parity-ledger', ledger);
-  audit.observe('Paired critical routes compared', ledger.length, String(routes.length));
-  audit.observe('Candidate-only or renamed baseline headings', ledger.reduce((sum, item) => sum + item.missingProductionHeadings.length, 0), 'Review as intentional redesign differences');
-  const candidateShot = testInfo.outputPath('content-parity-candidate.png');
-  const productionShot = testInfo.outputPath('content-parity-production.png');
-  await candidate.screenshot({ path: candidateShot, fullPage: false });
-  await production.screenshot({ path: productionShot, fullPage: false });
-  await testInfo.attach('content-parity-candidate', { path: candidateShot, contentType: 'image/png' });
-  await testInfo.attach('content-parity-production', { path: productionShot, contentType: 'image/png' });
-  await candidate.close();
-  await production.close();
+  audit.observe('Paired critical routes compared', ledger.length, String(CRITICAL_CONTENT_CONTRACTS.length));
+  audit.observe('Unknown production-heading omissions', ledger.reduce((sum, item) => sum + item.unexpectedMissingProductionHeadings.length, 0), '0 unless explicitly reviewed');
+  expect.soft(ledger.length, 'Every critical content contract must be evaluated').toBe(CRITICAL_CONTENT_CONTRACTS.length);
+  for (const entry of ledger) {
+    expect.soft(entry.productionPath, `${entry.contract.path} needs an approved production counterpart`).not.toBeNull();
+    expect.soft(entry.candidateStatus, `${entry.contract.path} candidate must return 200`).toBe(200);
+    expect.soft(entry.productionStatus, `${entry.productionPath ?? entry.contract.path} production must return 200`).toBe(200);
+    expect.soft(entry.missingRequiredHeadings, `${entry.contract.path} must retain every release-critical heading`).toEqual([]);
+    expect.soft(entry.missingWarnings, `${entry.contract.path} must retain every release-critical warning`).toEqual([]);
+    expect.soft(entry.missingDestinations, `${entry.contract.path} must retain every release-critical CTA destination`).toEqual([]);
+    expect.soft(entry.unexpectedMissingProductionHeadings, `${entry.contract.path} removed production headings require exact reviewed ledger entries`).toEqual([]);
+    expect.soft(entry.staleApprovedDifferences, `${entry.contract.path} reviewed-difference entries must describe a current omission`).toEqual([]);
+  }
+  await audit.checkpoint('critical-content-contract-candidate-reference');
+  audit.coverEnvironments('candidate', 'production');
 });

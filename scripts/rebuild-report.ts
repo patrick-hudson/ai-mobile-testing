@@ -1,10 +1,16 @@
-import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { ALL_AUDIT_BY_ID } from '../audit/definitions.js';
 import { AUDIT_EVIDENCE_POLICY_ANNOTATION, serializeEvidencePolicy } from '../audit/evidence-policy.js';
 import type { AuditEvidenceRecord, AuditProjectMetadata } from '../audit/types.js';
 import type { GalleryArchiveDescriptor } from '../shared/gallery-contract.mjs';
+import {
+  AttachmentSourceContainmentError,
+  createAttachmentSourceBoundary,
+  readContainedAttachmentSource,
+  validateContainedAttachmentSource,
+  type AttachmentSourceBoundary,
+} from '../reporters/gallery-model.js';
 import {
   resolveReportOutputDir,
   writeAuditReport,
@@ -77,16 +83,13 @@ function decodeOutput(chunks: JsonResult['stdout']): string[] {
   });
 }
 
-function attachment(value: JsonAttachment, jsonDirectory: string): ReportAttachmentInput {
+async function attachment(
+  value: JsonAttachment,
+  sourceBoundary: AttachmentSourceBoundary,
+): Promise<ReportAttachmentInput> {
   let sourcePath: string | undefined;
   if (value.path) {
-    if (path.isAbsolute(value.path)) {
-      sourcePath = value.path;
-    } else {
-      const fromWorkingDirectory = path.resolve(value.path);
-      const fromJsonDirectory = path.resolve(jsonDirectory, value.path);
-      sourcePath = existsSync(fromWorkingDirectory) ? fromWorkingDirectory : fromJsonDirectory;
-    }
+    sourcePath = await validateContainedAttachmentSource(value.path, sourceBoundary);
   }
   return {
     name: value.name,
@@ -96,7 +99,10 @@ function attachment(value: JsonAttachment, jsonDirectory: string): ReportAttachm
   };
 }
 
-function collectTests(report: PlaywrightJsonReport, jsonDirectory: string): ReportTestInput[] {
+async function collectTests(
+  report: PlaywrightJsonReport,
+  sourceBoundary: AttachmentSourceBoundary,
+): Promise<ReportTestInput[]> {
   const sourceShard = report.config?.shard
     ? { ordinal: report.config.shard.current, total: report.config.shard.total }
     : null;
@@ -111,12 +117,23 @@ function collectTests(report: PlaywrightJsonReport, jsonDirectory: string): Repo
   );
   const output: ReportTestInput[] = [];
 
-  function visit(suite: JsonSuite, parents: string[]): void {
+  async function visit(suite: JsonSuite, parents: string[]): Promise<void> {
     const currentParents = suite.title ? [...parents, suite.title] : parents;
     for (const spec of suite.specs ?? []) {
       for (const [index, test] of (spec.tests ?? []).entries()) {
         const project = projects.get(test.projectId ?? '') ?? projects.get(test.projectName ?? '');
         const projectName = test.projectName ?? project?.name ?? test.projectId ?? 'unknown-project';
+        const results = await Promise.all((test.results ?? []).map(async (result) => ({
+          status: result.status,
+          ...(test.expectedStatus ? { expectedStatus: test.expectedStatus } : {}),
+          duration: result.duration,
+          retry: result.retry,
+          ...(result.startTime ? { startedAt: result.startTime } : {}),
+          errors: result.errors ?? (result.error ? [result.error] : []),
+          attachments: await Promise.all((result.attachments ?? []).map((value) => attachment(value, sourceBoundary))),
+          stdout: decodeOutput(result.stdout),
+          stderr: decodeOutput(result.stderr),
+        })));
         output.push({
           id: spec.id ?? `${spec.file ?? suite.file ?? 'unknown'}:${spec.line ?? 0}:${projectName}:${index}`,
           title: spec.title,
@@ -129,24 +146,14 @@ function collectTests(report: PlaywrightJsonReport, jsonDirectory: string): Repo
           ...(sourceShard ? { sourceShard } : {}),
           tags: spec.tags ?? [],
           annotations: test.annotations ?? [],
-          results: (test.results ?? []).map((result) => ({
-            status: result.status,
-            ...(test.expectedStatus ? { expectedStatus: test.expectedStatus } : {}),
-            duration: result.duration,
-            retry: result.retry,
-            ...(result.startTime ? { startedAt: result.startTime } : {}),
-            errors: result.errors ?? (result.error ? [result.error] : []),
-            attachments: (result.attachments ?? []).map((value) => attachment(value, jsonDirectory)),
-            stdout: decodeOutput(result.stdout),
-            stderr: decodeOutput(result.stderr),
-          })),
+          results,
         });
       }
     }
-    for (const child of suite.suites ?? []) visit(child, currentParents);
+    for (const child of suite.suites ?? []) await visit(child, currentParents);
   }
 
-  for (const suite of report.suites ?? []) visit(suite, []);
+  for (const suite of report.suites ?? []) await visit(suite, []);
   return output;
 }
 
@@ -162,15 +169,22 @@ interface ManualEvidenceDocument {
   }>;
 }
 
-async function collectManualTests(runDirectory: string): Promise<ReportTestInput[]> {
+async function collectManualTests(
+  runDirectory: string,
+  sourceBoundary: AttachmentSourceBoundary,
+): Promise<ReportTestInput[]> {
   let document: ManualEvidenceDocument;
   try {
-    document = JSON.parse(await readFile(path.join(runDirectory, 'manual-evidence.json'), 'utf8')) as ManualEvidenceDocument;
+    document = JSON.parse((await readContainedAttachmentSource(
+      path.join(runDirectory, 'manual-evidence.json'),
+      sourceBoundary,
+      { maximumBytes: 16 * 1024 * 1024 },
+    )).toString('utf8')) as ManualEvidenceDocument;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
     throw error;
   }
-  const manualRoot = path.resolve(runDirectory, 'manual-evidence');
+  const manualRoot = path.join(sourceBoundary.realRoot, 'manual-evidence');
   const tests: ReportTestInput[] = [];
   for (const [index, entry] of (document.entries ?? []).entries()) {
     const definition = entry.auditId ? ALL_AUDIT_BY_ID.get(entry.auditId) : undefined;
@@ -223,9 +237,19 @@ async function collectManualTests(runDirectory: string): Promise<ReportTestInput
     ];
     for (const attachment of entry.attachments ?? []) {
       if (!attachment.path || !attachment.contentType) continue;
-      const absolute = path.resolve(runDirectory, attachment.path);
-      if (absolute !== manualRoot && !absolute.startsWith(`${manualRoot}${path.sep}`)) continue;
-      if (!existsSync(absolute)) continue;
+      if (path.isAbsolute(attachment.path) || attachment.path.replaceAll('\\', '/').split('/').includes('..')) {
+        throw new AttachmentSourceContainmentError('Manual attachment source rejected: paths must be relative and traversal-free.');
+      }
+      let absolute: string;
+      try {
+        absolute = await validateContainedAttachmentSource(attachment.path, sourceBoundary);
+      } catch (error) {
+        if (['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')) continue;
+        throw error;
+      }
+      if (absolute !== manualRoot && !absolute.startsWith(`${manualRoot}${path.sep}`)) {
+        throw new AttachmentSourceContainmentError('Manual attachment source rejected: the file is outside manual-evidence.');
+      }
       attachments.push({
         name: `manual-${attachment.name ?? path.basename(absolute)}`,
         contentType: attachment.contentType,
@@ -244,7 +268,7 @@ async function collectManualTests(runDirectory: string): Promise<ReportTestInput
           type: AUDIT_EVIDENCE_POLICY_ANNOTATION,
           description: serializeEvidencePolicy(definition.evidencePolicy),
         },
-        ...(entry.outcome === 'blocked' ? [{ type: 'BLOCKED', description: entry.notes || 'Manual review blocked.' }] : []),
+        ...(entry.outcome === 'blocked' ? [{ type: 'audit-status', description: 'BLOCKED' }] : []),
       ],
       results: [{
         status: entry.outcome === 'fail' ? 'failed' : 'passed',
@@ -293,24 +317,34 @@ function rebuildArguments(argv: string[]): RebuildArguments {
 const rebuild = rebuildArguments(process.argv.slice(2));
 const resultsFile = rebuild.resultsFile;
 const outputDir = rebuild.outputDir;
-const report = JSON.parse(await readFile(resultsFile, 'utf8')) as PlaywrightJsonReport;
+const runDirectory = path.dirname(resultsFile);
+const sourceBoundary = await createAttachmentSourceBoundary(runDirectory);
+const report = JSON.parse((await readContainedAttachmentSource(
+  resultsFile,
+  sourceBoundary,
+  { maximumBytes: 512 * 1024 * 1024 },
+)).toString('utf8')) as PlaywrightJsonReport;
 const tests = [
-  ...collectTests(report, path.dirname(resultsFile)),
-  ...await collectManualTests(path.dirname(resultsFile)),
+  ...await collectTests(report, sourceBoundary),
+  ...await collectManualTests(runDirectory, sourceBoundary),
 ];
 const unexpected = report.stats?.unexpected ?? 0;
-const manifest = await writeAuditReport({
+const reportOptions = {
   outputDir,
   tests,
   run: {
-    status: unexpected > 0 ? 'failed' : 'passed',
+    status: unexpected > 0 ? 'failed' as const : 'passed' as const,
     ...(report.stats?.startTime ? { startedAt: report.stats.startTime } : {}),
     ...(report.stats?.duration != null ? { durationMs: report.stats.duration } : {}),
-    source: 'playwright-json',
+    source: 'playwright-json' as const,
     profile: process.env.AUDIT_PROFILE ?? 'release',
     errors: report.errors ?? [],
   },
-});
+  // GenerateReportOptions is intentionally narrower, but buildAuditModels
+  // forwards this runtime property to the gallery boundary.
+  sourceRoot: runDirectory,
+};
+const manifest = await writeAuditReport(reportOptions);
 
 console.log(`Rebuilt ${path.resolve(outputDir, 'index.html')}`);
 const galleryDescriptor = JSON.parse(

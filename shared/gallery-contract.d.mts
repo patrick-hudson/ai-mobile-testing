@@ -100,6 +100,9 @@ export interface GalleryItem {
     ordinal: number;
     retry: number;
     status: string;
+    rawStatus?: string;
+    statusSource?: 'reviewed-manifest' | 'release-integrity';
+    reviewReasonCodes?: string[];
     expectedStatus: string | null;
     startedAt: string | null;
     durationMs: number;

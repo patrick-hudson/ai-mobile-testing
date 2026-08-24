@@ -46,15 +46,11 @@ Installed test suites come only from the generated, validated `audit/plugins.gen
 
 ### Optional AI evidence review
 
-AI review is opt-in for each portal run. Open Claude settings in the portal to save, replace, or delete the credential. The server encrypts saved credentials with AES-256-GCM in the named `ai-mobile-testing-portal-secrets` Docker volume. The browser receives only configured state and a short one-way fingerprint. It never stores the key locally or sends it in a run request.
+AI review is opt-in for each portal run. Open Claude settings in the portal to save, replace, or delete the credential. The server encrypts saved credentials with AES-256-GCM in the Compose-project-scoped `portal-secrets` Docker volume mounted at `/var/lib/ai-mobile-testing/secrets`, outside `/work` and Playwright's test-discovery tree. The browser receives only configured state and a short one-way fingerprint. It never stores the key locally or sends it in a run request.
 
-For CI or an environment-managed deployment, pass the key only to the container process:
+Compose deliberately does not forward `ANTHROPIC_API_KEY`: container environment/configuration is inspectable and frequently captured in diagnostics. Save the key in the portal instead. A separately managed deployment may still inject an environment key directly into the supervisor, but operators must treat its container configuration as secret-bearing.
 
-```sh
-ANTHROPIC_API_KEY='your-runtime-secret' docker compose up --build portal
-```
-
-The compose file forwards the host variable without embedding it in the image or source. A portal-saved key is accepted only by the dedicated same-origin credential endpoint and is never echoed. An environment-managed key cannot be deleted in the portal; restart the container without `ANTHROPIC_API_KEY` to remove it. Neither source reaches a run manifest, event stream, log, command summary, report, or artifact. The default model is `claude-sonnet-5`; override it with `ANTHROPIC_MODEL` at container startup or in the validated model field for one launch. `AI_REVIEW_DRY_RUN=1` exercises the stage and output contract without an API request.
+The root portal supervisor owns the mode-0700 vault. Playwright and video processing run as the image's non-root `pwuser`; AI review runs as non-root `aiworker`; and checklist generation runs as a distinct non-root `reportworker`. Every worker environment removes the vault path and every key source. `aiworker` shares only the completed run-artifact group and cannot read the vault or inspect browser processes as the same UID. The supervisor sends the selected key once over an anonymous stdin pipe, so it does not appear in the AI worker environment. Before any request, the AI worker freezes bounded regular evidence files through contained canonical paths, rejects every symbolic-link component, and opens the final file with no-follow semantics. After browser, media, and AI work, the supervisor removes symlinks, rejects hard links and non-regular artifacts, makes the run tree read-only to worker identities, gives `reportworker` one private staging directory, and atomically publishes the completed checklist. Credential settings and AI launch are disabled unless all three worker identities are established. A portal-saved key is accepted only by the dedicated same-origin credential endpoint and is never echoed. No key reaches a run manifest, event stream, log, command summary, report, or artifact. The default model is `claude-sonnet-5`; override it with `ANTHROPIC_MODEL` at container startup or in the validated model field for one launch. `AI_REVIEW_DRY_RUN=1` exercises the stage and output contract without an API request.
 
 The review appears under `ai-review/` as `review.json`, `index.html`, `review.md`, and a provider-safe lifecycle log. The portal displays only allowlisted telemetry: model, response status, latency, and token usage. It does not display request/response bodies or headers.
 
@@ -89,6 +85,53 @@ npm run portal:e2e:scale
 The `portal-e2e` service is constrained to 2 CPUs and 4 GiB. The runner verifies the actual cgroup values before collecting 5 cold warmups + 30 cold measurements and 10 warmup + 100 measured item transitions. The fixture physically materializes and recounts all 17,527 corpus files: every one of the 5,659 artifact hrefs plus 11,868 modeled storage copies. It does not infer this footprint from metadata. `artifacts/portal-e2e/gallery-scale-metrics.json` retains every sample, the materialized counts, and the DOM/media/heap/stale-work maxima; `gallery-scale-network.har.zip`, `gallery-scale-workbench.png`, `gallery-scale-overview.png`, `gallery-scale-archive-read-only.png`, and `gallery-scale-navigation.webm` are the review evidence. The video is justified because it records keyboard, filter, touch, comparison, fullscreen, and video-control interactions; static layout evidence remains screenshots.
 
 The scale gate requires p95 first usable at or below 2 seconds, p95 item change at or below 200 ms, no more than three cold metadata requests / 1 MiB, no more than 500 gallery DOM nodes, one selected video, no adjacent videos, no stale commit after 50 superseding changes, and no more than 25 MiB heap growth after 100 measured traversals. Both CDP heap samples must exist, be finite, and be positive; an unavailable metric is a failure. The video bound is taken from the observed selected-video DOM after the real playback/range journey, never a fabricated minimum. Archive query wrappers remain 256 KiB/100 rows, item details remain 512 KiB, and the direct-file first view loads only its intersecting published-order chunk plus selected detail and flags.
+
+### Browser and device target matrix
+
+The default release scope remains exactly the established seven projects. Adding target definitions does not silently multiply a normal or sharded run:
+
+| Default project ID | Runtime | Evidence fidelity |
+| --- | --- | --- |
+| `production-mobile-chromium` | Chromium with Pixel 5 descriptor | Android 11 user-agent, viewport, touch, and scale emulation; not a physical Pixel or Chrome for Android |
+| `candidate-mobile-chromium` | Chromium with Pixel 5 descriptor | Android 11 user-agent, viewport, touch, and scale emulation; not a physical Pixel or Chrome for Android |
+| `production-desktop-chromium` | Playwright Chromium | Docker-local desktop browser |
+| `candidate-desktop-chromium` | Playwright Chromium | Docker-local desktop browser |
+| `candidate-mobile-webkit` | WebKit with iPhone 13 descriptor | iOS 15 user-agent/device emulation; not iOS or Mobile Safari |
+| `candidate-tablet-webkit` | WebKit with iPad Mini descriptor | iPad descriptor emulation; not iPadOS or Mobile Safari |
+| `candidate-desktop-firefox` | Playwright Firefox | Docker-local desktop browser |
+
+Set `AUDIT_TARGET_IDS` to an exact comma-separated selection to opt into another Docker-local profile. When set, it replaces the defaults for that browser process; list every project needed for the run. Unknown IDs, duplicates, metadata-only provider IDs, and unavailable browser capabilities stop configuration before a browser launches.
+
+| Opt-in project ID | What actually runs |
+| --- | --- |
+| `candidate-mobile-webkit-iphone-17-ios18` | Playwright WebKit with iPhone 17 viewport/input and iOS 18.7 user agent |
+| `candidate-mobile-webkit-iphone-15-ios17` | Playwright WebKit with iPhone 15 viewport/input and iOS 17.5 user agent |
+| `candidate-mobile-chromium-pixel-10-android16` | Playwright Chromium with Pixel 10 viewport/input and Android 16 user agent |
+| `candidate-mobile-chromium-pixel-8-android14` | Playwright Chromium with Pixel 8 viewport/input and Android 14 user agent |
+| `candidate-mobile-chromium-galaxy-s24-android14` | Playwright Chromium with Galaxy S24 viewport/input and Android 14 user agent |
+| `candidate-desktop-chromium-edge-compat` | Playwright Chromium with the Edge desktop user agent/viewport; explicitly not the branded Edge binary |
+| `candidate-desktop-chromium-msedge` | Branded Microsoft Edge channel; requires the optional image capability below |
+
+For example, run current/recent mobile emulations together:
+
+```sh
+AUDIT_TARGET_IDS=candidate-mobile-webkit-iphone-17-ios18,candidate-mobile-webkit-iphone-15-ios17,candidate-mobile-chromium-pixel-10-android16,candidate-mobile-chromium-galaxy-s24-android14 \
+docker compose --profile audit run --rm audit-release
+```
+
+Branded Edge is deliberately a separate capability from Edge-compatible Chromium. It adds image size and a vendor download, so the default image does not install it:
+
+```sh
+INSTALL_MSEDGE=1 docker compose --profile audit build audit-release
+AUDIT_TARGET_IDS=candidate-desktop-chromium-msedge \
+docker compose --profile audit run --rm audit-release
+```
+
+The image records `AUDIT_MSEDGE_AVAILABLE=1`, and configuration also verifies the executable. Setting that runtime flag by hand without the binary still fails. Use `candidate-desktop-chromium-edge-compat` when user-agent/layout compatibility is sufficient; never label that evidence Microsoft Edge.
+
+The registry also publishes non-runnable provider metadata for current/previous real iOS Safari and Android Chrome. Those IDs are rejected by `AUDIT_TARGET_IDS`. A future BrowserStack, Sauce, or device-lab adapter must provide a real session, credentials, artifact transfer, and evidence provenance before a provider row can become executable. Until then, physical-device checklist rows remain manual and cannot be satisfied by Playwright emulation.
+
+Run `npm run targets:validate` after extending `audit/targets.ts`; it refreshes the checked-in browser-safe projection, `audit/targets.generated.json`. `npm run targets:check` rejects drift, and `npm run targets:self-test` validates unique IDs, the unchanged default order, shipped Playwright descriptors, emulation labels, provider non-runnability, and fail-closed capabilities.
 
 ### Parallel functional shards with isolated performance audit
 
@@ -138,7 +181,7 @@ sharded-run.json              Overall shard and final release result
 
 `video-manifest.json` also records the results-driven retention decision: eligible interaction attempts, skipped or policy-rejected attempts, pruned files and bytes, and any integrity errors. The release media stage fails closed when an executed interaction has no usable video; the smoke profile still uses retain-on-failure recording and does not require clips from passing interactions. This same stage runs for portal-launched and sharded releases; it preserves failed interaction clips and never removes reviewer-supplied files under `manual-evidence/`.
 
-Eligible clips receive a lightweight FFmpeg quality probe before poster generation. The manifest records duration, sampled-frame count, maximum frame change, usability, diagnostic-only retention, and rejection reasons for each attachment. Clips that cannot decode at least two representative frames and clips without measurable visual change are treated as helper/non-action media. Clips shorter than two seconds also fail release evidence integrity. A short failed or timed-out clip that does decode and visibly changes is retained only as diagnostic evidence; it cannot satisfy the action-video gate. Short blank/static helpers and other rejected clips are removed from normalized `results.json`, and their raw, blob-resource, HTML-data, checklist, and poster duplicates are pruned. A real interaction clip in the same test attempt remains linked and reviewable.
+Eligible clips receive a lightweight FFmpeg quality probe before poster generation. The manifest records duration, sampled-frame count, luma range, maximum frame change, usability, diagnostic-only retention, and rejection reasons for each attachment. Clips that cannot decode at least two representative frames, have only low-information solid frames, or lack measurable frame-to-frame visual change are treated as helper/non-action media. The solid-frame check uses sampled luma spread instead of a fixed brightness threshold, so studio-range and full-range white, black, gray, and tinted blanks are rejected consistently. Clips shorter than two seconds also fail release evidence integrity. A short failed or timed-out clip that does decode and visibly changes is retained only as diagnostic evidence; it cannot satisfy the action-video gate. Short blank/static helpers and other rejected clips are removed from normalized `results.json`, and their raw, blob-resource, HTML-data, checklist, and poster duplicates are pruned. A real interaction clip in the same test attempt remains linked and reviewable.
 
 The coordinator always attempts isolated performance collection after the functional shards and then attempts the merge/evidence pipeline. It records pipeline completion separately from release readiness, reads the final decision from `checklist/manifest.json`, and exits nonzero for either a failed pipeline or `NOT_READY`. The portal independently derives external terminal truth: `pipeline.status` must be `completed`, `pipeline.completed` must be true, the complete release object must pass the same decision/ready/reason/blocker/integrity validation as a checklist manifest, and the declared lifecycle status must match the normalized decision. A malformed `ready` lifecycle cannot override an incomplete pipeline, `NOT_READY`, `ready: false`, blockers, or an integrity failure; the portal marks the run `evidence-failed` and retains every reported field in lifecycle diagnostics. A nonzero functional-shard, performance, or merge process is diagnostic when it produced fresh, valid evidence: it can represent captured product findings. A missing or stale functional/performance blob, stale or missing merged result, failed media/rebuild stage, missing checklist, or contradictory release fields is always a pipeline failure and cannot be hidden by a later stage.
 
@@ -166,7 +209,7 @@ Each running audit container has a 1 GB shared-memory area and its browser proce
 
 Horizontal portal replicas are not supported. The portal queue, live run registry, and in-flight credential are process-local, while `artifacts/` and the named credential volume are shared storage. Scaling the portal can therefore bypass its concurrency limit and give different replicas incomplete live state. The supported multi-container topology is the shard coordinator above: each audit shard writes a distinct directory, and exactly one merge container creates the authoritative reports after every shard exits.
 
-The named `ai-mobile-testing-portal-secrets` volume is a single-deployment trust boundary: it contains both the encrypted credential envelope and its file-protected master key. Do not share it between unrelated users or deployments. Host administrators or any container granted access to that volume must be treated as able to recover the credential. Use a Compose override with a different secret-volume name, a separate artifact root, and a different host port for an intentionally independent portal deployment.
+The Compose-project-scoped `portal-secrets` volume is a single-deployment trust boundary: it contains both the encrypted credential envelope and its file-protected master key. Compose project names produce independent volumes by default; do not deliberately attach one project's volume to another deployment. Host administrators or any container granted access to that volume must be treated as able to recover the credential. Use a distinct Compose project name, artifact root, and host port for an intentionally independent portal deployment.
 
 Choose other origins or reduce parallelism without rebuilding:
 
@@ -202,7 +245,7 @@ The image bakes in this team's public Netskope root CA from `certs/development-c
 
 To reclaim local storage, open a terminal-state run in the portal, choose **Purge run and evidence**, and type the displayed `PURGE <run-id>` phrase exactly. The operation asynchronously counts and removes that run's complete directory, then reports files and bytes reclaimed. It is intentionally unavailable while a run is starting, running, stopping, or rebuilding manual evidence. The server resolves the selected run to one exact direct child of `PORTAL_ARTIFACT_ROOT` or `PORTAL_SHARDED_ARTIFACT_ROOT`, rejects broad roots and symlinked run directories, and never follows a browser-supplied filesystem path. Purging is irreversible and is not an archive workflow.
 
-The official Playwright image runs as root by default and Chromium runs without its sandbox in that mode. This is appropriate for testing the two trusted project origins. Do not point the suite at untrusted sites. For an environment that tests untrusted content, run with a dedicated non-root user and the seccomp profile recommended by Playwright.
+Direct smoke/release services use the official Playwright image's root execution model and are intended only for the two trusted project origins. Portal launches use a stricter four-identity split: the root supervisor owns the credential vault and lifecycle state; Playwright and FFmpeg run as `pwuser`; advisory AI review runs as `aiworker` with one-shot stdin secret delivery; and checklist generation runs as `reportworker` against a frozen source tree and private staging directory. All workers receive sanitized environments and none can read the vault. Do not point this suite at arbitrary untrusted sites. A deployment designed for hostile origins also needs Playwright's recommended seccomp profile and a separately reviewed container boundary.
 
 ## Continuous integration
 
@@ -221,14 +264,17 @@ These optional variables affect the portal container:
 | `PORTAL_SHARDED_ARTIFACT_ROOT` | `/work/artifacts/sharded` | Discovery/evidence root for terminal-launched releases; active execution stays read-only, terminal evidence may be purged with confirmation. |
 | `PORTAL_ALLOWED_HOSTS` | unset | Optional comma-separated extra local hostnames accepted by the request Host guard; loopback names are always allowed. |
 | `PORTAL_EXTERNAL_RUN_SYNC_MS` | `1000` | External-run log and lifecycle refresh interval; allowed range 250–30000 ms. |
+| `PORTAL_EXTERNAL_TERMINAL_REFRESH_MS` | `30000` | Recheck interval for terminal external lifecycle evidence; allowed range 1000–600000 ms. |
 | `AUDIT_WORKERS` | `3` | Playwright worker processes per run. |
+| `AUDIT_TARGET_IDS` | seven default projects | Exact comma-separated Docker-local target selection; unknown, duplicate, provider-only, or unavailable IDs fail before launch. |
 | `AUDIT_SHARD_TOTAL` | `4` | Parallel functional containers in a sharded release; allowed range 1–16. |
 | `AUDIT_SHARD_WORKERS` | `2` | Playwright workers inside each functional shard; allowed range 1–16. The isolated performance container always uses one. |
 | `AUDIT_SHARDED_RUN_ID` | generated | Optional unique 8–80 character lowercase run directory name; an existing directory is refused without mutation. |
 | `CANDIDATE_IGNORE_HTTPS_ERRORS` | `0` | Explicit development-only candidate bypass; affected evidence requires review. |
 | `PLAYWRIGHT_VERSION` | `1.62.1` | Official image tag version. Must match the package. |
+| `INSTALL_MSEDGE` | `0` | Build-time `0`/`1` switch for the optional branded Microsoft Edge channel. |
 | `ANTHROPIC_MODEL` | `claude-sonnet-5` | Default advisory evidence-review model. |
-| `ANTHROPIC_API_KEY` | unset | Optional environment-managed key; portal-saved credentials use the encrypted secret volume. |
+| `ANTHROPIC_API_KEY` | unset and not forwarded by Compose | Advanced supervisor-only injection; inspectable container configuration makes the portal vault the recommended path. |
 | `AI_REVIEW_DRY_RUN` | unset | Set to `1` to validate AI-stage artifacts without an API call. |
 
 Stopping the container sends a termination signal to the active Playwright process group and allows eight seconds for browser/report cleanup before forcing exit. An interrupted run is preserved and marked failed when the portal next starts, so incomplete evidence is never presented as a passing audit.

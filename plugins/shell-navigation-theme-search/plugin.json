@@ -45,6 +45,13 @@
     "candidate-desktop-chromium",
     "candidate-mobile-webkit",
     "candidate-tablet-webkit",
-    "candidate-desktop-firefox"
+    "candidate-desktop-firefox",
+    "candidate-mobile-webkit-iphone-17-ios18",
+    "candidate-mobile-webkit-iphone-15-ios17",
+    "candidate-mobile-chromium-pixel-10-android16",
+    "candidate-mobile-chromium-pixel-8-android14",
+    "candidate-mobile-chromium-galaxy-s24-android14",
+    "candidate-desktop-chromium-edge-compat",
+    "candidate-desktop-chromium-msedge"
   ]
 }

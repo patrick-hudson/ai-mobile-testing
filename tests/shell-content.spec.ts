@@ -38,10 +38,9 @@ interactionTest('[SHELL-003] skip link is first, visible on focus, and targets m
   const axe = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa']).analyze();
   await audit.attachJson('axe-skip-link-state', axe);
   expect(axe.violations, 'Skip-link page state must have no automated WCAG A/AA violations').toEqual([]);
-  await audit.checkpoint('skip-link-activated');
 });
 
-staticTest('[SHELL-004] footer exposes urgent, site, and safe external destinations', staticEvidence('Capture the footer with all urgent, site, community, and safely isolated external destinations.'), async ({ page, audit }, testInfo) => {
+staticTest('[SHELL-004] footer exposes urgent, site, and safe external destinations', staticEvidence('Capture the footer with all urgent, site, community, and safely isolated external destinations.', 'candidate-desktop-chromium'), async ({ page, audit }, testInfo) => {
   test.skip(!candidateChromium(testInfo) || meta(testInfo).deviceClass !== 'desktop', 'One candidate desktop footer audit.');
   await audit.goto('/');
   const footer = page.locator('footer');
@@ -79,7 +78,7 @@ interactionTest('[SHELL-005] back-to-top appears on long content and returns imm
   await audit.assertRuntimeHealthy();
 });
 
-staticTest('[SHELL-006] representative pages have no page-level horizontal overflow', staticEvidence('Capture representative mobile page geometry with the complete page-level overflow matrix.'), async ({ page, audit }, testInfo) => {
+staticTest('[SHELL-006] representative pages have no page-level horizontal overflow', staticEvidence('Capture representative mobile page geometry with the complete page-level overflow matrix.', 'candidate-mobile-chromium'), async ({ page, audit }, testInfo) => {
   test.skip(!candidateChromium(testInfo) || meta(testInfo).deviceClass !== 'mobile', 'Candidate mobile overflow audit.');
   const paths = ['/', '/start-here/welcome', '/resources/7-oh-taper-calculator', '/virtual-na-meetings-now', '/about/changelog'];
   const observations: Array<{ path: string; overflowPx: number }> = [];
@@ -89,7 +88,10 @@ staticTest('[SHELL-006] representative pages have no page-level horizontal overf
     observations.push({ path, overflowPx });
     expect(overflowPx, `${path} should not create page-level horizontal scrolling`).toBeLessThanOrEqual(1);
   }
+  expect(paths, 'The mobile overflow contract must retain all five representative pages').toHaveLength(5);
+  expect(observations.map(({ path }) => path), 'Every declared page must produce one overflow observation').toEqual(paths);
   await audit.attachJson('horizontal-overflow-matrix', observations);
+  await audit.checkpoint('mobile-overflow-reviewed-page');
 });
 
 interactionTest('[NAV-006] heading permalink copies a precise section without moving the reader', interactionEvidence('Activate a heading permalink and show its hash, clipboard confirmation, and stable scroll position.', 'candidate-chromium-projects'), async ({ page, context, audit }, testInfo) => {
@@ -140,7 +142,7 @@ interactionTest('[NAV-007] previous and next controls follow the published guide
   });
 });
 
-staticTest('[NAV-008] category landing enumerates valid guide destinations', staticEvidence('Capture the category landing page with its complete unique published-destination ledger.'), async ({ page, audit }, testInfo) => {
+staticTest('[NAV-008] category landing enumerates valid guide destinations', staticEvidence('Capture the category landing page with its complete unique published-destination ledger.', 'candidate-desktop-chromium'), async ({ page, audit }, testInfo) => {
   test.skip(!candidateChromium(testInfo) || meta(testInfo).deviceClass !== 'desktop', 'One candidate desktop category audit.');
   await audit.goto('/start-here');
   const links = page.locator('main a[href^="/start-here/"]');
@@ -151,6 +153,7 @@ staticTest('[NAV-008] category landing enumerates valid guide destinations', sta
     expect(responses.every((response) => response.status() === 200)).toBe(true);
     await audit.attachJson('category-destinations', hrefs);
   });
+  await audit.checkpoint('category-destination-directory');
 });
 
 interactionTest('[THEME-002] system mode follows live operating-system appearance changes', interactionEvidence('Choose system appearance, change the emulated device scheme, and show the page following it live.', 'candidate-desktop-chromium'), async ({ page, audit }, testInfo) => {
@@ -166,20 +169,24 @@ interactionTest('[THEME-002] system mode follows live operating-system appearanc
     await expect(page.locator('html')).toHaveClass(/dark/);
     await expect(page.locator('html')).toHaveAttribute('data-theme-mode', 'system');
   });
-  await audit.checkpoint('system-dark-theme');
 });
 
-staticTest('[HOME-003] homepage directory reaches every guide category', staticEvidence('Capture the homepage guide directory with all ten configured category destinations visible.'), async ({ page, audit }, testInfo) => {
+staticTest('[HOME-003] homepage directory reaches every guide category', staticEvidence('Capture the homepage guide directory with all ten configured category destinations visible.', 'candidate-desktop-chromium'), async ({ page, audit }, testInfo) => {
   test.skip(!candidateChromium(testInfo) || meta(testInfo).deviceClass !== 'desktop', 'One candidate desktop homepage directory audit.');
   await audit.goto('/');
-  const expected = ['/start-here', '/for-you', '/for-loved-ones', '/mat-suboxone', '/medications-supplements', '/post-acute', '/compounds', '/pharmacology', '/resources', '/about'];
+  const expected = ['/start-here', '/for-you', '/for-loved-ones', '/mat-suboxone', '/medications-supplements', '/post-acute', '/compounds', '/pharmacology', '/resources', '/about'] as const;
   await audit.step('Find every category', 'All ten configured category destinations appear on the homepage.', async () => {
     for (const href of expected) await expect(page.locator(`main a[href="${href}"]`).first()).toBeVisible();
   });
+  const discovered = [...new Set(await page.locator('main a[href]').evaluateAll((anchors) =>
+    anchors.map((anchor) => (anchor as HTMLAnchorElement).getAttribute('href')).filter((href): href is string => href !== null)))];
+  expect(expected, 'The reviewed homepage directory must retain ten guide categories').toHaveLength(10);
+  expect(discovered.filter((href) => expected.includes(href as (typeof expected)[number])).sort(), 'The homepage must expose every reviewed guide category').toEqual([...expected].sort());
   audit.observe('homepage categories', expected.length, '10');
+  await audit.checkpoint('homepage-guide-directory');
 });
 
-staticTest('[HOME-004] Discord failure leaves a usable community path', staticEvidence('Capture the degraded community card after a simulated Discord failure with its usable invite link.'), async ({ page, audit }, testInfo) => {
+staticTest('[HOME-004] Discord failure leaves a usable community path', staticEvidence('Capture the degraded community card after a simulated Discord failure with its usable invite link.', 'candidate-desktop-chromium'), async ({ page, audit }, testInfo) => {
   test.skip(!candidateChromium(testInfo) || meta(testInfo).deviceClass !== 'desktop', 'One candidate desktop dependency audit.');
   await page.route('https://discord.com/api/guilds/**', (route) => route.abort('failed'));
   await audit.goto('/');
@@ -192,7 +199,7 @@ staticTest('[HOME-004] Discord failure leaves a usable community path', staticEv
   await audit.checkpoint('discord-failure-fallback');
 });
 
-staticTest('[CRISIS-001] crisis fast path keeps urgent actions above unnecessary chrome', staticEvidence('Capture the mobile crisis first viewport with urgent actions visible and nonessential navigation absent.'), async ({ page, audit }, testInfo) => {
+staticTest('[CRISIS-001] crisis fast path keeps urgent actions above unnecessary chrome', staticEvidence('Capture the mobile crisis first viewport with urgent actions visible and nonessential navigation absent.', 'candidate-mobile-chromium'), async ({ page, audit }, testInfo) => {
   test.skip(!candidateChromium(testInfo) || meta(testInfo).deviceClass !== 'mobile', 'Candidate mobile crisis-layout audit.');
   await audit.goto('/start-here/7-oh-withdrawal-help');
   await audit.step('Inspect focused crisis layout', 'The first urgent actions are visible without sidebar or guide-drawer chrome.', async () => {
@@ -242,7 +249,7 @@ interactionTest('[REL-002] blocked local storage does not break current-page con
   await audit.assertRuntimeHealthy();
 });
 
-staticTest('[REL-003] blocked analytics and community dependencies do not block urgent content', staticEvidence('Capture the page with third-party dependencies blocked and urgent first-party content still visible.'), async ({ page, audit }, testInfo) => {
+staticTest('[REL-003] blocked analytics and community dependencies do not block urgent content', staticEvidence('Capture the page with third-party dependencies blocked and urgent first-party content still visible.', 'candidate-desktop-chromium'), async ({ page, audit }, testInfo) => {
   test.skip(!candidateChromium(testInfo) || meta(testInfo).deviceClass !== 'desktop', 'One candidate desktop third-party failure audit.');
   await page.route(/google-analytics|googletagmanager|discord\.com/, (route) => route.abort('failed'));
   await audit.goto('/');

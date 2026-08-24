@@ -1,5 +1,6 @@
 import { test, expect, interactionEvidence, interactionTest, staticEvidence, staticTest } from '../fixtures/test.js';
 import { meta, pageHasHorizontalOverflow } from './helpers.js';
+import type { Page } from '@playwright/test';
 
 const TAPER_PATH = '/resources/7-oh-taper-calculator';
 const SR17_PATH = '/resources/sr-17-taper-calculator';
@@ -13,6 +14,30 @@ async function replaceNumber(page: import('@playwright/test').Page, label: strin
   const input = page.getByLabel(label, { exact: true });
   await input.fill(value);
   await input.blur();
+}
+
+interface AdvancedScheduleRow {
+  day: string;
+  phase: string;
+  sr17: string;
+  source: string;
+}
+
+async function readAdvancedSchedule(page: Page): Promise<AdvancedScheduleRow[]> {
+  return page.locator('tr.sr-schedule-row').evaluateAll((rows) => rows.map((row) => {
+    const read = (label: string) => row.querySelector<HTMLElement>(`[data-label="${label}"]`)?.innerText.replace(/\s+/g, ' ').trim() ?? '';
+    return {
+      day: read('Day'),
+      phase: read('Phase'),
+      sr17: read('SR-17'),
+      source: read('7-OH'),
+    };
+  }));
+}
+
+async function chooseSelectOption(page: Page, label: string, option: string | RegExp): Promise<void> {
+  await page.getByLabel(label, { exact: true }).click();
+  await page.getByRole('option', { name: option, exact: typeof option === 'string' }).click();
 }
 
 interactionTest('[CALC-001] taper defaults and derived totals stay coherent', interactionEvidence('Select each substance and show the displayed default dose and derived daily total updating coherently.', 'candidate-chromium-projects'), async ({ page, audit }, testInfo) => {
@@ -35,7 +60,6 @@ interactionTest('[CALC-001] taper defaults and derived totals stay coherent', in
   });
 
   audit.observe('derived total', await page.getByText(/Total daily:/).first().innerText(), '80 mg (20 × 4)');
-  await audit.checkpoint('taper-derived-total');
   await audit.assertRuntimeHealthy();
 });
 
@@ -61,7 +85,6 @@ interactionTest('[CALC-002] taper inputs reject unsafe or unusable boundaries', 
     expect(await frequency.evaluate((element: HTMLInputElement) => element.validity.rangeOverflow)).toBe(true);
   });
 
-  await audit.checkpoint('taper-boundary-state');
   await audit.assertRuntimeHealthy();
 });
 
@@ -84,7 +107,6 @@ interactionTest('[CALC-003] custom taper generates the requested day-by-day sche
   });
 
   audit.observe('schedule data rows', await page.locator('tr.schedule-data-row').count(), '10');
-  await audit.checkpoint('custom-ten-day-plan', { fullPage: true });
   await audit.assertRuntimeHealthy();
 });
 
@@ -109,7 +131,6 @@ interactionTest('[CALC-004] taper chart and schedule remain contained on a phone
     }
   });
 
-  await audit.checkpoint('mobile-taper-output', { fullPage: true });
   await audit.assertRuntimeHealthy();
 });
 
@@ -159,7 +180,6 @@ interactionTest('[CALC-006] taper schedule copy and printable export contain the
     await popup.close();
   });
 
-  await audit.checkpoint('taper-export-confirmation');
   await audit.assertRuntimeHealthy();
 });
 
@@ -186,7 +206,6 @@ interactionTest('[CALC-007] SR-17 simple mode builds documented 7, 10, and 14-da
     });
   }
 
-  await audit.checkpoint('sr17-simple-plan', { fullPage: true });
   await audit.assertRuntimeHealthy();
 });
 
@@ -198,25 +217,84 @@ interactionTest('[CALC-008] SR-17 advanced mode exposes and applies each schedul
     await page.getByRole('group', { name: 'Calculator mode' }).getByRole('button', { name: 'Advanced' }).click();
     await expect(page.getByText(/Phase 1 · Preload/).first()).toBeVisible();
     await expect(page.getByLabel('Preload days', { exact: true })).toBeVisible();
-    await expect(page.getByLabel('Cross-taper days', { exact: true })).toBeVisible();
     await expect(page.getByLabel('Hold days', { exact: true })).toBeVisible();
     await expect(page.getByLabel('Jump-off (mg)', { exact: true })).toBeVisible();
   });
 
-  await audit.step('Change phase lengths', 'The rendered schedule and total duration update coherently.', async () => {
-    const before = await page.locator('table tbody tr').count();
-    await replaceNumber(page, 'Preload days', '3');
-    await replaceNumber(page, 'Hold days', '2');
-    const after = await page.locator('table tbody tr').count();
-    expect(after).toBeGreaterThanOrEqual(before);
-    await expect(page.getByText(/Preload/).first()).toBeVisible();
+  await audit.step('Build a custom milligram-cut protocol', 'Every configured phase produces the exact independently reviewed day-by-day schedule and total supply.', async () => {
+    await replaceNumber(page, 'Current per-dose (mg)', '20');
+    await replaceNumber(page, 'Times per day', '4');
+    await replaceNumber(page, 'Preload days', '2');
+    await replaceNumber(page, 'SR per dose (mg)', '40');
+    await replaceNumber(page, 'Doses per day', '3');
+    await chooseSelectOption(page, 'Mode', /Custom: even steps over N days/);
+    await expect(page.getByLabel('Cross-taper days', { exact: true })).toBeVisible();
+    await replaceNumber(page, 'Cross-taper days', '4');
+    await replaceNumber(page, 'Hold days', '1');
+    await chooseSelectOption(page, 'Taper mode', /Custom: cut N mg per day/);
+    await replaceNumber(page, 'Cut per day (mg)', '30');
+    await replaceNumber(page, 'Jump-off (mg)', '15');
+
+    const golden: AdvancedScheduleRow[] = [
+      { day: '0', phase: 'Allergy test', sr17: '10 mg × 1', source: '20 mg × 4 = 80 mg/day' },
+      { day: '1', phase: 'Preload', sr17: '120 mg/day · 3 doses (~40 mg each)', source: '20 mg × 4 = 80 mg/day' },
+      { day: '2', phase: 'Preload', sr17: '120 mg/day · 3 doses (~40 mg each)', source: '20 mg × 4 = 80 mg/day' },
+      { day: '3', phase: 'Cross-taper', sr17: '120 mg/day · 3 doses (~40 mg each)', source: '15 mg × 4 = 60 mg/day' },
+      { day: '4', phase: 'Cross-taper', sr17: '120 mg/day · 3 doses (~40 mg each)', source: '10 mg × 4 = 40 mg/day' },
+      { day: '5', phase: 'Cross-taper', sr17: '120 mg/day · 3 doses (~40 mg each)', source: '5 mg × 4 = 20 mg/day' },
+      { day: '6', phase: 'Cross-taper', sr17: '120 mg/day · 3 doses (~40 mg each)', source: '—' },
+      { day: '7', phase: 'Hold', sr17: '120 mg/day · 3 doses (~40 mg each)', source: '—' },
+      { day: '8', phase: 'SR taper', sr17: '90 mg/day · 3 doses (~30 mg each)', source: '—' },
+      { day: '9', phase: 'SR taper', sr17: '60 mg/day · 2 doses (~30 mg each)', source: '—' },
+      { day: '10', phase: 'SR taper', sr17: '30 mg × 1', source: '—' },
+      { day: '11', phase: 'Jump-off', sr17: '15 mg × 1', source: '—' },
+      { day: '12', phase: 'Stop', sr17: '—', source: '—' },
+    ];
+    await expect(page.locator('tr.sr-schedule-row')).toHaveCount(golden.length);
+    expect(await readAdvancedSchedule(page)).toEqual(golden);
+    await expect(page.getByText('13 days', { exact: true })).toBeVisible();
+    await expect(page.getByText('1045 mg', { exact: true })).toBeVisible();
+    audit.observe('custom milligram golden rows', golden.length, '13 exact rows');
   });
 
-  await audit.checkpoint('sr17-advanced-plan', { fullPage: true });
+  await audit.step('Exercise zero-day and percentage boundaries', 'Removing optional phases and jump-off yields the exact ten-day percentage schedule without a hidden frozen row.', async () => {
+    await page.getByRole('checkbox', { name: /Include allergy-test day/i }).uncheck();
+    await replaceNumber(page, 'Preload days', '1');
+    await replaceNumber(page, 'Cross-taper days', '1');
+    await replaceNumber(page, 'Hold days', '0');
+    await chooseSelectOption(page, 'Taper mode', /Custom: cut N% per day/);
+    await replaceNumber(page, 'Cut per day (%)', '50');
+    await replaceNumber(page, 'Jump-off (mg)', '0');
+
+    const boundaryGolden: AdvancedScheduleRow[] = [
+      { day: '1', phase: 'Preload', sr17: '120 mg/day · 3 doses (~40 mg each)', source: '20 mg × 4 = 80 mg/day' },
+      { day: '2', phase: 'Cross-taper', sr17: '120 mg/day · 3 doses (~40 mg each)', source: '—' },
+      { day: '3', phase: 'SR taper', sr17: '60 mg/day · 2 doses (~30 mg each)', source: '—' },
+      { day: '4', phase: 'SR taper', sr17: '30 mg × 1', source: '—' },
+      { day: '5', phase: 'SR taper', sr17: '15 mg × 1', source: '—' },
+      { day: '6', phase: 'SR taper', sr17: '8 mg × 1', source: '—' },
+      { day: '7', phase: 'SR taper', sr17: '4 mg × 1', source: '—' },
+      { day: '8', phase: 'SR taper', sr17: '2 mg × 1', source: '—' },
+      { day: '9', phase: 'SR taper', sr17: '1 mg × 1', source: '—' },
+      { day: '10', phase: 'Stop', sr17: '—', source: '—' },
+    ];
+    await expect(page.locator('tr.sr-schedule-row')).toHaveCount(boundaryGolden.length);
+    expect(await readAdvancedSchedule(page)).toEqual(boundaryGolden);
+    await expect(page.getByText('10 days', { exact: true })).toBeVisible();
+    await expect(page.getByText('360 mg', { exact: true })).toBeVisible();
+    await expect(page.getByText('Jump-off', { exact: true })).toHaveCount(0);
+    audit.observe('percentage boundary golden rows', boundaryGolden.length, '10 exact rows');
+  });
+
+  await audit.attachJson('sr17-advanced-golden-contract', {
+    oracle: 'Hand-calculated from the published phase definitions; no calculator implementation code is imported.',
+    cases: ['custom 30 mg cuts with explicit 15 mg jump-off', '50% cuts with allergy/hold/jump-off removed'],
+    invariants: ['sequential day labels', 'exact phase boundaries', 'exact source totals', 'exact SR totals', 'exact duration', 'exact total supply'],
+  });
   await audit.assertRuntimeHealthy();
 });
 
-staticTest('[CALC-009] taper arithmetic obeys monotonic and total-supply invariants', staticEvidence('Capture the rendered deterministic schedule together with monotonic-dose and total-supply assertions.'), async ({ page, audit }, testInfo) => {
+staticTest('[CALC-009] taper arithmetic obeys monotonic and total-supply invariants', staticEvidence('Capture the rendered deterministic schedule together with monotonic-dose and total-supply assertions.', 'candidate-desktop-chromium'), async ({ page, audit }, testInfo) => {
   test.skip(!candidateChromium(testInfo) || meta(testInfo).deviceClass !== 'desktop', 'One deterministic candidate desktop arithmetic audit.');
   await audit.goto(TAPER_PATH);
 
@@ -253,5 +331,6 @@ staticTest('[CALC-009] taper arithmetic obeys monotonic and total-supply invaria
     scheduleRows: await page.locator('tr.schedule-data-row').count(),
     invariantSet: ['sequential days', 'finite positive doses', 'per-dose × frequency = daily total', 'non-increasing total', 'supply sum'],
   });
+  await audit.checkpoint('taper-arithmetic-reviewed-schedule');
   await audit.assertRuntimeHealthy();
 });

@@ -13,6 +13,27 @@ export interface CandidateRoute {
   kind: CandidateRouteKind;
 }
 
+export interface DeclaredVisualItem {
+  name: string;
+  selector: string;
+  kind: 'img' | 'picture' | 'svg' | 'css-diagram';
+  exactCount: number;
+}
+
+export interface RouteVisualContract {
+  path: string;
+  items: readonly DeclaredVisualItem[];
+}
+
+export interface CriticalContentContract {
+  path: string;
+  requiredHeadings: readonly string[];
+  requiredWarningFragments: readonly string[];
+  requiredCandidateDestinations: readonly string[];
+  /** Exact production headings reviewed as intentionally absent on candidate. */
+  approvedMissingProductionHeadings: readonly string[];
+}
+
 /**
  * Static release inventory. Keeping this list explicit makes additions and removals
  * reviewable in pull requests instead of silently accepting whatever a crawl finds.
@@ -184,6 +205,75 @@ export const REPRESENTATIVE_VISUAL_ROUTES = [
   { path: '/sitemap', label: 'sitemap' },
 ] as const;
 
+/**
+ * Visuals whose presence is part of the published content contract. Exact
+ * counts prevent an empty page (or a silently dropped diagram) from passing.
+ */
+export const DECLARED_ROUTE_VISUALS: readonly RouteVisualContract[] = [
+  {
+    path: '/brand',
+    items: [
+      { name: 'light and dark Lift Cup specimens', selector: '#logo svg.logo-mark', kind: 'svg', exactCount: 2 },
+    ],
+  },
+  {
+    path: '/pharmacology/chemical-structures',
+    items: [
+      { name: 'reviewed molecular structure figures', selector: 'main figure img[src^="/images/structures/"]', kind: 'img', exactCount: 12 },
+    ],
+  },
+  {
+    path: '/about/site-architecture',
+    items: [
+      { name: 'core-stack architecture table', selector: 'main .architecture-table', kind: 'css-diagram', exactCount: 1 },
+      { name: 'static publishing pipeline', selector: 'main article > .not-prose > ol', kind: 'css-diagram', exactCount: 1 },
+    ],
+  },
+] as const;
+
+/**
+ * Release-critical content is reviewed explicitly. The approved-difference
+ * arrays intentionally start empty: a removed production heading blocks the
+ * release until a reviewer records the exact heading here.
+ */
+export const CRITICAL_CONTENT_CONTRACTS: readonly CriticalContentContract[] = [
+  {
+    path: '/',
+    requiredHeadings: ['Help quitting 7-OH', 'Support right now'],
+    requiredWarningFragments: ['community-compiled information, not medical advice'],
+    requiredCandidateDestinations: ['/start-here/7-oh-withdrawal-quickstart', '/start-here/how-to-quit-7-oh'],
+    approvedMissingProductionHeadings: [],
+  },
+  {
+    path: '/start-here/welcome',
+    requiredHeadings: ['Welcome', 'Scope and disclaimers', 'Where to go next', 'Find the community'],
+    requiredWarningFragments: ['Not medical advice'],
+    requiredCandidateDestinations: ['/start-here/7-oh-withdrawal-help', '/about/the-community'],
+    approvedMissingProductionHeadings: [],
+  },
+  {
+    path: '/compounds/7-oh',
+    requiredHeadings: ['7-OH (7-Hydroxymitragynine)', 'Withdrawal profile', "If you're trying to stop"],
+    requiredWarningFragments: ['No direct human PK study of standalone 7-OH has been published'],
+    requiredCandidateDestinations: ['/start-here/how-to-quit-7-oh', '/start-here/7-oh-withdrawal-help'],
+    approvedMissingProductionHeadings: [],
+  },
+  {
+    path: '/resources/7-oh-taper-calculator',
+    requiredHeadings: ['7-OH Taper Calculator', 'Which compound to pick', 'How the math works'],
+    requiredWarningFragments: ['Reference, not advice'],
+    requiredCandidateDestinations: ['/resources/taper-calculator', '/medications-supplements/helper-meds'],
+    approvedMissingProductionHeadings: [],
+  },
+  {
+    path: '/virtual-na-meetings-now',
+    requiredHeadings: ['Find a virtual NA meeting happening now'],
+    requiredWarningFragments: ['not affiliated with Narcotics Anonymous'],
+    requiredCandidateDestinations: ['/next-kratom-support-meeting', '/for-you/mutual-aid'],
+    approvedMissingProductionHeadings: [],
+  },
+] as const;
+
 export const REPRESENTATIVE_A11Y_ROUTES = [
   '/',
   '/start-here/welcome',
@@ -205,4 +295,3 @@ export const REPRESENTATIVE_PERFORMANCE_ROUTES = [
 export const EXPECTED_PUBLISHED_DOCUMENT_COUNT = 85;
 export const EXPECTED_CATEGORY_COUNT = 10;
 export const EXPECTED_HTML_ROUTE_COUNT = 102;
-

@@ -27,6 +27,19 @@ import {
 test.describe.configure({ mode: 'serial' });
 const execFileAsync = promisify(execFile);
 
+function syntheticNotReadyRelease(reason: string, decisionBasis: string) {
+  return {
+    decision: 'NOT_READY',
+    ready: false,
+    reason,
+    decisionBasis,
+    blockingFailures: 1,
+    blockingIncomplete: 0,
+    baselineIssues: 0,
+    runIntegrityFailure: false,
+  };
+}
+
 function galleryAttempt(
   id: string,
   title: string,
@@ -95,6 +108,13 @@ async function waitForRun(request: APIRequestContext, id: string): Promise<void>
   await expect.poll(async () => (await request.get(`/api/runs/${encodeURIComponent(id)}`)).status(), {
     timeout: 10_000,
   }).toBe(200);
+}
+
+async function waitForGalleryPhase(request: APIRequestContext, id: string, phase: 'live' | 'sealed'): Promise<void> {
+  await expect.poll(async () => {
+    const response = await request.get(`/api/runs/${encodeURIComponent(id)}/gallery`);
+    return response.ok() ? (await response.json()).phase : 'missing';
+  }, { timeout: 30_000 }).toBe(phase);
 }
 
 async function captureNextGalleryEvent(runId: string, trigger: () => Promise<void>): Promise<string> {
@@ -212,7 +232,7 @@ async function publishReferenceScaleRun(root: string, runId: string): Promise<{
   await writeFile(join(runDirectory, 'sharded-run.json'), `${JSON.stringify({
     schemaVersion: 2, runId, startedAt: finishedAt, finishedAt, shardTotal: 4,
     pipeline: { status: 'completed', completed: true, reason: 'Canonical reference-scale gallery fixture.', finishedAt },
-    release: { decision: 'NOT_READY', ready: false, reason: 'Reference-scale fixture.', decisionBasis: 'Gallery performance acceptance.' },
+    release: syntheticNotReadyRelease('Reference-scale fixture.', 'Gallery performance acceptance.'),
     status: 'not-ready',
   })}\n`);
   return { runDirectory, checklistRoot, materialization };
@@ -471,7 +491,7 @@ test('live gallery API publishes closed-attempt images, merges shards, and recov
     finishedAt,
     shardTotal: 2,
     pipeline: { status: 'completed', completed: true, reason: 'Synthetic sealed gallery fixture.', finishedAt },
-    release: { decision: 'NOT_READY', ready: false, reason: 'Synthetic fixture.', decisionBasis: 'Gallery acceptance.' },
+    release: syntheticNotReadyRelease('Synthetic fixture.', 'Gallery acceptance.'),
     status: 'not-ready',
   })}\n`);
   await expect.poll(async () => {
@@ -747,10 +767,11 @@ test('sealed archive gallery is the same bounded read-only workbench over HTTP a
   await writeFile(join(runDirectory, 'sharded-run.json'), `${JSON.stringify({
     schemaVersion: 2, runId, startedAt: finishedAt, finishedAt, shardTotal: 1,
     pipeline: { status: 'completed', completed: true, reason: 'Archive UI fixture.', finishedAt },
-    release: { decision: 'NOT_READY', ready: false, reason: 'Fixture.', decisionBasis: 'Archive acceptance.' },
+    release: syntheticNotReadyRelease('Fixture.', 'Archive acceptance.'),
     status: 'not-ready',
   })}\n`);
   await waitForRun(request, runId);
+  await waitForGalleryPhase(request, runId, 'sealed');
 
   const requests = [] as string[];
   const consoleErrors = [] as string[];
@@ -825,6 +846,7 @@ test('canonical reference-scale gallery satisfies KTD10, accessibility, and save
     storedFiles: GALLERY_SCALE.storedFiles,
   });
   await waitForRun(request, runId);
+  await waitForGalleryPhase(request, runId, 'sealed');
   console.log(`[GALLERY_SCALE] fixture-ready ${JSON.stringify({ runId, ...GALLERY_SCALE, materialization })}`);
   await mkdir(outputRoot!, { recursive: true });
   const route = `/gallery.html?run=${encodeURIComponent(runId)}&from=runs&kind=image`;
@@ -973,13 +995,15 @@ test('canonical reference-scale gallery satisfies KTD10, accessibility, and save
   let peakVideos = 0;
 
   for (let index = 0; index < warmupTransitions + warmMeasureCount; index += 1) {
-    const oldRoute = await page.locator('.gallery-context-list dd').nth(5).textContent();
+    const oldItemId = new URL(page.url()).searchParams.get('item');
+    const oldTitle = await page.locator('.gallery-viewer h2').textContent();
     await page.evaluate(() => {
       performance.clearMarks('gallery:item-input');
       performance.mark('gallery:item-input');
       document.querySelector('.gallery-shell')?.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
     });
-    await expect(page.locator('.gallery-context-list dd').nth(5)).not.toHaveText(oldRoute ?? '');
+    await expect.poll(() => new URL(page.url()).searchParams.get('item')).not.toBe(oldItemId);
+    await expect(page.locator('.gallery-viewer h2')).not.toHaveText(oldTitle ?? '');
     await expect(page.locator('.gallery-selected-image')).toHaveCount(1);
     const elapsed = await page.evaluate(() => performance.now() - performance.getEntriesByName('gallery:item-input').at(-1)!.startTime);
     if (index >= warmupTransitions) warmSamples.push(elapsed);

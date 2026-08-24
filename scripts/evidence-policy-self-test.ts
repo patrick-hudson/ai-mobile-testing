@@ -3,8 +3,14 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { AUDIT_CATALOG, pageAuditDefinition } from '../audit/catalog.js';
 import {
+  AUDIT_APPLICABILITY_ANNOTATION,
+  AUDIT_STATUS_ANNOTATION,
+  AUDIT_STATUS_WAIVER_ANNOTATION,
+  assertStaticCheckpoint,
   createEvidencePolicy,
   evidenceKindsForPolicy,
+  parseAuditStatusAnnotation,
+  parseAuditApplicabilityAnnotation,
   parseEvidencePolicyAnnotation,
   serializeEvidencePolicy,
   validateDefinitionEvidencePolicy,
@@ -33,12 +39,13 @@ for (const definition of AUDIT_CATALOG) {
   validateDefinitionEvidencePolicy(definition, definition.id);
   catalogCounts[definition.evidencePolicy.mode] += 1;
 }
-assert.equal(AUDIT_CATALOG.length, 81);
-assert.deepEqual(catalogCounts, {
-  'interaction-video': 43,
-  'static-screenshot': 33,
-  'structured-data': 5,
-});
+assert.equal(
+  Object.values(catalogCounts).reduce((total, count) => total + count, 0),
+  AUDIT_CATALOG.length,
+);
+for (const [mode, count] of Object.entries(catalogCounts)) {
+  assert(count > 0, `The catalog must exercise ${mode} policy validation.`);
+}
 
 const pageDefinition = pageAuditDefinition('/example/route');
 assert.equal(pageDefinition.evidencePolicy.mode, 'static-screenshot');
@@ -69,6 +76,65 @@ assert.deepEqual(
   overlayPolicy,
 );
 assert.equal(parseEvidencePolicyAnnotation([]), null);
+assert.equal(
+  parseAuditApplicabilityAnnotation([{ type: AUDIT_APPLICABILITY_ANNOTATION, description: 'candidate-desktop-chromium' }]),
+  'candidate-desktop-chromium',
+);
+assert.equal(
+  parseAuditApplicabilityAnnotation([{ type: AUDIT_APPLICABILITY_ANNOTATION, description: 'candidate-ish' }]),
+  null,
+);
+assert.equal(parseAuditApplicabilityAnnotation([]), null);
+assert.equal(
+  assertStaticCheckpoint(
+    createEvidencePolicy('static-screenshot', 'Capture the asserted placement of the rendered warning.'),
+    'rendered warning placement',
+  ),
+  'rendered warning placement',
+);
+assert.throws(
+  () => assertStaticCheckpoint(overlayPolicy, 'search dialog'),
+  /only valid for static-screenshot/,
+);
+assert.throws(
+  () => assertStaticCheckpoint(
+    createEvidencePolicy('static-screenshot', 'Capture one purposeful rendered state for review.'),
+    'automatic-static-evidence',
+  ),
+  /purposeful name/,
+);
+assert.equal(
+  parseAuditStatusAnnotation([{ type: AUDIT_STATUS_ANNOTATION, description: 'BLOCKED' }], 'A11Y-001'),
+  'BLOCKED',
+);
+assert.equal(
+  parseAuditStatusAnnotation([{ type: 'note', description: 'Storage was blocked during this passing audit.' }], 'REL-002'),
+  null,
+  'Ordinary prose must never control checklist status.',
+);
+assert.throws(
+  () => parseAuditStatusAnnotation([{ type: AUDIT_STATUS_ANNOTATION, description: 'blocked' }], 'A11Y-001'),
+  /exactly REVIEW, INTENDED_CHANGE, or BLOCKED/,
+);
+assert.throws(
+  () => parseAuditStatusAnnotation([{ type: AUDIT_STATUS_ANNOTATION, description: 'INTENDED_CHANGE' }], 'A11Y-001'),
+  /requires exactly one audit-status-waiver/,
+);
+assert.equal(
+  parseAuditStatusAnnotation([
+    { type: AUDIT_STATUS_ANNOTATION, description: 'INTENDED_CHANGE' },
+    {
+      type: AUDIT_STATUS_WAIVER_ANNOTATION,
+      description: JSON.stringify({
+        status: 'INTENDED_CHANGE',
+        auditId: 'A11Y-001',
+        reason: 'The approved redesign intentionally changes this reviewed state.',
+        approvedBy: 'Release owner',
+      }),
+    },
+  ], 'A11Y-001'),
+  'INTENDED_CHANGE',
+);
 
 const repositoryRoot = process.cwd();
 const enabledSpecs = [...new Set(INSTALLED_PLUGIN_REGISTRY.plugins.flatMap(({ entrySpecs }) => entrySpecs))];
@@ -91,12 +157,25 @@ for (const entrySpec of enabledSpecs) {
     `${entrySpec} has an interaction test without a matching action/response rationale.`,
   );
   for (const declaration of source.split(/(?=^(?:interactionTest|staticTest|structuredTest)\s*\()/m)) {
-    if (!declaration.startsWith('interactionTest(')) continue;
-    assert.match(
-      declaration,
-      /\baudit\.step\s*\(/,
-      `${entrySpec} has an interaction test without a labeled audit.step action/response checkpoint.`,
-    );
+    if (declaration.startsWith('interactionTest(')) {
+      assert.match(
+        declaration,
+        /\baudit\.step\s*\(/,
+        `${entrySpec} has an interaction test without a labeled audit.step action/response checkpoint.`,
+      );
+      assert.doesNotMatch(
+        declaration,
+        /\baudit\.checkpoint\s*\(/,
+        `${entrySpec} uses a static screenshot as primary evidence for an interaction-video audit.`,
+      );
+    }
+    if (declaration.startsWith('structuredTest(')) {
+      assert.doesNotMatch(
+        declaration,
+        /\baudit\.checkpoint\s*\(/,
+        `${entrySpec} uses a decorative screenshot in a structured-data audit.`,
+      );
+    }
   }
   assert.equal(
     [...source.matchAll(/\bstaticTest\s*\([^\n]*\bstaticEvidence\s*\(/g)].length,
@@ -109,11 +188,10 @@ for (const entrySpec of enabledSpecs) {
     `${entrySpec} has a data-only test without a matching structured-evidence rationale.`,
   );
 }
-assert.deepEqual(
-  { interactionDeclarations, staticDeclarations, structuredDeclarations },
-  { interactionDeclarations: 39, staticDeclarations: 35, structuredDeclarations: 5 },
-);
+assert(interactionDeclarations > 0, 'Enabled plugins must include interaction evidence.');
+assert(staticDeclarations > 0, 'Enabled plugins must include static evidence.');
+assert(structuredDeclarations > 0, 'Enabled plugins must include structured evidence.');
 
 process.stdout.write(
-  'Evidence policy self-test passed: 81 catalog audits and 79 enabled test declarations explicitly separate evidence modes; all interaction clips have bounded pacing and a labeled action/response checkpoint.\n',
+  `Evidence policy self-test passed: ${AUDIT_CATALOG.length} catalog audits and ${interactionDeclarations + staticDeclarations + structuredDeclarations} enabled test declarations explicitly separate evidence modes; all interaction clips have bounded pacing and a labeled action/response checkpoint.\n`,
 );

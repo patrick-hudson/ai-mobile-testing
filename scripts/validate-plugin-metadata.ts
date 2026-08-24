@@ -27,6 +27,13 @@ const inlineGate = {
   },
   manual: true,
 } satisfies AuditDefinition;
+const portalFixtureTargets = [{
+  id: 'candidate-mobile-chromium',
+  environment: 'candidate',
+  deviceClass: 'mobile',
+  engine: 'chromium',
+  fullSweep: true,
+}] as const;
 
 const installedPlugin: InstalledPlugin = {
   directory: 'metadata-safety-fixture',
@@ -44,11 +51,32 @@ const installedPlugin: InstalledPlugin = {
     supportedProjects: ['candidate-mobile-chromium'],
   },
   resolvedAuditDefinitions: [inlineGate],
+  resolvedAuditCases: [],
 };
 
 const generated = createPluginRegistry([installedPlugin]);
 const validated = validatePluginRegistryDocument(generated);
 assert.deepEqual(validated.plugins[0]?.auditDefinitions[0], inlineGate, 'generated registry dropped inline metadata');
+
+const nonBlockingP0 = structuredClone(generated) as unknown as {
+  plugins: Array<{ auditDefinitions: Array<{ severity: string; releaseBlocking: boolean }> }>;
+};
+nonBlockingP0.plugins[0]!.auditDefinitions[0]!.releaseBlocking = false;
+assert.throws(
+  () => validatePluginRegistryDocument(nonBlockingP0),
+  /releaseBlocking must be true for P0 and P1|non-blocking P0/i,
+  'A plugin must never downgrade P0/P1 release authority.',
+);
+
+const automatedWithoutCase = structuredClone(generated) as unknown as {
+  plugins: Array<{ auditDefinitions: Array<{ manual?: boolean }>; auditCases: unknown[] }>;
+};
+delete automatedWithoutCase.plugins[0]!.auditDefinitions[0]!.manual;
+assert.throws(
+  () => validatePluginRegistryDocument(automatedWithoutCase),
+  /auditCases must cover every automated audit|omit automated audits/i,
+  'An automated plugin audit with zero executable cases must fail closed.',
+);
 
 const fixtureCatalog = mergeAuditDefinitionCatalog([], validated);
 assert.deepEqual(fixtureCatalog[0], inlineGate, 'fixture definition resolver changed inline metadata');
@@ -56,6 +84,7 @@ assert.deepEqual(fixtureCatalog[0], inlineGate, 'fixture definition resolver cha
 const portalPlugins = validatePortalPluginRegistryDocument(generated, {
   coreDefinitions: [],
   projectIds: new Set(['candidate-mobile-chromium']),
+  localTargets: portalFixtureTargets,
   resolveEntrySpec: () => true,
 });
 const portalCatalog = mergePortalCatalog([], portalPlugins);
@@ -67,6 +96,7 @@ assert.throws(
   () => validatePortalPluginRegistryDocument(downgraded, {
     coreDefinitions: [],
     projectIds: new Set(['candidate-mobile-chromium']),
+    localTargets: portalFixtureTargets,
     resolveEntrySpec: () => true,
   }),
   /incomplete or invalid full audit definition/,

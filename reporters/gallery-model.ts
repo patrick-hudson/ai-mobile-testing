@@ -1,7 +1,19 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { createReadStream } from 'node:fs';
-import { copyFile, lstat, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { constants, createReadStream } from 'node:fs';
+import {
+  copyFile,
+  lstat,
+  mkdir,
+  mkdtemp,
+  open,
+  readFile,
+  realpath,
+  rm,
+  stat,
+  writeFile,
+  type FileHandle,
+} from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
@@ -91,6 +103,8 @@ export interface BuildGalleryCatalogOptions {
   definitionCatalog?: readonly AuditDefinition[];
   cwd?: string;
   warnings?: string[];
+  /** Exact artifact root that attachment sources are permitted to occupy. */
+  sourceRoot?: string;
 }
 
 export interface WriteGalleryArchiveOptions {
@@ -121,10 +135,421 @@ export interface PreparedGalleryArchive {
 }
 
 const execFileAsync = promisify(execFile);
+const GALLERY_MATERIALIZATION_CONCURRENCY = Math.max(
+  1,
+  Math.min(Number(process.env.AUDIT_GALLERY_WORKERS ?? '4') || 4, 8),
+);
 
 interface LegacyComparison {
   group: string;
   role: GalleryMemberRole;
+}
+
+export interface AttachmentSourceBoundary {
+  logicalRoot: string;
+  realRoot: string;
+}
+
+export class AttachmentSourceContainmentError extends Error {
+  override readonly name = 'AttachmentSourceContainmentError';
+}
+
+interface OpenedAttachmentSource {
+  handle: FileHandle;
+  path: string;
+  size: number;
+  sizeBigInt: bigint;
+  modifiedAtNs: bigint;
+  device: bigint;
+  inode: bigint;
+}
+
+function isContainedPath(root: string, candidate: string): boolean {
+  const relative = path.relative(root, candidate);
+  return relative === '' || (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`));
+}
+
+function hasTraversalSegment(value: string): boolean {
+  return value.replaceAll('\\', '/').split('/').includes('..');
+}
+
+function containmentFailure(message: string): AttachmentSourceContainmentError {
+  return new AttachmentSourceContainmentError(`Attachment source rejected: ${message}`);
+}
+
+export async function createAttachmentSourceBoundary(root: string): Promise<AttachmentSourceBoundary> {
+  const logicalRoot = path.resolve(root);
+  let realRoot: string;
+  try {
+    const logicalDetails = await lstat(logicalRoot);
+    if (logicalDetails.isSymbolicLink()) {
+      throw containmentFailure('the declared artifact root must not be a symbolic link.');
+    }
+    realRoot = await realpath(logicalRoot);
+  } catch (error) {
+    throw containmentFailure(`the run artifact root is unavailable (${error instanceof Error ? error.message : String(error)}).`);
+  }
+  const details = await lstat(realRoot);
+  if (!details.isDirectory() || details.isSymbolicLink()) {
+    throw containmentFailure('the run artifact root must resolve to a real directory.');
+  }
+  return { logicalRoot, realRoot };
+}
+
+async function ensureContainedOutputDirectory(
+  directory: string,
+  outputBoundary: AttachmentSourceBoundary,
+): Promise<void> {
+  const resolved = path.resolve(directory);
+  if (!isContainedPath(outputBoundary.realRoot, resolved)) {
+    throw containmentFailure('the generated evidence destination is outside the report output root.');
+  }
+  const relative = path.relative(outputBoundary.realRoot, resolved);
+  let current = outputBoundary.realRoot;
+  for (const segment of relative.split(path.sep).filter(Boolean)) {
+    current = path.join(current, segment);
+    try {
+      await mkdir(current, { mode: 0o750 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    }
+    const details = await lstat(current);
+    if (details.isSymbolicLink() || !details.isDirectory()) {
+      throw containmentFailure('the generated evidence destination contains a symbolic or non-directory component.');
+    }
+  }
+}
+
+async function openContainedOutputFile(
+  destination: string,
+  outputBoundary: AttachmentSourceBoundary,
+): Promise<FileHandle> {
+  const resolved = path.resolve(destination);
+  if (!isContainedPath(outputBoundary.realRoot, resolved) || resolved === outputBoundary.realRoot) {
+    throw containmentFailure('the generated evidence file is outside the report output root.');
+  }
+  await ensureContainedOutputDirectory(path.dirname(resolved), outputBoundary);
+  try {
+    const existing = await lstat(resolved);
+    if (existing.isSymbolicLink() || !existing.isFile()) {
+      throw containmentFailure('the generated evidence file destination is symbolic or not a regular file.');
+    }
+    await rm(resolved, { force: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  const handle = await open(
+    resolved,
+    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
+    0o640,
+  );
+  try {
+    await verifyOpenedOutputFile(handle, resolved, outputBoundary);
+    return handle;
+  } catch (error) {
+    await handle.close();
+    throw error;
+  }
+}
+
+async function verifyOpenedOutputFile(
+  handle: FileHandle,
+  destination: string,
+  outputBoundary: AttachmentSourceBoundary,
+): Promise<void> {
+  try {
+    await assertNoSymlinkComponents(destination, outputBoundary);
+    const [pathDetails, canonicalPath, handleDetails] = await Promise.all([
+      lstat(destination),
+      realpath(destination),
+      handle.stat({ bigint: true }),
+    ]);
+    if (
+      pathDetails.isSymbolicLink()
+      || !pathDetails.isFile()
+      || !handleDetails.isFile()
+      || !isContainedPath(outputBoundary.realRoot, canonicalPath)
+      || handleDetails.dev !== BigInt(pathDetails.dev)
+      || handleDetails.ino !== BigInt(pathDetails.ino)
+    ) {
+      throw containmentFailure('the generated evidence file changed identity or escaped the report output root.');
+    }
+  } catch (error) {
+    if (isContainmentError(error)) throw error;
+    throw containmentFailure(`the generated evidence file could not be verified (${error instanceof Error ? error.message : String(error)}).`);
+  }
+}
+
+async function writeContainedOutputFile(
+  destination: string,
+  body: Uint8Array,
+  outputBoundary: AttachmentSourceBoundary,
+): Promise<void> {
+  const handle = await openContainedOutputFile(destination, outputBoundary);
+  try {
+    await handle.writeFile(body);
+    await handle.sync();
+    await verifyOpenedOutputFile(handle, destination, outputBoundary);
+  } finally {
+    await handle.close();
+    // Do not clean up through a pathname whose ancestry may have changed.
+    // A verified partial file is safer than following an attacker-swapped path.
+  }
+}
+
+function resolveContainedAttachmentPath(sourcePath: string, boundary: AttachmentSourceBoundary): string {
+  if (!sourcePath || sourcePath.includes('\0')) throw containmentFailure('the declared path is empty or malformed.');
+  if (hasTraversalSegment(sourcePath)) throw containmentFailure('path traversal is not allowed.');
+
+  let relative: string;
+  if (path.isAbsolute(sourcePath)) {
+    const absolute = path.resolve(sourcePath);
+    if (isContainedPath(boundary.logicalRoot, absolute)) relative = path.relative(boundary.logicalRoot, absolute);
+    else if (isContainedPath(boundary.realRoot, absolute)) relative = path.relative(boundary.realRoot, absolute);
+    else throw containmentFailure('an absolute path is outside the run artifact root.');
+  } else if (path.win32.isAbsolute(sourcePath)) {
+    throw containmentFailure('an absolute path is outside the run artifact root.');
+  } else {
+    relative = sourcePath;
+  }
+
+  const candidate = path.resolve(boundary.realRoot, relative);
+  if (candidate === boundary.realRoot || !isContainedPath(boundary.realRoot, candidate)) {
+    throw containmentFailure('the declared path is outside the run artifact root.');
+  }
+  return candidate;
+}
+
+async function assertNoSymlinkComponents(candidate: string, boundary: AttachmentSourceBoundary): Promise<void> {
+  const relative = path.relative(boundary.realRoot, candidate);
+  let current = boundary.realRoot;
+  const segments = relative.split(path.sep).filter(Boolean);
+  for (const [index, segment] of segments.entries()) {
+    current = path.join(current, segment);
+    const details = await lstat(current);
+    if (details.isSymbolicLink()) {
+      throw containmentFailure(`symbolic links are not allowed beneath the run artifact root (${relative}).`);
+    }
+    if (index < segments.length - 1 && !details.isDirectory()) {
+      throw containmentFailure(`a non-directory path component was declared (${relative}).`);
+    }
+  }
+}
+
+async function verifyOpenedAttachmentSource(
+  source: OpenedAttachmentSource,
+  boundary: AttachmentSourceBoundary,
+): Promise<void> {
+  try {
+    await assertNoSymlinkComponents(source.path, boundary);
+    const [pathDetails, canonicalPath, handleDetails] = await Promise.all([
+      lstat(source.path),
+      realpath(source.path),
+      source.handle.stat({ bigint: true }),
+    ]);
+    if (pathDetails.isSymbolicLink() || !pathDetails.isFile() || !handleDetails.isFile()) {
+      throw containmentFailure('the declared attachment is not a regular, non-symbolic file.');
+    }
+    if (!isContainedPath(boundary.realRoot, canonicalPath)) {
+      throw containmentFailure('the canonical attachment path is outside the run artifact root.');
+    }
+    if (handleDetails.dev !== BigInt(pathDetails.dev) || handleDetails.ino !== BigInt(pathDetails.ino)) {
+      throw containmentFailure('the attachment path changed while it was being opened.');
+    }
+    if (handleDetails.dev !== source.device || handleDetails.ino !== source.inode) {
+      throw containmentFailure('the opened attachment identity changed unexpectedly.');
+    }
+  } catch (error) {
+    if (isContainmentError(error)) throw error;
+    throw containmentFailure(`the opened attachment path could not be revalidated (${error instanceof Error ? error.message : String(error)}).`);
+  }
+}
+
+async function openContainedAttachmentSource(
+  sourcePath: string,
+  boundary: AttachmentSourceBoundary,
+): Promise<OpenedAttachmentSource> {
+  const candidate = resolveContainedAttachmentPath(sourcePath, boundary);
+  await assertNoSymlinkComponents(candidate, boundary);
+  const canonicalPath = await realpath(candidate);
+  if (!isContainedPath(boundary.realRoot, canonicalPath)) {
+    throw containmentFailure('the canonical attachment path is outside the run artifact root.');
+  }
+  const handle = await open(candidate, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  try {
+    const details = await handle.stat({ bigint: true });
+    if (!details.isFile()) throw containmentFailure('the declared attachment is not a regular file.');
+    const source: OpenedAttachmentSource = {
+      handle,
+      path: candidate,
+      size: Number(details.size),
+      sizeBigInt: details.size,
+      modifiedAtNs: details.mtimeNs,
+      device: details.dev,
+      inode: details.ino,
+    };
+    await verifyOpenedAttachmentSource(source, boundary);
+    return source;
+  } catch (error) {
+    await handle.close();
+    throw error;
+  }
+}
+
+export async function validateContainedAttachmentSource(
+  sourcePath: string,
+  boundaryOrRoot: AttachmentSourceBoundary | string,
+): Promise<string> {
+  const boundary = typeof boundaryOrRoot === 'string'
+    ? await createAttachmentSourceBoundary(boundaryOrRoot)
+    : boundaryOrRoot;
+  const source = await openContainedAttachmentSource(sourcePath, boundary);
+  try {
+    await verifyOpenedAttachmentSource(source, boundary);
+    return source.path;
+  } finally {
+    await source.handle.close();
+  }
+}
+
+function isContainmentError(error: unknown): error is AttachmentSourceContainmentError {
+  return error instanceof AttachmentSourceContainmentError;
+}
+
+function isMissingSource(error: unknown): boolean {
+  return ['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '');
+}
+
+export async function readContainedAttachmentSource(
+  sourcePath: string,
+  boundaryOrRoot: AttachmentSourceBoundary | string,
+  options: { maximumBytes?: number } = {},
+): Promise<Buffer> {
+  const boundary = typeof boundaryOrRoot === 'string'
+    ? await createAttachmentSourceBoundary(boundaryOrRoot)
+    : boundaryOrRoot;
+  if (
+    options.maximumBytes != null
+    && (!Number.isSafeInteger(options.maximumBytes) || options.maximumBytes < 0)
+  ) {
+    throw new RangeError('maximumBytes must be a non-negative safe integer.');
+  }
+  const source = await openContainedAttachmentSource(sourcePath, boundary);
+  try {
+    if (options.maximumBytes != null && source.size > options.maximumBytes) {
+      throw new Error(`Attachment source exceeds the ${options.maximumBytes}-byte read limit.`);
+    }
+    const body = await source.handle.readFile();
+    if (options.maximumBytes != null && body.byteLength > options.maximumBytes) {
+      throw new Error(`Attachment source exceeds the ${options.maximumBytes}-byte read limit.`);
+    }
+    await verifyOpenedAttachmentSource(source, boundary);
+    const after = await source.handle.stat({ bigint: true });
+    if (after.size !== source.sizeBigInt || after.mtimeNs !== source.modifiedAtNs) {
+      throw containmentFailure('the attachment changed while it was being read.');
+    }
+    return body;
+  } finally {
+    await source.handle.close();
+  }
+}
+
+export async function hashContainedAttachmentSource(
+  sourcePath: string,
+  boundaryOrRoot: AttachmentSourceBoundary | string,
+): Promise<{ sha256: string; sizeBytes: number }> {
+  const boundary = typeof boundaryOrRoot === 'string'
+    ? await createAttachmentSourceBoundary(boundaryOrRoot)
+    : boundaryOrRoot;
+  const source = await openContainedAttachmentSource(sourcePath, boundary);
+  try {
+    const hash = createHash('sha256');
+    const buffer = Buffer.allocUnsafe(1024 * 1024);
+    let position = 0;
+    while (position < source.size) {
+      const bytesToRead = Math.min(buffer.byteLength, source.size - position);
+      const { bytesRead } = await source.handle.read(buffer, 0, bytesToRead, position);
+      if (bytesRead === 0) throw containmentFailure('the attachment changed while it was being hashed.');
+      hash.update(buffer.subarray(0, bytesRead));
+      position += bytesRead;
+    }
+    if ((await source.handle.read(buffer, 0, 1, source.size)).bytesRead !== 0) {
+      throw containmentFailure('the attachment changed while it was being hashed.');
+    }
+    await verifyOpenedAttachmentSource(source, boundary);
+    const after = await source.handle.stat({ bigint: true });
+    if (after.size !== source.sizeBigInt || after.mtimeNs !== source.modifiedAtNs) {
+      throw containmentFailure('the attachment changed while it was being hashed.');
+    }
+    return { sha256: hash.digest('hex'), sizeBytes: source.size };
+  } finally {
+    await source.handle.close();
+  }
+}
+
+async function copyContainedAttachmentSource(
+  sourcePath: string,
+  destination: string,
+  boundary: AttachmentSourceBoundary,
+  outputBoundary: AttachmentSourceBoundary,
+): Promise<void> {
+  const source = await openContainedAttachmentSource(sourcePath, boundary);
+  const destinationHandle = await openContainedOutputFile(destination, outputBoundary);
+  try {
+    const buffer = Buffer.allocUnsafe(1024 * 1024);
+    let position = 0;
+    while (position < source.size) {
+      const bytesToRead = Math.min(buffer.byteLength, source.size - position);
+      const { bytesRead } = await source.handle.read(buffer, 0, bytesToRead, position);
+      if (bytesRead === 0) throw containmentFailure('the attachment changed while it was being copied.');
+      let bytesWritten = 0;
+      while (bytesWritten < bytesRead) {
+        const writeResult = await destinationHandle.write(
+          buffer,
+          bytesWritten,
+          bytesRead - bytesWritten,
+          position + bytesWritten,
+        );
+        if (writeResult.bytesWritten === 0) throw new Error('The gallery evidence destination stopped accepting bytes.');
+        bytesWritten += writeResult.bytesWritten;
+      }
+      position += bytesRead;
+    }
+    const extra = Buffer.allocUnsafe(1);
+    if ((await source.handle.read(extra, 0, 1, source.size)).bytesRead !== 0) {
+      throw containmentFailure('the attachment changed while it was being copied.');
+    }
+    await verifyOpenedAttachmentSource(source, boundary);
+    const after = await source.handle.stat({ bigint: true });
+    if (after.size !== source.sizeBigInt || after.mtimeNs !== source.modifiedAtNs) {
+      throw containmentFailure('the attachment changed while it was being copied.');
+    }
+    await destinationHandle.sync();
+    await verifyOpenedOutputFile(destinationHandle, destination, outputBoundary);
+  } finally {
+    await Promise.allSettled([source.handle.close(), destinationHandle.close()]);
+  }
+}
+
+async function mapWithConcurrency<T, R>(
+  values: readonly T[],
+  requestedConcurrency: number,
+  task: (value: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const output = new Array<R>(values.length);
+  const concurrency = Math.max(1, Math.min(values.length || 1, requestedConcurrency));
+  let next = 0;
+  const workers = await Promise.allSettled(Array.from({ length: concurrency }, async () => {
+    while (next < values.length) {
+      const index = next;
+      next += 1;
+      const value = values[index];
+      if (value !== undefined) output[index] = await task(value, index);
+    }
+  }));
+  const failure = workers.find((worker): worker is PromiseRejectedResult => worker.status === 'rejected');
+  if (failure) throw failure.reason;
+  return output;
 }
 
 function safeSegment(value: string): string {
@@ -198,19 +623,38 @@ async function sha256File(file: string): Promise<string> {
   });
 }
 
-async function readAttachment(attachment: ReportAttachmentInput): Promise<Buffer | null> {
-  if (attachment.body) return attachment.body;
+async function readAttachment(
+  attachment: ReportAttachmentInput,
+  sourceBoundary: AttachmentSourceBoundary,
+  maximumBytes: number,
+): Promise<Buffer | null> {
+  if (attachment.body) {
+    if (attachment.body.byteLength > maximumBytes) {
+      throw new Error(`Attachment ${attachment.name} exceeds the ${maximumBytes}-byte structured read limit.`);
+    }
+    return attachment.body;
+  }
   if (!attachment.path) return null;
   try {
-    return await readFile(attachment.path);
-  } catch {
+    return await readContainedAttachmentSource(attachment.path, sourceBoundary, { maximumBytes });
+  } catch (error) {
+    if (isContainmentError(error) || !isMissingSource(error)) throw error;
     return null;
   }
 }
 
-async function attachmentDigest(attachment: ReportAttachmentInput): Promise<string | null> {
-  const buffer = await readAttachment(attachment);
-  return buffer ? createHash('sha256').update(buffer).digest('hex') : null;
+async function attachmentDigest(
+  attachment: ReportAttachmentInput,
+  sourceBoundary: AttachmentSourceBoundary,
+): Promise<string | null> {
+  if (attachment.body) return createHash('sha256').update(attachment.body).digest('hex');
+  if (!attachment.path) return null;
+  try {
+    return (await hashContainedAttachmentSource(attachment.path, sourceBoundary)).sha256;
+  } catch (error) {
+    if (isContainmentError(error) || !isMissingSource(error)) throw error;
+    return null;
+  }
 }
 
 function isEvidenceRecord(value: unknown): value is AuditEvidenceRecord {
@@ -226,12 +670,15 @@ function isEvidenceRecord(value: unknown): value is AuditEvidenceRecord {
   );
 }
 
-async function evidenceRecords(attachments: ReportAttachmentInput[]): Promise<AuditEvidenceRecord[]> {
+async function evidenceRecords(
+  attachments: ReportAttachmentInput[],
+  sourceBoundary: AttachmentSourceBoundary,
+): Promise<AuditEvidenceRecord[]> {
   const records: AuditEvidenceRecord[] = [];
   for (const attachment of attachments) {
     if (!attachment.contentType.includes('json') && !attachment.name.toLowerCase().includes('audit-result')) continue;
     if (attachment.contentType === GALLERY_CAPTURE_METADATA_CONTENT_TYPE) continue;
-    const buffer = await readAttachment(attachment);
+    const buffer = await readAttachment(attachment, sourceBoundary, 16 * 1024 * 1024);
     if (!buffer) continue;
     try {
       const parsed = JSON.parse(buffer.toString('utf8')) as unknown;
@@ -302,11 +749,14 @@ function normalizeCaptureMetadata(value: unknown): GalleryCaptureMetadata | null
   return metadata;
 }
 
-async function captureMetadataIndex(attachments: ReportAttachmentInput[]): Promise<Map<string, GalleryCaptureMetadata>> {
+async function captureMetadataIndex(
+  attachments: ReportAttachmentInput[],
+  sourceBoundary: AttachmentSourceBoundary,
+): Promise<Map<string, GalleryCaptureMetadata>> {
   const metadata = new Map<string, GalleryCaptureMetadata>();
   for (const attachment of attachments) {
     if (attachment.contentType !== GALLERY_CAPTURE_METADATA_CONTENT_TYPE) continue;
-    const buffer = await readAttachment(attachment);
+    const buffer = await readAttachment(attachment, sourceBoundary, 1024 * 1024);
     if (!buffer) continue;
     try {
       const parsed = normalizeCaptureMetadata(JSON.parse(buffer.toString('utf8')) as unknown);
@@ -334,20 +784,23 @@ function inferLegacyComparison(name: string): LegacyComparison | null {
   return null;
 }
 
-async function processedPosterIndex(outputDir: string, warnings: string[]): Promise<Map<string, string>> {
-  const candidates = new Set([
-    path.join(path.dirname(outputDir), 'video-manifest.json'),
-    ...(process.env.AUDIT_ARTIFACT_DIR
-      ? [path.join(path.resolve(process.env.AUDIT_ARTIFACT_DIR), 'video-manifest.json')]
-      : []),
-  ]);
+async function processedPosterIndex(
+  sourceBoundary: AttachmentSourceBoundary,
+  warnings: string[],
+): Promise<Map<string, string>> {
+  const candidates = new Set([path.join(sourceBoundary.realRoot, 'video-manifest.json')]);
   const posters = new Map<string, string>();
   for (const manifestPath of candidates) {
     let document: unknown;
     try {
-      document = JSON.parse(await readFile(manifestPath, 'utf8')) as unknown;
+      document = JSON.parse((await readContainedAttachmentSource(
+        manifestPath,
+        sourceBoundary,
+        { maximumBytes: 32 * 1024 * 1024 },
+      )).toString('utf8')) as unknown;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      if (isContainmentError(error)) throw error;
+      if (!isMissingSource(error)) {
         warnings.push(`Could not read processed video manifest ${manifestPath}: ${error instanceof Error ? error.message : String(error)}`);
       }
       continue;
@@ -356,16 +809,11 @@ async function processedPosterIndex(outputDir: string, warnings: string[]): Prom
       warnings.push(`Processed video manifest ${manifestPath} does not contain a videos array.`);
       continue;
     }
-    const artifactRoot = path.dirname(manifestPath);
     for (const entry of (document as { videos: unknown[] }).videos) {
       if (!entry || typeof entry !== 'object') continue;
       const { sha256, poster } = entry as { sha256?: unknown; poster?: unknown };
       if (typeof sha256 !== 'string' || !/^[a-f0-9]{64}$/i.test(sha256) || typeof poster !== 'string') continue;
-      const sourcePoster = path.resolve(artifactRoot, poster);
-      if (sourcePoster !== artifactRoot && !sourcePoster.startsWith(`${artifactRoot}${path.sep}`)) {
-        warnings.push(`Ignored processed video poster outside the artifact root: ${poster}`);
-        continue;
-      }
+      const sourcePoster = resolveContainedAttachmentPath(poster, sourceBoundary);
       if (!posters.has(sha256)) posters.set(sha256, sourcePoster);
     }
   }
@@ -378,15 +826,18 @@ async function materializeVideoPoster(
   outputDir: string,
   videoSha256: string,
   postersByVideoHash: ReadonlyMap<string, string>,
+  sourceBoundary: AttachmentSourceBoundary,
+  outputBoundary: AttachmentSourceBoundary,
 ): Promise<Pick<ReportArtifact, 'poster' | 'posterError'>> {
   if (!attachment.path) return {};
   const sourceExtension = path.extname(attachment.path);
   const sourcePoster = path.join(path.dirname(attachment.path), `${path.basename(attachment.path, sourceExtension)}-poster.jpg`);
   let sourcePosterPath: string | undefined;
   try {
-    const sourceDetails = await stat(sourcePoster);
-    if (sourceDetails.isFile()) sourcePosterPath = sourcePoster;
-  } catch {
+    sourcePosterPath = await validateContainedAttachmentSource(sourcePoster, sourceBoundary);
+  } catch (error) {
+    if (isContainmentError(error)) throw error;
+    if (!isMissingSource(error)) throw error;
     // A sibling is optional; merged blob reports can resolve by video checksum.
   }
   sourcePosterPath ??= postersByVideoHash.get(videoSha256);
@@ -394,19 +845,20 @@ async function materializeVideoPoster(
   const destinationExtension = path.extname(videoDestination);
   const destinationPoster = path.join(path.dirname(videoDestination), `${path.basename(videoDestination, destinationExtension)}-poster.jpg`);
   try {
-    if (path.resolve(sourcePosterPath) !== path.resolve(destinationPoster)) await copyFile(sourcePosterPath, destinationPoster);
-    const details = await stat(destinationPoster);
+    await copyContainedAttachmentSource(sourcePosterPath, destinationPoster, sourceBoundary, outputBoundary);
+    const details = await hashContainedAttachmentSource(destinationPoster, outputBoundary);
     return {
       poster: {
         name: `${attachment.name} poster`,
         contentType: 'image/jpeg',
         href: path.relative(outputDir, destinationPoster).split(path.sep).join('/'),
-        sourcePath: sourcePosterPath,
-        sizeBytes: details.size,
-        sha256: await sha256File(destinationPoster),
+        sourcePath: path.relative(sourceBoundary.realRoot, sourcePosterPath).split(path.sep).join('/'),
+        sizeBytes: details.sizeBytes,
+        sha256: details.sha256,
       },
     };
   } catch (error) {
+    if (isContainmentError(error)) throw error;
     return { posterError: error instanceof Error ? error.message : String(error) };
   }
 }
@@ -417,6 +869,8 @@ async function materializeAttachment(
   destinationDir: string,
   index: number,
   postersByVideoHash: ReadonlyMap<string, string>,
+  sourceBoundary: AttachmentSourceBoundary,
+  outputBoundary: AttachmentSourceBoundary,
 ): Promise<ReportArtifact> {
   const kind = attachmentKind(attachment.name, attachment.contentType);
   const extension = extensionFor(attachment);
@@ -429,21 +883,35 @@ async function materializeAttachment(
     kind,
     contentType: attachment.contentType,
     href,
-    sourcePath: attachment.path ?? null,
+    sourcePath: attachment.path
+      ? path.relative(
+          sourceBoundary.realRoot,
+          resolveContainedAttachmentPath(attachment.path, sourceBoundary),
+        ).split(path.sep).join('/')
+      : null,
   } satisfies Omit<ReportArtifact, 'available' | 'sizeBytes' | 'sha256'>;
   try {
-    await mkdir(destinationDir, { recursive: true });
-    if (attachment.body) await writeFile(destination, attachment.body);
+    await ensureContainedOutputDirectory(destinationDir, outputBoundary);
+    if (attachment.body) await writeContainedOutputFile(destination, attachment.body, outputBoundary);
     else if (attachment.path) {
-      if (path.resolve(attachment.path) !== path.resolve(destination)) await copyFile(attachment.path, destination);
+      await copyContainedAttachmentSource(attachment.path, destination, sourceBoundary, outputBoundary);
     } else throw new Error('Attachment has neither a path nor a body.');
-    const details = await stat(destination);
-    const sha256 = await sha256File(destination);
+    const details = await hashContainedAttachmentSource(destination, outputBoundary);
+    const sha256 = details.sha256;
     const poster = kind === 'video' && attachment.path
-      ? await materializeVideoPoster(attachment, destination, outputDir, sha256, postersByVideoHash)
+      ? await materializeVideoPoster(
+          attachment,
+          destination,
+          outputDir,
+          sha256,
+          postersByVideoHash,
+          sourceBoundary,
+          outputBoundary,
+        )
       : {};
-    return { ...base, available: true, sizeBytes: details.size, sha256, ...poster };
+    return { ...base, available: true, sizeBytes: details.sizeBytes, sha256, ...poster };
   } catch (error) {
+    if (isContainmentError(error)) throw error;
     return {
       ...base,
       href: null,
@@ -458,9 +926,15 @@ async function materializeAttachment(
 function mediaStorageLocations(
   attachments: ReportAttachmentInput[],
   artifact: ReportArtifact,
+  sourceBoundary: AttachmentSourceBoundary,
 ): string[] {
   return [...new Set([
-    ...attachments.flatMap((attachment) => attachment.path ? [path.resolve(attachment.path)] : []),
+    ...attachments.flatMap((attachment) => attachment.path ? [
+      path.relative(
+        sourceBoundary.realRoot,
+        resolveContainedAttachmentPath(attachment.path, sourceBoundary),
+      ).split(path.sep).join('/'),
+    ] : []),
     ...(artifact.href ? [artifact.href] : []),
   ])].sort();
 }
@@ -471,8 +945,10 @@ async function normalizeAttempt(
   ordinal: number,
   outputDir: string,
   postersByVideoHash: ReadonlyMap<string, string>,
+  sourceBoundary: AttachmentSourceBoundary,
+  outputBoundary: AttachmentSourceBoundary,
 ): Promise<NormalizedGalleryAttempt> {
-  const metadataByOccurrence = await captureMetadataIndex(result.attachments);
+  const metadataByOccurrence = await captureMetadataIndex(result.attachments, sourceBoundary);
   const nameOccurrences = new Map<string, number>();
   const logicalAttachments = new Map<string, {
     attachmentKey: string;
@@ -504,8 +980,8 @@ async function normalizeAttempt(
     const existing = logicalAttachments.get(key);
     if (existing) {
       const [existingDigest, candidateDigest] = await Promise.all([
-        attachmentDigest(existing.attachment),
-        attachmentDigest(attachment),
+        attachmentDigest(existing.attachment, sourceBoundary),
+        attachmentDigest(attachment, sourceBoundary),
       ]);
       if (existingDigest && existingDigest === candidateDigest) {
         existing.copies.push(attachment);
@@ -536,7 +1012,15 @@ async function normalizeAttempt(
   const artifacts: ReportArtifact[] = [];
   let materializedIndex = 0;
   for (const entry of logicalAttachments.values()) {
-    const artifact = await materializeAttachment(entry.attachment, outputDir, destinationDir, materializedIndex, postersByVideoHash);
+    const artifact = await materializeAttachment(
+      entry.attachment,
+      outputDir,
+      destinationDir,
+      materializedIndex,
+      postersByVideoHash,
+      sourceBoundary,
+      outputBoundary,
+    );
     materializedIndex += 1;
     artifacts.push(artifact);
     if (!galleryMediaKind(entry.attachment)) continue;
@@ -547,13 +1031,13 @@ async function normalizeAttempt(
       role: entry.role,
       comparisonGroup: entry.comparisonGroup,
       metadataProvenance: entry.metadataProvenance,
-      storageLocations: mediaStorageLocations(entry.copies, artifact),
+      storageLocations: mediaStorageLocations(entry.copies, artifact, sourceBoundary),
     });
   }
   return {
     ordinal,
     result,
-    evidenceRecords: await evidenceRecords(result.attachments),
+    evidenceRecords: await evidenceRecords(result.attachments, sourceBoundary),
     artifacts,
     media: normalized,
   };
@@ -816,20 +1300,55 @@ function catalogFromNormalized(
   return assertGalleryCatalog(catalog);
 }
 
+function defaultAttachmentSourceRoot(outputDir: string, cwd: string): string {
+  const configuredRoot = process.env.AUDIT_ARTIFACT_DIR?.trim();
+  if (configuredRoot) return path.resolve(cwd, configuredRoot);
+  return /checklist/i.test(path.basename(outputDir)) ? path.dirname(outputDir) : outputDir;
+}
+
+async function preflightAttachmentSources(
+  tests: readonly ReportTestInput[],
+  sourceBoundary: AttachmentSourceBoundary,
+): Promise<void> {
+  const paths = [...new Set(tests.flatMap(({ results }) => results.flatMap(({ attachments }) => (
+    attachments.flatMap((attachment) => attachment.path ? [attachment.path] : [])
+  ))))];
+  await mapWithConcurrency(paths, GALLERY_MATERIALIZATION_CONCURRENCY, async (sourcePath) => {
+    try {
+      await validateContainedAttachmentSource(sourcePath, sourceBoundary);
+    } catch (error) {
+      if (!isMissingSource(error)) throw error;
+      // Missing evidence remains visible as an unavailable artifact. Unsafe
+      // evidence aborts publication instead of being downgraded to unavailable.
+    }
+  });
+}
+
 export async function buildGalleryEvidenceModel(options: BuildGalleryCatalogOptions): Promise<GalleryEvidenceModel> {
-  const outputDir = path.resolve(options.cwd ?? process.cwd(), options.outputDir);
-  await mkdir(outputDir, { recursive: true });
+  const cwd = options.cwd ?? process.cwd();
+  const requestedOutputDir = path.resolve(cwd, options.outputDir);
+  await mkdir(requestedOutputDir, { recursive: true });
+  const outputBoundary = await createAttachmentSourceBoundary(requestedOutputDir);
+  const outputDir = outputBoundary.realRoot;
+  const sourceRoot = path.resolve(cwd, options.sourceRoot ?? defaultAttachmentSourceRoot(requestedOutputDir, cwd));
+  const sourceBoundary = await createAttachmentSourceBoundary(sourceRoot);
+  await preflightAttachmentSources(options.tests, sourceBoundary);
   const warnings = options.warnings ?? [];
   const definitionCatalog = options.definitionCatalog ?? [];
-  const postersByVideoHash = await processedPosterIndex(outputDir, warnings);
-  const tests = await Promise.all(options.tests.map(async (source): Promise<NormalizedGalleryTest> => {
-    const attempts = await Promise.all(source.results.map((attempt, index) => normalizeAttempt(
-      source,
-      attempt,
-      index + 1,
-      outputDir,
-      postersByVideoHash,
-    )));
+  const postersByVideoHash = await processedPosterIndex(sourceBoundary, warnings);
+  const tests = await mapWithConcurrency(options.tests, GALLERY_MATERIALIZATION_CONCURRENCY, async (source): Promise<NormalizedGalleryTest> => {
+    const attempts: NormalizedGalleryAttempt[] = [];
+    for (const [index, attempt] of source.results.entries()) {
+      attempts.push(await normalizeAttempt(
+        source,
+        attempt,
+        index + 1,
+        outputDir,
+        postersByVideoHash,
+        sourceBoundary,
+        outputBoundary,
+      ));
+    }
     const evidence = attempts.flatMap((attempt) => attempt.evidenceRecords);
     return {
       source,
@@ -837,7 +1356,7 @@ export async function buildGalleryEvidenceModel(options: BuildGalleryCatalogOpti
       evidenceRecords: evidence,
       attempts,
     };
-  }));
+  });
   return { tests, catalog: catalogFromNormalized(tests, definitionCatalog) };
 }
 

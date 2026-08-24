@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
-import { AUDIT_CATALOG } from './catalog.js';
+import { AUDIT_CATALOG, pageAuditDefinition } from './catalog.js';
+import { CANDIDATE_HTML_ROUTES } from './routes.js';
 import {
   auditDefinitionsEqual,
   cloneAuditDefinition,
@@ -30,5 +31,9 @@ const registryDocument = JSON.parse(
 ) as unknown;
 
 export const INSTALLED_PLUGIN_REGISTRY = validatePluginRegistryDocument(registryDocument);
-export const ALL_AUDIT_CATALOG = mergeAuditDefinitionCatalog(AUDIT_CATALOG, INSTALLED_PLUGIN_REGISTRY);
+export const ROUTE_AUDIT_CATALOG = CANDIDATE_HTML_ROUTES.map(({ path }) => pageAuditDefinition(path));
+export const ALL_AUDIT_CATALOG = mergeAuditDefinitionCatalog(
+  [...AUDIT_CATALOG, ...ROUTE_AUDIT_CATALOG],
+  INSTALLED_PLUGIN_REGISTRY,
+);
 export const ALL_AUDIT_BY_ID = new Map(ALL_AUDIT_CATALOG.map((definition) => [definition.id, definition]));

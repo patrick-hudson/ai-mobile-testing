@@ -193,6 +193,13 @@ export function decodeGalleryItemDetail(value) {
         ordinal: safeOrdinal(attempt.ordinal, 'Gallery attempt ordinal'),
         retry: safeOrdinal(attempt.retry, 'Gallery retry'),
         status: safeText(attempt.status, 'Gallery attempt status', 120),
+        rawStatus: attempt.rawStatus == null
+          ? safeText(attempt.status, 'Gallery raw attempt status', 120)
+          : safeText(attempt.rawStatus, 'Gallery raw attempt status', 120),
+        statusSource: attempt.statusSource == null
+          ? 'raw-live'
+          : safeText(attempt.statusSource, 'Gallery status source', 120),
+        reviewReasonCodes: Object.freeze(safeStrings(attempt.reviewReasonCodes ?? [], 'Gallery review reason codes', 12, 120)),
         expectedStatus: attempt.expectedStatus === null ? null : safeText(attempt.expectedStatus, 'Gallery expected status', 120),
         startedAt: attempt.startedAt === null ? null : safeText(attempt.startedAt, 'Gallery start time', 100),
         durationMs: Number.isFinite(attempt.durationMs) && attempt.durationMs >= 0 ? attempt.durationMs : 0,
@@ -816,7 +823,10 @@ function renderRegionsForAction(action) {
   if (type === 'MEDIA_ELEMENT_LOADED' || type === 'MEDIA_ELEMENT_FAILED' || type === 'POSTER_ELEMENT_FAILED') return ['status', 'viewer'];
   if (type === 'DETAIL_SUCCEEDED' || type === 'SET_MEMBER') return ['status', 'viewer', 'context'];
   if (type === 'OPEN_LAYER' || type === 'CLOSE_LAYER' || type === 'FULLSCREEN_CHANGED' || type === 'ESCAPE_LAYER') {
-    return ['controls', 'queue', 'viewer', 'context', 'overview', 'help'];
+    // Layer and fullscreen state do not change the selected media. Keeping the
+    // viewer DOM mounted preserves video playback, avoids duplicate range
+    // requests, and prevents a help/context action from resetting currentTime.
+    return ['controls', 'queue', 'context', 'overview', 'help'];
   }
   if (type === 'SET_MODE') return ['controls', 'queue', 'viewer', 'filmstrip', 'context', 'overview'];
   return ['status', 'controls', 'queue', 'viewer', 'filmstrip', 'context', 'overview', 'help'];
@@ -1553,7 +1563,14 @@ export function createGalleryWorkbench(root, options = {}) {
     appendContextPair(list, 'Audit', detail.item.auditAssociations.map(({ id, title }) => `${id}: ${title}`).join('; '));
     appendContextPair(list, 'Expected', detail.item.auditAssociations.map(({ expected }) => expected).join('; '));
     appendContextPair(list, 'Observed', detail.item.capture.observedState);
-    appendContextPair(list, 'Outcome', detail.item.attempt.status);
+    appendContextPair(list, 'Reviewed outcome', detail.item.attempt.status);
+    appendContextPair(list, 'Raw browser result', detail.item.attempt.rawStatus);
+    appendContextPair(list, 'Status authority', detail.item.attempt.statusSource === 'reviewed-manifest'
+      ? 'Structured audit review'
+      : detail.item.attempt.statusSource === 'release-integrity'
+        ? 'Release integrity review'
+        : 'Live browser result (provisional)');
+    appendContextPair(list, 'Review reason codes', detail.item.attempt.reviewReasonCodes.join(', ') || null);
     appendContextPair(list, 'Environment', detail.item.project.environment);
     appendContextPair(list, 'Route', detail.item.capture.route);
     appendContextPair(list, 'Browser / project', `${detail.item.project.browser} / ${detail.item.project.name}`);

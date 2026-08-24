@@ -18,7 +18,6 @@ interactionTest('[SEARCH-001] header search opens by pointer and keyboard shortc
     await expect(page.getByRole('dialog')).toBeVisible();
     await expect(page.getByRole('combobox', { name: 'Search all pages' })).toBeFocused();
   });
-  await audit.checkpoint('search-dialog-empty');
   await page.keyboard.press('Escape');
   await expect(page.getByRole('dialog')).toBeHidden();
 
@@ -43,7 +42,6 @@ interactionTest('[SEARCH-002] known medical query returns a relevant destination
   const resultCount = await page.getByRole('option').count();
   audit.observe('visible result count', resultCount, 'At least one result');
   expect(resultCount).toBeGreaterThan(0);
-  await audit.checkpoint('search-results-clonidine');
   await audit.assertRuntimeHealthy();
 });
 
@@ -58,11 +56,34 @@ interactionTest('[SEARCH-003] search keyboard navigation opens the active result
     await input.press('ArrowDown');
     const active = await input.getAttribute('aria-activedescendant');
     expect(active).toBeTruthy();
-    await Promise.all([
-      page.waitForURL((url) => url.pathname !== '/'),
+    const activeOption = page.locator(`[id="${active}"]`);
+    await expect(activeOption).toHaveAttribute('aria-selected', 'true');
+    const activeHref = await activeOption.getAttribute('href');
+    expect(activeHref, 'The active option must expose a concrete destination').toBeTruthy();
+    const expectedDestination = new URL(activeHref!, page.url());
+    const expectedRequestDestination = new URL(expectedDestination);
+    expectedRequestDestination.hash = '';
+    const sourceUrl = page.url();
+    const navigationRequestPromise = page.waitForRequest((request) =>
+      request.isNavigationRequest()
+      && request.frame() === page.mainFrame()
+      && request.url() !== sourceUrl);
+    const navigationResponsePromise = page.waitForNavigation({ waitUntil: 'load' });
+    const [, navigationRequest, navigationResponse] = await Promise.all([
       input.press('Enter'),
+      navigationRequestPromise,
+      navigationResponsePromise,
     ]);
-    expect(new URL(page.url()).pathname).not.toBe('/');
+    expect(navigationRequest.url(), 'Enter must initiate the active option’s exact network destination (URL fragments remain browser-local)').toBe(expectedRequestDestination.href);
+    expect(navigationResponse, 'The selected destination must complete a document navigation').not.toBeNull();
+    expect(navigationResponse?.status(), 'The selected destination must resolve successfully').toBe(200);
+
+    const expectedCanonicalDestination = new URL(expectedDestination);
+    if (expectedCanonicalDestination.pathname !== '/' && !expectedCanonicalDestination.pathname.endsWith('/')) {
+      expectedCanonicalDestination.pathname += '/';
+    }
+    expect(page.url(), 'The final page must be the exact canonical form of the active option').toBe(expectedCanonicalDestination.href);
+    audit.observe('active search destination', expectedDestination.href, `Canonical final URL: ${expectedCanonicalDestination.href}`);
   });
   await audit.assertRuntimeHealthy();
 });
@@ -98,12 +119,12 @@ interactionTest('[SEARCH-005] no-result state offers a usable recovery path', in
     await expect(page.getByText(/no pages matched/i)).toBeVisible();
     await expect(page.getByText(/try a medicine name/i)).toBeVisible();
   });
-  await audit.checkpoint('search-no-results');
   await audit.assertRuntimeHealthy();
 });
 
 interactionTest('[SEARCH-006] failed search index exposes the sitemap fallback', interactionEvidence('Open search and enter a query while the index fails, then show the fallback and stopped spinner.', 'candidate-chromium-projects'), async ({ page, audit }, testInfo) => {
   test.skip(meta(testInfo).environment !== 'candidate' || !testInfo.project.name.includes('chromium'), 'Candidate failure-injection audit.');
+  audit.expectRequestFailure('/search-index.json');
   await page.route('**/search-index.json', (route) => route.abort('failed'));
   await audit.goto('/search');
   const input = await readySearchInput(page);
@@ -112,5 +133,4 @@ interactionTest('[SEARCH-006] failed search index exposes the sitemap fallback',
     await expect(page.getByText(/search could not load/i)).toBeVisible();
     await expect(page.getByRole('link', { name: /complete site map/i })).toHaveAttribute('href', '/sitemap');
   });
-  await audit.checkpoint('search-index-failure');
 });

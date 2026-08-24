@@ -17,7 +17,6 @@ interactionTest('[NAV-001] mobile guide drawer preserves focus and page position
     await expect(page.getByRole('dialog', { name: 'Guide navigation' })).toBeVisible();
     await expect(page.getByRole('navigation', { name: 'Guide index' })).toBeVisible();
   });
-  await audit.checkpoint('mobile-guide-open');
 
   await audit.step('Expand a category', 'The category pages appear inside the drawer.', async () => {
     await page.getByRole('button', { name: /expand post-acute/i }).click();
@@ -63,7 +62,6 @@ interactionTest('[NAV-002] mobile categories expose their pages and current loca
   audit.observe('Mobile categories exposed', categories.length, '10');
   await audit.attachJson('mobile-category-ledger', categories);
   expect(categories.length).toBe(10);
-  await audit.checkpoint('mobile-category-expanded');
   await audit.assertRuntimeHealthy();
 });
 
@@ -81,7 +79,6 @@ interactionTest('[NAV-003] desktop sidebar collapse persists without moving the 
     await expect(page.getByRole('button', { name: 'Expand guide navigation' })).toBeVisible();
     expect(Math.abs((await page.evaluate(() => window.scrollY)) - before)).toBeLessThanOrEqual(2);
   });
-  await audit.checkpoint('desktop-sidebar-collapsed');
 
   await audit.step('Reload the page', 'The collapsed state survives the reload.', async () => {
     await page.reload({ waitUntil: 'load' });
@@ -125,7 +122,6 @@ interactionTest('[NAV-005] table of contents aligns and tracks document sections
     expect(top).toBeGreaterThanOrEqual(80);
     expect(top).toBeLessThan(180);
   });
-  await audit.checkpoint('toc-section-aligned');
   await audit.assertRuntimeHealthy();
 });
 import { AxeBuilder } from '@axe-core/playwright';

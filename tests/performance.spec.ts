@@ -6,7 +6,7 @@ import { chromium } from '@playwright/test';
 import { projectMetadata } from '../audit/environments.js';
 import { REPRESENTATIVE_PERFORMANCE_ROUTES } from '../audit/routes.js';
 import { candidateCertificateBypassApplies, chromiumNetskopeTrustArgument } from '../audit/tls.js';
-import { expect, staticEvidence, staticTest, test } from '../fixtures/test.js';
+import { expect, staticEvidence, staticTest, structuredEvidence, structuredTest, test } from '../fixtures/test.js';
 
 interface LayoutShiftRecord {
   value: number;
@@ -155,16 +155,70 @@ async function installPerformanceObservers(page: import('@playwright/test').Page
   });
 }
 
+function monitorNetworkActivity(page: import('@playwright/test').Page): {
+  waitForQuiet(options: { minimumObservationMs: number; quietWindowMs: number; timeoutMs: number }): Promise<{ elapsedMs: number; quietForMs: number; peakInflight: number }>;
+  dispose(): void;
+} {
+  const tracked = new Set<import('@playwright/test').Request>();
+  let peakInflight = 0;
+  let lastActivityAt = Date.now();
+  const shouldTrack = (request: import('@playwright/test').Request) => request.resourceType() !== 'websocket';
+  const started = (request: import('@playwright/test').Request) => {
+    if (!shouldTrack(request)) return;
+    tracked.add(request);
+    peakInflight = Math.max(peakInflight, tracked.size);
+    lastActivityAt = Date.now();
+  };
+  const settled = (request: import('@playwright/test').Request) => {
+    if (!tracked.delete(request)) return;
+    lastActivityAt = Date.now();
+  };
+  page.on('request', started);
+  page.on('requestfinished', settled);
+  page.on('requestfailed', settled);
+  return {
+    async waitForQuiet(options) {
+      const startedAt = Date.now();
+      lastActivityAt = startedAt;
+      while (Date.now() - startedAt < options.timeoutMs) {
+        const elapsedMs = Date.now() - startedAt;
+        const quietForMs = Date.now() - lastActivityAt;
+        if (elapsedMs >= options.minimumObservationMs && tracked.size === 0 && quietForMs >= options.quietWindowMs) {
+          return { elapsedMs, quietForMs, peakInflight };
+        }
+        await page.waitForTimeout(100);
+      }
+      throw new Error(`Network did not become quiet within ${options.timeoutMs}ms; ${tracked.size} request(s) remain active.`);
+    },
+    dispose() {
+      page.off('request', started);
+      page.off('requestfinished', settled);
+      page.off('requestfailed', settled);
+    },
+  };
+}
+
 for (const candidatePath of REPRESENTATIVE_PERFORMANCE_ROUTES) {
-  staticTest(`[PERF-001] browser resource budget for ${candidatePath}`, staticEvidence(`Capture the final ${candidatePath} state with browser timing, transfer, and isolated Lighthouse evidence.`), async ({ page, audit }, testInfo) => {
+  structuredTest(`[PERF-001] browser resource budget for ${candidatePath}`, structuredEvidence(`Retain bounded network-quiet, browser timing, transfer, and isolated Lighthouse evidence for ${candidatePath} without unrelated media.`, 'full-sweep-projects'), async ({ page, audit }, testInfo) => {
     test.setTimeout(180_000);
     const metadata = projectMetadata(testInfo.project.metadata);
     test.skip(!metadata.fullSweep, 'Performance sampling runs on the representative full-sweep matrix.');
     test.skip(audit.environmentPath(candidatePath) === null, 'No production-baseline equivalent exists.');
 
     await installPerformanceObservers(page);
-    await audit.goto(candidatePath);
-    await page.waitForTimeout(500);
+    const networkMonitor = monitorNetworkActivity(page);
+    let networkQuiet: { elapsedMs: number; quietForMs: number; peakInflight: number };
+    try {
+      await audit.goto(candidatePath);
+      await page.waitForLoadState('load');
+      networkQuiet = await networkMonitor.waitForQuiet({
+        minimumObservationMs: 2_500,
+        quietWindowMs: 1_000,
+        timeoutMs: 12_000,
+      });
+    } finally {
+      networkMonitor.dispose();
+    }
 
     const metrics = await page.evaluate(() => {
       const navigation = performance.getEntriesByType('navigation')[0] as PerformanceNavigationTiming | undefined;
@@ -174,6 +228,7 @@ for (const candidatePath of REPRESENTATIVE_PERFORMANCE_ROUTES) {
         url: resource.name,
         initiatorType: resource.initiatorType,
         durationMs: Math.round(resource.duration * 10) / 10,
+        responseEndMs: resource.responseEnd,
         transferBytes: resource.transferSize,
         encodedBytes: resource.encodedBodySize,
         decodedBytes: resource.decodedBodySize,
@@ -184,6 +239,7 @@ for (const candidatePath of REPRESENTATIVE_PERFORMANCE_ROUTES) {
           ttfbMs: navigation.responseStart,
           domContentLoadedMs: navigation.domContentLoadedEventEnd,
           loadMs: navigation.loadEventEnd,
+          responseEndMs: navigation.responseEnd,
           documentTransferBytes: navigation.transferSize,
           documentEncodedBytes: navigation.encodedBodySize,
         } : null,
@@ -193,9 +249,11 @@ for (const candidatePath of REPRESENTATIVE_PERFORMANCE_ROUTES) {
         stylesheetBytes: rows.filter((row) => row.initiatorType === 'css' || row.url.endsWith('.css')).reduce((sum, row) => sum + bytes(row), 0),
         imageBytes: rows.filter((row) => row.initiatorType === 'img').reduce((sum, row) => sum + bytes(row), 0),
         fontBytes: rows.filter((row) => /\.(?:woff2?|ttf|otf)(?:\?|$)/i.test(row.url)).reduce((sum, row) => sum + bytes(row), 0),
+        incompleteResources: rows.filter((row) => row.responseEndMs <= 0),
         slowestResources: [...rows].sort((left, right) => right.durationMs - left.durationMs).slice(0, 12),
         largestResources: [...rows].sort((left, right) => bytes(right) - bytes(left)).slice(0, 12),
         longTasks: performance.getEntriesByType('longtask').map((entry) => ({ startTime: entry.startTime, durationMs: entry.duration })),
+        measuredAtMs: performance.now(),
       };
     });
 
@@ -212,9 +270,14 @@ for (const candidatePath of REPRESENTATIVE_PERFORMANCE_ROUTES) {
     audit.observe('JavaScript bytes', metrics.javascriptBytes, `<= ${budgets.javascriptBytes}`);
     audit.observe('DOMContentLoaded ms', Math.round(metrics.navigation?.domContentLoadedMs ?? 0), `<= ${budgets.domContentLoadedMs}`);
     audit.observe('Load ms', Math.round(metrics.navigation?.loadMs ?? 0), `<= ${budgets.loadMs}`);
-    await audit.attachJson('browser-performance-evidence', { path: candidatePath, budgets, metrics });
+    await audit.attachJson('browser-performance-evidence', { path: candidatePath, budgets, networkQuiet, metrics });
 
     expect(metrics.navigation, 'Navigation Timing must be available').not.toBeNull();
+    expect(metrics.navigation?.domContentLoadedMs ?? 0, 'DOMContentLoaded must have completed before measurement').toBeGreaterThan(0);
+    expect(metrics.navigation?.loadMs ?? 0, 'The load event must have completed before measurement').toBeGreaterThan(0);
+    expect(metrics.navigation?.responseEndMs ?? 0, 'The document response must have completed before measurement').toBeGreaterThan(0);
+    expect(metrics.incompleteResources, 'Every captured first-party resource must have a completed response before budget measurement').toEqual([]);
+    expect(Math.max(metrics.navigation?.loadMs ?? 0, ...metrics.slowestResources.map(({ responseEndMs }) => responseEndMs)), 'Measurement must occur after the load event and every captured response').toBeLessThanOrEqual(metrics.measuredAtMs);
     expect(metrics.requestCount, 'Request count budget').toBeLessThanOrEqual(budgets.requestCount);
     expect(metrics.transferredBytes, 'Total first-party transfer budget').toBeLessThanOrEqual(budgets.transferredBytes);
     expect(metrics.javascriptBytes, 'JavaScript transfer budget').toBeLessThanOrEqual(budgets.javascriptBytes);
@@ -275,7 +338,7 @@ for (const candidatePath of REPRESENTATIVE_PERFORMANCE_ROUTES) {
     await audit.assertRuntimeHealthy();
   });
 
-  staticTest(`[PERF-002] layout stability evidence for ${candidatePath}`, staticEvidence(`Capture the post-hydration ${candidatePath} geometry with measured layout-shift records.`), async ({ page, audit }, testInfo) => {
+  staticTest(`[PERF-002] layout stability evidence for ${candidatePath}`, staticEvidence(`Capture the post-hydration ${candidatePath} geometry with measured layout-shift records.`, 'full-sweep-projects'), async ({ page, audit }, testInfo) => {
     const metadata = projectMetadata(testInfo.project.metadata);
     test.skip(!metadata.fullSweep, 'Layout-shift sampling runs on the representative full-sweep matrix.');
     test.skip(audit.environmentPath(candidatePath) === null, 'No production-baseline equivalent exists.');

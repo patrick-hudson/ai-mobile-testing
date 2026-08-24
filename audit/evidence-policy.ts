@@ -1,9 +1,39 @@
-import type { AuditDefinition, AuditEvidenceMode, AuditEvidencePolicy } from './types.js';
+import type {
+  AuditDefinition,
+  AuditApplicability,
+  AuditEvidenceMode,
+  AuditEvidencePolicy,
+  AuditStatusOverride,
+  AuditStatusWaiver,
+} from './types.js';
 
 export const AUDIT_EVIDENCE_POLICY_ANNOTATION = 'audit-evidence-policy';
+export const AUDIT_APPLICABILITY_ANNOTATION = 'audit-applicability';
+export const AUDIT_STATUS_ANNOTATION = 'audit-status';
+export const AUDIT_STATUS_WAIVER_ANNOTATION = 'audit-status-waiver';
 
 const MODES = new Set<AuditEvidenceMode>(['interaction-video', 'static-screenshot', 'structured-data']);
 const MEDIA_KINDS = new Set<AuditDefinition['evidence'][number]>(['video', 'screenshot']);
+const STATUS_OVERRIDES = new Set<AuditStatusOverride>(['REVIEW', 'INTENDED_CHANGE', 'BLOCKED']);
+export const AUDIT_APPLICABILITIES = Object.freeze<AuditApplicability[]>([
+  'all-projects',
+  'full-sweep-projects',
+  'candidate-projects',
+  'production-projects',
+  'candidate-non-tablet-projects',
+  'candidate-chromium-projects',
+  'production-chromium-projects',
+  'candidate-desktop-projects',
+  'candidate-desktop-chromium',
+  'candidate-mobile-projects',
+  'candidate-mobile-chromium',
+  'production-mobile-chromium',
+  'production-desktop-chromium',
+  'candidate-mobile-webkit',
+  'candidate-tablet-webkit',
+  'candidate-desktop-firefox',
+]);
+const APPLICABILITIES = new Set<AuditApplicability>(AUDIT_APPLICABILITIES);
 
 export function createEvidencePolicy(mode: AuditEvidenceMode, rationale: string): AuditEvidencePolicy {
   const normalized = rationale.replace(/\s+/g, ' ').trim();
@@ -52,6 +82,77 @@ export function parseEvidencePolicyAnnotation(
   } catch {
     return null;
   }
+}
+
+export function parseAuditApplicabilityAnnotation(
+  annotations: readonly { type: string; description?: string }[] | undefined,
+): AuditApplicability | null {
+  const matches = (annotations ?? []).filter(({ type }) => type === AUDIT_APPLICABILITY_ANNOTATION);
+  if (matches.length !== 1 || !matches[0]?.description) return null;
+  return APPLICABILITIES.has(matches[0].description as AuditApplicability)
+    ? matches[0].description as AuditApplicability
+    : null;
+}
+
+export function parseAuditStatusAnnotation(
+  annotations: readonly { type: string; description?: string }[] | undefined,
+  auditId: string,
+): AuditStatusOverride | null {
+  const matches = (annotations ?? []).filter(({ type }) => type === AUDIT_STATUS_ANNOTATION);
+  if (matches.length === 0) return null;
+  if (matches.length !== 1) throw new Error(`Audit ${auditId} must have at most one ${AUDIT_STATUS_ANNOTATION} annotation.`);
+  const status = matches[0]?.description;
+  if (!status || !STATUS_OVERRIDES.has(status as AuditStatusOverride)) {
+    throw new Error(`${AUDIT_STATUS_ANNOTATION} must be exactly REVIEW, INTENDED_CHANGE, or BLOCKED.`);
+  }
+  if (status !== 'INTENDED_CHANGE') return status as AuditStatusOverride;
+  parseAuditStatusWaiver(annotations, auditId);
+  return status;
+}
+
+export function parseAuditStatusWaiver(
+  annotations: readonly { type: string; description?: string }[] | undefined,
+  auditId: string,
+): AuditStatusWaiver {
+  const matches = (annotations ?? []).filter(({ type }) => type === AUDIT_STATUS_WAIVER_ANNOTATION);
+  if (matches.length !== 1 || !matches[0]?.description) {
+    throw new Error(`INTENDED_CHANGE for ${auditId} requires exactly one ${AUDIT_STATUS_WAIVER_ANNOTATION} annotation.`);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(matches[0].description);
+  } catch {
+    throw new Error(`${AUDIT_STATUS_WAIVER_ANNOTATION} for ${auditId} must be valid JSON.`);
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(`${AUDIT_STATUS_WAIVER_ANNOTATION} for ${auditId} must be an object.`);
+  }
+  const candidate = parsed as Partial<AuditStatusWaiver>;
+  const reason = typeof candidate.reason === 'string' ? candidate.reason.replace(/\s+/g, ' ').trim() : '';
+  const approvedBy = typeof candidate.approvedBy === 'string' ? candidate.approvedBy.replace(/\s+/g, ' ').trim() : '';
+  if (candidate.status !== 'INTENDED_CHANGE' || candidate.auditId !== auditId) {
+    throw new Error(`${AUDIT_STATUS_WAIVER_ANNOTATION} must bind INTENDED_CHANGE to audit ${auditId}.`);
+  }
+  if (reason.length < 12 || reason.length > 500) {
+    throw new Error(`${AUDIT_STATUS_WAIVER_ANNOTATION}.reason must be 12 to 500 characters.`);
+  }
+  if (approvedBy.length < 2 || approvedBy.length > 120) {
+    throw new Error(`${AUDIT_STATUS_WAIVER_ANNOTATION}.approvedBy must be 2 to 120 characters.`);
+  }
+  return { status: 'INTENDED_CHANGE', auditId, reason, approvedBy };
+}
+
+export function assertStaticCheckpoint(policy: AuditEvidencePolicy, name: string): string {
+  if (policy.mode !== 'static-screenshot') {
+    throw new Error(
+      `audit.checkpoint(...) is only valid for static-screenshot evidence; ${policy.mode} must not publish primary screenshots.`,
+    );
+  }
+  const normalized = name.replace(/\s+/g, ' ').trim();
+  if (!normalized || /^automatic(?:-|\s)|^checkpoint$/i.test(normalized)) {
+    throw new Error('Static checkpoints require a purposeful name describing the asserted visible state.');
+  }
+  return normalized;
 }
 
 export function validateDefinitionEvidencePolicy(definition: AuditDefinition, label: string): void {

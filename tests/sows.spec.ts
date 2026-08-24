@@ -41,7 +41,6 @@ interactionTest('[SOWS-001] every withdrawal item contributes exactly to the vis
 
   audit.observe('answered symptom count', 16, '16');
   audit.observe('computed score', 32, '32');
-  await audit.checkpoint('sows-complete-score', { fullPage: true });
   await audit.assertRuntimeHealthy();
 });
 
@@ -69,7 +68,6 @@ interactionTest('[SOWS-002] interpretation changes at the induction thresholds',
     await expect(page.getByText('Past the threshold — no need to keep scoring.')).toBeVisible();
   });
 
-  await audit.checkpoint('sows-threshold-guidance');
   await audit.assertRuntimeHealthy();
 });
 
@@ -102,6 +100,5 @@ interactionTest('[SOWS-003] completed score can be copied, collapsed, reopened, 
     await expect(page.getByRole('radio', { checked: true })).toHaveCount(0);
   });
 
-  await audit.checkpoint('sows-reset-state');
   await audit.assertRuntimeHealthy();
 });

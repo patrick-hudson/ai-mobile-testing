@@ -1,5 +1,5 @@
 import { test, expect, interactionEvidence, interactionTest, staticEvidence, staticTest } from '../fixtures/test.js';
-import { meta } from './helpers.js';
+import { meta, readAstroComponentProp } from './helpers.js';
 import type { Locator, Page } from '@playwright/test';
 
 const NEXT_PATH = '/next-kratom-support-meeting';
@@ -15,7 +15,55 @@ async function waitForHydratedIsland(page: Page, control: Locator): Promise<void
   await expect(island).not.toHaveAttribute('ssr', '');
 }
 
-staticTest('[MEET-001] meeting cards cross pre-live, starting, live, and ended boundaries', staticEvidence('Capture the deterministic meeting state at each frozen time boundary with the complete state ledger.'), async ({ page, audit }, testInfo) => {
+interface NaMeetingOracle {
+  id: string;
+  name: string;
+  formatTags: string[];
+  closed: 'Open' | 'Closed';
+  platform: string;
+  joinUrl: string;
+}
+
+interface NaMeetingBundleOracle {
+  meetings: NaMeetingOracle[];
+}
+
+interface SmartMeetingOracle {
+  id: string;
+  name: string;
+  program: string;
+  audiences: string[];
+  languages: string[];
+  pathminderUrl: string;
+  detailUrl: string;
+}
+
+interface SmartMeetingBundleOracle {
+  meetings: SmartMeetingOracle[];
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+async function visibleMeetingDestinations(page: Page): Promise<string[]> {
+  return page.locator('li.field-card').evaluateAll((cards) => cards
+    .map((card) => card.querySelector<HTMLAnchorElement>('a[href]')?.href ?? '')
+    .filter(Boolean)
+    .sort());
+}
+
+async function expectExactMeetingDestinations(page: Page, expected: readonly string[]): Promise<void> {
+  await expect.poll(() => visibleMeetingDestinations(page)).toEqual([...expected].sort());
+}
+
+async function filterButtonValues(row: Locator): Promise<string[]> {
+  return row.getByRole('button').evaluateAll((buttons) => buttons.map((button) =>
+    (button.textContent ?? '').replace(/\s*\([\d,]+\)\s*$/, '').replace(/\s+/g, ' ').trim(),
+  ).filter(Boolean));
+}
+
+staticTest('[MEET-001] meeting cards cross pre-live, starting, live, and ended boundaries', staticEvidence('Capture the deterministic meeting state at each frozen time boundary with the complete state ledger.', 'candidate-desktop-chromium'), async ({ page, audit }, testInfo) => {
   test.skip(!candidateChromium(testInfo) || meta(testInfo).deviceClass !== 'desktop', 'One deterministic candidate desktop time-state audit.');
   const states = [
     { at: '2026-08-24T13:50:00Z', expected: 'Starting soon' },
@@ -37,7 +85,7 @@ staticTest('[MEET-001] meeting cards cross pre-live, starting, live, and ended b
   await audit.assertRuntimeHealthy();
 });
 
-staticTest('[MEET-002] the same occurrence is converted across representative timezones', staticEvidence('Capture the same meeting occurrence with its exact rendered labels across representative timezones.'), async ({ browser, audit }, testInfo) => {
+staticTest('[MEET-002] the same occurrence is converted across representative timezones', staticEvidence('Capture the same meeting occurrence with its exact rendered labels across representative timezones.', 'candidate-desktop-chromium'), async ({ browser, page, audit }, testInfo) => {
   test.skip(!candidateChromium(testInfo) || meta(testInfo).deviceClass !== 'desktop', 'One deterministic multi-timezone audit.');
   const fixed = new Date('2026-08-24T12:30:00Z');
   const cases = [
@@ -66,7 +114,12 @@ staticTest('[MEET-002] the same occurrence is converted across representative ti
     });
   }
 
+  expect(cases, 'The timezone contract must retain all four reviewed regions').toHaveLength(4);
+  expect(Object.keys(observed), 'Every timezone case must produce one exact rendered label').toEqual(cases.map(({ timezoneId }) => timezoneId));
   await audit.attachJson('timezone-conversions', { occurrence: '2026-08-24T12:00:00Z', observed });
+  await page.clock.setFixedTime(fixed);
+  await audit.goto(NEXT_PATH);
+  await audit.checkpoint('meeting-timezone-central-reference');
 });
 
 interactionTest('[MEET-003] a joined room persists across pages and can be cleared', interactionEvidence('Join a featured room, navigate to meeting history, and clear it while showing persistence and removal.', 'candidate-chromium-projects'), async ({ page, audit }, testInfo) => {
@@ -100,7 +153,6 @@ interactionTest('[MEET-003] a joined room persists across pages and can be clear
     expect(historyKeys).toHaveLength(0);
   });
 
-  await audit.checkpoint('meeting-history-cleared');
   await audit.assertRuntimeHealthy();
 });
 
@@ -110,24 +162,66 @@ interactionTest('[MEET-004] NA search, type, access, and platform filters combin
   await audit.goto(NA_PATH);
   const search = page.getByLabel('Search meetings');
   await waitForHydratedIsland(page, search);
+  const baseline = await visibleMeetingDestinations(page);
+  expect(baseline.length, 'Frozen NA window must contain enough records to expose no-op filters').toBeGreaterThan(1);
+  const bundle = await readAstroComponentProp<NaMeetingBundleOracle>(page, 'VirtualNaMeetings', 'bundle');
+  const tagChips = [
+    ['Newcomer', 'Newcomer'],
+    ['Discussion', 'Discussion'],
+    ['Speaker', 'Speaker'],
+    ['JFT Study', 'Just For Today Study'],
+    ['Basic Text Study', 'Basic Text Study'],
+    ['Step Study', 'Step Study'],
+    ['Literature Study', 'Literature Study'],
+  ] as const;
+  const platformRow = page.getByText('Platform:', { exact: true }).locator('..');
+  const visiblePlatforms = await filterButtonValues(platformRow);
+  const target = bundle.meetings.find((meeting) =>
+    baseline.includes(meeting.joinUrl)
+    && bundle.meetings.filter(({ name }) => name === meeting.name).length === 1
+    && tagChips.some(([, tag]) => meeting.formatTags.includes(tag))
+    && visiblePlatforms.includes(meeting.platform)
+    && visiblePlatforms.some((platform) => platform !== meeting.platform));
+  expect(target, 'Frozen NA data needs one uniquely searchable visible record covering type, access, and platform controls').toBeDefined();
+  if (!target) throw new Error('No deterministic NA filter oracle record is available.');
+  const expected = [target.joinUrl];
+  const correctTag = tagChips.find(([, tag]) => target.formatTags.includes(tag));
+  const wrongTag = tagChips.find(([, tag]) => !target.formatTags.includes(tag));
+  const wrongPlatform = visiblePlatforms.find((platform) => platform !== target.platform);
+  expect(correctTag, 'Oracle record must expose one visible meeting-type chip').toBeDefined();
+  expect(wrongTag, 'Oracle record needs a nonmatching meeting-type control').toBeDefined();
+  expect(wrongPlatform, 'Oracle record needs a nonmatching platform control').toBeDefined();
+  if (!correctTag || !wrongTag || !wrongPlatform) throw new Error('NA control oracle is incomplete.');
 
-  await audit.step('Combine independent filters', 'Type, access, platform, and text search are simultaneously active.', async () => {
-    await page.getByRole('button', { name: 'Newcomer', exact: true }).click();
-    await page.getByRole('button', { name: /^open$/i }).click();
-    await page.getByRole('button', { name: /^Zoom \(/ }).click();
-    await search.fill('no-meeting-can-match-this-audit-query');
-    await expect(page.getByText('Nothing in this window matches your filters.').first()).toBeVisible();
-    await expect(page.getByRole('button', { name: 'Clear filters' })).toBeVisible();
+  await audit.step('Prove each NA filter changes an exact nonempty result set', 'Search isolates one reviewed record; every wrong control removes it and every matching control restores exactly it.', async () => {
+    await search.fill(target.name);
+    await expectExactMeetingDestinations(page, expected);
+
+    await page.getByRole('button', { name: wrongTag[0], exact: true }).click();
+    await expectExactMeetingDestinations(page, []);
+    await page.getByRole('button', { name: wrongTag[0], exact: true }).click();
+    await page.getByRole('button', { name: correctTag[0], exact: true }).click();
+    await expectExactMeetingDestinations(page, expected);
+
+    await page.getByRole('button', { name: target.closed === 'Open' ? /^closed$/i : /^open$/i }).click();
+    await expectExactMeetingDestinations(page, []);
+    await page.getByRole('button', { name: new RegExp(`^${target.closed}$`, 'i') }).click();
+    await expectExactMeetingDestinations(page, expected);
+
+    await platformRow.getByRole('button', { name: new RegExp(`^${escapeRegExp(wrongPlatform)}\\s*\\(`) }).click();
+    await expectExactMeetingDestinations(page, []);
+    await platformRow.getByRole('button', { name: new RegExp(`^${escapeRegExp(wrongPlatform)}\\s*\\(`) }).click();
+    await platformRow.getByRole('button', { name: new RegExp(`^${escapeRegExp(target.platform)}\\s*\\(`) }).click();
+    await expectExactMeetingDestinations(page, expected);
   });
 
-  await audit.step('Clear all filters', 'The search field and filter state reset and meeting cards return.', async () => {
+  await audit.step('Clear all NA filters', 'The exact original frozen result set returns, including every destination and no extras.', async () => {
     await page.getByRole('button', { name: 'Clear filters' }).click();
     await expect(search).toHaveValue('');
-    await expect(page.getByRole('button', { name: 'Clear filters' })).toHaveCount(0);
-    await expect(page.getByRole('link', { name: /Join/ }).first()).toBeVisible();
+    await expectExactMeetingDestinations(page, baseline);
   });
 
-  await audit.checkpoint('na-filters-cleared', { fullPage: true });
+  await audit.attachJson('na-filter-oracle', { target, correctTag, wrongTag, wrongPlatform, expected, baseline });
   await audit.assertRuntimeHealthy();
 });
 
@@ -137,24 +231,86 @@ interactionTest('[MEET-005] SMART program, audience, language, and search filter
   await audit.goto(SMART_PATH);
   const search = page.getByLabel('Search meetings');
   await waitForHydratedIsland(page, search);
-
-  await audit.step('Apply a program and impossible text query', 'The directory presents an explicit empty state, never an indefinite spinner.', async () => {
-    await page.getByRole('button', { name: /^4-Point Recovery \(/ }).click();
-    const adults = page.getByRole('button', { name: /^Adults \(/ });
-    if (await adults.count()) await adults.click();
-    const english = page.getByRole('button', { name: /^English \(/ });
-    if (await english.count()) await english.click();
-    await search.fill('no-smart-meeting-can-match-this-audit-query');
-    await expect(page.getByText('Nothing in this window matches your filters.').first()).toBeVisible();
+  const baseline = await visibleMeetingDestinations(page);
+  expect(baseline.length, 'Frozen SMART window must contain enough records to expose no-op filters').toBeGreaterThan(1);
+  const bundle = await readAstroComponentProp<SmartMeetingBundleOracle>(page, 'VirtualSmartMeetings', 'bundle');
+  const programRow = page.getByText('Program:', { exact: true }).locator('..');
+  const audienceRow = page.getByText('Audience:', { exact: true }).locator('..');
+  const languageRow = page.getByText('Language:', { exact: true }).locator('..');
+  const [programs, audiences, languages] = await Promise.all([
+    filterButtonValues(programRow),
+    filterButtonValues(audienceRow),
+    filterButtonValues(languageRow),
+  ]);
+  const destinationFor = (meeting: SmartMeetingOracle) =>
+    baseline.find((href) => href === meeting.pathminderUrl || href === meeting.detailUrl);
+  const target = bundle.meetings.find((meeting) =>
+    Boolean(destinationFor(meeting))
+    && bundle.meetings.filter(({ name }) => name === meeting.name).length === 1
+    && programs.includes(meeting.program)
+    && meeting.audiences.some((audience) => audiences.includes(audience))
+    && meeting.languages.some((language) => languages.includes(language))
+    && programs.some((program) => program !== meeting.program)
+    && audiences.some((audience) => !meeting.audiences.includes(audience))
+    && languages.some((language) => !meeting.languages.includes(language)));
+  expect(target, 'Frozen SMART data needs one uniquely searchable record represented by every visible filter group').toBeDefined();
+  if (!target) throw new Error('No deterministic SMART filter oracle record is available; review filter values against the data contract.');
+  const targetDestination = destinationFor(target);
+  const correctAudience = target.audiences.find((audience) => audiences.includes(audience));
+  const correctLanguage = target.languages.find((language) => languages.includes(language));
+  const wrongProgram = programs.find((program) => program !== target.program);
+  const wrongAudience = audiences.find((audience) => !target.audiences.includes(audience));
+  const wrongLanguage = languages.find((language) => !target.languages.includes(language));
+  expect(targetDestination).toBeDefined();
+  expect(correctAudience).toBeDefined();
+  expect(correctLanguage).toBeDefined();
+  expect(wrongProgram).toBeDefined();
+  expect(wrongAudience).toBeDefined();
+  expect(wrongLanguage).toBeDefined();
+  if (!targetDestination || !correctAudience || !correctLanguage || !wrongProgram || !wrongAudience || !wrongLanguage) {
+    throw new Error('SMART control oracle is incomplete.');
+  }
+  const expected = [targetDestination];
+  const countedButton = (row: Locator, value: string) => row.getByRole('button', {
+    name: new RegExp(`^${escapeRegExp(value)}\\s*\\(`),
   });
 
-  await audit.step('Clear all filters', 'All filter inputs reset and usable meeting actions return.', async () => {
+  await audit.step('Prove each SMART filter changes an exact nonempty result set', 'Search isolates one reviewed record; every wrong control removes it and every matching control restores exactly it.', async () => {
+    await search.fill(target.name);
+    await expectExactMeetingDestinations(page, expected);
+
+    await countedButton(programRow, wrongProgram).click();
+    await expectExactMeetingDestinations(page, []);
+    await countedButton(programRow, wrongProgram).click();
+    await countedButton(programRow, target.program).click();
+    await expectExactMeetingDestinations(page, expected);
+
+    await countedButton(audienceRow, wrongAudience).click();
+    await expectExactMeetingDestinations(page, []);
+    await countedButton(audienceRow, wrongAudience).click();
+    await countedButton(audienceRow, correctAudience).click();
+    await expectExactMeetingDestinations(page, expected);
+
+    await countedButton(languageRow, wrongLanguage).click();
+    await expectExactMeetingDestinations(page, []);
+    await countedButton(languageRow, wrongLanguage).click();
+    await countedButton(languageRow, correctLanguage).click();
+    await expectExactMeetingDestinations(page, expected);
+  });
+
+  await audit.step('Clear all SMART filters', 'The exact original frozen result set returns, including every destination and no extras.', async () => {
     await page.getByRole('button', { name: 'Clear filters' }).click();
     await expect(search).toHaveValue('');
-    await expect(page.getByRole('link', { name: /Join/ }).first()).toBeVisible();
+    await expectExactMeetingDestinations(page, baseline);
   });
 
-  await audit.checkpoint('smart-filters-cleared', { fullPage: true });
+  await audit.attachJson('smart-filter-oracle', {
+    target,
+    targetDestination,
+    controls: { programs, audiences, languages, wrongProgram, wrongAudience, wrongLanguage },
+    expected,
+    baseline,
+  });
   await audit.assertRuntimeHealthy();
 });
 
@@ -177,28 +333,81 @@ interactionTest('[MEET-006] meeting copy text agrees with the displayed join des
     audit.observe('copied join URL', expectedUrl, 'Displayed href');
   });
 
-  await audit.checkpoint('meeting-copy-confirmation');
   await audit.assertRuntimeHealthy();
 });
 
-staticTest('[MEET-007] a failed live-meeting index becomes an explicit usable fallback', staticEvidence('Capture the explicit meeting-data failure state with both usable directory recovery links.'), async ({ page, audit }, testInfo) => {
+staticTest('[MEET-007] a failed live-meeting index becomes an explicit usable fallback', staticEvidence('Capture the explicit meeting-data failure state with both usable directory recovery links.', 'candidate-desktop-chromium'), async ({ page, audit }, testInfo) => {
   test.skip(!candidateChromium(testInfo) || meta(testInfo).deviceClass !== 'desktop', 'One candidate desktop dependency-failure audit.');
   await page.clock.setFixedTime(new Date('2026-08-24T15:30:00Z'));
-  let interceptedRequests = 0;
-  await page.route('**/live-meeting-index.json', (route) => {
-    interceptedRequests += 1;
-    return route.abort('failed');
+  const emptyIndex = JSON.stringify({
+    generatedAt: '2026-08-24T15:30:00.000Z',
+    featuredNa: null,
+    na: [],
+    smart: [],
   });
-  await audit.goto(NEXT_PATH);
+  const scenarios = [
+    { name: 'transport-abort', kind: 'failure' as const },
+    { name: 'server-500', kind: 'failure' as const },
+    { name: 'malformed-json', kind: 'failure' as const },
+    { name: 'valid-empty-index', kind: 'empty' as const },
+  ];
+  const ledger: Array<{ name: string; kind: 'failure' | 'empty'; message: string; recoveryPaths: Array<string | null> }> = [];
 
-  await audit.step('Wait for dependency failure handling', 'Loading resolves to a truthful empty state with both directory links.', async () => {
+  for (const scenario of scenarios) {
+    await page.unroute('**/live-meeting-index.json');
+    if (scenario.name === 'transport-abort') {
+      audit.expectRequestFailure('/live-meeting-index.json');
+      await page.route('**/live-meeting-index.json', (route) => route.abort('failed'));
+    } else if (scenario.name === 'server-500') {
+      audit.expectResponseStatus('/live-meeting-index.json', 500);
+      await page.route('**/live-meeting-index.json', (route) => route.fulfill({
+        status: 500,
+        contentType: 'application/json',
+        body: JSON.stringify({ error: 'simulated dependency failure' }),
+      }));
+    } else if (scenario.name === 'malformed-json') {
+      await page.route('**/live-meeting-index.json', (route) => route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: '{not-json',
+      }));
+    } else {
+      await page.route('**/live-meeting-index.json', (route) => route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: emptyIndex,
+      }));
+    }
+
+    await audit.goto(NEXT_PATH);
     await expect(page.getByText('Checking live NA and SMART meetings…')).toHaveCount(0);
-    await expect(page.getByText('No additional live meeting is listed at this moment.')).toBeVisible();
-    await expect(page.getByRole('link', { name: 'Browse all NA meetings' })).toBeVisible();
-    await expect(page.getByRole('link', { name: 'Browse all SMART meetings' })).toBeVisible();
-    expect(interceptedRequests).toBeGreaterThan(0);
-  });
+    const fallback = page.locator('aside[aria-labelledby="live-general-meetings-heading"]');
+    const message = await fallback.locator('p[aria-live="polite"]').innerText();
+    const recoveryPaths = await fallback.getByRole('link', { name: /^Browse all/ }).evaluateAll((links) =>
+      links.map((link) => (link as HTMLAnchorElement).getAttribute('href')));
+    expect(recoveryPaths.sort(), `${scenario.name} must retain both recovery directories`).toEqual([
+      '/virtual-na-meetings-now',
+      '/virtual-smart-meetings-now',
+    ].sort());
+    ledger.push({ ...scenario, message, recoveryPaths });
+    await audit.checkpoint(`meeting-index-${scenario.name}`);
+  }
 
-  audit.observe('dependency', '/live-meeting-index.json', 'Simulated transport failure');
-  await audit.checkpoint('meeting-index-failure-fallback');
+  expect(scenarios, 'The dependency contract must retain abort, HTTP, malformed, and valid-empty scenarios').toHaveLength(4);
+  expect(ledger.map(({ name, kind }) => ({ name, kind })), 'Every declared dependency outcome must produce one inspected record').toEqual(
+    scenarios.map(({ name, kind }) => ({ name, kind })),
+  );
+  await audit.attachJson('meeting-index-outcome-ledger', ledger);
+  const errorLanguage = /could not|unavailable|failed|try again|problem loading/i;
+  for (const outcome of ledger) {
+    if (outcome.kind === 'failure') {
+      expect.soft(outcome.message, `${outcome.name} must not masquerade as a valid empty schedule`).toMatch(errorLanguage);
+      expect.soft(outcome.message, `${outcome.name} needs different copy from a successful empty index`).not.toBe('No additional live meeting is listed at this moment.');
+    } else {
+      expect.soft(outcome.message, 'A valid empty index should retain the truthful no-meetings state').toBe('No additional live meeting is listed at this moment.');
+      expect.soft(outcome.message, 'A valid empty index is not a dependency error').not.toMatch(errorLanguage);
+    }
+  }
+  audit.observe('Dependency outcomes distinguished', ledger.filter(({ kind, message }) =>
+    kind === 'empty' ? message === 'No additional live meeting is listed at this moment.' : errorLanguage.test(message)).length, String(scenarios.length));
 });

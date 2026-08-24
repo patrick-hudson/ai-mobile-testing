@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict';
-import { access, mkdtemp, mkdir, readFile, readdir, rm, stat, unlink, writeFile } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { access, mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { promisify } from 'node:util';
 import type { AuditDefinition } from '../audit/types.js';
 import {
   buildGalleryCatalog,
+  AttachmentSourceContainmentError,
   prepareGalleryArchive,
   publishPreparedGalleryArchive,
   writeGalleryArchive,
@@ -32,6 +35,7 @@ import {
 
 const CAPTURE_METADATA_TYPE = 'application/vnd.quitting7oh.gallery-capture+json';
 const timestamp = '2026-08-24T12:34:56.000Z';
+const execFileAsync = promisify(execFile);
 
 const definitions: AuditDefinition[] = [
   definition('NAV-001', 'navigation', 'Navigation response', 'Navigation retains the expected focus and route.'),
@@ -175,7 +179,94 @@ async function assertDescriptorReferencesExist(outputDir: string, descriptor: Ga
   ].map((href) => access(archivePath(outputDir, href))));
 }
 
+async function filesBelow(directory: string): Promise<string[]> {
+  let entries;
+  try {
+    entries = await readdir(directory, { withFileTypes: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw error;
+  }
+  return (await Promise.all(entries.map(async (entry) => {
+    const entryPath = path.join(directory, entry.name);
+    return entry.isDirectory() ? filesBelow(entryPath) : [entryPath];
+  }))).flat();
+}
+
+async function assertSecretWasNotPublished(outputDir: string, secret: string): Promise<void> {
+  const secretBytes = Buffer.from(secret);
+  for (const file of await filesBelow(outputDir)) {
+    assert.equal((await readFile(file)).includes(secretBytes), false, `Secret bytes were published to ${file}.`);
+  }
+}
+
+function runnerReport(attachmentPath: string): object {
+  return {
+    config: {
+      projects: [{
+        id: 'candidate-mobile-chromium',
+        name: 'candidate-mobile-chromium',
+        metadata: {
+          environment: 'candidate', browserLabel: 'Chromium', deviceClass: 'mobile',
+          fullSweep: true, visual: true, tlsPolicy: 'strict',
+        },
+      }],
+    },
+    suites: [{
+      title: 'runner-controlled attachment containment',
+      specs: [{
+        title: '[VISUAL-001] hostile attachment source is rejected',
+        file: 'tests/hostile.spec.ts',
+        tests: [{
+          projectId: 'candidate-mobile-chromium',
+          expectedStatus: 'passed',
+          annotations: [{ type: 'audit-id', description: 'VISUAL-001' }],
+          results: [{
+            status: 'passed', duration: 1, retry: 0,
+            attachments: [{ name: 'hostile-source', contentType: 'image/png', path: attachmentPath }],
+          }],
+        }],
+      }],
+    }],
+    stats: { unexpected: 0 },
+  };
+}
+
+async function assertRebuildRejects(runDirectory: string, attachmentPath: string, secret: string): Promise<void> {
+  await mkdir(runDirectory, { recursive: true });
+  await writeFile(path.join(runDirectory, 'results.json'), JSON.stringify(runnerReport(attachmentPath)));
+  let failure: (Error & { stderr?: string }) | null = null;
+  try {
+    await execFileAsync(process.execPath, [
+      '--import', 'tsx',
+      path.join(process.cwd(), 'scripts', 'rebuild-report.ts'),
+      '--run-dir', runDirectory,
+    ], { cwd: process.cwd(), maxBuffer: 4 * 1024 * 1024 });
+  } catch (error) {
+    failure = error as Error & { stderr?: string };
+  }
+  assert(failure, 'The rebuild must fail closed for an unsafe runner attachment path.');
+  assert.match(`${failure.message}\n${failure.stderr ?? ''}`, /Attachment source rejected:/);
+  await assertSecretWasNotPublished(path.join(runDirectory, 'checklist'), secret);
+}
+
+async function assertRebuildAcceptsContainedAbsolutePath(runDirectory: string): Promise<void> {
+  const source = path.join(runDirectory, 'raw', 'contained.png');
+  await mkdir(path.dirname(source), { recursive: true });
+  await writeFile(source, 'contained-run-evidence');
+  await writeFile(path.join(runDirectory, 'results.json'), JSON.stringify(runnerReport(source)));
+  await execFileAsync(process.execPath, [
+    '--import', 'tsx',
+    path.join(process.cwd(), 'scripts', 'rebuild-report.ts'),
+    '--run-dir', runDirectory,
+  ], { cwd: process.cwd(), maxBuffer: 4 * 1024 * 1024 });
+  const published = await Promise.all((await filesBelow(path.join(runDirectory, 'checklist', 'evidence')))
+    .map((file) => readFile(file)));
+  assert(published.some((body) => body.includes(Buffer.from('contained-run-evidence'))));
+}
+
 const root = await mkdtemp(path.join(tmpdir(), 'gallery-catalog-self-test-'));
+const vaultRoot = await mkdtemp(path.join(tmpdir(), 'gallery-attachment-vault-'));
 try {
   const mediaDir = path.join(root, 'media');
   await mkdir(mediaDir, { recursive: true });
@@ -284,6 +375,18 @@ try {
   assert.equal(copies.members.length, 1);
   assert.equal(catalog.blobs.filter((blob) => blob.id === copies.members[0]?.blobId).length, 1);
   assert.equal(catalog.blobs.find((blob) => blob.id === copies.members[0]?.blobId)?.storageLocations.length, 4);
+  const copiesBlob = catalog.blobs.find((blob) => blob.id === copies.members[0]?.blobId);
+  assert(copiesBlob);
+  const [sourceDetails, galleryDetails] = await Promise.all([
+    stat(files.sharedA),
+    stat(path.join(root, 'checklist', ...copiesBlob.href.split('/'))),
+  ]);
+  assert.equal(galleryDetails.dev, sourceDetails.dev);
+  assert.notEqual(galleryDetails.ino, sourceDetails.ino, 'Untrusted source evidence must not be hard-linked into the published gallery.');
+  const projectedCopy = path.join(root, 'checklist', ...copiesBlob.href.split('/'));
+  await writeFile(projectedCopy, 'projection-only mutation');
+  assert.equal(await readFile(files.sharedA, 'utf8'), 'one logical screenshot');
+  await writeFile(projectedCopy, 'one logical screenshot');
   assert.deepEqual(copies.auditAssociations.map(({ id }) => id).sort(), ['NAV-001', 'VISUAL-001']);
   assert.equal(copies.capture.route, '/path/to/page?lang&token');
   assert.doesNotMatch(JSON.stringify(copies), /user|password|secret|private-fragment/);
@@ -333,11 +436,13 @@ try {
 
   const shardOne = await buildGalleryCatalog({
     outputDir: path.join(root, 'shard-one'),
+    sourceRoot: root,
     tests: [reportTest('shard-stable', 'shard-stable item', [result([image('stable', files.repeatA)])], { shardOrdinal: 1 })],
     definitionCatalog: definitions,
   });
   const shardSeven = await buildGalleryCatalog({
     outputDir: path.join(root, 'shard-seven'),
+    sourceRoot: root,
     tests: [reportTest('shard-stable', 'shard-stable item', [result([image('stable', files.repeatA)])], { shardOrdinal: 7 })],
     definitionCatalog: definitions,
   });
@@ -349,12 +454,16 @@ try {
   assert.equal(catalog.primaryCounts.total, catalog.items.length);
 
   const reportModels = await buildAuditModels({
-    outputDir: path.join(root, 'report-integration'),
+    outputDir: path.join(root, 'checklist-report-integration'),
     tests: [tests[0]!],
     run: { status: 'passed', source: 'playwright-json', profile: 'self-test' },
     definitionCatalog: definitions,
   });
   assert.equal(reportModels.galleryCatalog.items.length, 1);
+  assert.equal(reportModels.galleryCatalog.items[0]?.attempt.rawStatus, 'passed');
+  assert.equal(reportModels.galleryCatalog.items[0]?.attempt.status, 'REVIEW');
+  assert.equal(reportModels.galleryCatalog.items[0]?.attempt.statusSource, 'reviewed-manifest');
+  assert((reportModels.galleryCatalog.items[0]?.attempt.reviewReasonCodes?.length ?? 0) > 0);
   const visualHref = reportModels.manifest.audits.find(({ id }) => id === 'VISUAL-001')?.executions[0]?.artifacts[0]?.href;
   const navigationHref = reportModels.manifest.audits.find(({ id }) => id === 'NAV-001')?.executions[0]?.artifacts[0]?.href;
   assert.equal(visualHref, navigationHref);
@@ -529,7 +638,61 @@ try {
   await assertDescriptorReferencesExist(archiveOutput, firstDescriptor);
   await assertDescriptorReferencesExist(archiveOutput, secondDescriptor);
   await assertDescriptorReferencesExist(archiveOutput, thirdDescriptor);
+
+  const vaultSecret = 'ANTHROPIC_API_KEY=synthetic-vault-secret-never-publish';
+  const vaultFile = path.join(vaultRoot, 'master.key');
+  const escapedLink = path.join(mediaDir, 'escape.png');
+  await writeFile(vaultFile, vaultSecret, { mode: 0o600 });
+  await symlink(vaultFile, escapedLink);
+
+  for (const [label, unsafePath] of [
+    ['absolute-vault', vaultFile],
+    ['in-root-symlink', escapedLink],
+    ['relative-traversal', `../${path.basename(vaultRoot)}/master.key`],
+  ] as const) {
+    const unsafeOutput = path.join(root, `containment-${label}`);
+    await assert.rejects(
+      buildGalleryCatalog({
+        outputDir: unsafeOutput,
+        sourceRoot: root,
+        tests: [reportTest(`containment-${label}`, `containment ${label}`, [result([
+          image('hostile-source', unsafePath),
+        ])])],
+        definitionCatalog: definitions,
+      }),
+      AttachmentSourceContainmentError,
+    );
+    await assertSecretWasNotPublished(unsafeOutput, vaultSecret);
+  }
+
+  await assertRebuildRejects(path.join(root, 'rebuild-absolute'), vaultFile, vaultSecret);
+  const rebuildSymlinkRoot = path.join(root, 'rebuild-symlink');
+  await mkdir(path.join(rebuildSymlinkRoot, 'raw'), { recursive: true });
+  await symlink(vaultFile, path.join(rebuildSymlinkRoot, 'raw', 'escape.png'));
+  await assertRebuildRejects(rebuildSymlinkRoot, 'raw/escape.png', vaultSecret);
+  await assertRebuildAcceptsContainedAbsolutePath(path.join(root, 'rebuild-contained-absolute'));
+
+  const destinationCanary = path.join(root, 'destination-checklist');
+  const outsideDestination = path.join(vaultRoot, 'outside-write');
+  await Promise.all([mkdir(destinationCanary), mkdir(outsideDestination)]);
+  await symlink(outsideDestination, path.join(destinationCanary, 'evidence'));
+  await assert.rejects(
+    buildGalleryCatalog({
+      outputDir: destinationCanary,
+      sourceRoot: root,
+      tests: [reportTest('destination-containment', 'destination containment', [result([{
+        name: 'body-source', contentType: 'image/png', body: Buffer.from('OUTSIDE-WRITE'),
+      }])])],
+      definitionCatalog: definitions,
+    }),
+    AttachmentSourceContainmentError,
+  );
+  assert.deepEqual(await readdir(outsideDestination), []);
+
   console.log('Gallery catalog self-test passed.');
 } finally {
-  await rm(root, { recursive: true, force: true });
+  await Promise.all([
+    rm(root, { recursive: true, force: true }),
+    rm(vaultRoot, { recursive: true, force: true }),
+  ]);
 }

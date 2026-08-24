@@ -28,6 +28,8 @@ import type {
 
 interface LiveGalleryReporterOptions {
   outputDir?: string;
+  batchSize?: number;
+  flushIntervalMs?: number;
 }
 
 export interface LiveGalleryAttemptInput {
@@ -143,17 +145,26 @@ function imageOnlyCatalog(catalog: GalleryCatalog): GalleryCatalog {
   });
 }
 
-async function publishAttempt(input: LiveGalleryAttemptInput): Promise<LiveGalleryHead> {
-  const outputDir = path.resolve(input.outputDir);
+function hasPublishableImage(test: ReportTestInput): boolean {
+  return test.results.some((result) => result.attachments.some((attachment) => attachment.contentType.startsWith('image/')));
+}
+
+async function publishAttempts(inputs: readonly LiveGalleryAttemptInput[]): Promise<LiveGalleryHead | null> {
+  const publishable = inputs.filter(({ test }) => hasPublishableImage(test));
+  if (publishable.length === 0) return null;
+  const outputDir = path.resolve(publishable[0]!.outputDir);
+  if (publishable.some((input) => path.resolve(input.outputDir) !== outputDir)) {
+    throw new Error('A live gallery publication batch cannot span output directories.');
+  }
   const liveRoot = path.join(outputDir, 'gallery-live');
   const revisionRoot = path.join(liveRoot, 'revisions');
   await mkdir(revisionRoot, { recursive: true });
   const incoming = imageOnlyCatalog(await buildGalleryCatalog({
     outputDir,
-    tests: [closedAttemptTest(input.test)],
+    tests: publishable.map(({ test }) => closedAttemptTest(test)),
     definitionCatalog: ALL_AUDIT_CATALOG,
   }));
-  const sourceShard = input.test.sourceShard ?? null;
+  const sourceShard = publishable[0]!.test.sourceShard ?? null;
   const requestPath = path.join(liveRoot, `.publish-${process.pid}-${randomUUID()}.json`);
   await writeFile(requestPath, `${JSON.stringify({
     schemaVersion: GALLERY_SCHEMA_VERSION,
@@ -179,7 +190,8 @@ export async function publishLiveGalleryAttempt(input: LiveGalleryAttemptInput):
   const key = path.resolve(input.outputDir);
   const prior = publicationQueues.get(key) ?? Promise.resolve();
   const current = prior.then(async () => {
-    const head = await publishAttempt(input);
+    const head = await publishAttempts([input]);
+    if (!head) return;
     process.stdout.write(`[GALLERY_LIVE] ${JSON.stringify({
       event: 'attempt-published',
       contentRevision: head.contentRevision,
@@ -193,12 +205,39 @@ export async function publishLiveGalleryAttempt(input: LiveGalleryAttemptInput):
   await current;
 }
 
+async function publishLiveGalleryBatch(inputs: readonly LiveGalleryAttemptInput[]): Promise<void> {
+  if (inputs.length === 0) return;
+  const key = path.resolve(inputs[0]!.outputDir);
+  const prior = publicationQueues.get(key) ?? Promise.resolve();
+  const current = prior.then(async () => {
+    const head = await publishAttempts(inputs);
+    if (!head) return;
+    process.stdout.write(`[GALLERY_LIVE] ${JSON.stringify({
+      event: 'attempt-batch-published',
+      contentRevision: head.contentRevision,
+      items: head.primaryCounts.total,
+      sourceShard: head.sourceShard,
+      attemptCount: inputs.length,
+    })}\n`);
+  });
+  publicationQueues.set(key, current.catch(() => undefined));
+  await current;
+}
+
 export default class LiveGalleryReporter implements Reporter {
   private readonly configuredOutputDir: string | undefined;
+  private readonly batchSize: number;
+  private readonly flushIntervalMs: number;
   private sourceShard: ReportTestInput['sourceShard'];
+  private pending: LiveGalleryAttemptInput[] = [];
+  private flushTimer: NodeJS.Timeout | null = null;
+  private flushChain: Promise<void> = Promise.resolve();
+  private publicationFailure: Error | null = null;
 
   constructor(options: LiveGalleryReporterOptions = {}) {
     this.configuredOutputDir = options.outputDir;
+    this.batchSize = Math.max(1, Math.min(options.batchSize ?? 12, 50));
+    this.flushIntervalMs = Math.max(100, Math.min(options.flushIntervalMs ?? 750, 5_000));
   }
 
   onBegin(config: FullConfig): void {
@@ -207,11 +246,58 @@ export default class LiveGalleryReporter implements Reporter {
       : undefined;
   }
 
-  async onTestEnd(test: TestCase, result: TestResult): Promise<void> {
-    await publishLiveGalleryAttempt({
+  onTestEnd(test: TestCase, result: TestResult): void {
+    const input = {
       outputDir: this.configuredOutputDir ?? process.env.AUDIT_ARTIFACT_DIR ?? './artifacts',
       test: reportTest(test, result, this.sourceShard),
-    });
+    };
+    if (!hasPublishableImage(input.test)) return;
+    this.pending.push(input);
+    this.scheduleFlush(this.pending.length >= this.batchSize ? 0 : this.flushIntervalMs);
+  }
+
+  private scheduleFlush(delayMs: number): void {
+    if (this.flushTimer) {
+      if (delayMs !== 0) return;
+      clearTimeout(this.flushTimer);
+    }
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = null;
+      const batch = this.pending.splice(0, this.batchSize);
+      if (batch.length === 0) return;
+      this.flushChain = this.flushChain.then(async () => {
+        try {
+          await publishLiveGalleryBatch(batch);
+        } catch (error) {
+          this.publicationFailure = error instanceof Error ? error : new Error(String(error));
+          process.stderr.write(`[GALLERY_LIVE] ${JSON.stringify({
+            event: 'publication-failed',
+            attemptCount: batch.length,
+            error: this.publicationFailure.message,
+          })}\n`);
+        }
+      });
+      if (this.pending.length > 0) this.scheduleFlush(0);
+    }, delayMs);
+  }
+
+  async onEnd(): Promise<void> {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    while (this.pending.length > 0) {
+      const batch = this.pending.splice(0, this.batchSize);
+      this.flushChain = this.flushChain.then(async () => {
+        try {
+          await publishLiveGalleryBatch(batch);
+        } catch (error) {
+          this.publicationFailure = error instanceof Error ? error : new Error(String(error));
+        }
+      });
+    }
+    await this.flushChain;
+    if (this.publicationFailure) throw this.publicationFailure;
   }
 
   printsToStdio(): boolean {

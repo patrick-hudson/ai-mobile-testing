@@ -9,6 +9,10 @@ import { createFreshShardedRunDirectory, validatedShardedRunId } from './lib/sha
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const shardTotal = integerEnvironment('AUDIT_SHARD_TOTAL', 4, 1, 16);
 const performanceExpectedExecutions = integerEnvironment('AUDIT_PERFORMANCE_EXPECTED_EXECUTIONS', 70, 1, 10_000);
+const heartbeatIntervalMs = integerEnvironment('AUDIT_SHARDED_HEARTBEAT_MS', 5_000, 1_000, 60_000);
+const heartbeatLeaseMs = integerEnvironment('AUDIT_SHARDED_LEASE_MS', 30_000, 10_000, 10 * 60_000);
+const commandStopGraceMs = integerEnvironment('AUDIT_COMMAND_STOP_GRACE_MS', 8_000, 1_000, 60_000);
+const maximumPartialLineCharacters = 64 * 1024;
 const runId = validatedShardedRunId(process.env.AUDIT_SHARDED_RUN_ID ?? makeRunId());
 const hostRunDirectory = await createFreshShardedRunDirectory(
   join(repositoryRoot, 'artifacts', 'sharded'),
@@ -17,19 +21,24 @@ const hostRunDirectory = await createFreshShardedRunDirectory(
 const logDirectory = join(hostRunDirectory, 'logs');
 const containerRunDirectory = `/work/artifacts/sharded/${runId}`;
 const lifecyclePath = join(hostRunDirectory, 'sharded-run.json');
+const heartbeatPath = join(hostRunDirectory, 'sharded-heartbeat.json');
 const activeChildren = new Set();
 const startedAt = new Date().toISOString();
+let stopRequest = null;
+let coordinatorFailure = null;
+let heartbeatWrite = Promise.resolve();
 await Promise.all([
   fs.mkdir(logDirectory, { recursive: true }),
   fs.mkdir(join(hostRunDirectory, 'blob-reports'), { recursive: true }),
 ]);
-const coordinatorLog = createWriteStream(join(logDirectory, 'coordinator.log'), { flags: 'a' });
+const coordinatorLog = await openLogStream(join(logDirectory, 'coordinator.log'));
+coordinatorLog.on('error', (error) => {
+  coordinatorFailure ??= `Coordinator log failed: ${error.message}`;
+  requestStop('LOG_FAILURE');
+});
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
-  process.once(signal, () => {
-    writeCoordinator('signal-received', { signal, activeCommands: activeChildren.size });
-    for (const child of activeChildren) child.kill(signal);
-  });
+  process.once(signal, () => requestStop(signal));
 }
 
 writeCoordinator('sharded-release-started', {
@@ -43,20 +52,33 @@ writeCoordinator('sharded-release-started', {
   performanceIsolation: 'dedicated-container-after-functional-shards',
   tlsPolicy: process.env.CANDIDATE_IGNORE_HTTPS_ERRORS === '1' ? 'candidate-development-bypass' : 'strict',
 });
+await publishHeartbeat('running');
+const heartbeatTimer = setInterval(() => void publishHeartbeat('running'), heartbeatIntervalMs);
+heartbeatTimer.unref();
 
-const buildResult = await runBuild();
-const shardResults = buildResult.exitCode === 0
-  ? await Promise.all(Array.from({ length: shardTotal }, (_, offset) => runShard(offset + 1)))
-  : [];
-const performanceResult = buildResult.exitCode === 0
-  ? await runPerformance()
-  : skippedResult('PERFORMANCE', 'Docker image build failed; isolated performance checks were not started.');
-const mergeResult = buildResult.exitCode === 0
-  ? await runMerge()
-  : skippedResult('MERGE', 'Docker image build failed; shards, isolated performance checks, and merge were not started.');
+let buildResult = skippedResult('BUILD', 'The coordinator stopped before the Docker build started.');
+let shardResults = [];
+let performanceResult = skippedResult('PERFORMANCE', 'The coordinator stopped before isolated performance checks started.');
+let mergeResult = skippedResult('MERGE', 'The coordinator stopped before the merge started.');
+try {
+  if (!stopRequest) buildResult = await runBuild();
+  if (!stopRequest && buildResult.exitCode === 0) {
+    shardResults = await Promise.all(Array.from({ length: shardTotal }, (_, offset) => runShard(offset + 1)));
+  }
+  if (!stopRequest && buildResult.exitCode === 0) performanceResult = await runPerformance();
+  else if (!stopRequest) performanceResult = skippedResult('PERFORMANCE', 'Docker image build failed; isolated performance checks were not started.');
+  if (!stopRequest && buildResult.exitCode === 0) mergeResult = await runMerge();
+  else if (!stopRequest) mergeResult = skippedResult('MERGE', 'Docker image build failed; shards, isolated performance checks, and merge were not started.');
+} catch (error) {
+  coordinatorFailure ??= `Coordinator command lifecycle failed: ${error.message}`;
+  requestStop('COORDINATOR_FAILURE');
+}
 const pipelineFailures = [];
 let mergeLifecycle = null;
-if (buildResult.exitCode !== 0) {
+if (coordinatorFailure) pipelineFailures.push(coordinatorFailure);
+if (stopRequest) {
+  pipelineFailures.push(`Stopped by ${stopRequest.signal}`);
+} else if (buildResult.exitCode !== 0) {
   pipelineFailures.push('Docker image build failed');
 } else {
   const mergeLifecyclePath = join(hostRunDirectory, 'merge-lifecycle.json');
@@ -90,9 +112,9 @@ if (pipelineFailures.length === 0) {
     pipelineFailures.push(error.message);
   }
 }
-const pipelineStatus = pipelineFailures.length === 0 ? 'completed' : 'failed';
+const pipelineStatus = stopRequest ? 'stopped' : pipelineFailures.length === 0 ? 'completed' : 'failed';
 release ??= unavailableRelease(`No authoritative release decision is usable because ${pipelineFailures.join('; ') || 'the sharded pipeline failed'}.`);
-const outcome = releaseOutcome(pipelineStatus, release);
+const outcome = stopRequest ? { status: 'stopped', exitCode: 130 } : releaseOutcome(pipelineStatus, release);
 const lifecycle = {
   schemaVersion: 2,
   runId,
@@ -123,8 +145,12 @@ const lifecycle = {
   },
   release,
   status: outcome.status,
+  stopRequestedAt: stopRequest?.requestedAt ?? null,
+  stopSignal: stopRequest?.signal ?? null,
 };
 await atomicWriteJson(lifecyclePath, lifecycle);
+clearInterval(heartbeatTimer);
+await publishHeartbeat(outcome.status);
 writeCoordinator('sharded-release-finished', {
   runId,
   status: lifecycle.status,
@@ -202,56 +228,100 @@ async function runDockerCommand({ kind, index, args, logPath }) {
   const label = kind === 'shard' ? `SHARD ${index}/${shardTotal}` : kind.toUpperCase();
   const command = ['docker', ...args];
   const commandStartedAt = new Date().toISOString();
-  writeCoordinator('command-started', { label, command, logPath });
-  const log = createWriteStream(logPath, { flags: 'a' });
+  const deadlineMs = commandDeadlineMs(kind);
+  writeCoordinator('command-started', { label, command, logPath, deadlineMs });
+  const log = await openLogStream(logPath);
   log.write(`${commandStartedAt} [${label}] command-started ${JSON.stringify({ command })}\n`);
   const started = performance.now();
 
   return new Promise((resolveCommand) => {
     let settled = false;
+    let timeoutError = null;
+    let logError = null;
+    let logBackpressured = false;
+    let escalationTimer = null;
     const child = spawn('docker', args, {
       cwd: repositoryRoot,
       env: process.env,
+      detached: process.platform !== 'win32',
       shell: false,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     activeChildren.add(child);
     relay(child.stdout, 'stdout');
     relay(child.stderr, 'stderr');
-    child.once('error', (error) => {
-      if (settled) return;
-      settled = true;
-      activeChildren.delete(child);
-      finish(127, null, error.message);
+    const deadlineTimer = setTimeout(() => {
+      timeoutError = `${label} exceeded its ${deadlineMs}ms deadline.`;
+      writeLine('stderr', `${timeoutError} Sending SIGTERM to the process group.`);
+      signalProcessTree(child, 'SIGTERM');
+      escalationTimer = setTimeout(() => {
+        if (!settled) {
+          writeLine('stderr', `${label} did not stop within ${commandStopGraceMs}ms; sending SIGKILL to the process group.`);
+          signalProcessTree(child, 'SIGKILL');
+        }
+      }, commandStopGraceMs);
+      escalationTimer.unref();
+    }, deadlineMs);
+    deadlineTimer.unref();
+    log.once('error', (error) => {
+      logError = `Command log failed: ${error.message}`;
+      coordinatorFailure ??= `${label} ${logError}`;
+      requestStop('LOG_FAILURE');
     });
-    child.once('close', (exitCode, signal) => {
-      if (settled) return;
-      settled = true;
-      activeChildren.delete(child);
-      finish(exitCode ?? 1, signal, null);
-    });
+    child.once('error', (error) => settle(127, null, error.message));
+    child.once('close', (exitCode, signal) => settle(exitCode ?? 1, signal, null));
 
     function relay(stream, channel) {
       let buffer = '';
+      let omitted = 0;
       stream.setEncoding('utf8');
       stream.on('data', (chunk) => {
         buffer += chunk;
         const lines = buffer.split(/\r?\n/);
         buffer = lines.pop() ?? '';
-        for (const line of lines) writeLine(channel, line);
+        for (const [lineIndex, line] of lines.entries()) {
+          writeLine(channel, lineIndex === 0 && omitted > 0
+            ? `[coordinator omitted ${omitted} oversized output characters] ${line}`
+            : line);
+          if (lineIndex === 0) omitted = 0;
+        }
+        if (buffer.length > maximumPartialLineCharacters) {
+          const remove = buffer.length - maximumPartialLineCharacters;
+          buffer = buffer.slice(remove);
+          omitted += remove;
+        }
       });
       stream.on('end', () => {
-        if (buffer) writeLine(channel, buffer);
+        if (buffer) writeLine(channel, omitted > 0
+          ? `[coordinator omitted ${omitted} oversized output characters] ${buffer}`
+          : buffer);
       });
+      stream.once('error', (error) => settle(1, null, `${channel} stream failed: ${error.message}`));
     }
 
     function writeLine(channel, line) {
       const output = `${new Date().toISOString()} [${label}][${channel}] ${line}\n`;
-      log.write(output);
+      const accepted = log.write(output);
+      if (!accepted && !logBackpressured) {
+        logBackpressured = true;
+        child.stdout?.pause();
+        child.stderr?.pause();
+        log.once('drain', () => {
+          logBackpressured = false;
+          child.stdout?.resume();
+          child.stderr?.resume();
+        });
+      }
       process.stdout.write(output);
     }
 
-    function finish(exitCode, signal, error) {
+    function settle(exitCode, signal, error) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadlineTimer);
+      if (escalationTimer) clearTimeout(escalationTimer);
+      if (child.auditStopTimer) clearTimeout(child.auditStopTimer);
+      activeChildren.delete(child);
       const result = {
         ...(index === null ? {} : { index }),
         label,
@@ -261,15 +331,51 @@ async function runDockerCommand({ kind, index, args, logPath }) {
         durationMs: Math.round(performance.now() - started),
         exitCode,
         signal,
-        error,
+        error: error ?? timeoutError ?? logError,
+        deadlineMs,
         logPath: relativeArtifactPath(logPath),
       };
-      log.write(`${result.finishedAt} [${label}] command-finished ${JSON.stringify(result)}\n`);
-      log.end();
+      if (!log.destroyed) {
+        log.write(`${result.finishedAt} [${label}] command-finished ${JSON.stringify(result)}\n`);
+        log.end();
+      }
       writeCoordinator('command-finished', result);
       resolveCommand(result);
     }
   });
+}
+
+function commandDeadlineMs(kind) {
+  if (kind === 'build') return integerEnvironment('AUDIT_BUILD_DEADLINE_MS', 20 * 60_000, 1_000, 24 * 60 * 60_000);
+  if (kind === 'merge') return integerEnvironment('AUDIT_MERGE_DEADLINE_MS', 30 * 60_000, 1_000, 24 * 60 * 60_000);
+  if (kind === 'performance') return integerEnvironment('AUDIT_PERFORMANCE_DEADLINE_MS', 45 * 60_000, 1_000, 24 * 60 * 60_000);
+  return integerEnvironment('AUDIT_SHARD_DEADLINE_MS', 45 * 60_000, 1_000, 24 * 60 * 60_000);
+}
+
+function requestStop(signal) {
+  if (!stopRequest) {
+    stopRequest = { signal, requestedAt: new Date().toISOString() };
+    if (signal !== 'LOG_FAILURE') writeCoordinator('signal-received', { signal, activeCommands: activeChildren.size });
+    void publishHeartbeat('stopping');
+  }
+  const childSignal = signal === 'SIGINT' ? 'SIGINT' : 'SIGTERM';
+  for (const child of activeChildren) {
+    signalProcessTree(child, childSignal);
+    if (child.auditStopTimer) continue;
+    child.auditStopTimer = setTimeout(() => {
+      if (activeChildren.has(child)) signalProcessTree(child, 'SIGKILL');
+    }, commandStopGraceMs);
+    child.auditStopTimer.unref();
+  }
+}
+
+function signalProcessTree(child, signal) {
+  try {
+    if (process.platform !== 'win32' && child.pid) process.kill(-child.pid, signal);
+    else child.kill(signal);
+  } catch (error) {
+    if (error?.code !== 'ESRCH') coordinatorFailure ??= `Could not send ${signal} to a command process group: ${error.message}`;
+  }
 }
 
 function skippedResult(label, error) {
@@ -287,9 +393,51 @@ function skippedResult(label, error) {
   };
 }
 
+function openLogStream(path) {
+  return new Promise((resolveStream, rejectStream) => {
+    const stream = createWriteStream(path, { flags: 'a', mode: 0o640 });
+    const onError = (error) => {
+      stream.removeListener('open', onOpen);
+      rejectStream(error);
+    };
+    const onOpen = () => {
+      stream.removeListener('error', onError);
+      resolveStream(stream);
+    };
+    stream.once('error', onError);
+    stream.once('open', onOpen);
+  });
+}
+
+async function publishHeartbeat(status) {
+  const updatedAt = new Date().toISOString();
+  const heartbeat = {
+    schemaVersion: 1,
+    runId,
+    processId: process.pid,
+    status,
+    startedAt,
+    updatedAt,
+    leaseExpiresAt: new Date(Date.now() + heartbeatLeaseMs).toISOString(),
+    activeCommands: activeChildren.size,
+    stopRequestedAt: stopRequest?.requestedAt ?? null,
+    stopSignal: stopRequest?.signal ?? null,
+  };
+  heartbeatWrite = heartbeatWrite.then(() => atomicWriteJson(heartbeatPath, heartbeat));
+  try {
+    await heartbeatWrite;
+  } catch (error) {
+    coordinatorFailure ??= `Coordinator heartbeat failed: ${error.message}`;
+    if (!stopRequest) {
+      stopRequest = { signal: 'HEARTBEAT_FAILURE', requestedAt: new Date().toISOString() };
+      for (const child of activeChildren) signalProcessTree(child, 'SIGTERM');
+    }
+  }
+}
+
 function writeCoordinator(event, detail) {
   const output = `${new Date().toISOString()} [COORDINATOR] ${event} ${JSON.stringify(detail)}\n`;
-  coordinatorLog.write(output);
+  if (!coordinatorLog.destroyed) coordinatorLog.write(output);
   process.stdout.write(output);
 }
 
@@ -313,9 +461,15 @@ function makeRunId() {
 }
 
 async function atomicWriteJson(path, value) {
-  const temporary = `${path}.tmp`;
-  await fs.writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: 'utf8', mode: 0o640 });
-  await fs.rename(temporary, path);
+  const temporary = `${path}.${randomBytes(4).toString('hex')}.tmp`;
+  try {
+    await fs.writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: 'utf8', mode: 0o640 });
+    await fs.rename(temporary, path);
+  } finally {
+    await fs.unlink(temporary).catch((error) => {
+      if (error?.code !== 'ENOENT') throw error;
+    });
+  }
 }
 
 async function isFreshFile(path, runStartedAt) {

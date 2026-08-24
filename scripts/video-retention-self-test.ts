@@ -99,6 +99,10 @@ const plan = await buildVideoRetentionPlan(report, root, resultsFile, {
         durationSeconds: 1.2,
         sampledFrames: 3,
         maxFrameDifference: 0.4,
+        changedFrames: 0,
+        blankFrameRatio: 1,
+        initialNonBlankRatio: 0,
+        finalNonBlankRatio: 0,
         usable: false,
         reasons: ['representative blank helper clip'],
       }
@@ -107,6 +111,10 @@ const plan = await buildVideoRetentionPlan(report, root, resultsFile, {
         durationSeconds: 8,
         sampledFrames: 12,
         maxFrameDifference: 7,
+        changedFrames: 3,
+        blankFrameRatio: 0,
+        initialNonBlankRatio: 1,
+        finalNonBlankRatio: 1,
         usable: true,
         reasons: [],
       },
@@ -157,17 +165,28 @@ assert.equal(assessVideoMetrics({
   durationSeconds: 1.2,
   sampledFrames: 3,
   maxFrameDifference: 0.4,
+  changedFrames: 0,
+  blankFrameRatio: 1,
+  initialNonBlankRatio: 0,
+  finalNonBlankRatio: 0,
 }).usable, false);
 assert.equal(assessVideoMetrics({
   durationSeconds: 4,
   sampledFrames: 8,
   maxFrameDifference: 6,
+  changedFrames: 1,
+  blankFrameRatio: 0,
+  initialNonBlankRatio: 1,
+  finalNonBlankRatio: 1,
 }).usable, true);
 
 const ffmpegAvailable = spawnSync('ffmpeg', ['-version'], { encoding: 'utf8' }).status === 0;
 if (ffmpegAvailable) {
   const whiteVideo = path.join(root, 'short-white.webm');
   const actionVideo = path.join(root, 'representative-action.webm');
+  const transientOverlayVideo = path.join(root, 'transient-overlay-then-white.webm');
+  const transientDarkOverlayVideo = path.join(root, 'transient-overlay-then-black.webm');
+  const lowMotionActionVideo = path.join(root, 'low-motion-action.webm');
   const generateWhite = spawnSync('ffmpeg', [
     '-hide_banner', '-loglevel', 'error', '-y',
     '-f', 'lavfi', '-i', 'color=c=white:s=320x240:r=25',
@@ -178,12 +197,48 @@ if (ffmpegAvailable) {
     '-f', 'lavfi', '-i', 'testsrc2=s=320x240:r=25:d=3',
     '-t', '3', '-an', '-c:v', 'libvpx', '-deadline', 'realtime', actionVideo,
   ], { encoding: 'utf8' });
+  const generateTransientOverlay = spawnSync('ffmpeg', [
+    '-hide_banner', '-loglevel', 'error', '-y',
+    '-f', 'lavfi', '-i', "color=c=white:s=320x240:r=25:d=4,drawbox=x=80:y=80:w=160:h=80:color=red:t=fill:enable='between(t,0.2,0.5)'",
+    '-t', '4', '-an', '-c:v', 'libvpx', '-deadline', 'realtime', transientOverlayVideo,
+  ], { encoding: 'utf8' });
+  const generateTransientDarkOverlay = spawnSync('ffmpeg', [
+    '-hide_banner', '-loglevel', 'error', '-y',
+    '-f', 'lavfi', '-i', "color=c=black:s=320x240:r=25:d=4,drawbox=x=80:y=80:w=160:h=80:color=red:t=fill:enable='between(t,0.2,0.5)'",
+    '-t', '4', '-an', '-c:v', 'libvpx', '-deadline', 'realtime', transientDarkOverlayVideo,
+  ], { encoding: 'utf8' });
+  const generateLowMotionAction = spawnSync('ffmpeg', [
+    '-hide_banner', '-loglevel', 'error', '-y',
+    '-f', 'lavfi', '-i', "color=c=gray:s=320x240:r=25:d=4,drawbox=x=80:y=80:w=160:h=80:color=red:t=fill:enable='lt(t,2)',drawbox=x=80:y=80:w=160:h=80:color=blue:t=fill:enable='gte(t,2)'",
+    '-t', '4', '-an', '-c:v', 'libvpx', '-deadline', 'realtime', lowMotionActionVideo,
+  ], { encoding: 'utf8' });
   assert.equal(generateWhite.status, 0, generateWhite.stderr);
   assert.equal(generateAction.status, 0, generateAction.stderr);
+  assert.equal(generateTransientOverlay.status, 0, generateTransientOverlay.stderr);
+  assert.equal(generateTransientDarkOverlay.status, 0, generateTransientDarkOverlay.stderr);
+  assert.equal(generateLowMotionAction.status, 0, generateLowMotionAction.stderr);
   const whiteAssessment = probeVideoQuality(whiteVideo, 'ffmpeg');
   const actionAssessment = probeVideoQuality(actionVideo, 'ffmpeg');
+  const transientOverlayAssessment = probeVideoQuality(transientOverlayVideo, 'ffmpeg');
+  const transientDarkOverlayAssessment = probeVideoQuality(transientDarkOverlayVideo, 'ffmpeg');
+  const lowMotionActionAssessment = probeVideoQuality(lowMotionActionVideo, 'ffmpeg');
   assert.equal(whiteAssessment.usable, false, JSON.stringify(whiteAssessment));
   assert.equal(actionAssessment.usable, true, JSON.stringify(actionAssessment));
+  assert.equal(
+    transientOverlayAssessment.usable,
+    false,
+    `A brief overlay must not make a mostly white clip reviewable: ${JSON.stringify(transientOverlayAssessment)}`,
+  );
+  assert.equal(
+    transientDarkOverlayAssessment.usable,
+    false,
+    `A brief overlay must not make a mostly black clip reviewable: ${JSON.stringify(transientDarkOverlayAssessment)}`,
+  );
+  assert.equal(
+    lowMotionActionAssessment.usable,
+    true,
+    `One legitimate visible state transition must survive the white-video gate: ${JSON.stringify(lowMotionActionAssessment)}`,
+  );
 }
 
 const missingReport = {
@@ -192,10 +247,8 @@ const missingReport = {
 const missingPlan = await buildVideoRetentionPlan(missingReport, root, resultsFile);
 assert.equal(missingPlan.errors.length, 1);
 assert.match(missingPlan.errors[0] ?? '', /no video attachment was produced; no usable interaction video remains/);
-const smokePlan = await buildVideoRetentionPlan(missingReport, root, resultsFile, {
-  requireExecutedInteractionVideo: false,
-});
-assert.deepEqual(smokePlan.errors, []);
+const smokePlan = await buildVideoRetentionPlan(missingReport, root, resultsFile);
+assert.equal(smokePlan.errors.length, 1, 'Smoke interactions must retain the same usable action evidence as release runs.');
 
 const helperOnlyReport = {
   suites: [{ specs: [{ title: 'helper-only interaction', tests: [{ annotations: [interaction], results: [{ status: 'passed', attachments: [video(skipped)] }] }] }] }],
@@ -207,6 +260,10 @@ const helperOnlyPlan = await buildVideoRetentionPlan(helperOnlyReport, root, res
     durationSeconds: 1.2,
     sampledFrames: 3,
     maxFrameDifference: 0.4,
+    changedFrames: 0,
+    blankFrameRatio: 1,
+    initialNonBlankRatio: 0,
+    finalNonBlankRatio: 0,
     usable: false,
     reasons: ['short, visually static helper page'],
   }),
@@ -247,6 +304,10 @@ const diagnosticPlan = await buildVideoRetentionPlan(diagnosticReport, diagnosti
         durationSeconds: 1.2,
         sampledFrames: 3,
         maxFrameDifference: 6,
+        changedFrames: 1,
+        blankFrameRatio: 0,
+        initialNonBlankRatio: 1,
+        finalNonBlankRatio: 1,
         usable: false,
         reasons: ['duration 1.200s is below 2.0s'],
       }
@@ -255,6 +316,10 @@ const diagnosticPlan = await buildVideoRetentionPlan(diagnosticReport, diagnosti
         durationSeconds: 1.2,
         sampledFrames: 3,
         maxFrameDifference: 0.4,
+        changedFrames: 0,
+        blankFrameRatio: 1,
+        initialNonBlankRatio: 0,
+        finalNonBlankRatio: 0,
         usable: false,
         reasons: ['duration 1.200s is below 2.0s', 'maximum frame change 0.400 is below 0.75'],
       },

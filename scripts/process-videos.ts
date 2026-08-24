@@ -1,10 +1,10 @@
 import { constants, promises as fs } from 'node:fs';
 import { basename, dirname, join, relative, resolve } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import {
   applyVideoRetentionPlan,
   buildVideoRetentionPlan,
-  probeVideoQuality,
+  probeVideoQualityAsync,
   removeRejectedVideoAttachments,
   sha256File,
 } from './lib/video-retention.js';
@@ -32,9 +32,65 @@ const artifactRoot = resolve(
   ?? './artifacts',
 );
 const manifestPath = join(artifactRoot, 'video-manifest.json');
+const requestedMediaWorkers = Number(process.env.AUDIT_MEDIA_WORKERS ?? '2');
+const mediaWorkers = Number.isInteger(requestedMediaWorkers)
+  ? Math.max(1, Math.min(requestedMediaWorkers, 8))
+  : 2;
 
 function log(event: string, detail: Record<string, unknown> = {}): void {
   process.stdout.write(`${new Date().toISOString()} [MEDIA] ${event} ${JSON.stringify(detail)}\n`);
+}
+
+async function mapWithConcurrency<T, R>(
+  values: readonly T[],
+  requestedConcurrency: number,
+  task: (value: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const output = new Array<R>(values.length);
+  const concurrency = Math.max(1, Math.min(values.length || 1, requestedConcurrency));
+  let next = 0;
+  await Promise.all(Array.from({ length: concurrency }, async () => {
+    while (next < values.length) {
+      const index = next;
+      next += 1;
+      const value = values[index];
+      if (value !== undefined) output[index] = await task(value, index);
+    }
+  }));
+  return output;
+}
+
+async function runBuffered(
+  command: string,
+  args: string[],
+  timeoutMs = 60_000,
+): Promise<{ status: number | null; signal: NodeJS.Signals | null; stderr: string; timedOut: boolean }> {
+  return await new Promise((resolveCommand) => {
+    const child = spawn(command, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+    const stderr: Buffer[] = [];
+    let stderrBytes = 0;
+    let timedOut = false;
+    let escalation: NodeJS.Timeout | null = null;
+    const deadline = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGTERM');
+      escalation = setTimeout(() => child.kill('SIGKILL'), 2_000);
+    }, timeoutMs);
+    child.stderr.on('data', (chunk: Buffer) => {
+      stderrBytes += chunk.length;
+      if (stderrBytes <= 2 * 1024 * 1024) stderr.push(chunk);
+    });
+    child.once('error', (error) => {
+      clearTimeout(deadline);
+      if (escalation) clearTimeout(escalation);
+      resolveCommand({ status: null, signal: null, stderr: error.message, timedOut });
+    });
+    child.once('close', (status, signal) => {
+      clearTimeout(deadline);
+      if (escalation) clearTimeout(escalation);
+      resolveCommand({ status, signal, stderr: Buffer.concat(stderr).toString('utf8'), timedOut });
+    });
+  });
 }
 
 async function filesUnder(root: string): Promise<string[]> {
@@ -83,7 +139,9 @@ async function locateFfmpeg(): Promise<string | null> {
 await fs.mkdir(artifactRoot, { recursive: true });
 const resultsPath = join(artifactRoot, 'results.json');
 const auditProfile = process.env.AUDIT_PROFILE ?? 'release';
-const requireExecutedInteractionVideo = auditProfile === 'release';
+// Evidence semantics do not weaken in smoke mode: if an interaction executes,
+// it must leave a reviewable action-and-response clip in every profile.
+const requireExecutedInteractionVideo = true;
 const ffmpeg = await locateFfmpeg();
 let retentionPlan;
 let results: Parameters<typeof buildVideoRetentionPlan>[0];
@@ -91,9 +149,9 @@ let removedVideoAttachments = 0;
 try {
   results = JSON.parse(await fs.readFile(resultsPath, 'utf8')) as Parameters<typeof buildVideoRetentionPlan>[0];
   retentionPlan = await buildVideoRetentionPlan(results, artifactRoot, resultsPath, {
-    requireExecutedInteractionVideo,
     ...(ffmpeg ? {
-      probeVideo: (file) => probeVideoQuality(file, ffmpeg, ({ event, ...detail }) => log(event, detail)),
+      probeVideo: (file) => probeVideoQualityAsync(file, ffmpeg, ({ event, ...detail }) => log(event, detail)),
+      probeConcurrency: mediaWorkers,
     } : {}),
   });
   removedVideoAttachments = await removeRejectedVideoAttachments(results, retentionPlan, artifactRoot, resultsPath);
@@ -144,10 +202,10 @@ log('Video evidence processing started', {
   videoRoots,
   videoCount: videos.length,
   ffmpeg: ffmpeg ?? 'unavailable',
+  mediaWorkers,
 });
 
-const evidence: VideoEvidence[] = [];
-for (const video of videos) {
+const evidence = await mapWithConcurrency(videos, mediaWorkers, async (video): Promise<VideoEvidence> => {
   const videoStat = await fs.stat(video);
   const poster = join(dirname(video), `${basename(video, '.webm')}-poster.jpg`);
   const base: Omit<VideoEvidence, 'processingStatus'> = {
@@ -160,19 +218,17 @@ for (const video of videos) {
   };
 
   if (!ffmpeg) {
-    evidence.push({ ...base, processingStatus: 'ffmpeg-unavailable' });
-    continue;
+    return { ...base, processingStatus: 'ffmpeg-unavailable' };
   }
   try {
     const existing = await fs.stat(poster).catch(() => null);
     if (existing) {
-      evidence.push({
+      return {
         ...base,
         poster: relative(artifactRoot, poster),
         posterBytes: existing.size,
         processingStatus: 'already-existed',
-      });
-      continue;
+      };
     }
     const args = [
       '-hide_banner', '-loglevel', 'warning', '-y', '-ss', '0.5', '-i', video,
@@ -180,34 +236,38 @@ for (const video of videos) {
     ];
     log('Command started', { command: [ffmpeg, ...args] });
     const started = performance.now();
-    const result = spawnSync(ffmpeg, args, { encoding: 'utf8' });
+    const result = await runBuffered(ffmpeg, args);
     const elapsedMs = Math.round(performance.now() - started);
     log('Command finished', {
       command: ffmpeg,
       exitCode: result.status,
       signal: result.signal,
       elapsedMs,
+      timedOut: result.timedOut,
       stderr: result.stderr.trim().slice(-2_000),
     });
-    if (result.status !== 0) {
-      evidence.push({ ...base, processingStatus: 'failed', error: result.stderr.trim().slice(-2_000) });
-      continue;
+    if (result.status !== 0 || result.timedOut) {
+      return {
+        ...base,
+        processingStatus: 'failed',
+        error: result.timedOut ? 'poster generation exceeded its 60 second deadline' : result.stderr.trim().slice(-2_000),
+      };
     }
     const posterStat = await fs.stat(poster);
-    evidence.push({
+    return {
       ...base,
       poster: relative(artifactRoot, poster),
       posterBytes: posterStat.size,
       processingStatus: 'created',
-    });
+    };
   } catch (error) {
-    evidence.push({
+    return {
       ...base,
       processingStatus: 'failed',
       error: error instanceof Error ? error.message : String(error),
-    });
+    };
   }
-}
+});
 
 const manifest = {
   schemaVersion: 2,
@@ -219,7 +279,7 @@ const manifest = {
   failedCount: evidence.filter(({ processingStatus }) => processingStatus === 'failed').length,
   unavailableCount: evidence.filter(({ processingStatus }) => processingStatus === 'ffmpeg-unavailable').length,
   retention: {
-    policy: 'Only usable videos attached to explicitly declared interaction-video attempts whose status is not skipped are retained as release media. Usable clips are at least 2 seconds long, decode representative frames, and show measurable visual change. A shorter decodable and visibly changing failed or timed-out interaction is retained only as diagnostic evidence and does not satisfy release integrity. Blank, static, corrupt, skipped, and non-interaction clips are pruned. Release-profile executed interactions must retain at least one usable clip.',
+    policy: 'Only usable videos attached to explicitly declared interaction-video attempts whose status is not skipped are retained as release media. Usable clips are at least 2 seconds long, decode representative center-crop frames, contain sustained non-blank initial and final states, remain below the blank-frame limit, and show measurable page-content change. A shorter decodable and visibly changing failed or timed-out interaction is retained only as diagnostic evidence and does not satisfy release integrity. Blank, transient-overlay-only, static, corrupt, skipped, and non-interaction clips are pruned. Every executed interaction in every profile must retain at least one usable clip.',
     auditProfile,
     requireExecutedInteractionVideo,
     eligibleExecutions: retentionPlan.eligibleExecutions,
@@ -239,6 +299,10 @@ const manifest = {
       durationSeconds: assessment.durationSeconds,
       sampledFrames: assessment.sampledFrames,
       maxFrameDifference: assessment.maxFrameDifference,
+      changedFrames: assessment.changedFrames,
+      blankFrameRatio: assessment.blankFrameRatio,
+      initialNonBlankRatio: assessment.initialNonBlankRatio,
+      finalNonBlankRatio: assessment.finalNonBlankRatio,
       usable: assessment.usable,
       reasons: assessment.reasons,
       ...(assessment.probeError ? { probeError: assessment.probeError } : {}),

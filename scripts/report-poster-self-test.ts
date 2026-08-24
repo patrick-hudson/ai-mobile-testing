@@ -95,7 +95,7 @@ try {
 
   assert.equal(withPoster?.available, true);
   assert.equal(withPoster?.poster?.contentType, 'image/jpeg');
-  assert.equal(withPoster?.poster?.sourcePath, sourcePoster);
+  assert.equal(withPoster?.poster?.sourcePath, 'with-poster-poster.jpg');
   assert.match(withPoster?.poster?.href ?? '', /01-with-poster-poster\.jpg$/);
   assert.equal(withPoster?.poster?.sizeBytes, Buffer.byteLength('synthetic jpeg poster'));
   assert.match(withPoster?.poster?.sha256 ?? '', /^[a-f0-9]{64}$/);
@@ -105,7 +105,7 @@ try {
   assert.equal(withoutPoster?.poster, undefined);
   assert.equal(withoutPoster?.posterError, undefined);
   assert.equal(mergedWithPoster?.available, true);
-  assert.equal(mergedWithPoster?.poster?.sourcePath, fallbackPoster);
+  assert.equal(mergedWithPoster?.poster?.sourcePath, 'raw/original-video-poster.jpg');
   assert.match(mergedWithPoster?.poster?.href ?? '', /03-blob-resource-poster\.jpg$/);
   assert.equal(manifest.summary.videos, 3);
   assert.equal(manifest.summary.posters, 2);

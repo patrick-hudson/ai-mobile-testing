@@ -3,6 +3,7 @@ x-audit-base: &audit-base
     context: .
     args:
       PLAYWRIGHT_VERSION: ${PLAYWRIGHT_VERSION:-1.62.1}
+      INSTALL_MSEDGE: ${INSTALL_MSEDGE:-0}
   image: quitting7oh-release-audit:${AUDIT_IMAGE_TAG:-local}
   init: true
   shm_size: 1gb
@@ -14,6 +15,7 @@ x-audit-base: &audit-base
     CANDIDATE_URL: ${CANDIDATE_URL:-https://beta.quitting7oh-org.pages.dev}
     AUDIT_WORKERS: ${AUDIT_WORKERS:-3}
     AUDIT_VERBOSE: ${AUDIT_VERBOSE:-1}
+    AUDIT_TARGET_IDS: ${AUDIT_TARGET_IDS:-}
     CANDIDATE_IGNORE_HTTPS_ERRORS: ${CANDIDATE_IGNORE_HTTPS_ERRORS:-0}
 
 services:
@@ -26,20 +28,20 @@ services:
       - CANDIDATE_URL=${CANDIDATE_URL:-https://beta.quitting7oh-org.pages.dev}
       - AUDIT_WORKERS=${AUDIT_WORKERS:-3}
       - AUDIT_VERBOSE=${AUDIT_VERBOSE:-1}
+      - AUDIT_TARGET_IDS=${AUDIT_TARGET_IDS:-}
       - CANDIDATE_IGNORE_HTTPS_ERRORS=${CANDIDATE_IGNORE_HTTPS_ERRORS:-0}
       - PORTAL_MAX_CONCURRENT_RUNS=${PORTAL_MAX_CONCURRENT_RUNS:-1}
       - PORTAL_SHARDED_ARTIFACT_ROOT=${PORTAL_SHARDED_ARTIFACT_ROOT:-/work/artifacts/sharded}
       - PORTAL_EXTERNAL_RUN_SYNC_MS=${PORTAL_EXTERNAL_RUN_SYNC_MS:-1000}
       - PORTAL_LOOPBACK_PUBLISHED=1
-      - PORTAL_SECRET_ROOT=/work/secrets
+      - PORTAL_SECRET_ROOT=/var/lib/ai-mobile-testing/secrets
       - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-claude-sonnet-5}
-      - ANTHROPIC_API_KEY
       - AI_REVIEW_DRY_RUN
     stop_grace_period: 15s
     volumes:
       - ./artifacts:/work/artifacts
       - ./certs:/work/certs:ro
-      - portal-secrets:/work/secrets
+      - portal-secrets:/var/lib/ai-mobile-testing/secrets
 
   portal-e2e:
     <<: *audit-base
@@ -52,6 +54,7 @@ services:
       CANDIDATE_URL: ${CANDIDATE_URL:-https://beta.quitting7oh-org.pages.dev}
       AUDIT_WORKERS: ${PORTAL_E2E_WORKERS:-1}
       AUDIT_VERBOSE: ${AUDIT_VERBOSE:-1}
+      AUDIT_TARGET_IDS: ""
       CANDIDATE_IGNORE_HTTPS_ERRORS: "0"
       PORTAL_E2E_OUTPUT_DIR: /work/artifacts/portal-e2e
       PORTAL_E2E_CANONICAL_PROFILE: "1"
@@ -65,6 +68,7 @@ services:
       CANDIDATE_URL: ${CANDIDATE_URL:-https://beta.quitting7oh-org.pages.dev}
       AUDIT_WORKERS: ${AUDIT_WORKERS:-3}
       AUDIT_VERBOSE: ${AUDIT_VERBOSE:-1}
+      AUDIT_TARGET_IDS: ${AUDIT_TARGET_IDS:-}
       CANDIDATE_IGNORE_HTTPS_ERRORS: ${CANDIDATE_IGNORE_HTTPS_ERRORS:-0}
       AUDIT_ARTIFACT_DIR: ${AUDIT_ARTIFACT_DIR:-/work/artifacts/docker-smoke}
 
@@ -77,6 +81,7 @@ services:
       CANDIDATE_URL: ${CANDIDATE_URL:-https://beta.quitting7oh-org.pages.dev}
       AUDIT_WORKERS: ${AUDIT_WORKERS:-3}
       AUDIT_VERBOSE: ${AUDIT_VERBOSE:-1}
+      AUDIT_TARGET_IDS: ${AUDIT_TARGET_IDS:-}
       CANDIDATE_IGNORE_HTTPS_ERRORS: ${CANDIDATE_IGNORE_HTTPS_ERRORS:-0}
       AUDIT_ARTIFACT_DIR: ${AUDIT_ARTIFACT_DIR:-/work/artifacts/docker-release}
 
@@ -89,6 +94,7 @@ services:
       CANDIDATE_URL: ${CANDIDATE_URL:-https://beta.quitting7oh-org.pages.dev}
       AUDIT_WORKERS: ${AUDIT_SHARD_WORKERS:-2}
       AUDIT_VERBOSE: ${AUDIT_VERBOSE:-1}
+      AUDIT_TARGET_IDS: ${AUDIT_TARGET_IDS:-}
       CANDIDATE_IGNORE_HTTPS_ERRORS: ${CANDIDATE_IGNORE_HTTPS_ERRORS:-0}
       AUDIT_PROFILE: release
       AUDIT_EXCLUDE_PERFORMANCE: "1"
@@ -107,6 +113,7 @@ services:
       CANDIDATE_URL: ${CANDIDATE_URL:-https://beta.quitting7oh-org.pages.dev}
       AUDIT_WORKERS: "1"
       AUDIT_VERBOSE: ${AUDIT_VERBOSE:-1}
+      AUDIT_TARGET_IDS: ${AUDIT_TARGET_IDS:-}
       CANDIDATE_IGNORE_HTTPS_ERRORS: ${CANDIDATE_IGNORE_HTTPS_ERRORS:-0}
       AUDIT_PROFILE: release
       AUDIT_EXCLUDE_PERFORMANCE: "0"
@@ -122,6 +129,7 @@ services:
       PRODUCTION_URL: ${PRODUCTION_URL:-https://quitting7oh.org}
       CANDIDATE_URL: ${CANDIDATE_URL:-https://beta.quitting7oh-org.pages.dev}
       AUDIT_VERBOSE: ${AUDIT_VERBOSE:-1}
+      AUDIT_TARGET_IDS: ${AUDIT_TARGET_IDS:-}
       CANDIDATE_IGNORE_HTTPS_ERRORS: ${CANDIDATE_IGNORE_HTTPS_ERRORS:-0}
       AUDIT_PROFILE: release
       AUDIT_SHARDED_RUN_ID: ${AUDIT_SHARDED_RUN_ID:-manual-sharded-release}
@@ -141,9 +149,9 @@ services:
       CANDIDATE_URL: ${CANDIDATE_URL:-https://beta.quitting7oh-org.pages.dev}
       AUDIT_WORKERS: ${AUDIT_WORKERS:-2}
       AUDIT_VERBOSE: ${AUDIT_VERBOSE:-1}
+      AUDIT_TARGET_IDS: ${AUDIT_TARGET_IDS:-}
       CANDIDATE_IGNORE_HTTPS_ERRORS: ${CANDIDATE_IGNORE_HTTPS_ERRORS:-0}
       AUDIT_ARTIFACT_DIR: ${AUDIT_ARTIFACT_DIR:-/work/artifacts/visual-baseline}
 
 volumes:
   portal-secrets:
-    name: ai-mobile-testing-portal-secrets

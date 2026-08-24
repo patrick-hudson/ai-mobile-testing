@@ -8,21 +8,15 @@ import path from 'node:path';
 import { AUDIT_BY_ID } from './catalog.js';
 import { AUDIT_ID_PATTERN } from './audit-id.js';
 import { assertEvidencePolicy, validateDefinitionEvidencePolicy } from './evidence-policy.js';
-import type { AuditArea, AuditDefinition } from './types.js';
+import { LOCAL_AUDIT_TARGETS } from './targets.js';
+import type { AuditApplicability, AuditArea, AuditDefinition } from './types.js';
+import { applicableTargetIds } from '../shared/target-applicability.mjs';
 
 export const PLUGIN_SCHEMA_VERSION = 1 as const;
 export const PLUGIN_MANIFEST_NAME = 'plugin.json';
 export const GENERATED_PLUGIN_REGISTRY_PATH = 'audit/plugins.generated.json';
 
-export const CANONICAL_PROJECTS = [
-  'production-mobile-chromium',
-  'candidate-mobile-chromium',
-  'production-desktop-chromium',
-  'candidate-desktop-chromium',
-  'candidate-mobile-webkit',
-  'candidate-tablet-webkit',
-  'candidate-desktop-firefox',
-] as const;
+export const CANONICAL_PROJECTS = LOCAL_AUDIT_TARGETS.map(({ id }) => id);
 
 const AUDIT_AREAS = [
   'environment',
@@ -60,7 +54,14 @@ const TAG_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
 const CORE_TEST_PATTERN = /^tests\/[a-zA-Z0-9_./-]+\.spec\.ts$/;
 const PLUGIN_TEST_PATTERN = /^plugins\/[a-zA-Z0-9_-]+\/tests\/[a-zA-Z0-9_./-]+\.spec\.ts$/;
 
-type CanonicalProject = (typeof CANONICAL_PROJECTS)[number];
+type CanonicalProject = (typeof LOCAL_AUDIT_TARGETS)[number]['id'];
+
+export interface PluginAuditCase {
+  auditId: string;
+  entrySpec: string;
+  applicability: AuditApplicability;
+  supportedProjects: CanonicalProject[];
+}
 
 export interface CoreAuditReference {
   id: string;
@@ -87,6 +88,7 @@ export interface InstalledPlugin {
   manifestPath: string;
   manifest: PluginManifest;
   resolvedAuditDefinitions: AuditDefinition[];
+  resolvedAuditCases: PluginAuditCase[];
 }
 
 export type PluginRegistryAuditDefinition = AuditDefinition;
@@ -100,6 +102,7 @@ export interface PluginRegistryEntry {
   auditDefinitions: PluginRegistryAuditDefinition[];
   entrySpecs: string[];
   supportedProjects: CanonicalProject[];
+  auditCases: PluginAuditCase[];
 }
 
 export interface PluginRegistry {
@@ -162,6 +165,133 @@ function duplicateValues(values: readonly string[]): string[] {
 function isInside(root: string, target: string): boolean {
   const relative = path.relative(root, target);
   return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
+}
+
+const AUDIT_TEST_HELPERS = new Set(['interactionTest', 'staticTest', 'structuredTest']);
+const AUDIT_EVIDENCE_HELPERS = new Set(['interactionEvidence', 'staticEvidence', 'structuredEvidence']);
+
+function supportedProjectsForApplicability(applicability: AuditApplicability | CanonicalProject): CanonicalProject[] {
+  return applicableTargetIds(applicability, LOCAL_AUDIT_TARGETS) as CanonicalProject[];
+}
+
+function callArguments(source: string, openParenthesis: number): { args: string[]; end: number } | null {
+  const args: string[] = [];
+  let start = openParenthesis + 1;
+  let depth = 1;
+  let quote: "'" | '"' | '`' | null = null;
+  let escaped = false;
+  for (let index = start; index < source.length; index += 1) {
+    const character = source[index]!;
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (character === '\\') escaped = true;
+      else if (character === quote) quote = null;
+      continue;
+    }
+    if (character === "'" || character === '"' || character === '`') {
+      quote = character;
+      continue;
+    }
+    if (character === '(' || character === '[' || character === '{') depth += 1;
+    else if (character === ')' || character === ']' || character === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        args.push(source.slice(start, index).trim());
+        return { args, end: index + 1 };
+      }
+    } else if (character === ',' && depth === 1) {
+      args.push(source.slice(start, index).trim());
+      if (args.length === 2) return { args, end: index + 1 };
+      start = index + 1;
+    }
+  }
+  return null;
+}
+
+function literalPrefix(value: string | undefined): string | null {
+  const trimmed = value?.trim() ?? '';
+  const quote = trimmed[0];
+  if (!['"', "'", '`'].includes(quote ?? '')) return null;
+  let output = '';
+  let escaped = false;
+  for (let index = 1; index < trimmed.length; index += 1) {
+    const character = trimmed[index]!;
+    if (escaped) {
+      output += character;
+      escaped = false;
+    } else if (character === '\\') escaped = true;
+    else if (character === quote || (quote === '`' && character === '$' && trimmed[index + 1] === '{')) return output;
+    else output += character;
+  }
+  return null;
+}
+
+function auditCasesFromEntrySpec(
+  repositoryRoot: string,
+  entrySpec: string,
+  ownedAuditIds: ReadonlySet<string>,
+  issues: string[],
+): PluginAuditCase[] {
+  const file = path.resolve(repositoryRoot, entrySpec);
+  const source = readFileSync(file, 'utf8');
+  const cases: PluginAuditCase[] = [];
+  const helperPattern = /\b(interactionTest|staticTest|structuredTest)\s*\(/g;
+  for (const match of source.matchAll(helperPattern)) {
+    if (!AUDIT_TEST_HELPERS.has(match[1] ?? '')) continue;
+    const openParenthesis = (match.index ?? 0) + match[0].lastIndexOf('(');
+    const parsed = callArguments(source, openParenthesis);
+    if (!parsed) {
+      issues.push(`${entrySpec} contains an unterminated ${match[1]} declaration.`);
+      continue;
+    }
+    const title = literalPrefix(parsed.args[0]);
+    const auditIds = title ? [...title.matchAll(/\[([A-Z0-9]+(?:-[A-Z0-9]+)+)\]/g)].map((idMatch) => idMatch[1]!) : [];
+    const evidence = parsed.args[1] ?? '';
+    const evidenceHelper = evidence.match(/^([a-zA-Z]+Evidence)\s*\(/)?.[1] ?? '';
+    const applicability = AUDIT_EVIDENCE_HELPERS.has(evidenceHelper)
+      ? evidence.match(/,\s*(['"])([^'"]+)\1\s*\)\s*$/)?.[2] ?? null
+      : null;
+    for (const auditId of auditIds.filter((id) => ownedAuditIds.has(id))) {
+      if (!applicability) {
+        issues.push(`${entrySpec} declares ${auditId} without a literal applicability argument.`);
+        continue;
+      }
+      const projects = supportedProjectsForApplicability(applicability as AuditApplicability);
+      if (projects.length === 0) {
+        issues.push(`${entrySpec} declares ${auditId} with unknown or zero-project applicability "${applicability}".`);
+        continue;
+      }
+      cases.push({ auditId, entrySpec, applicability: applicability as AuditApplicability, supportedProjects: projects });
+    }
+  }
+  return cases;
+}
+
+function resolveAuditCases(
+  repositoryRoot: string,
+  entrySpecs: readonly string[],
+  definitions: readonly AuditDefinition[],
+  supportedProjects: readonly CanonicalProject[],
+  issues: string[],
+): PluginAuditCase[] {
+  const ownedAuditIds = new Set(definitions.map(({ id }) => id));
+  const cases = entrySpecs.flatMap((entrySpec) => auditCasesFromEntrySpec(repositoryRoot, entrySpec, ownedAuditIds, issues));
+  const unique = [...new Map(cases.map((entry) => [JSON.stringify(entry), entry])).values()]
+    .sort((left, right) => left.auditId.localeCompare(right.auditId)
+      || left.entrySpec.localeCompare(right.entrySpec)
+      || left.applicability.localeCompare(right.applicability));
+  const pluginProjects = new Set(supportedProjects);
+  for (const entry of unique) {
+    const outside = entry.supportedProjects.filter((project) => !pluginProjects.has(project));
+    if (outside.length > 0) {
+      issues.push(`${entry.entrySpec} maps ${entry.auditId} to projects outside the plugin allowlist: ${outside.join(', ')}.`);
+    }
+  }
+  const automated = definitions.filter(({ manual }) => !manual);
+  const declared = new Set(unique.map(({ auditId }) => auditId));
+  const missing = automated.filter(({ id }) => !declared.has(id)).map(({ id }) => id);
+  if (missing.length > 0) issues.push(`Automated audits have no executable test/applicability case: ${missing.join(', ')}.`);
+  return unique;
 }
 
 function validateEntrySpec(
@@ -228,6 +358,9 @@ function validateInlineAudit(value: Record<string, unknown>, label: string, issu
   if (!nonEmptyString(value.userPromise)) issues.push(`${label}.userPromise must be a non-empty string.`);
   if (!SEVERITIES.includes(value.severity as (typeof SEVERITIES)[number])) issues.push(`${label}.severity must be P0, P1, P2, or P3.`);
   if (typeof value.releaseBlocking !== 'boolean') issues.push(`${label}.releaseBlocking must be boolean.`);
+  if ((value.severity === 'P0' || value.severity === 'P1') && value.releaseBlocking !== true) {
+    issues.push(`${label}.releaseBlocking must be true for P0 and P1 audits.`);
+  }
   if (!nonEmptyString(value.expected)) issues.push(`${label}.expected must be a non-empty string.`);
   if (!Array.isArray(value.evidence) || value.evidence.length === 0) {
     issues.push(`${label}.evidence must be a non-empty array.`);
@@ -307,6 +440,9 @@ export function validatePluginRegistryDocument(raw: unknown): PluginRegistry {
     }
     const auditDefinitions = value.auditDefinitions.map((definition, definitionIndex) => {
       const resolved = assertAuditDefinition(definition, `${label}.auditDefinitions[${definitionIndex}]`);
+      if ((resolved.severity === 'P0' || resolved.severity === 'P1') && !resolved.releaseBlocking) {
+        throw new Error(`${label}.auditDefinitions[${definitionIndex}] cannot publish a non-blocking ${resolved.severity} audit.`);
+      }
       if (auditIds.has(resolved.id)) throw new Error(`Duplicate generated audit definition: ${resolved.id}.`);
       auditIds.add(resolved.id);
       return resolved;
@@ -325,6 +461,35 @@ export function validatePluginRegistryDocument(raw: unknown): PluginRegistry {
     if (!supportedProjects || supportedProjects.length === 0 || duplicateValues(supportedProjects).length > 0) {
       throw new Error(`${label}.supportedProjects is invalid.`);
     }
+    if (!Array.isArray(value.auditCases) || (value.auditCases.length === 0 && auditDefinitions.some(({ manual }) => !manual))) {
+      throw new Error(`${label}.auditCases must cover every automated audit.`);
+    }
+    const definitionIds = new Set(auditDefinitions.map(({ id }) => id));
+    const auditCases = value.auditCases.map((rawCase, caseIndex): PluginAuditCase => {
+      const caseLabel = `${label}.auditCases[${caseIndex}]`;
+      if (!isRecord(rawCase) || !nonEmptyString(rawCase.auditId) || !definitionIds.has(rawCase.auditId)) {
+        throw new Error(`${caseLabel}.auditId must reference an audit owned by this plugin.`);
+      }
+      if (!nonEmptyString(rawCase.entrySpec) || !entrySpecs.includes(rawCase.entrySpec)) {
+        throw new Error(`${caseLabel}.entrySpec must reference this plugin's executable allowlist.`);
+      }
+      if (!nonEmptyString(rawCase.applicability)) throw new Error(`${caseLabel}.applicability is invalid.`);
+      const expectedProjects = supportedProjectsForApplicability(rawCase.applicability as AuditApplicability);
+      if (!Array.isArray(rawCase.supportedProjects)
+        || rawCase.supportedProjects.some((project) => typeof project !== 'string' || !CANONICAL_PROJECTS.includes(project as CanonicalProject))
+        || JSON.stringify(rawCase.supportedProjects) !== JSON.stringify(expectedProjects)) {
+        throw new Error(`${caseLabel}.supportedProjects does not match its declared applicability.`);
+      }
+      return {
+        auditId: rawCase.auditId,
+        entrySpec: rawCase.entrySpec,
+        applicability: rawCase.applicability as AuditApplicability,
+        supportedProjects: expectedProjects,
+      };
+    });
+    const declaredCases = new Set(auditCases.map(({ auditId }) => auditId));
+    const missingCases = auditDefinitions.filter(({ id, manual }) => !manual && !declaredCases.has(id)).map(({ id }) => id);
+    if (missingCases.length > 0) throw new Error(`${label}.auditCases omit automated audits: ${missingCases.join(', ')}.`);
     return {
       id: value.id,
       version: value.version,
@@ -334,6 +499,7 @@ export function validatePluginRegistryDocument(raw: unknown): PluginRegistry {
       auditDefinitions,
       entrySpecs,
       supportedProjects,
+      auditCases,
     };
   });
   return { schemaVersion: PLUGIN_SCHEMA_VERSION, plugins };
@@ -434,6 +600,10 @@ export function validatePluginManifest(
   const duplicateProjects = duplicateValues(supportedProjects);
   if (duplicateProjects.length > 0) issues.push(`Duplicate supported projects: ${duplicateProjects.join(', ')}.`);
 
+  const resolvedAuditCases = options.requireEntryFiles === false
+    ? []
+    : resolveAuditCases(repositoryRoot, entrySpecs, resolvedAuditDefinitions, supportedProjects, issues);
+
   if (issues.length > 0) throw new PluginValidationError(manifestPath, issues);
   return {
     directory,
@@ -451,6 +621,7 @@ export function validatePluginManifest(
       supportedProjects,
     },
     resolvedAuditDefinitions,
+    resolvedAuditCases,
   };
 }
 
@@ -501,7 +672,7 @@ export function createPluginRegistry(plugins: readonly InstalledPlugin[]): Plugi
     schemaVersion: PLUGIN_SCHEMA_VERSION,
     plugins: plugins
       .filter(({ manifest }) => manifest.enabled)
-      .map(({ manifest, resolvedAuditDefinitions }) => ({
+      .map(({ manifest, resolvedAuditDefinitions, resolvedAuditCases }) => ({
         id: manifest.id,
         version: manifest.version,
         name: manifest.name,
@@ -510,6 +681,10 @@ export function createPluginRegistry(plugins: readonly InstalledPlugin[]): Plugi
         auditDefinitions: resolvedAuditDefinitions.map(cloneAuditDefinition),
         entrySpecs: [...manifest.entrySpecs],
         supportedProjects: [...manifest.supportedProjects],
+        auditCases: resolvedAuditCases.map((entry) => ({
+          ...entry,
+          supportedProjects: [...entry.supportedProjects],
+        })),
       })),
   };
 }

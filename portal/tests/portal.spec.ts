@@ -35,7 +35,7 @@ async function waitForTerminal(request: APIRequestContext, id: string, timeoutMs
 function runRequest(overrides: Record<string, unknown> = {}) {
   return {
     profile: 'release',
-    projects: ['candidate-mobile-chromium'],
+    targetIds: ['candidate-mobile-chromium'],
     pluginIds: [],
     areas: [],
     auditIds: ['ENV-001'],
@@ -56,7 +56,9 @@ test('portal renders the complete launch surface and asynchronous loading state'
   await page.goto('/');
   await expect(page.getByRole('heading', { name: /release audit/i })).toBeVisible();
   await expect(page.locator('#catalog-summary')).toContainText('81 documented checks');
-  await expect(page.locator('#project-options input')).toHaveCount(7);
+  await expect(page.locator('#project-options input[name="targetId"]')).toHaveCount(18);
+  await expect(page.locator('#project-options input[name="targetId"]:checked')).toHaveCount(7);
+  await expect(page.locator('#project-options input[name="targetId"]:disabled')).toHaveCount(5);
   await expect(page.locator('#plugin-options input')).toHaveCount(5);
   await expect(page.locator('#audit-options input')).toHaveCount(81);
   await page.locator('#refresh-runs').click();
@@ -109,6 +111,17 @@ test('reviewer report has bounded loading, empty, and terminal error states with
   expect(requestedUrls.some((url) => url.endsWith('/checklist/manifest.json'))).toBeFalsy();
   expect(requestedUrls.some((url) => url.includes('/logs'))).toBeFalsy();
 
+  await page.route('**/api/runs/ui-state-demo/logs?*', (route) => route.fulfill({
+    json: {
+      log: 'bounded redacted output', bytes: 23, truncated: false,
+      sources: [{ path: 'logs/runner.log', size: 10_000 }],
+    },
+  }));
+  await page.locator('#load-log').click();
+  await expect(page.locator('#report-log')).toContainText('bounded redacted output');
+  await expect(page.locator('#log-links')).toContainText(/redacted source/i);
+  await expect(page.locator('#log-links a')).toHaveCount(0);
+
   await page.route('**/api/runs/missing-report-demo', (route) => route.fulfill({ json: { ...run, id: 'missing-report-demo' } }));
   await page.route('**/api/runs/missing-report-demo/report', (route) => route.fulfill({ status: 404, json: { error: 'Compact report not found.' } }));
   await page.goto('/report.html?run=missing-report-demo');
@@ -147,6 +160,23 @@ test('reviewer report never presents a READY checklist as release authority when
   await expect(page.locator('#decision-title')).toContainText(/checklist passed.*signoff is withheld/i);
   await expect(page.locator('#decision-summary')).toContainText(/new-ID sharded release run/i);
   await expect(page.locator('#decision-title')).not.toContainText('ready for release');
+
+  const failedRun = {
+    ...run,
+    id: 'stale-ready-report-demo',
+    status: 'evidence-failed',
+    pipeline: { status: 'failed', completed: false, reason: 'Final evidence persistence failed.' },
+    release: { decision: 'UNAVAILABLE', reason: 'No durable terminal evidence exists.', decisionBasis: 'Terminal lifecycle truth.' },
+    reviewReasons: [],
+  };
+  await page.route('**/api/runs/stale-ready-report-demo', (route) => route.fulfill({ json: failedRun }));
+  await page.route('**/api/runs/stale-ready-report-demo/report', (route) => route.fulfill({ json: report }));
+  await page.route('**/api/runs/stale-ready-report-demo/report/audits?*', (route) => route.fulfill({ json: { items: [], total: 0, offset: 0, limit: 25, nextOffset: 0, hasMore: false, filters: report.filters } }));
+  await page.route('**/api/runs/stale-ready-report-demo/artifacts?*', (route) => route.fulfill({ json: { files: [], total: 0, knownTotal: 0, totalComplete: true, offset: 0, limit: 80, nextOffset: 0, hasMore: false } }));
+  await page.goto('/report.html?run=stale-ready-report-demo');
+  await expect(page.locator('#decision-badge')).toHaveText('Decision unavailable');
+  await expect(page.locator('#decision-title')).not.toContainText('ready for release');
+  await expect(page.locator('#decision-summary')).toContainText(/no durable terminal evidence/i);
 });
 
 test('credential vault UI saves, reloads, fingerprints, and deletes without returning plaintext', async ({ page }) => {
@@ -160,7 +190,12 @@ test('credential vault UI saves, reloads, fingerprints, and deletes without retu
   const stateResponse = await page.request.get('/api/settings/anthropic-key');
   expect(stateResponse.ok()).toBeTruthy();
   const state = await stateResponse.json();
-  expect(state).toEqual({ configured: true, fingerprint: expect.stringMatching(/^sha256:[a-f0-9]{12}$/) });
+  expect(state).toMatchObject({
+    configured: true,
+    fingerprint: expect.stringMatching(/^sha256:[a-f0-9]{12}$/),
+    storageEnabled: true,
+    unavailableReason: null,
+  });
   expect(JSON.stringify(state)).not.toContain(syntheticKey);
 
   await page.reload();
@@ -168,7 +203,9 @@ test('credential vault UI saves, reloads, fingerprints, and deletes without retu
   await page.locator('#delete-anthropic-key').click();
   await page.locator('#delete-anthropic-key').click();
   await expect(page.locator('#anthropic-key-message')).toContainText(/deleted/i);
-  expect(await (await page.request.get('/api/settings/anthropic-key')).json()).toEqual({ configured: false, fingerprint: null });
+  expect(await (await page.request.get('/api/settings/anthropic-key')).json()).toMatchObject({
+    configured: false, fingerprint: null, storageEnabled: true, unavailableReason: null,
+  });
 });
 
 test('mutation security and production certificate guards fail closed', async ({ request, playwright }) => {
@@ -181,6 +218,12 @@ test('mutation security and production certificate guards fail closed', async ({
   const blockedOrigin = await crossOrigin.post('/api/runs', { data: runRequest() });
   expect(blockedOrigin.status()).toBe(403);
   await crossOrigin.dispose();
+  const sandboxed = await playwright.request.newContext({
+    baseURL: portalBaseUrl,
+    extraHTTPHeaders: { Origin: 'null', 'Content-Type': 'application/json' },
+  });
+  expect((await sandboxed.delete('/api/settings/anthropic-key', { data: {} })).status()).toBe(403);
+  await sandboxed.dispose();
 
   const rebound = await playwright.request.newContext({
     baseURL: portalBaseUrl,
@@ -237,10 +280,13 @@ test('targeted portal run streams verbose evidence and cannot report a false rel
   await page.goto('/');
   const portalBaseUrl = process.env.PORTAL_E2E_BASE_URL;
   if (!portalBaseUrl) throw new Error('PORTAL_E2E_BASE_URL is required for portal acceptance tests.');
+  const syntheticKey = ['sk', 'ant', 'isolated-stage', '7'.repeat(40)].join('-');
+  const savedCredential = await request.put('/api/settings/anthropic-key', { data: { apiKey: syntheticKey } });
+  expect(savedCredential.status(), await savedCredential.text()).toBe(200);
   const parallelRequest = await playwright.request.newContext({ baseURL: portalBaseUrl });
   const launchAttempts = await Promise.all([
-    request.post('/api/runs', { data: runRequest({ auditIds: ['SEARCH-001'] }) }),
-    parallelRequest.post('/api/runs', { data: runRequest({ auditIds: ['SEARCH-001'] }) }),
+    request.post('/api/runs', { data: runRequest({ auditIds: ['SEARCH-001'], aiReview: true }) }),
+    parallelRequest.post('/api/runs', { data: runRequest({ auditIds: ['SEARCH-001'], aiReview: true }) }),
   ]);
   expect(launchAttempts.map((response) => response.status()).sort()).toEqual([202, 409]);
   const launch = launchAttempts.find((response) => response.status() === 202)!;
@@ -257,7 +303,21 @@ test('targeted portal run streams verbose evidence and cannot report a false rel
   expect(finished.pipeline).toMatchObject({ completed: true, status: 'completed' });
   expect(finished.release.decision).toBe('NOT_READY');
   expect(finished.status).toBe('not-ready');
+  expect(finished.stages.aiReview).toMatchObject({ status: 'completed' });
   expect(finished.reviewReasons.join(' ')).toMatch(/selected scope|cannot certify|targeted|manual|not ready|incomplete/i);
+  const finalLogResponse = await request.get(`/api/runs/${encodeURIComponent(started.id)}/logs?maxBytes=1048576`);
+  expect(finalLogResponse.ok()).toBeTruthy();
+  const finalLog = (await finalLogResponse.json()).log as string;
+  expect(finalLog).toContain('Execution identity: aiworker');
+  expect(finalLog).toContain('Execution identity: reportworker');
+  expect(finalLog).toContain('Privately staged checklist published atomically.');
+  expect(finalLog).not.toContain(syntheticKey);
+  const aiReview = await request.get(`/artifacts/${encodeURIComponent(started.id)}/ai-review/review.json`);
+  const aiReviewBody = await aiReview.text();
+  expect(aiReview.status(), aiReviewBody).toBe(200);
+  expect(aiReviewBody).not.toContain(syntheticKey);
+  const deletedCredential = await request.delete('/api/settings/anthropic-key', { data: {} });
+  expect(deletedCredential.status(), await deletedCredential.text()).toBe(200);
 
   const serverArtifactRoot = process.env.PORTAL_E2E_SERVER_ARTIFACT_ROOT;
   expect(serverArtifactRoot, 'The isolated portal test root must be provided by the Docker runner').toBeTruthy();
@@ -386,7 +446,7 @@ test('targeted portal run streams verbose evidence and cannot report a false rel
 
 test('active work can be stopped and purge closes both live event streams', async ({ page, request }) => {
   const launch = await request.post('/api/runs', {
-    data: runRequest({ auditIds: ['CONTENT-002'], projects: ['candidate-desktop-chromium'] }),
+    data: runRequest({ auditIds: ['CONTENT-002'], targetIds: ['candidate-desktop-chromium'] }),
   });
   expect(launch.status(), await launch.text()).toBe(202);
   const started = await launch.json();
@@ -435,10 +495,10 @@ test('active work can be stopped and purge closes both live event streams', asyn
     id: started.id,
     purged: true,
     source: 'portal-managed',
-    filesReclaimed: expect.any(Number),
-    bytesReclaimed: expect.any(Number),
+    filesRemoved: expect.any(Number),
+    logicalBytesRemoved: expect.any(Number),
   });
-  expect(reclaimed.filesReclaimed).toBeGreaterThan(0);
+  expect(reclaimed.filesRemoved).toBeGreaterThan(0);
   await expect.poll(() => page.evaluate(() => (window as any).__purgeStreamEvents)).toEqual({ run: ['purged'], gallery: ['purged'] });
   await page.evaluate(() => (window as any).__purgeStreamSources?.forEach((source: EventSource) => source.close()));
   expect((await request.get(`/api/runs/${encodeURIComponent(started.id)}`)).status()).toBe(404);
@@ -687,7 +747,7 @@ test('externally launched shards are discovered while active and retained with l
   await expect(page.locator('#confirm-purge')).toBeEnabled();
   await page.locator('#confirm-purge').click();
   await expect(page.locator('#run-dialog')).not.toBeVisible();
-  await expect(page.locator('#runs-status')).toContainText(/reclaimed/i);
+  await expect(page.locator('#runs-status')).toContainText(/removed|deleted/i);
   expect((await request.get(`/api/runs/${encodeURIComponent(id)}`)).status()).toBe(404);
   expect(await access(directory).then(() => true, () => false)).toBe(false);
 });

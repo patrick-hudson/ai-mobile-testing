@@ -302,6 +302,19 @@ export function assertGalleryCatalog(value) {
     for (const member of item.members) {
       if (!MEMBER_ROLES.has(member.role)) throw new TypeError(`Gallery item ${item.id} has an unsupported member role.`);
     }
+    if (item.attempt?.rawStatus !== undefined) {
+      if (typeof item.attempt.rawStatus !== 'string' || item.attempt.rawStatus.length > 120) {
+        throw new TypeError(`Gallery item ${item.id} has an invalid raw attempt status.`);
+      }
+      if (!['reviewed-manifest', 'release-integrity'].includes(item.attempt.statusSource)) {
+        throw new TypeError(`Gallery item ${item.id} has an invalid reviewed status source.`);
+      }
+      if (
+        !Array.isArray(item.attempt.reviewReasonCodes)
+        || item.attempt.reviewReasonCodes.length > 12
+        || item.attempt.reviewReasonCodes.some((code) => typeof code !== 'string' || code.length > 120)
+      ) throw new TypeError(`Gallery item ${item.id} has invalid review reason codes.`);
+    }
     if (!CAPTURE_PROVENANCE.has(item.capture?.provenance)) throw new TypeError(`Gallery item ${item.id} has invalid capture provenance.`);
   }
   const blobIds = new Set();

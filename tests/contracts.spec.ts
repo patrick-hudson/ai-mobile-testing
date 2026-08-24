@@ -1,5 +1,10 @@
-import { ENVIRONMENTS, projectMetadata } from '../audit/environments.js';
-import { resolveEnvironmentPath } from '../audit/environments.js';
+import {
+  APPROVED_CANDIDATE_ADDITION_PATHS,
+  ENVIRONMENTS,
+  LEGACY_ROUTE_REDIRECTS,
+  productionRouteDisposition,
+  projectMetadata,
+} from '../audit/environments.js';
 import {
   CANDIDATE_HTML_ROUTES,
   CANDIDATE_PATHS,
@@ -8,10 +13,80 @@ import {
   EXPECTED_HTML_ROUTE_COUNT,
   EXPECTED_PUBLISHED_DOCUMENT_COUNT,
 } from '../audit/routes.js';
-import { expect, staticEvidence, staticTest, structuredEvidence, structuredTest, test } from '../fixtures/test.js';
-import { inspectHtmlDestination, loggedGet } from './helpers.js';
+import {
+  expect,
+  interactionEvidence,
+  interactionTest,
+  staticEvidence,
+  staticTest,
+  structuredEvidence,
+  structuredTest,
+  test,
+} from '../fixtures/test.js';
+import {
+  extractSitemapLocations,
+  inspectHtmlDestination,
+  loggedGet,
+  mapWithConcurrency,
+  type HtmlDestinationEvidence,
+} from './helpers.js';
 
-staticTest('[ENV-001] configured origin serves a secure, meaningful HTML document', staticEvidence('Capture the secure homepage response, meaningful content, and final rendered state.'), async ({ page, audit }) => {
+const ROUTE_REQUEST_TIMEOUT_MS = 10_000;
+
+function normalizeRoutePath(pathname: string): string {
+  return pathname === '/' ? pathname : pathname.replace(/\/+$/, '');
+}
+
+async function safeInspectHtmlDestination(
+  request: Parameters<typeof inspectHtmlDestination>[0],
+  audit: Parameters<typeof inspectHtmlDestination>[1],
+  url: string,
+): Promise<HtmlDestinationEvidence> {
+  try {
+    return await inspectHtmlDestination(request, audit, url, { timeoutMs: ROUTE_REQUEST_TIMEOUT_MS });
+  } catch (error) {
+    return {
+      requestedUrl: url,
+      initialStatus: 0,
+      redirectLocation: null,
+      finalUrl: url,
+      finalStatus: null,
+      contentType: null,
+      valid: false,
+      issue: `Request did not complete within the route deadline: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+}
+
+async function discoverProductionSitemapPaths(
+  request: Parameters<typeof loggedGet>[0],
+  audit: Parameters<typeof loggedGet>[1],
+): Promise<string[]> {
+  const indexUrl = new URL('/sitemap-index.xml', ENVIRONMENTS.production.baseURL).href;
+  const index = await loggedGet(request, audit, indexUrl, { timeout: ROUTE_REQUEST_TIMEOUT_MS });
+  expect(index.status(), 'Production sitemap index must load').toBe(200);
+  const indexText = await index.text();
+  const indexLocations = extractSitemapLocations(indexText);
+  expect(indexLocations.length, 'Production sitemap index must enumerate at least one location').toBeGreaterThan(0);
+
+  const sitemapDocuments = /<sitemapindex[\s>]/i.test(indexText)
+    ? await mapWithConcurrency(indexLocations, 4, async (location) => {
+        const response = await loggedGet(request, audit, location, { timeout: ROUTE_REQUEST_TIMEOUT_MS });
+        expect(response.status(), `Production child sitemap ${location} must load`).toBe(200);
+        return response.text();
+      })
+    : [indexText];
+
+  const expectedOrigin = new URL(ENVIRONMENTS.production.baseURL).origin;
+  const discovered = sitemapDocuments
+    .flatMap(extractSitemapLocations)
+    .map((location) => new URL(location, expectedOrigin))
+    .filter((location) => location.origin === expectedOrigin)
+    .map((location) => normalizeRoutePath(location.pathname));
+  return [...new Set(discovered)].sort();
+}
+
+staticTest('[ENV-001] configured origin serves a secure, meaningful HTML document', staticEvidence('Capture the secure homepage response, meaningful content, and final rendered state.', 'all-projects'), async ({ page, audit }) => {
   const response = await audit.step('Open the configured origin', 'HTTPS returns a successful HTML homepage.', async () => {
     const navigation = await page.goto('/', { waitUntil: 'domcontentloaded' });
     return navigation;
@@ -28,7 +103,7 @@ staticTest('[ENV-001] configured origin serves a secure, meaningful HTML documen
   await audit.assertRuntimeHealthy();
 });
 
-staticTest('[ENV-002] static candidate route inventory is complete and internally consistent', staticEvidence('Capture the route inventory totals and the rendered sitemap that represents the published destinations.'), async ({ audit }, testInfo) => {
+staticTest('[ENV-002] static candidate route inventory is complete and internally consistent', staticEvidence('Capture the route inventory totals and the rendered sitemap that represents the published destinations.', 'full-sweep-projects'), async ({ audit }, testInfo) => {
   const metadata = projectMetadata(testInfo.project.metadata);
   test.skip(!metadata.fullSweep, 'Inventory validation belongs to full-sweep projects.');
 
@@ -51,64 +126,128 @@ staticTest('[ENV-002] static candidate route inventory is complete and internall
   await audit.checkpoint('candidate-route-inventory-sitemap');
 });
 
-structuredTest('[ENV-003] every candidate destination has an explicit production mapping or approved addition', structuredEvidence('Retain the paired production-to-candidate response and disposition ledger without unrelated media.'), async ({ request, audit }, testInfo) => {
+structuredTest('[ENV-003] every production sitemap route has a reviewed candidate disposition', structuredEvidence('Retain the production-first route inventory, bounded response probes, migration dispositions, and candidate-only reconciliation.', 'candidate-desktop-chromium'), async ({ request, audit }, testInfo) => {
   test.skip(testInfo.project.name !== 'candidate-desktop-chromium', 'One candidate project validates the paired migration ledger.');
-  const ledger = [];
-  for (const route of CANDIDATE_HTML_ROUTES) {
-    const productionPath = resolveEnvironmentPath('production', route.path);
-    const candidateResponse = await inspectHtmlDestination(request, audit, new URL(route.path, ENVIRONMENTS.candidate.baseURL).href);
-    const productionResponse = productionPath === null
-      ? null
-      : await inspectHtmlDestination(request, audit, new URL(productionPath, ENVIRONMENTS.production.baseURL).href);
-    ledger.push({
-      candidatePath: route.path,
+  test.setTimeout(150_000);
+  const productionPaths = await discoverProductionSitemapPaths(request, audit);
+  const candidatePaths = new Set(CANDIDATE_PATHS);
+  const ledger = await mapWithConcurrency(productionPaths, 8, async (productionPath) => {
+    const disposition = productionRouteDisposition(productionPath);
+    const production = await safeInspectHtmlDestination(
+      request,
+      audit,
+      new URL(productionPath, ENVIRONMENTS.production.baseURL).href,
+    );
+    if (disposition.disposition === 'approved-removal') {
+      return { productionPath, disposition, production, candidate: null, issue: production.valid ? null : production.issue };
+    }
+    if (disposition.disposition !== 'mapped' || !candidatePaths.has(disposition.candidatePath)) {
+      return {
+        productionPath,
+        disposition: { ...disposition, disposition: 'unreviewed' as const },
+        production,
+        candidate: null,
+        issue: `Production route ${productionPath} has no reviewed candidate destination or removal.`,
+      };
+    }
+    const candidate = await safeInspectHtmlDestination(
+      request,
+      audit,
+      new URL(disposition.candidatePath, ENVIRONMENTS.candidate.baseURL).href,
+    );
+    return {
       productionPath,
-      candidate: candidateResponse,
-      production: productionResponse,
-      disposition: productionPath === null ? 'approved-candidate-addition' : 'mapped',
-    });
-  }
-  const brokenCandidate = ledger.filter(({ candidate }) => !candidate.valid);
-  const brokenProductionMapping = ledger.filter(({ productionPath, production }) => productionPath !== null && !production?.valid);
-  audit.observe('Mapped production routes', ledger.filter(({ disposition }) => disposition === 'mapped').length);
-  audit.observe('Approved candidate additions', ledger.filter(({ disposition }) => disposition === 'approved-candidate-addition').length);
-  await audit.attachJson('network-production-candidate-mapping-ledger', { ledger, brokenCandidate, brokenProductionMapping });
-  expect(brokenCandidate, 'Every mapped candidate destination must exist').toEqual([]);
-  expect(brokenProductionMapping, 'Every declared production counterpart must still be inspectable').toEqual([]);
+      disposition,
+      production,
+      candidate,
+      issue: !production.valid ? production.issue : !candidate.valid ? candidate.issue : null,
+    };
+  });
+
+  const mappedCandidatePaths = new Set(ledger.flatMap(({ disposition }) =>
+    disposition.disposition === 'mapped' ? [disposition.candidatePath] : []));
+  const explicitlyReviewedLegacyDestinations = new Set<string>(LEGACY_ROUTE_REDIRECTS.map(({ candidatePath }) => candidatePath));
+  const approvedAdditions = new Set<string>(APPROVED_CANDIDATE_ADDITION_PATHS);
+  const unreconciledCandidate = CANDIDATE_PATHS.filter((path) =>
+    !mappedCandidatePaths.has(path)
+    && !explicitlyReviewedLegacyDestinations.has(path)
+    && !approvedAdditions.has(path));
+  const invalidApprovedAdditions = [...approvedAdditions].filter((path) => !candidatePaths.has(path));
+  const additionProbes = await mapWithConcurrency(APPROVED_CANDIDATE_ADDITION_PATHS, 4, async (candidatePath) => ({
+    candidatePath,
+    evidence: await safeInspectHtmlDestination(
+      request,
+      audit,
+      new URL(candidatePath, ENVIRONMENTS.candidate.baseURL).href,
+    ),
+  }));
+  const additionProblems = additionProbes.filter(({ evidence }) => !evidence.valid);
+  const problems = ledger.filter(({ issue }) => issue !== null);
+
+  audit.observe('Production sitemap routes', productionPaths.length);
+  audit.observe('Mapped production routes', ledger.filter(({ disposition }) => disposition.disposition === 'mapped').length);
+  audit.observe('Approved production removals', ledger.filter(({ disposition }) => disposition.disposition === 'approved-removal').length);
+  audit.observe('Approved candidate-only additions', APPROVED_CANDIDATE_ADDITION_PATHS.length);
+  await audit.attachJson('network-production-candidate-mapping-ledger', {
+    summary: {
+      productionRoutes: productionPaths.length,
+      mappedRoutes: ledger.filter(({ disposition }) => disposition.disposition === 'mapped').length,
+      approvedRemovals: ledger.filter(({ disposition }) => disposition.disposition === 'approved-removal').length,
+      problems: problems.length,
+    },
+    productionPaths,
+    explicitlyReviewedLegacyDestinations: [...explicitlyReviewedLegacyDestinations].sort(),
+    approvedCandidateAdditions: APPROVED_CANDIDATE_ADDITION_PATHS,
+    unreconciledCandidate,
+    invalidApprovedAdditions,
+    additionProbes,
+    diagnostics: [...problems, ...additionProblems],
+    dispositions: ledger.map(({ productionPath, disposition, production, candidate, issue }) => ({
+      productionPath,
+      disposition,
+      productionStatus: production.finalStatus ?? production.initialStatus,
+      candidateStatus: candidate?.finalStatus ?? candidate?.initialStatus ?? null,
+      issue,
+    })),
+  });
+  expect.soft(problems, 'Every production route must have a reachable reviewed candidate disposition').toEqual([]);
+  expect.soft(unreconciledCandidate, 'Every candidate route must map from production or be an explicit reviewed addition').toEqual([]);
+  expect.soft(invalidApprovedAdditions, 'Approved additions must remain in the reviewed candidate inventory').toEqual([]);
+  expect.soft(additionProblems, 'Every explicit candidate-only addition must be reachable').toEqual([]);
+  audit.coverEnvironments('candidate', 'production');
 });
 
-structuredTest('[ENV-004] legacy aliases redirect once to a successful canonical page', structuredEvidence('Retain every redirect status, Location header, and final destination response without unrelated media.'), async ({ request, audit }, testInfo) => {
+structuredTest('[ENV-004] legacy aliases redirect once to a successful canonical page', structuredEvidence('Retain every redirect status, Location header, and final destination response without unrelated media.', 'candidate-chromium-projects'), async ({ request, audit }, testInfo) => {
   const metadata = projectMetadata(testInfo.project.metadata);
   test.skip(metadata.environment !== 'candidate' || !metadata.fullSweep, 'Redirect migration contracts run once against the candidate.');
 
-  const redirects = [
-    ['/other-tools', '/medications-supplements/'],
-    ['/other-tools/helper-meds-info', '/medications-supplements/helper-meds/'],
-    ['/start-here/withdrawal-help', '/start-here/7-oh-withdrawal-help/'],
-    ['/post-acute/what-is-paws', '/post-acute/paws-post-acute-withdrawal/'],
-    ['/mat-suboxone/suboxone-cows', '/mat-suboxone/sows-cows-induction-guide/'],
-    ['/about/for-fly', '/about/acknowledgments/'],
-  ] as const;
-  const results: Array<{ source: string; status: number; location: string | null; destinationStatus: number }> = [];
+  const results: Array<{ source: string; status: number; location: string; resolvedLocation: string; destinationStatus: number }> = [];
 
-  for (const [source, destination] of redirects) {
-    const first = await loggedGet(request, audit, source, { maxRedirects: 0 });
+  for (const { sourcePath, expectedLocationPath } of LEGACY_ROUTE_REDIRECTS) {
+    const sourceUrl = new URL(sourcePath, ENVIRONMENTS.candidate.baseURL);
+    const first = await loggedGet(request, audit, sourceUrl.href, { maxRedirects: 0, timeout: ROUTE_REQUEST_TIMEOUT_MS });
     const location = first.headers().location ?? null;
-    expect([301, 308], `${source} should be permanent`).toContain(first.status());
-    expect(location, `${source} should include a Location header`).not.toBeNull();
-    expect(new URL(location ?? '/', ENVIRONMENTS.candidate.baseURL).pathname, `${source} should point directly to its approved destination`).toBe(destination);
+    expect([301, 308], `${sourcePath} should be permanent`).toContain(first.status());
+    expect(location, `${sourcePath} should include a Location header`).not.toBeNull();
+    const resolvedLocation = new URL(location ?? '/', sourceUrl);
+    const expectedLocation = new URL(expectedLocationPath, ENVIRONMENTS.candidate.baseURL);
+    expect(resolvedLocation.href, `${sourcePath} must redirect to the exact approved origin, path, query, and fragment`).toBe(expectedLocation.href);
 
-    const final = await loggedGet(request, audit, destination, { maxRedirects: 0 });
-    expect(final.status(), `${destination} should not add another redirect`).toBe(200);
+    const final = await loggedGet(request, audit, resolvedLocation.href, { maxRedirects: 0, timeout: ROUTE_REQUEST_TIMEOUT_MS });
+    expect(final.status(), `${resolvedLocation.href} should not add another redirect`).toBe(200);
     expect(final.headers()['content-type']).toContain('text/html');
-    results.push({ source, status: first.status(), location, destinationStatus: final.status() });
+    results.push({ source: sourceUrl.href, status: first.status(), location: location!, resolvedLocation: resolvedLocation.href, destinationStatus: final.status() });
   }
 
+  expect(LEGACY_ROUTE_REDIRECTS, 'The reviewed migration ledger must retain all seven legacy aliases').toHaveLength(7);
+  expect(results.map(({ source }) => source), 'Every declared legacy alias must produce one redirect result').toEqual(
+    LEGACY_ROUTE_REDIRECTS.map(({ sourcePath }) => new URL(sourcePath, ENVIRONMENTS.candidate.baseURL).href),
+  );
   audit.observe('Legacy redirects checked', results.length);
   await audit.attachJson('redirect-chain-evidence', results);
 });
 
-staticTest('[ENV-005] environment indexing policy and canonical intent are explicit', staticEvidence('Capture the rendered page together with its robots, canonical, and social URL metadata.'), async ({ page, audit }, testInfo) => {
+staticTest('[ENV-005] environment indexing policy and canonical intent are explicit', staticEvidence('Capture the rendered page together with its robots, canonical, and social URL metadata.', 'all-projects'), async ({ page, audit }, testInfo) => {
   const metadata = projectMetadata(testInfo.project.metadata);
   await audit.goto('/start-here/welcome');
   const inspection = await audit.inspectPage();
@@ -129,9 +268,10 @@ staticTest('[ENV-005] environment indexing policy and canonical intent are expli
     expect(robots).not.toContain('noindex');
   }
   await expect(page.locator('meta[property="og:url"]')).toHaveAttribute('content', inspection.canonical ?? '');
+  await audit.checkpoint('indexing-policy-page');
 });
 
-staticTest('[ENV-006] document security headers and hashed-asset caching are deployed', staticEvidence('Capture the rendered document alongside its security-header and immutable-asset response evidence.'), async ({ page, request, audit }) => {
+staticTest('[ENV-006] document security headers and hashed-asset caching are deployed', staticEvidence('Capture the rendered document alongside its security-header and immutable-asset response evidence.', 'all-projects'), async ({ page, request, audit }) => {
   const documentResponse = await page.goto('/', { waitUntil: 'domcontentloaded' });
   expect(documentResponse).not.toBeNull();
   const headers = documentResponse?.headers() ?? {};
@@ -162,24 +302,47 @@ staticTest('[ENV-006] document security headers and hashed-asset caching are dep
   audit.observe('Hashed asset inspected', hashedAsset);
   audit.observe('Hashed asset cache-control', cacheControl);
   await audit.attachJson('header-evidence', { document: headerEvidence, hashedAsset, cacheControl });
+  await audit.checkpoint('secure-cached-document');
 });
 
-staticTest('[ENV-007] unknown routes return a useful not-found document', staticEvidence('Capture the complete not-found state, recovery search, and usable destination links.'), async ({ page, audit }) => {
-  const missingPath = `/__audit_missing_${Date.now()}__`;
-  const response = await page.goto(missingPath, { waitUntil: 'domcontentloaded' });
+interactionTest('[ENV-007] unknown routes provide working search and recovery navigation', interactionEvidence('Open a deterministic missing URL, enter a useful query in the named combobox, and activate the complete site-map recovery link.', 'all-projects'), async ({ page, audit }) => {
+  const missingPath = '/__visual-audit-not-found__';
+  audit.expectResponseStatus(missingPath, 404);
+  const response = await audit.step('Open an unknown URL', 'The server returns HTTP 404 with the custom recovery document.', async () =>
+    page.goto(missingPath, { waitUntil: 'domcontentloaded' }));
 
   expect(response?.status(), 'A missing URL must not masquerade as a successful page').toBe(404);
-  await expect(page.locator('h1')).toContainText(/not|isn.t here/i);
-  await expect(page.locator('main')).toContainText(/search/i);
-  expect(await page.locator('main a[href]').count(), 'The error page should provide recovery destinations').toBeGreaterThanOrEqual(2);
-  const searchInputs = await page.locator('main input[type="search"], main [role="searchbox"]').count();
-  expect(searchInputs, 'The error page should offer site search').toBeGreaterThanOrEqual(1);
+  await expect(page.getByRole('heading', { level: 1 })).toHaveText('That page isn’t here.');
+  const recovery = page.getByRole('navigation', { name: 'Common destinations' });
+  const recoveryDestinations = await recovery.locator('a[href]').evaluateAll((anchors) =>
+    anchors.map((anchor) => (anchor as HTMLAnchorElement).getAttribute('href')));
+  expect(recoveryDestinations.sort()).toEqual([
+    '/',
+    '/resources/meeting-schedules',
+    '/sitemap',
+    '/start-here/7-oh-withdrawal-help',
+  ].sort());
 
+  const search = page.getByRole('combobox', { name: 'Search all pages' });
+  await audit.step('Search from the not-found page', 'A known medical query returns a labeled, usable destination.', async () => {
+    await search.fill('clonidine');
+    const result = page.getByRole('option').filter({ hasText: /Helper Medications/i }).first();
+    await expect(result).toBeVisible();
+    const expectedHelperPath = audit.environmentPath('/medications-supplements/helper-meds');
+    expect(expectedHelperPath, 'Every audited environment must map the helper-medications recovery route').not.toBeNull();
+    expect(await result.getAttribute('href'), 'The result must target the exact environment-specific clonidine section').toBe(`${expectedHelperPath}#clonidine`);
+  });
+
+  await audit.step('Use a recovery destination', 'Complete site map opens as a successful document.', async () => {
+    await recovery.getByRole('link', { name: 'Complete site map' }).click();
+    await expect(page).toHaveURL(/\/sitemap\/?$/);
+    await expect(page.getByRole('heading', { level: 1 })).toContainText(/Site map/i);
+  });
   audit.observe('Not-found status', response?.status() ?? null, '404');
-  await audit.checkpoint('useful-not-found-page');
+  await audit.assertRuntimeHealthy();
 });
 
-structuredTest('[ENV-008] static data endpoints expose usable, versioned contracts', structuredEvidence('Retain endpoint status, content type, schema, record totals, and asset response evidence without unrelated media.'), async ({ request, audit }) => {
+structuredTest('[ENV-008] static data endpoints expose usable, versioned contracts', structuredEvidence('Retain endpoint status, content type, schema, record totals, and asset response evidence without unrelated media.', 'all-projects'), async ({ request, audit }) => {
   const endpointEvidence: Record<string, unknown> = {};
 
   for (const endpoint of DATA_ENDPOINTS) {
@@ -215,10 +378,22 @@ structuredTest('[ENV-008] static data endpoints expose usable, versioned contrac
   await audit.attachJson('endpoint-contract-evidence', endpointEvidence);
 });
 
-staticTest('[SEO-001] representative metadata is complete, consistent, and shareable', staticEvidence('Capture representative rendered pages and their title, canonical, Open Graph, and Twitter metadata.'), async ({ page, audit }, testInfo) => {
+staticTest('[SEO-001] representative metadata is complete, consistent, and shareable', staticEvidence('Capture representative rendered pages and their title, canonical, Open Graph, and Twitter metadata.', 'all-projects'), async ({ page, audit }, testInfo) => {
   const metadata = projectMetadata(testInfo.project.metadata);
-  const routes = ['/', '/start-here/welcome', '/resources/7-oh-taper-calculator', '/virtual-na-meetings-now'];
-  const evidence: unknown[] = [];
+  const routes = ['/', '/start-here/welcome', '/resources/7-oh-taper-calculator', '/virtual-na-meetings-now'] as const;
+  const evidence: Array<{
+    candidatePath: string;
+    mappedPath: string;
+    environment: string;
+    title: string;
+    description: string;
+    canonical: string;
+    ogTitle: string;
+    ogDescription: string;
+    ogUrl: string;
+    ogImage: string;
+    twitterCard: string;
+  }> = [];
 
   for (const candidatePath of routes) {
     const mappedPath = audit.environmentPath(candidatePath);
@@ -248,11 +423,16 @@ staticTest('[SEO-001] representative metadata is complete, consistent, and share
     evidence.push({ candidatePath, mappedPath, environment: metadata.environment, ...values });
   }
 
+  expect(routes, 'The metadata contract must retain all four representative routes').toHaveLength(4);
+  const expectedRoutes = routes.filter((candidatePath) => audit.environmentPath(candidatePath) !== null);
+  expect(expectedRoutes, 'Every representative metadata route must remain applicable in both audited environments').toHaveLength(4);
+  expect(evidence.map(({ candidatePath }) => candidatePath), 'Every environment-applicable metadata route must produce one inspected record').toEqual(expectedRoutes);
   audit.observe('Metadata routes inspected', evidence.length, String(routes.length));
   await audit.attachJson('metadata-evidence', evidence);
+  await audit.checkpoint('representative-metadata-page');
 });
 
-structuredTest('[SEO-002] XML sitemap contains every canonical candidate HTML route', structuredEvidence('Retain parsed sitemap locations, missing entries, duplicates, and response evidence without unrelated media.'), async ({ request, audit }, testInfo) => {
+structuredTest('[SEO-002] XML sitemap contains every canonical candidate HTML route', structuredEvidence('Retain parsed sitemap locations, missing entries, duplicates, and response evidence without unrelated media.', 'candidate-chromium-projects'), async ({ request, audit }, testInfo) => {
   const metadata = projectMetadata(testInfo.project.metadata);
   test.skip(metadata.environment !== 'candidate' || !metadata.fullSweep, 'The canonical sitemap contract runs once against the candidate.');
 

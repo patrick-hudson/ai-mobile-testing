@@ -33,6 +33,12 @@ npm run portal:e2e
 
 Every run exposes a Visual Gallery as soon as finalized evidence exists. The workbench keeps the selected test dominant, groups and sorts by feature or technical suite, preserves a frozen review order until the reviewer accepts an update, and provides keyboard navigation, a virtualized overview, test context, reviewer flags, and bounded activity/execution/raw drawers. The generated Long Build Checklist contains the same shared gallery as an immutable read-only snapshot. It works over HTTP or by opening `checklist/gallery.html` directly; it never needs the full manifest or eager item/media downloads.
 
+## Browser and device targets
+
+Normal and sharded releases retain the same seven-project Chromium, Firefox, WebKit, mobile, tablet, desktop, production, and candidate matrix. Extra profiles are opt-in with `AUDIT_TARGET_IDS`; the registry includes recent/current iPhone WebKit emulations, Pixel and Galaxy Android Chromium emulations, Edge-compatible Chromium, and capability-gated branded Microsoft Edge. Invalid, duplicate, provider-only, or unavailable targets stop before launch.
+
+Device emulation is labeled honestly: it covers viewport, input, scale, user-agent, and engine behavior inside the Linux container, not real iOS, Mobile Safari, Android Chrome, or physical hardware. The registry includes provider-ready metadata for real current/previous iOS and Android devices, but does not expose those rows as runnable until a real-device adapter and evidence pipeline exist. See [`docs/DOCKER.md`](docs/DOCKER.md#browser-and-device-target-matrix) for IDs, commands, Edge installation, and fidelity limits.
+
 The canonical gallery scale gate is Docker-only:
 
 ```sh
@@ -52,13 +58,7 @@ The smoke profile checks the environment and critical recovery paths. The releas
 
 ## AI evidence review
 
-AI review is optional and advisory. The portal can save, replace, or delete a key from its Claude settings. The saved value is AES-256-GCM encrypted in a dedicated persistent Docker volume; only its status and short SHA-256 fingerprint are returned to the browser. It is never stored in browser storage, source, run manifests, logs, reports, artifacts, or image layers.
-
-An environment-only credential remains supported for automated deployments:
-
-```sh
-ANTHROPIC_API_KEY='replace-at-runtime' docker compose up --build portal
-```
+AI review is optional and advisory. The portal can save, replace, or delete a key from its Claude settings. The saved value is AES-256-GCM encrypted in a dedicated project-scoped Docker volume outside the repository and browser-discovery tree; only its status and short SHA-256 fingerprint are returned to the browser. The root supervisor can use credentials only when it has three separate non-root workers: Playwright and video processing run as `pwuser`, AI review runs as `aiworker`, and checklist generation runs as `reportworker` in private staging after the run tree is frozen. None can read the vault. The saved key reaches `aiworker` once through an anonymous stdin pipe, never through the worker environment. AI and report inputs use contained, no-symlink/no-follow regular-file reads; the supervisor atomically publishes the completed staged checklist. The key is never stored in browser storage, source, run manifests, logs, reports, artifacts, image layers, or Compose configuration.
 
 The default model is `claude-sonnet-5`; set `ANTHROPIC_MODEL` to an explicit supported model ID when needed. The pipeline logs the model, selected evidence names and sizes, HTTP status, latency, and token usage, but never authorization headers, request image data, or the API key. AI output cannot convert a failed deterministic check into a pass and is labeled for human verification.
 
@@ -84,7 +84,7 @@ The shipped suite covers the complete candidate route inventory and these featur
 - page structure, internal/external links, imagery, long and wide content, accessibility, performance, layout stability, and runtime failures;
 - Chromium, WebKit, and Firefox emulations plus explicit physical-device and screen-reader acceptance rows.
 
-The canonical inventory is in [`audit/catalog.ts`](audit/catalog.ts). Generated checklist rows link to their available video, poster, screenshot, trace, network/JSON, Lighthouse, and AI evidence. Test declarations must use `interactionTest(..., interactionEvidence("action → response"), ...)`, `staticTest(..., staticEvidence("relevant rendered state"), ...)`, or `structuredTest(..., structuredEvidence("machine-readable proof"), ...)`; validation rejects undecided tests and plugins. Interaction actions live inside named `audit.step` checkpoints, and the fixture adds interaction-only pacing plus on-video test, step, pointer, and action labels so clips remain understandable during human review.
+The authoritative inventory contains 81 feature and cross-cutting contracts plus 102 generated route contracts. It is defined by [`audit/catalog.ts`](audit/catalog.ts) and the reviewed route inventory, then rendered as the reviewer-facing [`docs/ASSERTION_LEDGER.md`](docs/ASSERTION_LEDGER.md). Generated checklist rows link to their available video, poster, screenshot, trace, network/JSON, Lighthouse, and AI evidence. Test declarations must use `interactionTest(..., interactionEvidence("action → response"), ...)`, `staticTest(..., staticEvidence("relevant rendered state"), ...)`, or `structuredTest(..., structuredEvidence("machine-readable proof"), ...)`; validation rejects undecided tests and plugins. The assertion-quality gate also rejects tautologies, swallowed failures, conditional-only checks, observation-only cases, missing executable cases, and non-blocking P0/P1 definitions. Interaction actions live inside named `audit.step` checkpoints, and the fixture adds interaction-only pacing plus on-video test, step, pointer, and action labels so clips remain understandable during human review.
 
 ## Extend the suite
 
@@ -101,6 +101,7 @@ docker compose run --rm audit-smoke
 ## Documentation
 
 - [`docs/TEST_PLAN.md`](docs/TEST_PLAN.md) — strategy, layers, evidence, and pass/fail rules
+- [`docs/ASSERTION_LEDGER.md`](docs/ASSERTION_LEDGER.md) — generated promise-to-oracle, source, evidence, and target map for every audit
 - [`docs/RELEASE_PROCESS.md`](docs/RELEASE_PROCESS.md) — launch sequence and human sign-off
 - [`docs/REQUIREMENTS_TRACEABILITY.md`](docs/REQUIREMENTS_TRACEABILITY.md) — requirement-to-implementation ledger
 - [`docs/DOCKER.md`](docs/DOCKER.md) — container operations and troubleshooting

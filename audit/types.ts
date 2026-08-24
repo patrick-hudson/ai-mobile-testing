@@ -4,9 +4,43 @@ export type AuditSeverity = 'P0' | 'P1' | 'P2' | 'P3';
 
 export type AuditEvidenceMode = 'interaction-video' | 'static-screenshot' | 'structured-data';
 
+export type AuditApplicability =
+  | 'all-projects'
+  | 'full-sweep-projects'
+  | 'candidate-projects'
+  | 'production-projects'
+  | 'candidate-non-tablet-projects'
+  | 'candidate-chromium-projects'
+  | 'production-chromium-projects'
+  | 'candidate-desktop-projects'
+  | 'candidate-desktop-chromium'
+  | 'candidate-mobile-projects'
+  | 'candidate-mobile-chromium'
+  | 'production-mobile-chromium'
+  | 'production-desktop-chromium'
+  | 'candidate-mobile-webkit'
+  | 'candidate-tablet-webkit'
+  | 'candidate-desktop-firefox';
+
 export interface AuditEvidencePolicy {
   mode: AuditEvidenceMode;
   rationale: string;
+}
+
+export type AuditStatusOverride = 'REVIEW' | 'INTENDED_CHANGE' | 'BLOCKED';
+
+export interface AuditStatusWaiver {
+  status: 'INTENDED_CHANGE';
+  auditId: string;
+  reason: string;
+  approvedBy: string;
+}
+
+export interface AuditRuntimeExpectation {
+  kind: 'response-status' | 'request-failure' | 'page-error' | 'console-error';
+  target: string;
+  expected: string | number;
+  matched: boolean;
 }
 
 export type AuditArea =
@@ -58,6 +92,7 @@ export interface AuditFinding {
 export interface AuditStepRecord {
   name: string;
   expected: string;
+  kind?: 'interaction' | 'runtime-health';
   startedAt: string;
   finishedAt: string;
   status: 'passed' | 'failed';
@@ -85,6 +120,7 @@ export interface AuditEvidenceRecord {
   definition: AuditDefinition | null;
   evidencePolicy: AuditEvidencePolicy;
   environment: AuditEnvironment;
+  coveredEnvironments?: AuditEnvironment[];
   baseURL: string;
   project: string;
   browser: string;
@@ -110,6 +146,7 @@ export interface AuditEvidenceRecord {
   }>;
   failedRequests: Array<{ url: string; reason: string }>;
   badResponses: Array<{ url: string; status: number }>;
+  runtimeExpectations?: AuditRuntimeExpectation[];
 }
 
 export interface AuditProjectMetadata {

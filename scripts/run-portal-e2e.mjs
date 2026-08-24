@@ -1,7 +1,7 @@
 import { createServer } from 'node:net';
 import { once } from 'node:events';
 import { createWriteStream } from 'node:fs';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -12,6 +12,7 @@ import { resetPortalE2EOutput } from './lib/portal-e2e-output.mjs';
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const outputRoot = resolve(process.env.PORTAL_E2E_OUTPUT_DIR ?? join(repositoryRoot, 'artifacts', 'portal-e2e'));
 const temporaryRoot = await mkdtemp(join(tmpdir(), 'ai-mobile-testing-portal-e2e-'));
+await chmod(temporaryRoot, 0o711);
 const port = await availablePort();
 const baseURL = `http://127.0.0.1:${port}`;
 await resetPortalE2EOutput({ repositoryRoot, outputRoot });
@@ -57,6 +58,8 @@ try {
       PORTAL_SHARDED_ARTIFACT_ROOT: join(temporaryRoot, 'sharded'),
       PORTAL_SECRET_ROOT: join(temporaryRoot, 'secrets'),
       PORTAL_MAX_CONCURRENT_RUNS: '1',
+      PORTAL_EXTERNAL_TERMINAL_REFRESH_MS: '1000',
+      AI_REVIEW_DRY_RUN: '1',
       PORTAL_ALLOWED_HOSTS: 'shared-review.example.test',
       PORTAL_E2E_FAILURE_INJECTION: '1',
       AI_REVIEW_DRY_RUN: '1',

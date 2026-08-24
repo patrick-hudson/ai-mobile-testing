@@ -1,7 +1,9 @@
 import { promises as fs } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import {
   GALLERY_DESCRIPTOR_MAX_BYTES,
+  GALLERY_FLAG_HISTORY_MAX_BYTES,
   GALLERY_ITEM_DETAIL_MAX_BYTES,
   GALLERY_QUERY_CHUNK_MAX_BYTES,
   GALLERY_QUERY_CHUNK_MAX_ROWS,
@@ -29,6 +31,8 @@ const MAX_LIVE_AGGREGATE_BYTES = 64 * 1024 * 1024;
 const MAX_LIVE_SOURCES = 64;
 const MAX_SEALED_QUERY_BYTES = 64 * 1024 * 1024;
 const MAX_SEALED_QUERY_CHUNKS = 1_024;
+const MAX_SEALED_INTEGRITY_BYTES = 16 * 1024 * 1024;
+const MAX_SEALED_INTEGRITY_RECORDS = 100_000;
 const EMPTY_FLAG_REVISION = galleryFlagRevision(emptyGalleryFlagHistory());
 
 export class GalleryHttpError extends Error {
@@ -159,6 +163,7 @@ export async function probeGalleryPublication(run, signal) {
       GALLERY_DESCRIPTOR_MAX_BYTES,
       signal,
     ));
+    await loadSealedIntegrity(join(run.directory, 'checklist'), descriptor, signal);
     return {
       phase: 'sealed',
       contentRevision: descriptor.contentRevision,
@@ -297,7 +302,9 @@ export async function readGalleryItem(snapshot, runId, itemId, signal) {
     const href = galleryItemHref(snapshot.descriptor, itemId);
     const file = contained(snapshot.outputRoot, href);
     if (!file) throw new GalleryHttpError(404, 'Gallery item not found.');
-    detail = await readArchiveWrapper(file, GALLERY_ITEM_DETAIL_MAX_BYTES, signal);
+    const record = integrityRecordFor(snapshot.integrity, file);
+    const source = await readIntegrityCheckedFile(file, record, GALLERY_ITEM_DETAIL_MAX_BYTES, signal);
+    detail = decodeArchiveWrapper(source.toString('utf8'));
     detail = withResolvedMedia(detail, runId, snapshot.outputRoot, snapshot.runDirectory);
   } else {
     const item = snapshot.catalog.items.find(({ id }) => id === itemId);
@@ -358,26 +365,55 @@ async function loadSealedSnapshot(run, headFile, signal, includeRows) {
     GALLERY_DESCRIPTOR_MAX_BYTES,
     signal,
   ));
+  const integrity = await loadSealedIntegrity(outputRoot, descriptor, signal);
   const rows = [];
   const queryBytes = descriptor.query.chunks.reduce((total, chunk) => total + chunk.bytes, 0);
   if (descriptor.query.chunks.length > MAX_SEALED_QUERY_CHUNKS || queryBytes > MAX_SEALED_QUERY_BYTES) {
     throw new GalleryHttpError(413, 'The sealed gallery query index exceeds the bounded aggregate read limit.');
   }
-  for (const chunk of includeRows ? descriptor.query.chunks : []) {
+  let actualQueryBytes = 0;
+  for (const [index, chunk] of (includeRows ? descriptor.query.chunks : []).entries()) {
     assertActive(signal);
     const file = contained(outputRoot, chunk.href);
     if (!file) throw new GalleryHttpError(500, 'The sealed gallery query index escapes its run directory.');
-    const payload = await readArchiveWrapper(file, GALLERY_QUERY_CHUNK_MAX_BYTES, signal);
-    if (payload.contentRevision !== descriptor.contentRevision || !Array.isArray(payload.rows)) {
+    const record = integrityRecordFor(integrity, file);
+    const source = await readIntegrityCheckedFile(
+      file,
+      record,
+      Math.min(GALLERY_QUERY_CHUNK_MAX_BYTES, descriptor.query.maxBytesPerChunk),
+      signal,
+    );
+    actualQueryBytes += source.length;
+    if (actualQueryBytes > MAX_SEALED_QUERY_BYTES || source.length !== chunk.bytes) {
+      throw new GalleryHttpError(500, 'The sealed gallery query index has invalid actual byte totals.');
+    }
+    const payload = decodeArchiveWrapper(source.toString('utf8'));
+    if (payload.contentRevision !== descriptor.contentRevision || !Array.isArray(payload.rows)
+      || payload.rows.length !== chunk.rows || payload.rows.length > descriptor.query.maxRowsPerChunk
+      || payload.ordinal !== index + 1
+      || payload.archiveDocument?.kind !== 'query'
+      || payload.archiveDocument?.contentRevision !== descriptor.contentRevision
+      || payload.archiveDocument?.exportRevision !== descriptor.exportRevision) {
       throw new GalleryHttpError(500, 'The sealed gallery query index does not match its publication head.');
     }
     rows.push(...payload.rows.map(assertGalleryQueryRow));
+  }
+  if (includeRows && rows.length !== descriptor.query.rows) {
+    throw new GalleryHttpError(500, 'The sealed gallery query index actual row total does not match its publication head.');
+  }
+  if (new Set(rows.map(({ id }) => id)).size !== rows.length) {
+    throw new GalleryHttpError(500, 'The sealed gallery query index contains duplicate item identities.');
+  }
+  if (includeRows) {
+    await verifySealedRawChunks(outputRoot, descriptor, integrity, signal);
+    await verifySealedFlagDocument(outputRoot, descriptor, integrity, signal);
   }
   return {
     kind: 'sealed',
     runDirectory: run.directory,
     outputRoot,
     descriptor,
+    integrity,
     rows,
     head: {
       schemaVersion: GALLERY_SCHEMA_VERSION,
@@ -791,8 +827,7 @@ function decodeCursor(value) {
   }
 }
 
-async function readArchiveWrapper(file, maximumBytes, signal) {
-  const source = await readTextBounded(file, maximumBytes, signal);
+function decodeArchiveWrapper(source) {
   const encoded = source.match(/data-gallery-payload="([A-Za-z0-9+/=]+)"/)?.[1];
   if (!encoded) throw new GalleryHttpError(500, 'Gallery archive document is malformed.');
   try {
@@ -800,6 +835,175 @@ async function readArchiveWrapper(file, maximumBytes, signal) {
   } catch {
     throw new GalleryHttpError(500, 'Gallery archive payload is malformed.');
   }
+}
+
+async function readArchiveWrapper(file, maximumBytes, signal) {
+  return decodeArchiveWrapper(await readTextBounded(file, maximumBytes, signal));
+}
+
+async function loadSealedIntegrity(outputRoot, descriptor, signal) {
+  const integrityFile = contained(outputRoot, descriptor.integrity.href);
+  if (!integrityFile) throw new GalleryHttpError(500, 'The sealed gallery integrity document escapes its run directory.');
+  const document = await readJsonBounded(integrityFile, MAX_SEALED_INTEGRITY_BYTES, signal);
+  if (document?.schemaVersion !== GALLERY_SCHEMA_VERSION
+    || document.exportRevision !== descriptor.exportRevision
+    || !Array.isArray(document.files)
+    || document.files.length !== descriptor.integrity.documentCount
+    || document.files.length > MAX_SEALED_INTEGRITY_RECORDS) {
+    throw new GalleryHttpError(500, 'The sealed gallery integrity document does not match its publication head.');
+  }
+  const root = resolve(integrityFile, '..');
+  const records = new Map();
+  for (const record of document.files) {
+    if (!record || typeof record !== 'object' || !safeRelative(record.path)
+      || !Number.isSafeInteger(record.sizeBytes) || record.sizeBytes < 1
+      || record.sizeBytes > MAX_SEALED_INTEGRITY_BYTES
+      || typeof record.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(record.sha256)
+      || records.has(record.path)) {
+      throw new GalleryHttpError(500, 'The sealed gallery integrity document contains an invalid file record.');
+    }
+    records.set(record.path, record);
+  }
+  const expectedDocumentCount = 2
+    + descriptor.query.chunks.length
+    + descriptor.raw.chunks.length
+    + descriptor.itemDetails.count;
+  if (records.size !== expectedDocumentCount) {
+    throw new GalleryHttpError(500, 'The sealed gallery integrity index has an impossible document count.');
+  }
+  const referencedPaths = new Set(['descriptor.json']);
+  for (const href of [
+    ...descriptor.query.chunks.map(({ href }) => href),
+    ...descriptor.raw.chunks.map(({ href }) => href),
+    descriptor.flags.href,
+  ]) {
+    const file = contained(outputRoot, href);
+    if (!file) throw new GalleryHttpError(500, 'A sealed gallery descriptor reference escapes its run directory.');
+    referencedPaths.add(integrityRelativePath(root, file));
+  }
+  const itemDirectory = contained(outputRoot, descriptor.itemDetails.hrefPrefix);
+  if (!itemDirectory) throw new GalleryHttpError(500, 'The sealed gallery item index escapes its run directory.');
+  const itemPrefix = `${integrityRelativePath(root, itemDirectory).replace(/\/+$/, '')}/`;
+  const itemRecords = [...records.keys()].filter((path) => (
+    path.startsWith(itemPrefix)
+    && path.endsWith(descriptor.itemDetails.hrefSuffix)
+    && path.length > itemPrefix.length + descriptor.itemDetails.hrefSuffix.length
+  ));
+  const itemRecordPaths = new Set(itemRecords);
+  if (itemRecords.length !== descriptor.itemDetails.count
+    || [...records.keys()].some((path) => !referencedPaths.has(path) && !itemRecordPaths.has(path))) {
+    throw new GalleryHttpError(500, 'The sealed gallery integrity index does not match the descriptor document set.');
+  }
+  for (const path of itemRecords) {
+    if (records.get(path).sizeBytes > descriptor.itemDetails.maxBytes) {
+      throw new GalleryHttpError(500, 'A sealed gallery item detail exceeds its indexed byte limit.');
+    }
+  }
+  const descriptorFile = resolve(root, 'descriptor.json');
+  const descriptorRecord = integrityRecordFor({ root, records }, descriptorFile);
+  const descriptorSource = await readIntegrityCheckedFile(descriptorFile, descriptorRecord, GALLERY_DESCRIPTOR_MAX_BYTES, signal);
+  let installedDescriptor;
+  try {
+    installedDescriptor = JSON.parse(descriptorSource.toString('utf8'));
+  } catch {
+    throw new GalleryHttpError(500, 'The sealed gallery immutable descriptor is malformed.');
+  }
+  if (JSON.stringify(installedDescriptor) !== JSON.stringify(descriptor)) {
+    throw new GalleryHttpError(500, 'The sealed gallery head does not match its integrity-checked immutable descriptor.');
+  }
+  return { root, records };
+}
+
+async function verifySealedRawChunks(outputRoot, descriptor, integrity, signal) {
+  if (descriptor.raw.chunks.length > MAX_SEALED_QUERY_CHUNKS) {
+    throw new GalleryHttpError(413, 'The sealed gallery raw index exceeds the bounded chunk limit.');
+  }
+  let actualBytes = 0;
+  let actualRows = 0;
+  for (const [index, chunk] of descriptor.raw.chunks.entries()) {
+    assertActive(signal);
+    const file = contained(outputRoot, chunk.href);
+    if (!file) throw new GalleryHttpError(500, 'The sealed gallery raw index escapes its run directory.');
+    const source = await readIntegrityCheckedFile(
+      file,
+      integrityRecordFor(integrity, file),
+      Math.min(GALLERY_QUERY_CHUNK_MAX_BYTES, descriptor.raw.maxBytesPerChunk),
+      signal,
+    );
+    actualBytes += source.length;
+    if (actualBytes > MAX_SEALED_QUERY_BYTES || source.length !== chunk.bytes) {
+      throw new GalleryHttpError(500, 'The sealed gallery raw index has invalid actual byte totals.');
+    }
+    const payload = decodeArchiveWrapper(source.toString('utf8'));
+    if (!Array.isArray(payload.rows) || payload.rows.length !== chunk.rows
+      || payload.rows.length > descriptor.raw.maxRowsPerChunk
+      || payload.ordinal !== index + 1
+      || payload.advancedRawOnly !== true
+      || payload.contentRevision !== descriptor.contentRevision
+      || payload.archiveDocument?.kind !== 'raw'
+      || payload.archiveDocument?.contentRevision !== descriptor.contentRevision
+      || payload.archiveDocument?.exportRevision !== descriptor.exportRevision) {
+      throw new GalleryHttpError(500, 'The sealed gallery raw index does not match its publication head.');
+    }
+    actualRows += payload.rows.length;
+  }
+  if (actualRows !== descriptor.raw.rows) {
+    throw new GalleryHttpError(500, 'The sealed gallery raw index actual row total does not match its publication head.');
+  }
+}
+
+async function verifySealedFlagDocument(outputRoot, descriptor, integrity, signal) {
+  const file = contained(outputRoot, descriptor.flags.href);
+  if (!file) throw new GalleryHttpError(500, 'The sealed gallery flag document escapes its run directory.');
+  const source = await readIntegrityCheckedFile(
+    file,
+    integrityRecordFor(integrity, file),
+    GALLERY_FLAG_HISTORY_MAX_BYTES,
+    signal,
+  );
+  const payload = decodeArchiveWrapper(source.toString('utf8'));
+  if (payload.throughEvent !== descriptor.flags.throughEvent
+    || payload.flagRevision !== descriptor.flagRevision
+    || payload.archiveDocument?.kind !== 'flags'
+    || payload.archiveDocument?.contentRevision !== descriptor.contentRevision
+    || payload.archiveDocument?.exportRevision !== descriptor.exportRevision
+    || payload.archiveDocument?.flagRevision !== descriptor.flagRevision) {
+    throw new GalleryHttpError(500, 'The sealed gallery flag document does not match its publication head.');
+  }
+}
+
+function integrityRelativePath(root, file) {
+  const relativePath = relative(root, file).split(sep).join('/');
+  if (!safeRelative(relativePath)) throw new GalleryHttpError(500, 'A sealed gallery document escapes its immutable revision.');
+  return relativePath;
+}
+
+function integrityRecordFor(integrity, file) {
+  const relativePath = integrityRelativePath(integrity.root, file);
+  const record = integrity.records.get(relativePath);
+  if (!record) throw new GalleryHttpError(500, 'A sealed gallery document is missing from its integrity index.');
+  return record;
+}
+
+async function readIntegrityCheckedFile(file, record, maximumBytes, signal) {
+  assertActive(signal);
+  let stat;
+  try {
+    stat = await fs.stat(file);
+  } catch (error) {
+    if (error?.code === 'ENOENT') throw new GalleryHttpError(500, 'An integrity-indexed gallery document is missing.');
+    throw error;
+  }
+  if (!stat.isFile() || stat.size !== record.sizeBytes || stat.size > maximumBytes) {
+    throw new GalleryHttpError(500, 'A sealed gallery document violates its actual byte or integrity limits.');
+  }
+  const buffer = await fs.readFile(file, { signal });
+  assertActive(signal);
+  const sha256 = createHash('sha256').update(buffer).digest('hex');
+  if (buffer.length !== record.sizeBytes || sha256 !== record.sha256) {
+    throw new GalleryHttpError(500, 'A sealed gallery document failed content hash verification.');
+  }
+  return buffer;
 }
 
 async function readJsonBounded(file, maximumBytes, signal) {

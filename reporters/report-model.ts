@@ -3,7 +3,11 @@ import { copyFile, mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ALL_AUDIT_CATALOG } from '../audit/definitions.js';
-import { evidenceKindsForPolicy, parseEvidencePolicyAnnotation } from '../audit/evidence-policy.js';
+import {
+  evidenceKindsForPolicy,
+  parseAuditStatusAnnotation,
+  parseEvidencePolicyAnnotation,
+} from '../audit/evidence-policy.js';
 import type {
   AuditDefinition,
   AuditEnvironment,
@@ -102,16 +106,29 @@ export interface ReportArtifact {
 
 export interface ReportExecution {
   id: string;
+  sourceTestId: string;
   auditId: string;
   title: string;
   titlePath: string[];
   location: { file: string; line: number | null; column: number | null };
   project: string;
   environment: AuditEnvironment | 'unknown';
+  coveredEnvironments: AuditEnvironment[];
   browser: string;
   deviceClass: AuditProjectMetadata['deviceClass'] | 'unknown';
   tlsPolicy: AuditProjectMetadata['tlsPolicy'] | 'unknown';
   status: ChecklistStatus;
+  evidenceAuthority: 'authoritative' | 'withheld';
+  reasonCodes: Array<
+    | 'FLAKY_RETRY'
+    | 'TLS_BYPASS'
+    | 'MISSING_REQUIRED_EVIDENCE'
+    | 'MISSING_EVIDENCE_POLICY'
+    | 'EVIDENCE_POLICY_MISMATCH'
+    | 'MISSING_ACTION_STEP'
+    | 'FORBIDDEN_PRIMARY_MEDIA'
+    | 'INVALID_STATUS_ANNOTATION'
+  >;
   rawStatus: string;
   expectedStatus: string | null;
   retry: number;
@@ -136,6 +153,8 @@ export interface ReportExecution {
     artifacts: ReportArtifact[];
   }>;
   artifacts: ReportArtifact[];
+  primaryArtifacts: ReportArtifact[];
+  diagnosticArtifacts: ReportArtifact[];
   annotations: Array<{ type: string; description?: string }>;
 }
 
@@ -163,6 +182,10 @@ export interface AuditChecklistItem {
     candidate: number;
     unknown: number;
     projects: string[];
+    selectedProjects: string[];
+    selected: { production: number; candidate: number; unknown: number; total: number };
+    applicable: { production: number; candidate: number; unknown: number; total: number };
+    skipped: { production: number; candidate: number; unknown: number; total: number };
   };
   evidenceCounts: Record<ReportArtifact['kind'], number>;
   findings: AuditFinding[];
@@ -272,6 +295,85 @@ const STATUS_ORDER: ChecklistStatus[] = [
   'PASS',
 ];
 
+type ReviewedGalleryAttempt = GalleryCatalog['items'][number]['attempt'] & {
+  rawStatus: string;
+  statusSource: 'reviewed-manifest' | 'release-integrity';
+  reviewReasonCodes: string[];
+};
+
+function executionReviewedStatus(execution: ReportExecution): ChecklistStatus {
+  if (
+    execution.evidenceAuthority === 'withheld'
+    && ['PASS', 'INTENDED_CHANGE'].includes(execution.status)
+  ) return 'REVIEW';
+  return execution.status;
+}
+
+function worstReviewedStatus(executions: ReportExecution[]): ChecklistStatus {
+  return executions
+    .map(executionReviewedStatus)
+    .sort((left, right) => STATUS_ORDER.indexOf(left) - STATUS_ORDER.indexOf(right))[0] ?? 'REVIEW';
+}
+
+/**
+ * Sealed archives use reviewed checklist truth. The live reporter deliberately
+ * bypasses this projection and remains a provisional view of raw Playwright state.
+ */
+export function projectReviewedExecutionTruth(
+  catalog: GalleryCatalog,
+  executions: readonly ReportExecution[],
+): GalleryCatalog {
+  for (const item of catalog.items) {
+    const auditIds = new Set(item.auditAssociations.map(({ id }) => id));
+    const unknownAuditIds = item.auditAssociations
+      .filter(({ catalogOrdinal }) => catalogOrdinal === null)
+      .map(({ id }) => id);
+    const matches = executions.filter((execution) => (
+      execution.sourceTestId === item.test.id
+      && execution.project === item.project.name
+      && auditIds.has(execution.auditId)
+    ));
+    const matchedAuditIds = new Set(matches.map(({ auditId }) => auditId));
+    const uncoveredKnownAuditIds = item.auditAssociations
+      .filter(({ catalogOrdinal, id }) => catalogOrdinal !== null && !matchedAuditIds.has(id))
+      .map(({ id }) => id);
+    const rawStatus = item.attempt.status;
+    if (matches.length === 0 || unknownAuditIds.length > 0 || uncoveredKnownAuditIds.length > 0) {
+      const integrityReasons = [
+        ...(auditIds.size === 0 ? ['UNMAPPED_TEST'] : []),
+        ...(unknownAuditIds.length > 0 ? ['UNKNOWN_AUDIT_ID'] : []),
+        ...(uncoveredKnownAuditIds.length > 0 ? ['UNCOVERED_AUDIT_ASSOCIATION'] : []),
+      ];
+      item.attempt = {
+        ...item.attempt,
+        rawStatus,
+        status: 'REVIEW',
+        statusSource: 'release-integrity',
+        reviewReasonCodes: integrityReasons.length > 0 ? integrityReasons : ['UNKNOWN_AUDIT_ID'],
+      } as ReviewedGalleryAttempt;
+      continue;
+    }
+    const reviewedStatus = worstReviewedStatus(matches);
+    const reasonCodes = [...new Set(matches.flatMap((execution) => [
+      ...execution.reasonCodes,
+      ...(execution.status === 'FAIL' ? ['ASSERTION_FAIL'] : []),
+      ...(execution.status === 'BLOCKED' ? ['EXPLICIT_BLOCKER'] : []),
+      ...(execution.status === 'REVIEW' && execution.reasonCodes.length === 0 ? ['HUMAN_REVIEW'] : []),
+    ]))]
+      .map((value) => value.replace(/[^A-Z0-9_:-]+/gi, '_').slice(0, 120))
+      .filter(Boolean)
+      .slice(0, 12);
+    item.attempt = {
+      ...item.attempt,
+      rawStatus,
+      status: reviewedStatus,
+      statusSource: 'reviewed-manifest',
+      reviewReasonCodes: reasonCodes,
+    } as ReviewedGalleryAttempt;
+  }
+  return catalog;
+}
+
 // These contracts explicitly require evidence from both origins. Other rows
 // assess the candidate for release while retaining production failures as
 // visible baseline context. This prevents a redesign that fixes an existing
@@ -291,30 +393,44 @@ function stableId(value: string): string {
   return createHash('sha256').update(value).digest('hex').slice(0, 12);
 }
 
-function explicitStatus(test: ReportTestInput): ChecklistStatus | null {
-  const annotations = test.annotations ?? [];
-  for (const annotation of annotations) {
-    const combined = `${annotation.type} ${annotation.description ?? ''}`.toUpperCase().replaceAll('-', '_');
-    if (combined.includes('INTENDED_CHANGE')) return 'INTENDED_CHANGE';
-    if (combined.includes('BLOCKED')) return 'BLOCKED';
-    if (combined.includes('REVIEW')) return 'REVIEW';
-  }
-  return null;
+function recordHasUnexpectedRuntimeFailure(record: AuditEvidenceRecord): boolean {
+  const allRuntimeMessages = [...record.pageErrors, ...record.consoleErrors];
+  const cloudflareRumFailure = allRuntimeMessages.some((message) => /cloudflareinsights\.com\/cdn-cgi\/rum/i.test(message))
+    || record.httpResponses.some(({ firstParty, status, url }) => (
+      !firstParty && status >= 400 && /cloudflareinsights\.com\/cdn-cgi\/rum/i.test(url)
+    ));
+  const isKnownAnalyticsNoise = (message: string): boolean => {
+    if (/cloudflareinsights\.com\/cdn-cgi\/rum/i.test(message)) return true;
+    if (cloudflareRumFailure && /(?:Failed to load resource:\s*(?:net::ERR_FAILED|Origin https?:\/\/[^ ]+ is not allowed by Access-Control-Allow-Origin\. Status code: 404)|Origin https?:\/\/[^ ]+ is not allowed by Access-Control-Allow-Origin\. Status code: 404)/i.test(message)) return true;
+    if (/Cookie [“\"]_ga(?:_[A-Z0-9]+)?[”\"] has been rejected for invalid domain/i.test(message)) return true;
+    return false;
+  };
+  const consoleErrors = record.auditId === 'REL-001'
+    ? record.consoleErrors
+    : record.consoleErrors.filter((message) => !isKnownAnalyticsNoise(message));
+  const pageErrors = record.auditId === 'REL-001'
+    ? record.pageErrors
+    : record.pageErrors.filter((message) => !isKnownAnalyticsNoise(message));
+  return pageErrors.length > 0
+    || consoleErrors.length > 0
+    || record.failedRequests.length > 0
+    || record.badResponses.length > 0
+    || (record.runtimeExpectations ?? []).some(({ matched }) => !matched);
 }
 
 function executionStatus(
-  test: ReportTestInput,
   result: ReportResultInput,
   record: AuditEvidenceRecord | null,
+  statusOverride: ChecklistStatus | null,
 ): ChecklistStatus {
-  const annotated = explicitStatus(test);
-  if (annotated) return annotated;
   if (result.status === 'skipped' || result.status === 'interrupted') return 'NOT_RUN';
   if (result.status === 'timedOut' || result.status === 'failed') return 'FAIL';
   if (result.status !== 'passed') return 'REVIEW';
+  if (record?.findings.some((finding) => finding.blocking)) return 'FAIL';
+  if (record?.steps.some((step) => step.status === 'failed')) return 'FAIL';
+  if (record && recordHasUnexpectedRuntimeFailure(record)) return 'FAIL';
+  if (statusOverride) return statusOverride;
   if (!record) return 'REVIEW';
-  if (record.findings.some((finding) => finding.blocking)) return 'FAIL';
-  if (record.steps.some((step) => step.status === 'failed')) return 'FAIL';
   if (record.findings.length > 0) return 'REVIEW';
   return 'PASS';
 }
@@ -334,30 +450,14 @@ function aggregateStatus(definition: AuditDefinition, executions: ReportExecutio
   if (statuses.has('FAIL')) return { status: 'FAIL', reason: 'At least one execution failed or reported a blocking finding.' };
   if (statuses.has('BLOCKED')) return { status: 'BLOCKED', reason: 'At least one execution is explicitly blocked.' };
   if (hadFailedRetry || statuses.has('FLAKY')) return { status: 'FLAKY', reason: 'A passing execution required a retry.' };
+  if (applicableExecutions.some((execution) => execution.evidenceAuthority === 'withheld')) {
+    return { status: 'REVIEW', reason: 'The observed behavior passed, but one or more evidence-integrity conditions withhold release authority.' };
+  }
   if (statuses.has('REVIEW')) return { status: 'REVIEW', reason: 'Evidence or non-blocking findings require human review.' };
   if (statuses.has('INTENDED_CHANGE')) {
     return { status: 'INTENDED_CHANGE', reason: 'The result is marked as an intentional, reviewable redesign difference.' };
   }
   return { status: 'PASS', reason: 'All recorded executions passed with structured audit evidence and no findings.' };
-}
-
-function unknownDefinition(id: string, title: string, record: AuditEvidenceRecord | null): AuditDefinition {
-  return (
-    record?.definition ?? {
-      id,
-      area: 'reliability',
-      title,
-      userPromise: 'This executed check is represented in the release evidence.',
-      severity: 'P2',
-      releaseBlocking: false,
-      expected: 'The check passes with structured evidence and no unreviewed findings.',
-      evidence: ['screenshot', 'json'],
-      evidencePolicy: {
-        mode: 'static-screenshot',
-        rationale: 'This fallback audit records a static verification state; interaction video is not required.',
-      },
-    }
-  );
 }
 
 function emptyEvidenceCounts(): Record<ReportArtifact['kind'], number> {
@@ -382,6 +482,13 @@ async function buildExecutions(
   const byAuditId = new Map<string, ReportExecution[]>();
   const definitions = new Map<string, AuditDefinition>(definitionCatalog.map((definition) => [definition.id, definition]));
   const unmapped: ReportTestInput[] = [];
+  const unmappedKeys = new Set<string>();
+  const markUnmapped = (test: ReportTestInput): void => {
+    const key = `${test.id}\u0000${test.projectName}`;
+    if (unmappedKeys.has(key)) return;
+    unmappedKeys.add(key);
+    unmapped.push(test);
+  };
 
   for (const normalizedTest of tests) {
     const test = normalizedTest.source;
@@ -389,10 +496,10 @@ async function buildExecutions(
     if (!result) {
       const declaredAuditIds = normalizedTest.auditIds;
       if (declaredAuditIds.length === 0) {
-        unmapped.push(test);
+        markUnmapped(test);
       } else {
         for (const auditId of declaredAuditIds) {
-          if (!definitions.has(auditId)) definitions.set(auditId, unknownDefinition(auditId, test.title, null));
+          if (!definitions.has(auditId)) markUnmapped(test);
         }
       }
       continue;
@@ -401,18 +508,24 @@ async function buildExecutions(
     const records = normalizedTest.evidenceRecords;
     const auditIds = normalizedTest.auditIds;
     if (auditIds.length === 0) {
-      unmapped.push(test);
+      markUnmapped(test);
       continue;
     }
 
     for (const auditId of auditIds) {
+      if (!definitions.has(auditId)) {
+        markUnmapped(test);
+        warnings.push(`${auditId} / ${test.projectName}: executed audit ID is absent from the authoritative definition catalog.`);
+        continue;
+      }
       const latestAttemptRecords = recordsByAttempt[recordsByAttempt.length - 1] ?? [];
       const record = latestAttemptRecords.find((candidate) => candidate.auditId === auditId) ?? null;
-      const anyRecord = record ?? [...records].reverse().find((candidate) => candidate.auditId === auditId) ?? null;
-      if (anyRecord?.definition && !definitions.has(auditId)) definitions.set(auditId, anyRecord.definition);
-      if (!definitions.has(auditId)) definitions.set(auditId, unknownDefinition(auditId, test.title, anyRecord));
 
       const environment = record?.environment ?? test.projectMetadata?.environment ?? 'unknown';
+      const coveredEnvironments = [...new Set(
+        (record?.coveredEnvironments ?? (environment === 'unknown' ? [] : [environment]))
+          .filter((candidate): candidate is AuditEnvironment => candidate === 'candidate' || candidate === 'production'),
+      )].sort();
       const attemptHistory = normalizedTest.attempts.map((attempt, attemptIndex) => {
         return {
           attempt: attemptIndex + 1,
@@ -426,52 +539,126 @@ async function buildExecutions(
         };
       });
       const artifacts = attemptHistory.flatMap((attempt) => attempt.artifacts);
+      const finalArtifacts = attemptHistory.at(-1)?.artifacts ?? [];
       for (const artifact of artifacts) {
         if (!artifact.available) warnings.push(`${auditId}: could not copy ${artifact.name}: ${artifact.error ?? 'unknown error'}`);
         if (artifact.posterError) warnings.push(`${auditId}: could not copy poster for ${artifact.name}: ${artifact.posterError}`);
       }
 
-      let status = executionStatus(test, result, record);
-      const definition = definitions.get(auditId);
+      let statusOverride: ChecklistStatus | null = null;
+      let invalidStatusAnnotation: string | null = null;
+      try {
+        statusOverride = parseAuditStatusAnnotation(test.annotations, auditId);
+      } catch (error) {
+        invalidStatusAnnotation = error instanceof Error ? error.message : String(error);
+      }
+      let status = executionStatus(result, record, statusOverride);
+      if (status === 'PASS' && failedEarlierAttempt(test)) status = 'FLAKY';
+      const definition = definitions.get(auditId)!;
       const evidencePolicy = parseEvidencePolicyAnnotation(test.annotations);
-      const requiredEvidence = definition && evidencePolicy
+      const requiredEvidence = evidencePolicy
         ? evidenceKindsForPolicy(definition.evidence, evidencePolicy)
-        : definition?.evidence ?? [];
-      if (status === 'PASS' && definition) {
-        const availableKinds = new Set(artifacts.filter((artifact) => artifact.available).map((artifact) => artifact.kind));
+        : definition.evidence;
+      const purposefulScreenshot = (artifact: ReportArtifact): boolean => (
+        artifact.kind === 'screenshot'
+        && artifact.available
+        && artifact.name !== 'screenshot'
+        && !/automatic[-_ ]static[-_ ]evidence/i.test(artifact.name)
+      );
+      const permittedPrimaryMedia = (artifact: ReportArtifact): boolean => {
+        if (!evidencePolicy) return false;
+        if (evidencePolicy.mode === 'interaction-video') return artifact.kind === 'video' && artifact.available;
+        if (evidencePolicy.mode === 'static-screenshot') return purposefulScreenshot(artifact);
+        return false;
+      };
+      const isMedia = (artifact: ReportArtifact): boolean => artifact.kind === 'video' || artifact.kind === 'screenshot';
+      const primaryArtifacts = finalArtifacts.filter((artifact) => (
+        !isMedia(artifact) || (result.status === 'passed' && permittedPrimaryMedia(artifact))
+      ));
+      const diagnosticArtifacts = artifacts.filter((artifact) => !primaryArtifacts.includes(artifact));
+      const reasonCodes: ReportExecution['reasonCodes'] = [];
+      let evidenceAuthority: ReportExecution['evidenceAuthority'] = 'authoritative';
+      const withholdAuthority = (code: ReportExecution['reasonCodes'][number], warning: string): void => {
+        evidenceAuthority = 'withheld';
+        if (!reasonCodes.includes(code)) reasonCodes.push(code);
+        warnings.push(warning);
+      };
+      if (status !== 'NOT_RUN') {
+        const availableKinds = new Set(primaryArtifacts.filter((artifact) => artifact.available).map((artifact) => artifact.kind));
         const missingKinds = requiredEvidence.filter((kind) => !availableKinds.has(kind));
         if (missingKinds.length > 0) {
-          status = 'REVIEW';
-          warnings.push(`${auditId} / ${test.projectName}: missing required ${missingKinds.join(', ')} evidence.`);
+          withholdAuthority(
+            'MISSING_REQUIRED_EVIDENCE',
+            `${auditId} / ${test.projectName}: missing required ${missingKinds.join(', ')} evidence from the final attempt.`,
+          );
         }
       }
-      if (status === 'PASS' && !evidencePolicy) {
-        status = 'REVIEW';
-        warnings.push(`${auditId} / ${test.projectName}: missing or invalid explicit audit-evidence-policy annotation.`);
+      if (status !== 'NOT_RUN' && !evidencePolicy) {
+        withholdAuthority(
+          'MISSING_EVIDENCE_POLICY',
+          `${auditId} / ${test.projectName}: missing or invalid explicit audit-evidence-policy annotation.`,
+        );
       }
-      if (status === 'PASS' && record?.evidencePolicy && evidencePolicy
+      if (status !== 'NOT_RUN' && record?.evidencePolicy && evidencePolicy
         && (record.evidencePolicy.mode !== evidencePolicy.mode || record.evidencePolicy.rationale !== evidencePolicy.rationale)) {
-        status = 'REVIEW';
-        warnings.push(`${auditId} / ${test.projectName}: structured evidence policy does not match its test declaration.`);
+        withholdAuthority(
+          'EVIDENCE_POLICY_MISMATCH',
+          `${auditId} / ${test.projectName}: structured evidence policy does not match its test declaration.`,
+        );
+      }
+      if (
+        status !== 'NOT_RUN'
+        && evidencePolicy?.mode === 'interaction-video'
+        && record
+        && !record.steps.some((step) => (
+          step.kind === 'interaction'
+          || (step.kind === undefined && step.name !== 'Inspect browser runtime health')
+        ))
+      ) {
+        withholdAuthority(
+          'MISSING_ACTION_STEP',
+          `${auditId} / ${test.projectName}: interaction evidence has no recorded user action/response step.`,
+        );
+      }
+      const forbiddenPrimaryMedia = result.status === 'passed'
+        ? finalArtifacts.filter((artifact) => isMedia(artifact) && !permittedPrimaryMedia(artifact))
+        : [];
+      if (forbiddenPrimaryMedia.length > 0) {
+        withholdAuthority(
+          'FORBIDDEN_PRIMARY_MEDIA',
+          `${auditId} / ${test.projectName}: ${forbiddenPrimaryMedia.map(({ name }) => name).join(', ')} violate the ${evidencePolicy?.mode ?? 'undeclared'} primary-media policy.`,
+        );
+      }
+      if (invalidStatusAnnotation) {
+        withholdAuthority(
+          'INVALID_STATUS_ANNOTATION',
+          `${auditId} / ${test.projectName}: ${invalidStatusAnnotation}`,
+        );
       }
       const tlsPolicy = test.projectMetadata?.tlsPolicy ?? 'unknown';
-      if (status === 'PASS' && environment === 'candidate' && tlsPolicy === 'ignored-for-development') {
-        status = 'REVIEW';
-        warnings.push(`${auditId} / ${test.projectName}: candidate certificate verification was bypassed for development; this evidence cannot make the release READY.`);
+      if (status !== 'NOT_RUN' && coveredEnvironments.includes('candidate') && tlsPolicy === 'ignored-for-development') {
+        withholdAuthority(
+          'TLS_BYPASS',
+          `${auditId} / ${test.projectName}: candidate certificate verification was bypassed for development; this evidence cannot make the release READY.`,
+        );
       }
-      if (status === 'PASS' && failedEarlierAttempt(test)) status = 'FLAKY';
+      if (status === 'FLAKY') reasonCodes.push('FLAKY_RETRY');
       const execution: ReportExecution = {
         id: `${safeSegment(auditId)}-${stableId(`${test.id}:${test.projectName}`)}`,
+        sourceTestId: test.id,
         auditId,
         title: test.title,
         titlePath: test.titlePath,
         location: { file: test.file, line: test.line ?? null, column: test.column ?? null },
         project: test.projectName,
         environment,
+        coveredEnvironments,
         browser: record?.browser ?? test.projectMetadata?.browserLabel ?? test.projectName,
         deviceClass: test.projectMetadata?.deviceClass ?? 'unknown',
         tlsPolicy,
         status,
+        evidenceAuthority,
+        reasonCodes,
         rawStatus: result.status,
         expectedStatus: result.expectedStatus ?? null,
         retry: result.retry,
@@ -487,6 +674,8 @@ async function buildExecutions(
         stderr: result.stderr,
         attemptHistory,
         artifacts,
+        primaryArtifacts,
+        diagnosticArtifacts,
         annotations: test.annotations ?? [],
       };
       const existing = byAuditId.get(auditId) ?? [];
@@ -538,9 +727,9 @@ export async function buildAuditModels(options: GenerateReportOptions): Promise<
   const audits = [...definitions.values()]
     .map((definition): AuditChecklistItem => {
       const executions = byAuditId.get(definition.id) ?? [];
-      const candidateExecutions = executions.filter((execution) => execution.environment === 'candidate');
-      const productionExecutions = executions.filter((execution) => execution.environment === 'production');
-      const unknownExecutions = executions.filter((execution) => execution.environment === 'unknown');
+      const candidateExecutions = executions.filter((execution) => execution.coveredEnvironments.includes('candidate'));
+      const productionExecutions = executions.filter((execution) => execution.coveredEnvironments.includes('production'));
+      const unknownExecutions = executions.filter((execution) => execution.coveredEnvironments.length === 0);
       const crossEnvironmentGate = CROSS_ENVIRONMENT_GATES.has(definition.id);
       const releaseExecutions = crossEnvironmentGate ? executions : [...candidateExecutions, ...unknownExecutions];
       let aggregate = aggregateStatus(definition, releaseExecutions);
@@ -561,12 +750,37 @@ export async function buildAuditModels(options: GenerateReportOptions): Promise<
         };
       }
       const baselineIssueExecutions = productionExecutions.filter((execution) =>
-        ['FAIL', 'BLOCKED', 'FLAKY', 'REVIEW'].includes(execution.status));
+        execution.status !== 'NOT_RUN'
+        && (
+          ['FAIL', 'BLOCKED', 'FLAKY', 'REVIEW'].includes(execution.status)
+          || execution.evidenceAuthority === 'withheld'
+        ));
       const baselineHasIssues = baselineIssueExecutions.length > 0;
       const evidenceCounts = emptyEvidenceCounts();
       for (const execution of executions) {
-        for (const artifact of execution.artifacts) evidenceCounts[artifact.kind] += 1;
+        for (const artifact of execution.primaryArtifacts) {
+          if (artifact.available) evidenceCounts[artifact.kind] += 1;
+        }
       }
+      const applicableExecutions = executions.filter((execution) => execution.status !== 'NOT_RUN');
+      const skippedExecutions = executions.filter((execution) => execution.status === 'NOT_RUN');
+      const countEnvironment = (
+        collection: ReportExecution[],
+        environment: AuditEnvironment | 'unknown',
+      ): number => collection.filter((execution) => (
+        environment === 'unknown'
+          ? execution.coveredEnvironments.length === 0
+          : execution.coveredEnvironments.includes(environment)
+      )).length;
+      const coverageCounts = (collection: ReportExecution[]) => ({
+        production: countEnvironment(collection, 'production'),
+        candidate: countEnvironment(collection, 'candidate'),
+        unknown: countEnvironment(collection, 'unknown'),
+        total: collection.length,
+      });
+      const selectedCoverage = coverageCounts(executions);
+      const applicableCoverage = coverageCounts(applicableExecutions);
+      const skippedCoverage = coverageCounts(skippedExecutions);
       return {
         id: definition.id,
         definition,
@@ -590,13 +804,19 @@ export async function buildAuditModels(options: GenerateReportOptions): Promise<
             ? 'Production evidence is part of this explicit cross-environment release contract.'
             : baselineHasIssues
               ? 'Production issues are preserved as baseline context but do not veto a candidate that fixes them.'
-              : 'No production-baseline issue was recorded for this check.',
+              : applicableCoverage.production === 0
+                ? 'Production baseline was not tested for this check.'
+                : 'The tested production baseline recorded no issue for this check.',
         },
         coverage: {
-          production: productionExecutions.length,
-          candidate: candidateExecutions.length,
-          unknown: unknownExecutions.length,
-          projects: [...new Set(executions.map((execution) => execution.project))].sort(),
+          production: applicableCoverage.production,
+          candidate: applicableCoverage.candidate,
+          unknown: applicableCoverage.unknown,
+          projects: [...new Set(applicableExecutions.map((execution) => execution.project))].sort(),
+          selectedProjects: [...new Set(executions.map((execution) => execution.project))].sort(),
+          selected: selectedCoverage,
+          applicable: applicableCoverage,
+          skipped: skippedCoverage,
         },
         evidenceCounts,
         findings: executions.flatMap((execution) => execution.evidence?.findings ?? []),
@@ -625,14 +845,13 @@ export async function buildAuditModels(options: GenerateReportOptions): Promise<
     (item) => item.definition.releaseBlocking && ['NOT_RUN', 'MANUAL_REQUIRED'].includes(item.status),
   ).length;
   const baselineIssues = audits.filter((item) => item.baseline.hasIssues).length;
-  const nonBaselineUnmappedFailure = unmapped.some((test) => {
-    const finalResult = latestResult(test);
-    return test.projectMetadata?.environment !== 'production'
-      && finalResult != null
-      && !['passed', 'skipped'].includes(finalResult.status);
-  });
-  const runIntegrityFailure = options.run.status !== 'passed'
-    && ((options.run.errors?.length ?? 0) > 0 || allExecutions.length === 0 || nonBaselineUnmappedFailure);
+  const unknownAuditPresent = unmapped.length > 0;
+  const knownTerminalFailure = allExecutions.some((execution) => ['failed', 'timedOut'].includes(execution.rawStatus));
+  const unexplainedRunFailure = options.run.status !== 'passed' && !knownTerminalFailure;
+  const runIntegrityFailure = unknownAuditPresent
+    || allExecutions.length === 0
+    || (options.run.errors?.length ?? 0) > 0
+    || unexplainedRunFailure;
   const ready = blockingFailures === 0 && blockingIncomplete === 0 && !runIntegrityFailure;
   const generatedAt = new Date().toISOString();
   const startedAt = options.run.startedAt ?? null;
@@ -661,8 +880,8 @@ export async function buildAuditModels(options: GenerateReportOptions): Promise<
       runIntegrityFailure,
       reason: ready
         ? 'Every release-blocking audit has complete passing evidence.'
-        : `${blockingFailures} blocking audit${blockingFailures === 1 ? '' : 's'} failed or need review; ${blockingIncomplete} blocking audit${blockingIncomplete === 1 ? '' : 's'} remain incomplete.${runIntegrityFailure ? ' The run also has an infrastructure or unmapped non-baseline failure.' : ''}`,
-      decisionBasis: 'Release gating uses candidate and environment-unknown executions. Production failures are non-gating baseline context except for ENV-001, ENV-003, ENV-005, and CONTENT-008, whose contracts explicitly compare environments. A raw Playwright failure caused only by baseline checks does not veto the candidate; infrastructure and unmapped non-baseline failures still do.',
+        : `${blockingFailures} blocking audit${blockingFailures === 1 ? '' : 's'} failed or need review; ${blockingIncomplete} blocking audit${blockingIncomplete === 1 ? '' : 's'} remain incomplete.${runIntegrityFailure ? ' The run also has an infrastructure or unknown-audit integrity failure.' : ''}`,
+      decisionBasis: 'Release gating uses applicable candidate and environment-unknown executions. Production failures are non-gating baseline context except for ENV-001, ENV-003, ENV-005, and CONTENT-008, whose contracts explicitly compare environments or declare paired-origin coverage. Skipped selections do not count as tested. Development TLS bypass withholds evidence authority without erasing the observed functional status. Unknown executed audit IDs fail run integrity.',
     },
     summary: {
       total: audits.length,
@@ -698,7 +917,8 @@ export async function buildAuditModels(options: GenerateReportOptions): Promise<
     })),
     warnings,
   };
-  return { manifest, galleryCatalog: evidenceModel.catalog };
+  const galleryCatalog = projectReviewedExecutionTruth(evidenceModel.catalog, allExecutions);
+  return { manifest, galleryCatalog };
 }
 
 export async function buildAuditManifest(options: GenerateReportOptions): Promise<AuditManifest> {
@@ -771,6 +991,7 @@ function portalAuditRow(audit: AuditChecklistItem): PortalReportAuditRow {
     coverage: {
       ...audit.coverage,
       projects: audit.coverage.projects.slice(0, 40).map((project) => portalText(project, 180)),
+      selectedProjects: audit.coverage.selectedProjects.slice(0, 40).map((project) => portalText(project, 180)),
     },
     evidenceCounts: audit.evidenceCounts,
     findingCount: audit.findings.length,
@@ -818,6 +1039,7 @@ function portalEvidence(record: AuditEvidenceRecord | null): Record<string, unkn
   }
   return {
     environment: record.environment,
+    coveredEnvironments: record.coveredEnvironments ?? [record.environment],
     evidencePolicy: {
       mode: evidencePolicy.mode,
       rationale: portalText(evidencePolicy.rationale, 1_200),
@@ -842,6 +1064,7 @@ function portalEvidence(record: AuditEvidenceRecord | null): Record<string, unkn
     steps: record.steps.slice(0, PORTAL_REPORT_MAX_EVIDENCE_ITEMS).map((step) => ({
       name: portalText(step.name, 500),
       expected: portalText(step.expected),
+      kind: step.kind ?? 'legacy',
       status: step.status,
       ...(step.detail ? { detail: portalText(step.detail) } : {}),
     })),
@@ -878,21 +1101,31 @@ function portalEvidence(record: AuditEvidenceRecord | null): Record<string, unkn
         status: response.status,
       })),
     },
+    runtimeExpectations: (record.runtimeExpectations ?? []).slice(0, PORTAL_REPORT_MAX_EVIDENCE_ITEMS).map((expectation) => ({
+      kind: expectation.kind,
+      target: portalText(expectation.target, 700),
+      expected: portalText(expectation.expected, 500),
+      matched: expectation.matched,
+    })),
   };
 }
 
 function portalExecution(execution: ReportExecution): Record<string, unknown> {
   return {
     id: execution.id,
+    sourceTestId: portalText(execution.sourceTestId, 300),
     title: portalText(execution.title, 500),
     titlePath: execution.titlePath.slice(-6).map((part) => portalText(part, 300)),
     location: execution.location,
     project: portalText(execution.project, 240),
     environment: execution.environment,
+    coveredEnvironments: execution.coveredEnvironments,
     browser: portalText(execution.browser, 160),
     deviceClass: execution.deviceClass,
     tlsPolicy: execution.tlsPolicy,
     status: execution.status,
+    evidenceAuthority: execution.evidenceAuthority,
+    reasonCodes: execution.reasonCodes,
     rawStatus: execution.rawStatus,
     expectedStatus: execution.expectedStatus,
     retry: execution.retry,
@@ -918,6 +1151,8 @@ function portalExecution(execution: ReportExecution): Record<string, unknown> {
       errorCount: attempt.errors.length,
     })),
     artifactCount: execution.artifacts.length,
+    primaryArtifactCount: execution.primaryArtifacts.length,
+    diagnosticArtifactCount: execution.diagnosticArtifacts.length,
     artifacts: execution.artifacts.slice(0, PORTAL_REPORT_MAX_ARTIFACTS).map(portalArtifact),
     annotations: execution.annotations.slice(0, 10).map((annotation) => ({
       type: portalText(annotation.type, 120),

@@ -24,11 +24,10 @@ interactionTest('[HOME-001] homepage exposes clear starting paths instead of a d
   }
   audit.observe('Actionable starting paths', startingPaths.length, 'At least 2');
   await audit.attachJson('homepage-starting-paths', startingPaths);
-  await audit.checkpoint('homepage-starting-paths');
   await audit.assertRuntimeHealthy();
 });
 
-staticTest('[CRISIS-002] withdrawal fast path exposes urgent human-help destinations', staticEvidence('Capture the withdrawal fast path with its visible human-help actions and exact destinations.'), async ({ page, audit }, testInfo) => {
+staticTest('[CRISIS-002] withdrawal fast path exposes urgent human-help destinations', staticEvidence('Capture the withdrawal fast path with its visible human-help actions and exact destinations.', 'all-projects'), async ({ page, audit }, testInfo) => {
   const metadata = projectMetadata(testInfo.project.metadata);
   await audit.goto('/start-here/7-oh-withdrawal-help');
   await expect(page.locator('h1')).toContainText(/withdrawal|okay|help/i);
@@ -52,10 +51,11 @@ staticTest('[CRISIS-002] withdrawal fast path exposes urgent human-help destinat
   await audit.assertRuntimeHealthy();
 });
 
-staticTest('[REL-001] primary page has no browser or first-party loading failures', staticEvidence('Capture the loaded primary page with its browser, request, response, and rendered-health evidence.'), async ({ audit }) => {
+staticTest('[REL-001] primary page has no browser or first-party loading failures', staticEvidence('Capture the loaded primary page with its browser, request, response, and rendered-health evidence.', 'all-projects'), async ({ audit }) => {
   await audit.goto('/');
   const inspection = await audit.inspectPage();
   audit.observe('Document height', inspection.documentHeight);
   audit.observe('Broken images', inspection.brokenImages.length, '0');
+  await audit.checkpoint('runtime-healthy-primary-page');
   await audit.assertRuntimeHealthy();
 });

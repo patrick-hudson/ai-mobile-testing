@@ -50,7 +50,9 @@ legend { padding: 0 0 16px; font-size: .78rem; font-weight: 800; letter-spacing:
 .choice-grid { display: grid; gap: 12px; }
 .two-up { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .project-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.target-group-heading { grid-column: 1 / -1; margin: 8px 0 0; font-size: .76rem; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; }
 .choice-card { display: flex; gap: 12px; align-items: flex-start; min-height: 86px; padding: 17px; border: 1px solid var(--line); border-radius: 13px; background: rgba(255,255,255,.025); cursor: pointer; }
+.choice-card.unavailable-target { opacity: .64; cursor: not-allowed; }
 .choice-card:has(input:checked) { border-color: rgba(244,186,85,.65); background: rgba(244,186,85,.075); }
 .choice-card input { margin-top: 3px; accent-color: var(--accent); }
 .choice-card strong, .choice-card small { display: block; }

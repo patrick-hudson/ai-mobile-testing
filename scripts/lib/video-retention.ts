@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import {
   AUDIT_EVIDENCE_POLICY_ANNOTATION,
   parseEvidencePolicyAnnotation,
@@ -38,6 +38,10 @@ export interface VideoQualityMetrics {
   durationSeconds: number | null;
   sampledFrames: number;
   maxFrameDifference: number | null;
+  changedFrames: number | null;
+  blankFrameRatio: number | null;
+  initialNonBlankRatio: number | null;
+  finalNonBlankRatio: number | null;
 }
 
 export interface VideoQualityAssessment extends VideoQualityMetrics {
@@ -56,6 +60,65 @@ export interface VideoProbeCommandEvent {
 
 export const MIN_ACTION_VIDEO_SECONDS = 2;
 export const MIN_ACTION_FRAME_DIFFERENCE = 0.75;
+export const MAX_BLANK_FRAME_RATIO = 0.5;
+export const MIN_WINDOW_NONBLANK_RATIO = 0.5;
+
+interface SampledVideoFrame {
+  averageLuma: number | null;
+  lowLuma: number | null;
+  highLuma: number | null;
+  difference: number | null;
+}
+
+function finiteMetric(block: string, name: string): number | null {
+  const match = block.match(new RegExp(`lavfi\\.signalstats\\.${name}=([0-9.eE+-]+)`));
+  if (!match) return null;
+  const value = Number(match[1]);
+  return Number.isFinite(value) ? value : null;
+}
+
+function sampledFrames(output: string): SampledVideoFrame[] {
+  return [...output.matchAll(/frame:\d+[\s\S]*?(?=frame:\d+|$)/g)].map(([block]) => ({
+    averageLuma: finiteMetric(block, 'YAVG'),
+    lowLuma: finiteMetric(block, 'YLOW') ?? finiteMetric(block, 'YMIN'),
+    highLuma: finiteMetric(block, 'YHIGH') ?? finiteMetric(block, 'YMAX'),
+    difference: finiteMetric(block, 'YDIF'),
+  }));
+}
+
+function isBlankFrame(frame: SampledVideoFrame): boolean {
+  // Assess the center crop, not Playwright's top-left/bottom-right overlays.
+  // FFmpeg reports full-range white near 255 on some platforms/codecs and
+  // studio-range white near 235 on others. Luma spread is range-independent:
+  // a center crop whose 10th and 90th percentiles are nearly identical is a
+  // low-information solid frame whether it is white, black, gray, or tinted.
+  // Real page content, text, and controls create a materially wider spread.
+  return frame.averageLuma !== null
+    && frame.lowLuma !== null
+    && frame.highLuma !== null
+    && frame.highLuma - frame.lowLuma <= 6;
+}
+
+function ratio(values: boolean[]): number | null {
+  if (values.length === 0) return null;
+  return values.filter(Boolean).length / values.length;
+}
+
+function metricsFromProbeOutput(durationSeconds: number, output: string): VideoQualityMetrics {
+  const frames = sampledFrames(output);
+  const differences = frames.map(({ difference }) => difference).filter((value): value is number => value !== null);
+  const nonBlank = frames.map((frame) => !isBlankFrame(frame));
+  const windowSize = Math.max(1, Math.ceil(frames.length / 4));
+  return {
+    durationSeconds: Number.isFinite(durationSeconds) ? durationSeconds : null,
+    sampledFrames: frames.length,
+    maxFrameDifference: differences.length > 0 ? Math.max(...differences) : null,
+    changedFrames: differences.filter((value) => value >= MIN_ACTION_FRAME_DIFFERENCE).length,
+    blankFrameRatio: ratio(nonBlank.map((value) => !value)),
+    initialNonBlankRatio: ratio(nonBlank.slice(0, windowSize)),
+    finalNonBlankRatio: ratio(nonBlank.slice(-windowSize)),
+  };
+}
 
 export function assessVideoMetrics(metrics: VideoQualityMetrics): Pick<VideoQualityAssessment, 'usable' | 'reasons'> {
   const reasons: string[] = [];
@@ -72,6 +135,22 @@ export function assessVideoMetrics(metrics: VideoQualityMetrics): Pick<VideoQual
       `maximum frame change ${metrics.maxFrameDifference.toFixed(3)} is below ${MIN_ACTION_FRAME_DIFFERENCE.toFixed(2)}`,
     );
   }
+  if (metrics.changedFrames == null || !Number.isFinite(metrics.changedFrames)) {
+    reasons.push('sustained frame changes could not be measured');
+  } else if (metrics.changedFrames < 1) {
+    reasons.push('no representative page-content transition was measured');
+  }
+  if (metrics.blankFrameRatio == null || !Number.isFinite(metrics.blankFrameRatio)) {
+    reasons.push('blank-frame ratio could not be measured');
+  } else if (metrics.blankFrameRatio > MAX_BLANK_FRAME_RATIO) {
+    reasons.push(`blank-frame ratio ${metrics.blankFrameRatio.toFixed(3)} exceeds ${MAX_BLANK_FRAME_RATIO.toFixed(2)}`);
+  }
+  if (metrics.initialNonBlankRatio == null || metrics.initialNonBlankRatio < MIN_WINDOW_NONBLANK_RATIO) {
+    reasons.push('the initial-state window does not contain sustained page content');
+  }
+  if (metrics.finalNonBlankRatio == null || metrics.finalNonBlankRatio < MIN_WINDOW_NONBLANK_RATIO) {
+    reasons.push('the final-response window does not contain sustained page content');
+  }
   return { usable: reasons.length === 0, reasons };
 }
 
@@ -85,6 +164,14 @@ function isShortDynamicFailure(status: string | undefined, assessment: VideoQual
     && assessment.maxFrameDifference !== null
     && Number.isFinite(assessment.maxFrameDifference)
     && assessment.maxFrameDifference >= MIN_ACTION_FRAME_DIFFERENCE
+    && assessment.changedFrames !== null
+    && assessment.changedFrames >= 1
+    && assessment.blankFrameRatio !== null
+    && assessment.blankFrameRatio <= MAX_BLANK_FRAME_RATIO
+    && assessment.initialNonBlankRatio !== null
+    && assessment.initialNonBlankRatio >= MIN_WINDOW_NONBLANK_RATIO
+    && assessment.finalNonBlankRatio !== null
+    && assessment.finalNonBlankRatio >= MIN_WINDOW_NONBLANK_RATIO
     && !assessment.probeError
     && assessment.reasons.length === 1
     && assessment.reasons[0]?.startsWith('duration ') === true;
@@ -119,6 +206,10 @@ export function probeVideoQuality(
       durationSeconds: null,
       sampledFrames: 0,
       maxFrameDifference: null,
+      changedFrames: null,
+      blankFrameRatio: null,
+      initialNonBlankRatio: null,
+      finalNonBlankRatio: null,
       usable: false,
       reasons: ['video metadata probe failed'],
       probeError,
@@ -128,8 +219,8 @@ export function probeVideoQuality(
   const frameArgs = [
     '-hide_banner', '-loglevel', 'error', '-nostats',
     '-i', file,
-    '-vf', 'fps=2,scale=160:-2,signalstats,metadata=print:file=-',
-    '-frames:v', '120',
+    '-vf', 'crop=iw*0.70:ih*0.70:iw*0.15:ih*0.15,fps=4,scale=160:-2,signalstats,metadata=print:file=-',
+    '-frames:v', '240',
     '-f', 'null', '-',
   ];
   onCommand?.({ event: 'Command started', command: [ffmpeg, ...frameArgs] });
@@ -141,14 +232,7 @@ export function probeVideoQuality(
     signal: frameProbe.signal,
   });
   const output = `${frameProbe.stdout}\n${frameProbe.stderr}`;
-  const frameDifferences = [...output.matchAll(/lavfi\.signalstats\.YDIF=([0-9.eE+-]+)/g)]
-    .map((match) => Number(match[1]))
-    .filter(Number.isFinite);
-  const metrics: VideoQualityMetrics = {
-    durationSeconds: Number.isFinite(durationSeconds) ? durationSeconds : null,
-    sampledFrames: frameDifferences.length,
-    maxFrameDifference: frameDifferences.length > 0 ? Math.max(...frameDifferences) : null,
-  };
+  const metrics = metricsFromProbeOutput(durationSeconds, output);
   const assessment = assessVideoMetrics(metrics);
   if (frameProbe.status !== 0) {
     assessment.usable = false;
@@ -160,6 +244,131 @@ export function probeVideoQuality(
     ...assessment,
     ...(frameProbe.status !== 0
       ? { probeError: frameProbe.stderr.trim() || `ffmpeg exited ${frameProbe.status ?? 'without a status'}` }
+      : {}),
+  };
+}
+
+interface BufferedCommandResult {
+  status: number | null;
+  signal: NodeJS.Signals | null;
+  stdout: string;
+  stderr: string;
+  timedOut: boolean;
+}
+
+function spawnBuffered(command: string, args: string[], timeoutMs = 60_000): Promise<BufferedCommandResult> {
+  return new Promise((resolveCommand) => {
+    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    const maxBytes = 8 * 1024 * 1024;
+    let timedOut = false;
+    let escalation: NodeJS.Timeout | null = null;
+    const deadline = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGTERM');
+      escalation = setTimeout(() => child.kill('SIGKILL'), 2_000);
+    }, timeoutMs);
+    child.stdout.on('data', (chunk: Buffer) => {
+      stdoutBytes += chunk.length;
+      if (stdoutBytes <= maxBytes) stdout.push(chunk);
+    });
+    child.stderr.on('data', (chunk: Buffer) => {
+      stderrBytes += chunk.length;
+      if (stderrBytes <= maxBytes) stderr.push(chunk);
+    });
+    child.once('error', (error) => {
+      clearTimeout(deadline);
+      if (escalation) clearTimeout(escalation);
+      resolveCommand({ status: null, signal: null, stdout: '', stderr: error.message, timedOut });
+    });
+    child.once('close', (status, signal) => {
+      clearTimeout(deadline);
+      if (escalation) clearTimeout(escalation);
+      resolveCommand({
+        status,
+        signal,
+        stdout: Buffer.concat(stdout).toString('utf8'),
+        stderr: Buffer.concat(stderr).toString('utf8'),
+        timedOut,
+      });
+    });
+  });
+}
+
+export async function probeVideoQualityAsync(
+  file: string,
+  ffmpeg: string,
+  onCommand?: (event: VideoProbeCommandEvent) => void,
+): Promise<VideoQualityAssessment> {
+  const ffprobe = path.basename(ffmpeg).startsWith('ffmpeg')
+    ? path.join(path.dirname(ffmpeg), path.basename(ffmpeg).replace(/^ffmpeg/, 'ffprobe'))
+    : 'ffprobe';
+  const durationArgs = [
+    '-v', 'error',
+    '-show_entries', 'format=duration',
+    '-of', 'default=noprint_wrappers=1:nokey=1',
+    file,
+  ];
+  onCommand?.({ event: 'Command started', command: [ffprobe, ...durationArgs] });
+  const durationProbe = await spawnBuffered(ffprobe, durationArgs);
+  onCommand?.({
+    event: 'Command finished',
+    command: [ffprobe, ...durationArgs],
+    exitCode: durationProbe.status,
+    signal: durationProbe.signal,
+  });
+  if (durationProbe.status !== 0 || durationProbe.timedOut) {
+    return {
+      path: file,
+      durationSeconds: null,
+      sampledFrames: 0,
+      maxFrameDifference: null,
+      changedFrames: null,
+      blankFrameRatio: null,
+      initialNonBlankRatio: null,
+      finalNonBlankRatio: null,
+      usable: false,
+      reasons: ['video metadata probe failed'],
+      probeError: durationProbe.timedOut
+        ? 'ffprobe exceeded its 60 second deadline'
+        : durationProbe.stderr.trim() || `ffprobe exited ${durationProbe.status ?? 'without a status'}`,
+    };
+  }
+  const durationSeconds = Number(durationProbe.stdout.trim());
+  const frameArgs = [
+    '-hide_banner', '-loglevel', 'error', '-nostats',
+    '-i', file,
+    '-vf', 'crop=iw*0.70:ih*0.70:iw*0.15:ih*0.15,fps=4,scale=160:-2,signalstats,metadata=print:file=-',
+    '-frames:v', '240',
+    '-f', 'null', '-',
+  ];
+  onCommand?.({ event: 'Command started', command: [ffmpeg, ...frameArgs] });
+  const frameProbe = await spawnBuffered(ffmpeg, frameArgs);
+  onCommand?.({
+    event: 'Command finished',
+    command: [ffmpeg, ...frameArgs],
+    exitCode: frameProbe.status,
+    signal: frameProbe.signal,
+  });
+  const metrics = metricsFromProbeOutput(durationSeconds, `${frameProbe.stdout}\n${frameProbe.stderr}`);
+  const assessment = assessVideoMetrics(metrics);
+  if (frameProbe.status !== 0 || frameProbe.timedOut) {
+    assessment.usable = false;
+    assessment.reasons.push('representative frame decoding failed');
+  }
+  return {
+    path: file,
+    ...metrics,
+    ...assessment,
+    ...(frameProbe.status !== 0 || frameProbe.timedOut
+      ? {
+          probeError: frameProbe.timedOut
+            ? 'ffmpeg exceeded its 60 second deadline'
+            : frameProbe.stderr.trim() || `ffmpeg exited ${frameProbe.status ?? 'without a status'}`,
+        }
       : {}),
   };
 }
@@ -238,8 +447,8 @@ export async function buildVideoRetentionPlan(
   artifactRootValue: string,
   resultsFileValue: string,
   options: {
-    requireExecutedInteractionVideo?: boolean;
     probeVideo?: (file: string) => VideoQualityAssessment | Promise<VideoQualityAssessment>;
+    probeConcurrency?: number;
   } = {},
 ): Promise<VideoRetentionPlan> {
   const artifactRoot = path.resolve(artifactRootValue);
@@ -261,6 +470,18 @@ export async function buildVideoRetentionPlan(
     errors: [],
   };
 
+  const boundedForEach = async <T>(values: readonly T[], requestedConcurrency: number, task: (value: T) => Promise<void>): Promise<void> => {
+    const concurrency = Math.max(1, Math.min(values.length || 1, Math.floor(requestedConcurrency)));
+    let next = 0;
+    await Promise.all(Array.from({ length: concurrency }, async () => {
+      while (next < values.length) {
+        const value = values[next];
+        next += 1;
+        if (value !== undefined) await task(value);
+      }
+    }));
+  };
+
   const tests: Array<{ spec: JsonSpec; test: JsonTest }> = [];
   const visit = (suite: JsonSuite): void => {
     for (const spec of suite.specs ?? []) {
@@ -269,6 +490,44 @@ export async function buildVideoRetentionPlan(
     for (const child of suite.suites ?? []) visit(child);
   };
   for (const suite of report.suites ?? []) visit(suite);
+
+  // Decode each unique eligible clip once. The main reconciliation pass stays
+  // deterministic, while FFmpeg work runs through a small CPU-aware pool.
+  const qualityBySource = new Map<string, VideoQualityAssessment>();
+  if (options.probeVideo) {
+    const sources = new Set<string>();
+    for (const { test } of tests) {
+      const policy = parseEvidencePolicyAnnotation(test.annotations);
+      for (const result of test.results ?? []) {
+        if (result.status === 'skipped' || policy?.mode !== 'interaction-video') continue;
+        for (const attachment of (result.attachments ?? []).filter(isVideo)) {
+          if (!attachment.path) continue;
+          const source = resolveAttachmentPath(attachment.path, artifactRoot, resultsDirectory);
+          if (source) sources.add(source);
+        }
+      }
+    }
+    await boundedForEach([...sources].sort(), options.probeConcurrency ?? 2, async (source) => {
+      try {
+        qualityBySource.set(source, await options.probeVideo!(source));
+      } catch (error) {
+        qualityBySource.set(source, {
+          path: source,
+          durationSeconds: null,
+          sampledFrames: 0,
+          maxFrameDifference: null,
+          changedFrames: null,
+          blankFrameRatio: null,
+          initialNonBlankRatio: null,
+          finalNonBlankRatio: null,
+          usable: false,
+          reasons: ['video quality probe failed'],
+          probeError: error instanceof Error ? error.message : String(error),
+        });
+      }
+    });
+  }
+  const hashBySource = new Map<string, Promise<string>>();
 
   for (const { spec, test } of tests) {
     const policy = parseEvidencePolicyAnnotation(test.annotations);
@@ -300,7 +559,12 @@ export async function buildVideoRetentionPlan(
         if (!eligible) plan.rejectedPaths.add(source);
         let hash: string;
         try {
-          hash = await sha256File(source);
+          let pendingHash = hashBySource.get(source);
+          if (!pendingHash) {
+            pendingHash = sha256File(source);
+            hashBySource.set(source, pendingHash);
+          }
+          hash = await pendingHash;
         } catch (error) {
           if (eligible) {
             plan.rejectedPaths.add(source);
@@ -310,12 +574,28 @@ export async function buildVideoRetentionPlan(
         }
         if (eligible) {
           const quality = options.probeVideo
-            ? await options.probeVideo(source)
+            ? qualityBySource.get(source) ?? {
+                path: source,
+                durationSeconds: null,
+                sampledFrames: 0,
+                maxFrameDifference: null,
+                changedFrames: null,
+                blankFrameRatio: null,
+                initialNonBlankRatio: null,
+                finalNonBlankRatio: null,
+                usable: false,
+                reasons: ['video quality probe was not completed'],
+                probeError: 'eligible clip was absent from the bounded probe inventory',
+              }
             : {
                 path: source,
                 durationSeconds: null,
                 sampledFrames: 0,
                 maxFrameDifference: null,
+                changedFrames: null,
+                blankFrameRatio: null,
+                initialNonBlankRatio: null,
+                finalNonBlankRatio: null,
                 usable: true,
                 reasons: ['quality probe was not requested'],
               };
@@ -345,7 +625,7 @@ export async function buildVideoRetentionPlan(
           plan.rejectedHashes.add(hash);
         }
       }
-      if (eligible && usableVideoCount === 0 && (options.requireExecutedInteractionVideo ?? true)) {
+      if (eligible && usableVideoCount === 0) {
         const diagnosticCount = videoAttachments.filter((attachment) => {
           if (!attachment.path) return false;
           const source = resolveAttachmentPath(attachment.path, artifactRoot, resultsDirectory);

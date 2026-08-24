@@ -7,6 +7,7 @@ import {
 } from '../shared/gallery-contract.mjs';
 
 const ready = parseChecklistRelease({
+  schemaVersion: 1,
   release: {
     ready: true,
     decision: 'READY',
@@ -22,6 +23,7 @@ assert.equal(releaseOutcome('completed', ready).status, 'ready');
 assert.equal(releaseOutcome('completed', ready).exitCode, 0);
 
 const notReady = parseChecklistRelease({
+  schemaVersion: 1,
   release: {
     ready: false,
     decision: 'NOT_READY',
@@ -42,6 +44,7 @@ assert.equal(pipelineOnlyOutcome('failed', notReady).exitCode, 1);
 assert.equal(releaseOutcome('failed', ready).status, 'pipeline-failed');
 
 const incompleteSmoke = parseChecklistRelease({
+  schemaVersion: 1,
   release: {
     ready: false,
     decision: 'NOT_READY',
@@ -56,6 +59,7 @@ const incompleteSmoke = parseChecklistRelease({
 assert.equal(pipelineOnlyOutcome('completed', incompleteSmoke).status, 'completed-not-ready');
 assert.equal(pipelineOnlyOutcome('completed', incompleteSmoke).exitCode, 0);
 assert.throws(() => parseChecklistRelease({
+  schemaVersion: 1,
   release: {
     ready: false,
     decision: 'READY',
@@ -68,6 +72,7 @@ assert.throws(() => parseChecklistRelease({
   },
 }), /contradicts/);
 assert.throws(() => parseChecklistRelease({
+  schemaVersion: 1,
   release: {
     ready: true,
     decision: 'READY',
@@ -80,6 +85,7 @@ assert.throws(() => parseChecklistRelease({
   },
 }), /reason/);
 assert.throws(() => parseChecklistRelease({
+  schemaVersion: 1,
   release: {
     ready: true,
     decision: 'READY',
@@ -91,6 +97,41 @@ assert.throws(() => parseChecklistRelease({
     runIntegrityFailure: false,
   },
 }), /blocking or run-integrity/);
+
+assert.throws(() => parseChecklistRelease({ release: ready }), /schemaVersion/);
+assert.throws(() => parseChecklistRelease({ schemaVersion: 2, release: ready }), /schemaVersion/);
+
+const completeReadyRelease = {
+  ready: true,
+  decision: 'READY',
+  reason: 'All release gates passed with authoritative evidence.',
+  decisionBasis: 'The complete versioned checklist is authoritative.',
+  blockingFailures: 0,
+  blockingIncomplete: 0,
+  baselineIssues: 0,
+  runIntegrityFailure: false,
+};
+for (const requiredField of [
+  'blockingFailures',
+  'blockingIncomplete',
+  'baselineIssues',
+  'runIntegrityFailure',
+  'decisionBasis',
+]) {
+  const incompleteRelease = { ...completeReadyRelease };
+  delete incompleteRelease[requiredField];
+  assert.throws(
+    () => parseChecklistRelease({ schemaVersion: 1, release: incompleteRelease }),
+    new RegExp(requiredField),
+    `READY must not be accepted without ${requiredField}.`,
+  );
+  const nullRelease = { ...completeReadyRelease, [requiredField]: null };
+  assert.throws(
+    () => parseChecklistRelease({ schemaVersion: 1, release: nullRelease }),
+    new RegExp(requiredField),
+    `READY must not be accepted with null ${requiredField}.`,
+  );
+}
 
 const releaseBeforeFlags = JSON.stringify(notReady);
 const openedHistory = applyGalleryFlagTransition({

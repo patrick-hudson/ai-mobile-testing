@@ -1,7 +1,7 @@
 import { test, expect, interactionEvidence, interactionTest, staticEvidence, staticTest } from '../fixtures/test.js';
 import { meta, dismissSchedulingNotice, pageHasHorizontalOverflow, waitForSettledUI } from './helpers.js';
 
-staticTest('[SHELL-002] responsive header keeps its primary actions visible and operable', staticEvidence('Capture the responsive header across every custom breakpoint with visible-control and clipping geometry.'), async ({ page, audit }, testInfo) => {
+staticTest('[SHELL-002] responsive header keeps its primary actions visible and operable', staticEvidence('Capture the responsive header across every custom breakpoint with visible-control and clipping geometry.', 'candidate-desktop-chromium'), async ({ page, audit }, testInfo) => {
   test.skip(testInfo.project.name !== 'candidate-desktop-chromium', 'One resizable Chromium project checks the complete responsive header contract.');
   const widths = [320, 360, 520, 719, 720, 760, 900, 1024, 1440] as const;
   const evidence = [];
@@ -27,6 +27,8 @@ staticTest('[SHELL-002] responsive header keeps its primary actions visible and 
     if (width >= 520) expect(visibleActions.some(({ href }) => href === '/next-kratom-support-meeting')).toBe(true);
     evidence.push({ width, visibleActions, clipped });
   }
+  expect(widths, 'The responsive-header contract must retain all nine reviewed widths').toHaveLength(9);
+  expect(evidence.map(({ width }) => width), 'Every declared header width must produce one inspected record').toEqual([...widths]);
   await audit.attachJson('responsive-header-ledger', evidence);
   audit.observe('Header breakpoints inspected', widths.length, String(widths.length));
   await audit.checkpoint('responsive-header-final');
@@ -44,7 +46,6 @@ interactionTest('[THEME-001] explicit light and dark modes persist', interaction
     await expect(page.locator('html')).not.toHaveClass(/dark/);
     expect(await page.evaluate(() => localStorage.getItem('theme'))).toBe('light');
   });
-  await audit.checkpoint('theme-light');
 
   await audit.step('Choose dark mode and reload', 'Dark mode applies and survives navigation.', async () => {
     await trigger.click();
@@ -53,13 +54,13 @@ interactionTest('[THEME-001] explicit light and dark modes persist', interaction
     await page.reload({ waitUntil: 'load' });
     await expect(page.locator('html')).toHaveClass(/dark/);
   });
-  await audit.checkpoint('theme-dark');
   await audit.assertRuntimeHealthy();
 });
 
-staticTest('[THEME-004] custom breakpoints do not clip header actions', staticEvidence('Capture the final breakpoint state with the full breakpoint overflow and overlap ledger.'), async ({ page, audit }, testInfo) => {
+staticTest('[THEME-004] custom breakpoints do not clip header actions', staticEvidence('Capture the final breakpoint state with the full breakpoint overflow and overlap ledger.', 'candidate-desktop-chromium'), async ({ page, audit }, testInfo) => {
   test.skip(testInfo.project.name !== 'candidate-desktop-chromium', 'Single resizable Chromium project prevents redundant probes.');
-  const widths = [320, 359, 360, 519, 520, 719, 720, 759, 760, 899, 900, 1023, 1024, 1279, 1280];
+  const widths = [320, 359, 360, 519, 520, 719, 720, 759, 760, 899, 900, 1023, 1024, 1279, 1280] as const;
+  const observations: Array<{ width: number; overflowPx: number; overlap: boolean }> = [];
 
   for (const width of widths) {
     await audit.step(`Render header at ${width}px`, 'Visible header controls fit inside the viewport without overlap.', async () => {
@@ -67,7 +68,8 @@ staticTest('[THEME-004] custom breakpoints do not clip header actions', staticEv
       await audit.goto('/');
       await dismissSchedulingNotice(page);
       await waitForSettledUI(page);
-      expect(await pageHasHorizontalOverflow(page), `Page overflow at ${width}px`).toBe(0);
+      const overflowPx = await pageHasHorizontalOverflow(page);
+      expect(overflowPx, `Page overflow at ${width}px`).toBe(0);
       const overlap = await page.locator('header').evaluate((header) => {
         const visible = [...header.querySelectorAll<HTMLElement>('a,button')].filter((element) => {
           const box = element.getBoundingClientRect();
@@ -83,13 +85,17 @@ staticTest('[THEME-004] custom breakpoints do not clip header actions', staticEv
         }));
       });
       expect(overlap, `Header overlap at ${width}px`).toBe(false);
-      audit.observe(`horizontal overflow at ${width}px`, 0, '0 px');
+      observations.push({ width, overflowPx, overlap });
+      audit.observe(`horizontal overflow at ${width}px`, overflowPx, '0 px');
     });
   }
+  expect(widths, 'The breakpoint-boundary contract must retain all fifteen reviewed widths').toHaveLength(15);
+  expect(observations.map(({ width }) => width), 'Every declared breakpoint width must produce one geometry observation').toEqual([...widths]);
+  expect(observations.every(({ overflowPx, overlap }) => overflowPx === 0 && !overlap), 'Every inspected breakpoint must remain overflow- and overlap-free').toBe(true);
   await audit.checkpoint('breakpoint-final-1280');
 });
 
-staticTest('[THEME-003] first paint honors stored dark mode', staticEvidence('Capture the first rendered dark state with its pre-hydration class, mode, and computed background.'), async ({ page, audit }, testInfo) => {
+staticTest('[THEME-003] first paint honors stored dark mode', staticEvidence('Capture the first rendered dark state with its pre-hydration class, mode, and computed background.', 'candidate-desktop-chromium'), async ({ page, audit }, testInfo) => {
   test.skip(testInfo.project.name !== 'candidate-desktop-chromium', 'Candidate first-paint audit.');
   await page.addInitScript(() => localStorage.setItem('theme', 'dark'));
   await audit.goto('/');

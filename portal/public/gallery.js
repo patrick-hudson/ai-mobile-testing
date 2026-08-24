@@ -56,6 +56,9 @@ const state = {
   flagAttempt: null,
   flagController: null,
   flagGeneration: 0,
+  flagMutationController: null,
+  flagMutationGeneration: 0,
+  flagCloseTimer: null,
   deltaController: null,
   deltaGeneration: 0,
   flagItemId: null,
@@ -565,6 +568,7 @@ function validateRawArtifactUrl(value) {
 
 async function openFlagDialog(itemId) {
   if (!ITEM_ID.test(itemId ?? '')) return;
+  cancelFlagMutation();
   state.flagController?.abort();
   const controller = new AbortController();
   const generation = ++state.flagGeneration;
@@ -653,6 +657,13 @@ async function submitFlag(event) {
   if (!state.flagAttempt || state.flagAttempt.fingerprint !== fingerprint) {
     state.flagAttempt = { fingerprint, idempotencyKey: crypto.randomUUID() };
   }
+  state.flagMutationController?.abort();
+  if (state.flagCloseTimer) clearTimeout(state.flagCloseTimer);
+  state.flagCloseTimer = null;
+  const controller = new AbortController();
+  const generation = ++state.flagMutationGeneration;
+  const itemId = state.flagItemId;
+  state.flagMutationController = controller;
   elements.gallery_flag_submit.disabled = true;
   elements.gallery_flag_state.textContent = 'Saving one idempotent reviewer event…';
   try {
@@ -665,20 +676,35 @@ async function submitFlag(event) {
       justification: ['resolved', 'dismissed'].includes(action) ? text : undefined,
       expectedFlagRevision: state.flags.flagRevision,
       idempotencyKey: state.flagAttempt.idempotencyKey,
+      signal: controller.signal,
     });
+    if (controller.signal.aborted || generation !== state.flagMutationGeneration
+      || state.flagItemId !== itemId || !elements.gallery_flag_dialog.open) return;
     if (!result) throw new Error('The reviewer event was not accepted.');
     await discoverRevision();
+    if (controller.signal.aborted || generation !== state.flagMutationGeneration
+      || state.flagItemId !== itemId || !elements.gallery_flag_dialog.open) return;
     elements.gallery_flag_state.textContent = result.idempotent ? 'The earlier save was confirmed without creating a duplicate.' : 'Reviewer event saved. Apply the updated order when you are ready.';
     state.flagAttempt = null;
-    setTimeout(closeFlagDialog, 650);
+    state.flagCloseTimer = setTimeout(() => {
+      state.flagCloseTimer = null;
+      if (generation === state.flagMutationGeneration && state.flagItemId === itemId
+        && elements.gallery_flag_dialog.open) closeFlagDialog();
+    }, 650);
   } catch (error) {
+    if (error?.name === 'AbortError' || controller.signal.aborted || generation !== state.flagMutationGeneration) return;
     if (error.status === 409) {
       elements.gallery_flag_state.textContent = 'The flag history changed. Your text is retained; reload the current issue state, then retry.';
       try { await reloadFlagsKeepingText(); } catch (reloadError) {
         if (reloadError?.name !== 'AbortError') elements.gallery_flag_state.textContent = `Flag conflict reload failed: ${friendlyError(reloadError)} Your text is still retained.`;
       }
     } else elements.gallery_flag_state.textContent = `${friendlyError(error)} You can retry the exact save without creating a duplicate.`;
-  } finally { elements.gallery_flag_submit.disabled = !state.flags?.capability?.mutable; }
+  } finally {
+    if (state.flagMutationController === controller) state.flagMutationController = null;
+    if (generation === state.flagMutationGeneration && state.flagItemId === itemId) {
+      elements.gallery_flag_submit.disabled = !state.flags?.capability?.mutable;
+    }
+  }
 }
 
 function transitionFlagId(action) {
@@ -721,6 +747,7 @@ async function reloadFlagsKeepingText() {
 }
 
 function closeFlagDialog() {
+  cancelFlagMutation();
   state.flagController?.abort();
   state.flagController = null;
   state.flagGeneration += 1;
@@ -733,6 +760,14 @@ function closeFlagDialog() {
   elements.gallery_flag_state.textContent = '';
   if (elements.gallery_flag_dialog.open) elements.gallery_flag_dialog.close();
   opener?.focus?.();
+}
+
+function cancelFlagMutation() {
+  state.flagMutationController?.abort();
+  state.flagMutationController = null;
+  state.flagMutationGeneration += 1;
+  if (state.flagCloseTimer) clearTimeout(state.flagCloseTimer);
+  state.flagCloseTimer = null;
 }
 
 function activity(kind, message) {
@@ -785,6 +820,7 @@ function showFatal(error) {
 
 function destroy() {
   state.destroyed = true;
+  cancelFlagMutation();
   state.flagController?.abort();
   state.deltaController?.abort();
   state.stream?.close();

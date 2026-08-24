@@ -117,8 +117,11 @@ async function loadReport() {
     setMainState('content');
     renderReport();
     elements.report_connection.textContent = `Loaded ${formatDate(state.report.generatedAt)}`;
-    announce(`Release report loaded. ${state.run.status === 'review-required' ? 'Release signoff is withheld for review.' : `Decision: ${state.report.release?.decision ?? 'not available'}.`}`);
+    announce(`Release report loaded. ${state.run.status === 'review-required' ? 'Release signoff is withheld for review.' : `Decision: ${state.run.release?.decision ?? state.report.release?.decision ?? 'not available'}.`}`);
     await Promise.allSettled([loadAudits(), loadArtifacts()]);
+    if (!TERMINAL_STATUSES.has(state.run.status)) {
+      state.retryTimer = window.setTimeout(() => void loadReport(), REPORT_RETRY_MS);
+    }
   } catch (error) {
     if (controller.signal.aborted) return;
     showFatal('This report could not be loaded', friendlyError(error));
@@ -166,9 +169,11 @@ function renderReport() {
 
 function renderDecision() {
   const { run, report } = state;
-  const release = report.release ?? run.release;
-  const decision = release?.decision ?? 'UNAVAILABLE';
   const active = !TERMINAL_STATUSES.has(run.status);
+  // The run lifecycle is the current authority. A compact report can be a
+  // successful but provisional snapshot produced before a later stage failed.
+  const release = run.release ?? report.release;
+  const decision = release?.decision ?? 'UNAVAILABLE';
   const reviewRequired = run.status === 'review-required' || (decision === 'READY' && (run.reviewReasons?.length ?? 0) > 0);
   const tone = active ? 'running' : decision === 'NOT_READY' ? 'not-ready' : reviewRequired ? 'review' : decision === 'READY' ? 'ready' : 'review';
   elements.decision_hero.dataset.tone = tone;
@@ -214,7 +219,7 @@ function renderDecision() {
 
 function renderMetrics() {
   const summary = state.report.summary ?? {};
-  const release = state.report.release ?? {};
+  const release = state.run.release ?? state.report.release ?? {};
   const metrics = [
     ['Documented checks', number(summary.total), 'Every expected behavior stays visible'],
     ['Executed checks', `${number(summary.executed)} / ${number(summary.total)}`, percentCopy(summary.executed, summary.total)],
@@ -747,11 +752,14 @@ async function loadLog() {
     elements.report_log.textContent = log || 'No log output has been recorded.';
     elements.report_log.hidden = false;
     elements.log_state.textContent = snapshot.truncated
-      ? `Showing the newest ${formatBytes(snapshot.bytes)}. Earlier output is preserved in the complete source logs below.`
-      : `Showing ${formatBytes(snapshot.bytes)} of persisted output.`;
+      ? `Showing the newest ${formatBytes(snapshot.bytes)} through the bounded, redacting log API.`
+      : `Showing ${formatBytes(snapshot.bytes)} of persisted output through the bounded, redacting log API.`;
     elements.log_links.replaceChildren();
     for (const source of snapshot.sources ?? []) {
-      elements.log_links.append(evidenceLink(artifactUrl(source.path), `Complete log · ${source.path}`, formatBytes(source.size)));
+      const item = document.createElement('p');
+      item.className = 'muted';
+      item.textContent = `Redacted source · ${source.path} · ${formatBytes(source.size)} stored`;
+      elements.log_links.append(item);
     }
     announce('Recent execution log loaded.');
   } catch (error) {

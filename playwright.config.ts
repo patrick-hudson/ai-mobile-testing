@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { defineConfig, devices, type ReporterDescription } from '@playwright/test';
 import { ENVIRONMENTS } from './audit/environments.js';
+import { resolveAuditTargetSelection, type AuditTargetDefinition } from './audit/targets.js';
 import { assertCandidateCertificateBypassAllowed, chromiumNetskopeTrustArgument } from './audit/tls.js';
 import type { AuditProjectMetadata } from './audit/types.js';
 
@@ -22,6 +23,7 @@ const firefoxCorporateTrust = {
     firefoxUserPrefs: { 'security.enterprise_roots.enabled': true },
   },
 };
+const selectedTargets = resolveAuditTargetSelection(process.env.AUDIT_TARGET_IDS);
 const pluginRegistry = JSON.parse(readFileSync(new URL('./audit/plugins.generated.json', import.meta.url), 'utf8')) as {
   plugins: Array<{ entrySpecs: string[] }>;
 };
@@ -41,22 +43,41 @@ const reporters: ReporterDescription[] = blobShardRun
       ['json', { outputFile: `${artifactRoot}/results.json` }],
     ];
 
-function metadata(
-  environment: AuditProjectMetadata['environment'],
-  browserLabel: string,
-  deviceClass: AuditProjectMetadata['deviceClass'],
-  fullSweep: boolean,
-  visual: boolean,
-): AuditProjectMetadata {
+function metadata(target: AuditTargetDefinition): AuditProjectMetadata {
   return {
-    environment,
-    browserLabel,
-    deviceClass,
-    fullSweep,
-    visual,
-    tlsPolicy: environment === 'candidate' && candidateIgnoreHTTPSErrors
+    environment: target.environment,
+    browserLabel: target.browserLabel,
+    deviceClass: target.deviceClass,
+    fullSweep: target.fullSweep,
+    visual: target.visual,
+    tlsPolicy: target.environment === 'candidate' && candidateIgnoreHTTPSErrors
       ? 'ignored-for-development'
       : 'strict',
+  };
+}
+
+function projectForTarget(target: AuditTargetDefinition) {
+  const trust = target.engine === 'chromium'
+    ? chromiumCorporateTrust
+    : target.engine === 'firefox'
+      ? firefoxCorporateTrust
+      : {};
+  const descriptor = devices[target.deviceDescriptor];
+  if (!descriptor) throw new Error(`Audit target ${target.id} references unavailable Playwright device descriptor ${target.deviceDescriptor}.`);
+  const deviceOptions = target.userAgentSource === 'browser-native'
+    ? Object.fromEntries(Object.entries(descriptor).filter(([key]) => key !== 'userAgent'))
+    : descriptor;
+  return {
+    name: target.id,
+    metadata: metadata(target),
+    use: {
+      ...deviceOptions,
+      ...trust,
+      baseURL: ENVIRONMENTS[target.environment].baseURL,
+      ignoreHTTPSErrors: target.environment === 'candidate' ? candidateIgnoreHTTPSErrors : false,
+      ...(target.deviceClass === 'desktop' ? { viewport: { width: 1440, height: 900 } } : {}),
+      ...(target.browserProduct === 'microsoft-edge' ? { channel: 'msedge' } : {}),
+    },
   };
 }
 
@@ -69,6 +90,7 @@ function binaryEnvironmentFlag(name: string, defaultValue: boolean): boolean {
 }
 
 console.log(`[AUDIT_CONFIG] TLS policy: Netskope CA + pinned Chromium SPKI trusted; candidate certificate errors ${candidateIgnoreHTTPSErrors ? 'ignored for development' : 'enforced'}; production certificate errors enforced.`);
+console.log(`[AUDIT_CONFIG] Targets: ${selectedTargets.map(({ id, fidelity, browserProduct }) => `${id} (${browserProduct}; ${fidelity})`).join(', ')}.`);
 
 export default defineConfig({
   testDir: '.',
@@ -106,58 +128,5 @@ export default defineConfig({
     screenshot: 'only-on-failure',
     video: 'off',
   },
-  projects: [
-    {
-      name: 'production-mobile-chromium',
-      metadata: metadata('production', 'Chromium / Pixel 5', 'mobile', true, false),
-      use: { ...devices['Pixel 5'], ...chromiumCorporateTrust, baseURL: ENVIRONMENTS.production.baseURL },
-    },
-    {
-      name: 'candidate-mobile-chromium',
-      metadata: metadata('candidate', 'Chromium / Pixel 5', 'mobile', true, true),
-      use: { ...devices['Pixel 5'], ...chromiumCorporateTrust, baseURL: ENVIRONMENTS.candidate.baseURL, ignoreHTTPSErrors: candidateIgnoreHTTPSErrors },
-    },
-    {
-      name: 'production-desktop-chromium',
-      metadata: metadata('production', 'Chromium / desktop', 'desktop', false, false),
-      use: {
-        ...devices['Desktop Chrome'],
-        ...chromiumCorporateTrust,
-        baseURL: ENVIRONMENTS.production.baseURL,
-        viewport: { width: 1440, height: 900 },
-      },
-    },
-    {
-      name: 'candidate-desktop-chromium',
-      metadata: metadata('candidate', 'Chromium / desktop', 'desktop', true, true),
-      use: {
-        ...devices['Desktop Chrome'],
-        ...chromiumCorporateTrust,
-        baseURL: ENVIRONMENTS.candidate.baseURL,
-        ignoreHTTPSErrors: candidateIgnoreHTTPSErrors,
-        viewport: { width: 1440, height: 900 },
-      },
-    },
-    {
-      name: 'candidate-mobile-webkit',
-      metadata: metadata('candidate', 'WebKit / iPhone 13', 'mobile', false, true),
-      use: { ...devices['iPhone 13'], baseURL: ENVIRONMENTS.candidate.baseURL, ignoreHTTPSErrors: candidateIgnoreHTTPSErrors },
-    },
-    {
-      name: 'candidate-tablet-webkit',
-      metadata: metadata('candidate', 'WebKit / iPad Mini', 'tablet', false, true),
-      use: { ...devices['iPad Mini'], baseURL: ENVIRONMENTS.candidate.baseURL, ignoreHTTPSErrors: candidateIgnoreHTTPSErrors },
-    },
-    {
-      name: 'candidate-desktop-firefox',
-      metadata: metadata('candidate', 'Firefox / desktop', 'desktop', false, true),
-      use: {
-        ...devices['Desktop Firefox'],
-        baseURL: ENVIRONMENTS.candidate.baseURL,
-        ...firefoxCorporateTrust,
-        ignoreHTTPSErrors: candidateIgnoreHTTPSErrors,
-        viewport: { width: 1440, height: 900 },
-      },
-    },
-  ],
+  projects: selectedTargets.map(projectForTarget),
 });

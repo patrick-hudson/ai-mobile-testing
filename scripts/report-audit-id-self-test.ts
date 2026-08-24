@@ -3,9 +3,19 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { bracketedAuditIds, firstBracketedAuditId } from '../audit/audit-id.js';
-import { AUDIT_EVIDENCE_POLICY_ANNOTATION, serializeEvidencePolicy } from '../audit/evidence-policy.js';
+import {
+  AUDIT_EVIDENCE_POLICY_ANNOTATION,
+  AUDIT_STATUS_ANNOTATION,
+  serializeEvidencePolicy,
+} from '../audit/evidence-policy.js';
 import type { AuditDefinition, AuditEvidenceRecord } from '../audit/types.js';
-import { buildAuditManifest, type ReportTestInput } from '../reporters/report-model.js';
+import type { GalleryCatalog } from '../shared/gallery-contract.mjs';
+import {
+  buildAuditManifest,
+  buildAuditModels,
+  projectReviewedExecutionTruth,
+  type ReportTestInput,
+} from '../reporters/report-model.js';
 
 const definitions: AuditDefinition[] = [
   {
@@ -41,9 +51,23 @@ const definitions: AuditDefinition[] = [
     evidence: ['json'],
     evidencePolicy: { mode: 'structured-data', rationale: 'Retain the horizontal-overflow mapping as structured evidence.' },
   },
+  {
+    id: 'ENV-003',
+    area: 'routes',
+    title: 'Paired route migration ledger',
+    userPromise: 'One correlated ledger can prove both origin inventories were compared.',
+    severity: 'P0',
+    releaseBlocking: true,
+    expected: 'Candidate and production are explicitly covered by one structured record.',
+    evidence: ['json'],
+    evidencePolicy: { mode: 'structured-data', rationale: 'Retain the paired origin route ledger as structured evidence.' },
+  },
 ];
 
-function evidence(definition: AuditDefinition): AuditEvidenceRecord {
+function evidence(
+  definition: AuditDefinition,
+  overrides: Partial<AuditEvidenceRecord> = {},
+): AuditEvidenceRecord {
   const timestamp = '2026-08-24T00:00:00.000Z';
   return {
     schemaVersion: 1,
@@ -68,7 +92,15 @@ function evidence(definition: AuditDefinition): AuditEvidenceRecord {
     httpResponses: [],
     failedRequests: [],
     badResponses: [],
+    ...overrides,
   };
+}
+
+interface ReportTestOptions {
+  annotations?: Array<{ type: string; description?: string }>;
+  metadata?: ReportTestInput['projectMetadata'];
+  record?: AuditEvidenceRecord;
+  results?: ReportTestInput['results'];
 }
 
 function reportTest(
@@ -76,15 +108,16 @@ function reportTest(
   title: string,
   file: string,
   extraTitlePath: string[] = [],
+  options: ReportTestOptions = {},
 ): ReportTestInput {
-  const record = evidence(definition);
+  const record = options.record ?? evidence(definition);
   return {
     id: `audit-id-self-test-${definition.id}`,
     title,
     titlePath: [file, ...extraTitlePath, title],
     file,
     projectName: 'candidate-self-test',
-    projectMetadata: {
+    projectMetadata: options.metadata ?? {
       environment: 'candidate',
       browserLabel: 'synthetic',
       deviceClass: 'mobile',
@@ -92,11 +125,11 @@ function reportTest(
       visual: false,
       tlsPolicy: 'strict',
     },
-    annotations: [
+    annotations: options.annotations ?? [
       { type: 'audit-id', description: definition.id },
       { type: AUDIT_EVIDENCE_POLICY_ANNOTATION, description: serializeEvidencePolicy(definition.evidencePolicy) },
     ],
-    results: [{
+    results: options.results ?? [{
       status: 'passed',
       expectedStatus: 'passed',
       duration: 1,
@@ -136,13 +169,400 @@ try {
     definitionCatalog: definitions,
   });
 
-  assert.deepEqual(manifest.audits.map(({ id }) => id), ['A11Y-001', 'PAGE-HOME', 'SHELL-006']);
+  assert.deepEqual(manifest.audits.map(({ id }) => id), ['A11Y-001', 'PAGE-HOME', 'SHELL-006', 'ENV-003']);
   assert.equal(manifest.audits.find(({ id }) => id === 'A11Y-001')?.executions[0]?.structuredEvidence, true);
   assert.equal(manifest.audits.find(({ id }) => id === 'A11Y-001')?.executions[0]?.auditId, 'A11Y-001');
   assert.equal(manifest.audits.some(({ id }) => id === 'UNMAPPED'), false);
   assert.equal(manifest.audits.some(({ id }) => id === 'PAGE-AUDIT'), false);
   assert.equal(manifest.audits.some(({ id }) => id === 'PAGE-LEVEL'), false);
   assert.deepEqual(manifest.unmappedTests, []);
+
+  const knownExecution = manifest.audits.find(({ id }) => id === 'A11Y-001')?.executions[0];
+  assert(knownExecution);
+  const mixedAssociationCatalog: GalleryCatalog = {
+    schemaVersion: 1,
+    items: [{
+      id: 'mixed-known-unknown-association',
+      kind: 'image',
+      test: {
+        id: knownExecution.sourceTestId,
+        title: knownExecution.title,
+        titlePath: knownExecution.titlePath,
+        file: knownExecution.location.file,
+        line: knownExecution.location.line,
+        column: knownExecution.location.column,
+        technicalSuite: 'assertion-integrity',
+      },
+      attempt: {
+        ordinal: 1,
+        retry: 0,
+        status: 'passed',
+        expectedStatus: 'passed',
+        startedAt: null,
+        durationMs: 1,
+      },
+      project: {
+        name: knownExecution.project,
+        environment: knownExecution.environment,
+        browser: knownExecution.browser,
+        deviceClass: knownExecution.deviceClass,
+      },
+      auditAssociations: [{
+        id: 'A11Y-001',
+        title: definitions[0]!.title,
+        expected: definitions[0]!.expected,
+        featureSuite: definitions[0]!.area,
+        catalogOrdinal: 0,
+      }, {
+        id: 'TYPO-999',
+        title: 'Unknown association',
+        expected: 'This association must not be accepted.',
+        featureSuite: 'unmapped',
+        catalogOrdinal: null,
+      }],
+      members: [],
+      comparison: null,
+      capture: {
+        route: null,
+        viewport: null,
+        capturedAt: null,
+        observedState: null,
+        rationale: null,
+        provenance: 'missing',
+      },
+      provenance: { sourceShard: null },
+    }],
+    blobs: [],
+    primaryCounts: { total: 1, images: 1, videos: 0 },
+  };
+  projectReviewedExecutionTruth(mixedAssociationCatalog, [knownExecution]);
+  assert.equal(mixedAssociationCatalog.items[0]?.attempt.status, 'REVIEW');
+  assert.equal(mixedAssociationCatalog.items[0]?.attempt.statusSource, 'release-integrity');
+  assert.deepEqual(mixedAssociationCatalog.items[0]?.attempt.reviewReasonCodes, ['UNKNOWN_AUDIT_ID']);
+
+  const proseCannotControlStatus = reportTest(
+    definitions[0]!,
+    '[A11Y-001] blocked storage remains usable',
+    'tests/status-regression.spec.ts',
+    [],
+    {
+      annotations: [
+        { type: 'audit-id', description: 'A11Y-001' },
+        { type: 'note', description: 'The browser blocks storage by design.' },
+        { type: AUDIT_EVIDENCE_POLICY_ANNOTATION, description: serializeEvidencePolicy(definitions[0]!.evidencePolicy) },
+      ],
+    },
+  );
+  const exactBlocked = reportTest(
+    definitions[1]!,
+    '[PAGE-HOME] explicit review blocker',
+    'tests/status-regression.spec.ts',
+    [],
+    {
+      annotations: [
+        { type: 'audit-id', description: 'PAGE-HOME' },
+        { type: AUDIT_STATUS_ANNOTATION, description: 'BLOCKED' },
+        { type: AUDIT_EVIDENCE_POLICY_ANNOTATION, description: serializeEvidencePolicy(definitions[1]!.evidencePolicy) },
+      ],
+    },
+  );
+  const failedCannotBeWaived = reportTest(
+    definitions[2]!,
+    '[SHELL-006] failed result wins over review annotation',
+    'tests/status-regression.spec.ts',
+    [],
+    {
+      annotations: [
+        { type: 'audit-id', description: 'SHELL-006' },
+        { type: AUDIT_STATUS_ANNOTATION, description: 'REVIEW' },
+        { type: AUDIT_EVIDENCE_POLICY_ANNOTATION, description: serializeEvidencePolicy(definitions[2]!.evidencePolicy) },
+      ],
+      results: [{
+        status: 'failed',
+        expectedStatus: 'passed',
+        duration: 1,
+        retry: 0,
+        errors: [{ message: 'Synthetic failure' }],
+        attachments: [{
+          name: 'audit-result',
+          contentType: 'application/json',
+          body: Buffer.from(JSON.stringify(evidence(definitions[2]!))),
+        }],
+        stdout: [],
+        stderr: [],
+      }],
+    },
+  );
+  const statusManifest = await buildAuditManifest({
+    outputDir: path.join(root, 'status-checklist'),
+    tests: [proseCannotControlStatus, exactBlocked, failedCannotBeWaived],
+    run: { status: 'failed', source: 'playwright-json', profile: 'self-test' },
+    definitionCatalog: definitions.slice(0, 3),
+  });
+  assert.equal(statusManifest.audits.find(({ id }) => id === 'A11Y-001')?.status, 'PASS');
+  assert.equal(statusManifest.audits.find(({ id }) => id === 'PAGE-HOME')?.status, 'BLOCKED');
+  assert.equal(statusManifest.audits.find(({ id }) => id === 'SHELL-006')?.status, 'FAIL');
+
+  const pairedDefinition = definitions[3]!;
+  const pairedRecord = evidence(pairedDefinition, { coveredEnvironments: ['candidate', 'production'] });
+  const pairedManifest = await buildAuditManifest({
+    outputDir: path.join(root, 'paired-checklist'),
+    tests: [reportTest(
+      pairedDefinition,
+      '[ENV-003] compare both origins in one route ledger',
+      'tests/contracts.spec.ts',
+      [],
+      { record: pairedRecord },
+    )],
+    run: { status: 'passed', source: 'playwright-json', profile: 'self-test' },
+    definitionCatalog: [pairedDefinition],
+  });
+  const pairedAudit = pairedManifest.audits[0]!;
+  assert.equal(pairedAudit.status, 'PASS');
+  assert.equal(pairedAudit.environmentStatus.candidate, 'PASS');
+  assert.equal(pairedAudit.environmentStatus.production, 'PASS');
+  assert.equal(pairedAudit.coverage.candidate, 1);
+  assert.equal(pairedAudit.coverage.production, 1);
+
+  const unknownDefinition = { ...definitions[0]!, id: 'TYPO-999' };
+  const unknownManifest = await buildAuditManifest({
+    outputDir: path.join(root, 'unknown-checklist'),
+    tests: [reportTest(
+      unknownDefinition,
+      '[TYPO-999] this audit is absent from the catalog',
+      'tests/typo.spec.ts',
+    )],
+    run: { status: 'passed', source: 'playwright-json', profile: 'self-test' },
+    definitionCatalog: [definitions[0]!],
+  });
+  assert.equal(unknownManifest.release.ready, false);
+  assert.equal(unknownManifest.release.runIntegrityFailure, true);
+  assert.equal(unknownManifest.audits.some(({ id }) => id === 'TYPO-999'), false);
+  assert.equal(unknownManifest.unmappedTests.length, 1);
+
+  const productionSkipped = reportTest(
+    definitions[0]!,
+    '[A11Y-001] production selection is skipped',
+    'tests/accessibility.spec.ts',
+    [],
+    {
+      metadata: {
+        environment: 'production',
+        browserLabel: 'synthetic',
+        deviceClass: 'desktop',
+        fullSweep: false,
+        visual: false,
+        tlsPolicy: 'strict',
+      },
+      results: [{
+        status: 'skipped',
+        expectedStatus: 'skipped',
+        duration: 0,
+        retry: 0,
+        errors: [],
+        attachments: [],
+        stdout: [],
+        stderr: [],
+      }],
+    },
+  );
+  const coverageManifest = await buildAuditManifest({
+    outputDir: path.join(root, 'coverage-checklist'),
+    tests: [proseCannotControlStatus, productionSkipped],
+    run: { status: 'passed', source: 'playwright-json', profile: 'self-test' },
+    definitionCatalog: [definitions[0]!],
+  });
+  const coverage = coverageManifest.audits[0]!.coverage;
+  assert.equal(coverage.production, 0);
+  assert.equal(coverage.selected.production, 1);
+  assert.equal(coverage.skipped.production, 1);
+  assert.match(coverageManifest.audits[0]!.baseline.note, /not tested/i);
+
+  const flakyRecord = evidence(definitions[0]!);
+  const flakyTest = reportTest(
+    definitions[0]!,
+    '[A11Y-001] retry and development TLS retain both facts',
+    'tests/tls-regression.spec.ts',
+    [],
+    {
+      metadata: {
+        environment: 'candidate',
+        browserLabel: 'synthetic',
+        deviceClass: 'mobile',
+        fullSweep: false,
+        visual: false,
+        tlsPolicy: 'ignored-for-development',
+      },
+      results: [{
+        status: 'failed',
+        expectedStatus: 'passed',
+        duration: 1,
+        retry: 0,
+        errors: [{ message: 'Transient synthetic failure' }],
+        attachments: [],
+        stdout: [],
+        stderr: [],
+      }, {
+        status: 'passed',
+        expectedStatus: 'passed',
+        duration: 1,
+        retry: 1,
+        errors: [],
+        attachments: [{
+          name: 'audit-result',
+          contentType: 'application/json',
+          body: Buffer.from(JSON.stringify(flakyRecord)),
+        }],
+        stdout: [],
+        stderr: [],
+      }],
+    },
+  );
+  const flakyManifest = await buildAuditManifest({
+    outputDir: path.join(root, 'flaky-tls-checklist'),
+    tests: [flakyTest],
+    run: { status: 'passed', source: 'playwright-json', profile: 'self-test' },
+    definitionCatalog: [definitions[0]!],
+  });
+  const flakyExecution = flakyManifest.audits[0]!.executions[0]!;
+  assert.equal(flakyExecution.status, 'FLAKY');
+  assert.equal(flakyExecution.evidenceAuthority, 'withheld');
+  assert.deepEqual(flakyExecution.reasonCodes.sort(), ['FLAKY_RETRY', 'TLS_BYPASS']);
+  assert.equal(flakyManifest.audits[0]!.status, 'FLAKY');
+
+  const lateRuntimeRecord = evidence(definitions[0]!, {
+    pageErrors: ['Late hydration failed after the visible assertion.'],
+  });
+  const lateRuntimeManifest = await buildAuditManifest({
+    outputDir: path.join(root, 'late-runtime-checklist'),
+    tests: [reportTest(
+      definitions[0]!,
+      '[A11Y-001] late runtime failure cannot remain passed',
+      'tests/runtime-regression.spec.ts',
+      [],
+      { record: lateRuntimeRecord },
+    )],
+    run: { status: 'passed', source: 'playwright-json', profile: 'self-test' },
+    definitionCatalog: [definitions[0]!],
+  });
+  assert.equal(lateRuntimeManifest.audits[0]!.status, 'FAIL');
+  assert.equal(lateRuntimeManifest.audits[0]!.executions[0]!.rawStatus, 'passed');
+
+  const matchedExpectedRuntimeRecord = evidence(definitions[0]!, {
+    runtimeExpectations: [{
+      kind: 'response-status',
+      target: 'https://candidate.example.test/__missing__',
+      expected: 404,
+      matched: true,
+    }],
+  });
+  const expectedRuntimeManifest = await buildAuditManifest({
+    outputDir: path.join(root, 'expected-runtime-checklist'),
+    tests: [reportTest(
+      definitions[0]!,
+      '[A11Y-001] matched expected runtime event remains evidence',
+      'tests/runtime-regression.spec.ts',
+      [],
+      { record: matchedExpectedRuntimeRecord },
+    )],
+    run: { status: 'passed', source: 'playwright-json', profile: 'self-test' },
+    definitionCatalog: [definitions[0]!],
+  });
+  assert.equal(expectedRuntimeManifest.audits[0]!.status, 'PASS');
+
+  const interactionDefinition: AuditDefinition = {
+    ...definitions[0]!,
+    id: 'ACTION-001',
+    title: 'Interaction video integrity',
+    evidence: ['video', 'json'],
+    evidencePolicy: {
+      mode: 'interaction-video',
+      rationale: 'Show the action and its visible response in one reviewable clip.',
+    },
+  };
+  const missingVideoManifest = await buildAuditManifest({
+    outputDir: path.join(root, 'smoke-video-checklist'),
+    tests: [reportTest(
+      interactionDefinition,
+      '[ACTION-001] successful smoke interaction needs video',
+      'tests/smoke.spec.ts',
+    )],
+    run: { status: 'passed', source: 'playwright-json', profile: 'smoke' },
+    definitionCatalog: [interactionDefinition],
+  });
+  const missingVideo = missingVideoManifest.audits[0]!.executions[0]!;
+  assert.equal(missingVideo.status, 'PASS');
+  assert.equal(missingVideo.evidenceAuthority, 'withheld');
+  assert.equal(missingVideo.reasonCodes.includes('MISSING_REQUIRED_EVIDENCE'), true);
+  assert.equal(missingVideoManifest.audits[0]!.status, 'REVIEW');
+
+  const staticDefinition: AuditDefinition = {
+    ...definitions[0]!,
+    id: 'STATIC-001',
+    title: 'Static evidence integrity',
+    evidence: ['screenshot', 'json'],
+    evidencePolicy: {
+      mode: 'static-screenshot',
+      rationale: 'Capture a named visible state that directly supports the assertion.',
+    },
+  };
+  const staticRecord = evidence(staticDefinition);
+  const forbiddenMediaTest = reportTest(
+    staticDefinition,
+    '[STATIC-001] generic and wrong-mode media are rejected',
+    'tests/static.spec.ts',
+    [],
+    {
+      results: [{
+        status: 'passed',
+        expectedStatus: 'passed',
+        duration: 1,
+        retry: 0,
+        errors: [],
+        attachments: [{
+          name: 'audit-result',
+          contentType: 'application/json',
+          body: Buffer.from(JSON.stringify(staticRecord)),
+        }, {
+          name: 'screenshot',
+          contentType: 'image/png',
+          body: Buffer.from('generic diagnostic screenshot'),
+        }, {
+          name: 'video',
+          contentType: 'video/webm',
+          body: Buffer.from('wrong mode video'),
+        }],
+        stdout: [],
+        stderr: [],
+      }],
+    },
+  );
+  const forbiddenMediaModels = await buildAuditModels({
+    outputDir: path.join(root, 'forbidden-media-checklist'),
+    tests: [forbiddenMediaTest],
+    run: { status: 'passed', source: 'playwright-json', profile: 'self-test' },
+    definitionCatalog: [staticDefinition],
+  });
+  const forbiddenMediaManifest = forbiddenMediaModels.manifest;
+  const forbiddenMedia = forbiddenMediaManifest.audits[0]!.executions[0]!;
+  assert.equal(forbiddenMedia.evidenceAuthority, 'withheld');
+  assert.equal(forbiddenMedia.reasonCodes.includes('FORBIDDEN_PRIMARY_MEDIA'), true);
+  assert.equal(forbiddenMedia.reasonCodes.includes('MISSING_REQUIRED_EVIDENCE'), true);
+  assert.equal(forbiddenMedia.primaryArtifacts.some(({ kind }) => kind === 'screenshot' || kind === 'video'), false);
+  assert.equal(forbiddenMedia.diagnosticArtifacts.filter(({ kind }) => kind === 'screenshot' || kind === 'video').length, 2);
+  for (const item of forbiddenMediaModels.galleryCatalog.items) {
+    const attempt = item.attempt as typeof item.attempt & {
+      rawStatus: string;
+      statusSource: string;
+      reviewReasonCodes: string[];
+    };
+    assert.equal(attempt.rawStatus, 'passed');
+    assert.equal(attempt.status, 'REVIEW');
+    assert.equal(attempt.statusSource, 'reviewed-manifest');
+    assert.equal(attempt.reviewReasonCodes.includes('FORBIDDEN_PRIMARY_MEDIA'), true);
+    assert(attempt.reviewReasonCodes.length <= 12);
+    assert(attempt.reviewReasonCodes.every((code) => code.length <= 120));
+  }
   console.log('Report audit ID self-test passed.');
 } finally {
   await rm(root, { recursive: true, force: true });

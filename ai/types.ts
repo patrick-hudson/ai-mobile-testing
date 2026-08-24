@@ -77,7 +77,17 @@ export interface AiReviewLimits {
 export interface AiReviewOptions {
   runDir: string;
   outputDir?: string;
+  /** Runtime-only secret supplied in memory; never serialized into review output. */
+  apiKey?: string;
   dryRun: boolean;
   model: string;
   limits: AiReviewLimits;
+  request?: {
+    /** Overall wall-clock budget across every API attempt and retry delay. */
+    deadlineMs: number;
+    /** Total attempts, including the first request. */
+    maxAttempts: number;
+    /** Maximum server-directed or exponential delay between attempts. */
+    maxRetryDelayMs: number;
+  };
 }

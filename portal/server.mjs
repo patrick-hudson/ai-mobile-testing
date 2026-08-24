@@ -6,6 +6,16 @@ import { spawn } from 'node:child_process';
 import { StringDecoder } from 'node:string_decoder';
 import { fileURLToPath } from 'node:url';
 import { mergePortalCatalog, validatePortalPluginRegistryDocument } from './plugin-registry.mjs';
+import { loadPortalTargetRegistry } from './target-registry.mjs';
+import {
+  resolvePortalAiWorkerIdentity,
+  resolvePortalReportWorkerIdentity,
+  resolvePortalRunnerIdentity,
+  runnerSpawnIdentity,
+  sanitizedChildEnvironment,
+} from './runner-isolation.mjs';
+import { publishCredentialEnvelope, removeCredentialEnvelope } from './credential-store.mjs';
+import { ByteLruCache } from './byte-lru-cache.mjs';
 import { readBoundedFileTail } from './bounded-file.mjs';
 import {
   parseChecklistRelease,
@@ -62,6 +72,9 @@ const MAX_GALLERY_SSE_REPLAY_BYTES = 64 * 1024;
 const GALLERY_SSE_EVENT_TYPES = new Set(['gallery', 'gallery-flag', 'snapshot', 'stage', 'status']);
 const MAX_EXTERNAL_LOG_INGEST_BYTES = 512 * 1024;
 const MAX_EXTERNAL_PARTIAL_LINE_CHARS = 64 * 1024;
+const MAX_EXTERNAL_LIFECYCLE_JSON_BYTES = 256 * 1024;
+const MAX_EXTERNAL_HEARTBEAT_JSON_BYTES = 64 * 1024;
+const MAX_CHILD_PARTIAL_LINE_CHARS = 64 * 1024;
 const DEFAULT_LOG_SNAPSHOT_BYTES = 256 * 1024;
 const MIN_LOG_SNAPSHOT_BYTES = 16 * 1024;
 const MAX_LOG_SNAPSHOT_BYTES = 1024 * 1024;
@@ -70,10 +83,18 @@ const MAX_ARTIFACT_PAGE_SIZE = 500;
 const MAX_PREFERRED_MEDIA_ARTIFACTS = 120;
 const MAX_VIDEO_MANIFEST_BYTES = 8 * 1024 * 1024;
 const STOP_GRACE_MS = 8_000;
+const PLAYWRIGHT_DEADLINE_MS = parseInteger(process.env.PORTAL_PLAYWRIGHT_DEADLINE_MS, 60 * 60_000, 1_000, 24 * 60 * 60_000);
+const VIDEO_STAGE_DEADLINE_MS = parseInteger(process.env.PORTAL_VIDEO_STAGE_DEADLINE_MS, 15 * 60_000, 1_000, 24 * 60 * 60_000);
+const AI_STAGE_DEADLINE_MS = parseInteger(process.env.PORTAL_AI_STAGE_DEADLINE_MS, 5 * 60_000, 1_000, 24 * 60 * 60_000);
+const REPORT_STAGE_DEADLINE_MS = parseInteger(process.env.PORTAL_REPORT_STAGE_DEADLINE_MS, 15 * 60_000, 1_000, 24 * 60 * 60_000);
 const EXTERNAL_RUN_SYNC_MS = parseInteger(process.env.PORTAL_EXTERNAL_RUN_SYNC_MS, 1_000, 250, 30_000);
+const EXTERNAL_TERMINAL_REFRESH_MS = parseInteger(process.env.PORTAL_EXTERNAL_TERMINAL_REFRESH_MS, 30_000, 1_000, 10 * 60_000);
+const EXTERNAL_STALE_LEASE_MS = parseInteger(process.env.PORTAL_EXTERNAL_STALE_LEASE_MS, 90_000, 15_000, 60 * 60_000);
 const MAX_REPORT_SUMMARY_BYTES = 256 * 1024;
 const MAX_REPORT_AUDIT_INDEX_BYTES = 2 * 1024 * 1024;
 const MAX_REPORT_AUDIT_DETAIL_BYTES = 512 * 1024;
+const MAX_REPORT_CACHE_ENTRIES = 256;
+const MAX_REPORT_CACHE_BYTES = 32 * 1024 * 1024;
 const DEFAULT_AI_MODEL = process.env.ANTHROPIC_MODEL ?? 'claude-sonnet-5';
 const ANTHROPIC_KEY_PATTERN = /^sk-ant-[a-zA-Z0-9_-]{20,512}$/;
 const DEFAULT_CANDIDATE_IGNORE_HTTPS_ERRORS = binaryEnvironmentFlag(
@@ -93,16 +114,30 @@ const RESTART_PROGRESS_TAIL_BYTES = 1024 * 1024;
 const MEDIA_VALIDATION_TIMEOUT_MS = 20_000;
 const MAX_MEDIA_VALIDATION_OUTPUT_BYTES = 64 * 1024;
 
-const PROJECTS = Object.freeze([
-  { id: 'production-mobile-chromium', label: 'Production · Pixel 5 · Chromium', environment: 'production' },
-  { id: 'candidate-mobile-chromium', label: 'Candidate · Pixel 5 · Chromium', environment: 'candidate' },
-  { id: 'production-desktop-chromium', label: 'Production · Desktop · Chromium', environment: 'production' },
-  { id: 'candidate-desktop-chromium', label: 'Candidate · Desktop · Chromium', environment: 'candidate' },
-  { id: 'candidate-mobile-webkit', label: 'Candidate · iPhone 13 · WebKit', environment: 'candidate' },
-  { id: 'candidate-tablet-webkit', label: 'Candidate · iPad Mini · WebKit', environment: 'candidate' },
-  { id: 'candidate-desktop-firefox', label: 'Candidate · Desktop · Firefox', environment: 'candidate' },
-]);
+const targetRegistry = loadPortalTargetRegistry(join(REPOSITORY_ROOT, 'audit', 'targets.generated.json'));
+const PROJECTS = Object.freeze(targetRegistry.localTargets);
 const PROJECT_IDS = new Set(PROJECTS.map(({ id }) => id));
+const RUNNABLE_PROJECT_IDS = new Set(PROJECTS.filter(({ available }) => available).map(({ id }) => id));
+const PROVIDER_PROJECT_IDS = new Set(targetRegistry.providerTargets.map(({ id }) => id));
+const DEFAULT_PROJECT_IDS = new Set(targetRegistry.defaultTargetIds);
+const FULL_PROJECT_COUNT = targetRegistry.defaultTargetIds.length;
+const RUNNER_IDENTITY = resolvePortalRunnerIdentity();
+const AI_WORKER_IDENTITY = resolvePortalAiWorkerIdentity(
+  process.env,
+  process.platform,
+  typeof process.getuid === 'function' ? process.getuid() : null,
+  RUNNER_IDENTITY,
+);
+const REPORT_WORKER_IDENTITY = resolvePortalReportWorkerIdentity(
+  process.env,
+  process.platform,
+  typeof process.getuid === 'function' ? process.getuid() : null,
+  RUNNER_IDENTITY,
+  AI_WORKER_IDENTITY,
+);
+const CREDENTIAL_ISOLATION_ACTIVE = RUNNER_IDENTITY.active
+  && AI_WORKER_IDENTITY.active
+  && REPORT_WORKER_IDENTITY.active;
 const PROFILES = new Set(['smoke', 'release']);
 const TERMINAL_STATUSES = new Set(['passed', 'not-ready', 'review-required', 'failed', 'evidence-failed', 'stopped', 'spawn-failed']);
 const PURGE_ELIGIBLE_STATUSES = new Set(TERMINAL_STATUSES);
@@ -126,9 +161,11 @@ const MIME_TYPES = Object.freeze({
   '.zip': 'application/zip',
 });
 
-const coreCatalog = await loadCatalog();
-const plugins = await loadPluginRegistry(coreCatalog);
-const catalog = mergePortalCatalog(coreCatalog, plugins);
+// The generated registry is the same validated metadata boundary consumed by
+// the test runner and reporters. Loading it directly prevents the portal from
+// publishing a lossy regex projection of audit/catalog.ts.
+const plugins = await loadPluginRegistry([]);
+const catalog = mergePortalCatalog([], plugins);
 const AUDIT_IDS = new Set(catalog.map(({ id }) => id));
 const AUDIT_AREAS = new Set(catalog.map(({ area }) => area));
 const MANUAL_AUDIT_IDS = new Set(catalog.filter(({ manual }) => manual).map(({ id }) => id));
@@ -136,17 +173,19 @@ const PLUGIN_IDS = new Set(plugins.map(({ id }) => id));
 const runs = new Map();
 const sensitiveLogValues = new Set();
 const artifactPathCache = new Map();
-const reportDataCache = new Map();
+const reportDataCache = new ByteLruCache(MAX_REPORT_CACHE_ENTRIES, MAX_REPORT_CACHE_BYTES);
 const galleryRevisionCache = new Map();
 const observedGalleryPublications = new Map();
 const purgedGalleryRunIds = new Set();
 const purgingRunIds = new Set();
 const manualMutationRunIds = new Set();
+const galleryMutationRunIds = new Set();
 const launchReservations = new Set();
 const galleryFlagRateWindows = new Map();
 let secretMasterKey;
 let savedAnthropicCredential = null;
 let externalRunSyncPromise = null;
+let credentialMutationPromise = Promise.resolve();
 
 await fs.mkdir(ARTIFACT_ROOT, { recursive: true });
 await initializeSecretVault();
@@ -215,12 +254,12 @@ async function routeRequest(request, response) {
     if (!body || typeof body !== 'object' || Array.isArray(body) || typeof body.apiKey !== 'string') {
       throw httpError(400, 'Provide an Anthropic API key.');
     }
-    await saveAnthropicCredential(body.apiKey);
+    await serializeCredentialMutation(() => saveAnthropicCredential(body.apiKey));
     return sendJson(response, 200, anthropicCredentialState());
   }
   if (request.method === 'DELETE' && pathname === '/api/settings/anthropic-key') {
     assertMutationRequest(request);
-    await deleteAnthropicCredential();
+    await serializeCredentialMutation(deleteAnthropicCredential);
     return sendJson(response, 200, anthropicCredentialState());
   }
   if (request.method === 'GET' && pathname === '/api/config') {
@@ -228,6 +267,7 @@ async function routeRequest(request, response) {
       catalog,
       plugins,
       projects: PROJECTS,
+      targets: targetRegistry,
       defaults: {
         productionUrl: process.env.PRODUCTION_URL ?? 'https://quitting7oh.org',
         candidateUrl: process.env.CANDIDATE_URL ?? 'https://beta.quitting7oh-org.pages.dev',
@@ -239,6 +279,21 @@ async function routeRequest(request, response) {
         available: Boolean(currentAnthropicApiKey()) || process.env.AI_REVIEW_DRY_RUN === '1',
         dryRun: process.env.AI_REVIEW_DRY_RUN === '1',
         defaultModel: DEFAULT_AI_MODEL,
+      },
+      runnerIsolation: {
+        active: RUNNER_IDENTITY.active,
+        runnerUid: RUNNER_IDENTITY.uid,
+        runnerGid: RUNNER_IDENTITY.gid,
+        reason: RUNNER_IDENTITY.reason,
+        aiWorkerActive: AI_WORKER_IDENTITY.active,
+        aiWorkerUid: AI_WORKER_IDENTITY.uid,
+        aiWorkerGid: AI_WORKER_IDENTITY.gid,
+        aiWorkerReason: AI_WORKER_IDENTITY.reason,
+        reportWorkerActive: REPORT_WORKER_IDENTITY.active,
+        reportWorkerUid: REPORT_WORKER_IDENTITY.uid,
+        reportWorkerGid: REPORT_WORKER_IDENTITY.gid,
+        reportWorkerReason: REPORT_WORKER_IDENTITY.reason,
+        credentialStorageEnabled: CREDENTIAL_ISOLATION_ACTIVE,
       },
     });
   }
@@ -439,19 +494,21 @@ async function routeRequest(request, response) {
     assertGalleryFlagMutationAllowed(request);
     const body = await readJsonBody(request);
     consumeGalleryFlagRate(request, run.manifest.id);
-    const snapshot = await loadGallerySnapshot(run, undefined, { includeRows: false });
-    const detail = await readGalleryItem(snapshot, run.manifest.id, body?.itemId);
-    const result = await mutateGalleryFlag(run.directory, {
-      action: 'open',
-      itemId: detail.item.id,
-      identity: galleryFlagIdentity(detail.item),
-      reviewer: body?.reviewer,
-      note: body?.note,
-      idempotencyKey: body?.idempotencyKey,
-      expectedFlagRevision: body?.expectedFlagRevision,
-      timestamp: new Date().toISOString(),
-      eventId: `gfevent_${randomBytes(16).toString('hex')}`,
-      flagId: `gflag_${randomBytes(16).toString('hex')}`,
+    const result = await withGalleryMutationLock(run, async () => {
+      const snapshot = await loadGallerySnapshot(run, undefined, { includeRows: false });
+      const detail = await readGalleryItem(snapshot, run.manifest.id, body?.itemId);
+      return mutateGalleryFlag(run.directory, {
+        action: 'open',
+        itemId: detail.item.id,
+        identity: galleryFlagIdentity(detail.item),
+        reviewer: body?.reviewer,
+        note: body?.note,
+        idempotencyKey: body?.idempotencyKey,
+        expectedFlagRevision: body?.expectedFlagRevision,
+        timestamp: new Date().toISOString(),
+        eventId: `gfevent_${randomBytes(16).toString('hex')}`,
+        flagId: `gflag_${randomBytes(16).toString('hex')}`,
+      });
     });
     logGalleryFlagMutation(run, result, 201);
     return sendJson(response, result.idempotent ? 200 : 201, result);
@@ -467,7 +524,7 @@ async function routeRequest(request, response) {
     if (!/^gflag_[a-f0-9]{16,64}$/.test(flagId)) throw httpError(404, 'Reviewer flag was not found.');
     const body = await readJsonBody(request);
     consumeGalleryFlagRate(request, run.manifest.id);
-    const result = await mutateGalleryFlag(run.directory, {
+    const result = await withGalleryMutationLock(run, () => mutateGalleryFlag(run.directory, {
       action: body?.action,
       flagId,
       reviewer: body?.reviewer,
@@ -477,7 +534,7 @@ async function routeRequest(request, response) {
       expectedFlagRevision: body?.expectedFlagRevision,
       timestamp: new Date().toISOString(),
       eventId: `gfevent_${randomBytes(16).toString('hex')}`,
-    });
+    }));
     logGalleryFlagMutation(run, result, 200);
     return sendJson(response, 200, result);
   }
@@ -820,6 +877,7 @@ async function createRun(request, response) {
   const logDirectory = join(directory, 'logs');
   try {
     await fs.mkdir(logDirectory, { recursive: true });
+    await prepareRunDirectoryForRunner(directory);
   } catch (error) {
     launchReservations.delete(reservation);
     throw error;
@@ -886,7 +944,12 @@ async function createRun(request, response) {
     events: [],
     sequence: 0,
     lineBuffer: { stdout: '', stderr: '' },
+    omittedLineCharacters: { stdout: 0, stderr: 0 },
+    outputStreams: new Set(),
     killTimer: null,
+    childDeadlineTimer: null,
+    childTimeoutError: null,
+    infrastructureFailure: null,
     aiApiKey,
   };
   let logStream = null;
@@ -907,6 +970,7 @@ async function createRun(request, response) {
     throw httpError(500, 'Audit run initialization failed before log storage could open. The capacity reservation was released and the failure was recorded when storage remained available.');
   }
   const run = { ...runBase, logStream, lifecycleStream };
+  attachRunStreamFailureGuards(run);
   runs.set(id, run);
   let child = null;
   let earlySpawnError = null;
@@ -918,13 +982,25 @@ async function createRun(request, response) {
     await persistManifest(run);
     appendEvent(run, 'status', { status: 'starting', message: 'Preparing Playwright.' });
 
+    if (run.manifest.stopRequestedAt) {
+      const stage = run.manifest.stages.playwright;
+      stage.status = 'skipped';
+      stage.finishedAt = new Date().toISOString();
+      stage.durationMs = 0;
+      stage.error = 'Skipped because a reviewer stopped the run before Playwright launched.';
+      await finishStoppedRun(run);
+      return sendJson(response, 202, publicManifest(run.manifest));
+    }
+
     if (initializationFailpoint === 'spawn') throw new Error('Injected synchronous spawn setup failure.');
     child = spawn(executable, args, {
       cwd: REPOSITORY_ROOT,
       detached: process.platform !== 'win32',
+      ...runnerSpawnIdentity(RUNNER_IDENTITY),
       env: {
-        ...sanitizedProcessEnvironment(),
+        ...sanitizedChildEnvironment(process.env, RUNNER_IDENTITY),
         AUDIT_PROFILE: options.profile,
+        AUDIT_TARGET_IDS: options.projects.join(','),
         AUDIT_ARTIFACT_DIR: directory,
         AUDIT_OUTPUT_DIR: join(directory, 'checklist'),
         AUDIT_RUN_ID: id,
@@ -947,6 +1023,8 @@ async function createRun(request, response) {
     run.manifest.startedAt = new Date().toISOString();
     run.manifest.stages.playwright.status = 'running';
     run.manifest.stages.playwright.startedAt = run.manifest.startedAt;
+    run.manifest.stages.playwright.timeoutMs = PLAYWRIGHT_DEADLINE_MS;
+    armRunChildDeadline(run, 'playwright', PLAYWRIGHT_DEADLINE_MS);
     await persistManifest(run);
     if (earlySpawnError) throw earlySpawnError;
     if (earlyClose) throw new Error(`Playwright exited during launch initialization (exit ${earlyClose.exitCode ?? 'null'}, signal ${earlyClose.signal ?? 'none'}).`);
@@ -975,62 +1053,61 @@ async function createRun(request, response) {
   consumeOutput(run, child.stdout, 'stdout', 'playwright');
   consumeOutput(run, child.stderr, 'stderr', 'playwright');
 
-  child.once('error', async (error) => {
-    appendLog(run, 'stderr', `Unable to start Playwright: ${error.message}`, 'playwright');
-    run.manifest.status = 'spawn-failed';
-    run.manifest.phase = 'Could not start Playwright';
-    run.manifest.finishedAt = new Date().toISOString();
-    run.manifest.error = error.message;
-    run.manifest.pipeline = {
-      status: 'failed',
-      completed: false,
-      reason: `Playwright could not start: ${error.message}`,
-      finishedAt: run.manifest.finishedAt,
-    };
-    run.manifest.release = unavailableRelease('No authoritative release decision exists because Playwright could not start.');
-    completeStage(run.manifest.stages.playwright, 127, null, error.message);
-    appendLog(run, 'stderr', 'Command finished: exit=127 signal=none', 'playwright');
-    await finishRun(run);
-  });
-  child.once('close', async (code, signal) => {
-    if (TERMINAL_STATUSES.has(run.manifest.status)) return;
-    flushOutput(run, 'playwright');
-    run.manifest.exitCode = code;
-    run.manifest.signal = signal;
-    completeStage(run.manifest.stages.playwright, code, signal);
-    appendLog(
-      run,
-      code === 0 ? 'stdout' : 'stderr',
-      `Command finished: exit=${code ?? 'null'} signal=${signal ?? 'none'} duration=${run.manifest.stages.playwright.durationMs}ms`,
-      'playwright',
-    );
-    appendEvent(run, 'stage', {
-      name: 'playwright',
-      status: run.manifest.stages.playwright.status,
-      label: 'Browser checks finished',
-      stage: structuredClone(run.manifest.stages.playwright),
-    });
-    run.child = null;
-    if (run.manifest.stopRequestedAt) {
-      run.manifest.status = 'stopped';
-      run.manifest.phase = 'Stopped by reviewer';
+  child.once('error', (error) => {
+    void runLifecycleCallback(run, 'Playwright spawn failure', async () => {
+      clearRunChildDeadline(run);
+      appendLog(run, 'stderr', `Unable to start Playwright: ${error.message}`, 'playwright');
+      run.manifest.status = 'spawn-failed';
+      run.manifest.phase = 'Could not start Playwright';
       run.manifest.finishedAt = new Date().toISOString();
+      run.manifest.error = error.message;
       run.manifest.pipeline = {
-        status: 'stopped',
+        status: 'failed',
         completed: false,
-        reason: 'The evidence pipeline was stopped by a reviewer.',
+        reason: `Playwright could not start: ${error.message}`,
         finishedAt: run.manifest.finishedAt,
       };
-      run.manifest.release = unavailableRelease('No authoritative release decision exists because the run was stopped.');
-      return finishRun(run);
-    }
-    await runPostTestStages(run);
+      run.manifest.release = unavailableRelease('No authoritative release decision exists because Playwright could not start.');
+      completeStage(run.manifest.stages.playwright, 127, null, error.message);
+      appendLog(run, 'stderr', 'Command finished: exit=127 signal=none', 'playwright');
+      await finishRun(run);
+    });
+  });
+  child.once('close', (code, signal) => {
+    void runLifecycleCallback(run, 'Playwright close handler', async () => {
+      if (TERMINAL_STATUSES.has(run.manifest.status)) return;
+      clearRunChildDeadline(run);
+      flushOutput(run, 'playwright');
+      run.manifest.exitCode = code;
+      run.manifest.signal = signal;
+      completeStage(run.manifest.stages.playwright, code, signal, run.childTimeoutError);
+      appendLog(
+        run,
+        code === 0 && !run.childTimeoutError ? 'stdout' : 'stderr',
+        `Command finished: exit=${code ?? 'null'} signal=${signal ?? 'none'} duration=${run.manifest.stages.playwright.durationMs}ms${run.childTimeoutError ? ` error=${run.childTimeoutError}` : ''}`,
+        'playwright',
+      );
+      appendEvent(run, 'stage', {
+        name: 'playwright',
+        status: run.manifest.stages.playwright.status,
+        label: 'Browser checks finished',
+        stage: structuredClone(run.manifest.stages.playwright),
+      });
+      if (process.platform !== 'win32') {
+        signalChild(child, 'SIGKILL');
+        appendLog(run, 'stdout', 'Residual Playwright process-group cleanup completed before evidence processing.', 'playwright');
+      }
+      run.child = null;
+      if (run.manifest.stopRequestedAt) return finishStoppedRun(run);
+      await runPostTestStages(run);
+    });
   });
 
   return sendJson(response, 202, publicManifest(manifest));
 }
 
 async function rollbackRunInitialization(run, child, error) {
+  clearRunChildDeadline(run);
   if (child?.pid) {
     try {
       signalChild(child, 'SIGKILL');
@@ -1088,10 +1165,25 @@ function validateRunRequest(body) {
   const profile = typeof body.profile === 'string' ? body.profile : '';
   if (!PROFILES.has(profile)) throw httpError(400, 'Profile must be smoke or release.');
 
-  const projects = uniqueStrings(body.projects);
+  if (body.targetIds !== undefined && body.projects !== undefined
+    && JSON.stringify(body.targetIds) !== JSON.stringify(body.projects)) {
+    throw httpError(400, 'targetIds and legacy projects selections disagree.');
+  }
+  const rawProjects = body.targetIds ?? body.projects;
+  const projects = uniqueStrings(rawProjects);
   if (projects.length === 0) throw httpError(400, 'Select at least one browser project.');
+  if (Array.isArray(rawProjects) && new Set(rawProjects).size !== rawProjects.length) {
+    throw httpError(400, 'Browser target selections cannot contain duplicates.');
+  }
+  if (projects.some((project) => PROVIDER_PROJECT_IDS.has(project))) {
+    throw httpError(400, 'Provider-only real-device targets are unavailable until a device-lab adapter is installed.');
+  }
   if (projects.length > PROJECTS.length || projects.some((project) => !PROJECT_IDS.has(project))) {
-    throw httpError(400, 'One or more browser projects are not allowed.');
+    throw httpError(400, 'One or more browser target IDs are unknown.');
+  }
+  const unavailableProjects = projects.filter((project) => !RUNNABLE_PROJECT_IDS.has(project));
+  if (unavailableProjects.length > 0) {
+    throw httpError(400, `These Docker-local targets are unavailable in this image: ${unavailableProjects.join(', ')}.`);
   }
 
   const requestedAreas = uniqueStrings(body.areas);
@@ -1114,7 +1206,8 @@ function validateRunRequest(body) {
     .flatMap(({ auditDefinitions }) => auditDefinitions.map(({ id }) => id));
   const auditIds = [...new Set([...requestedIds, ...expandedIds, ...pluginAuditIds])].sort();
   if (auditIds.length > catalog.length) throw httpError(400, 'Too many audit IDs selected.');
-  if (profile === 'release' && auditIds.length === 0 && projects.length !== PROJECTS.length) {
+  if (profile === 'release' && auditIds.length === 0
+    && [...DEFAULT_PROJECT_IDS].some((project) => !projects.includes(project))) {
     throw httpError(400, 'A full release run requires the complete browser and device matrix. Use targeted scope for a narrower release-evidence run.');
   }
   const selectedPlugins = plugins.filter((plugin) =>
@@ -1124,6 +1217,14 @@ function validateRunRequest(body) {
     const unsupportedProjects = projects.filter((project) => !plugin.supportedProjects.includes(project));
     if (unsupportedProjects.length > 0) {
       throw httpError(400, `${plugin.name} does not support: ${unsupportedProjects.join(', ')}.`);
+    }
+  }
+  for (const auditId of auditIds) {
+    if (MANUAL_AUDIT_IDS.has(auditId)) continue;
+    const cases = selectedPlugins.flatMap((plugin) =>
+      plugin.auditCases.filter((auditCase) => auditCase.auditId === auditId));
+    if (!cases.some((auditCase) => auditCase.supportedProjects.some((project) => projects.includes(project)))) {
+      throw httpError(400, `${auditId} has no executable test case for the selected browser projects.`);
     }
   }
   const entrySpecs = [...new Set(selectedPlugins.flatMap(({ entrySpecs }) => entrySpecs))].sort();
@@ -1157,6 +1258,7 @@ function validateRunRequest(body) {
   return {
     profile,
     projects,
+    targetIds: [...projects],
     areas: requestedAreas.sort(),
     auditIds,
     pluginIds: requestedPlugins.sort(),
@@ -1187,26 +1289,58 @@ function validateTargetUrl(value, label) {
 }
 
 function consumeOutput(run, stream, channel, stage) {
+  if (!stream) return;
+  run.outputStreams?.add(stream);
   stream.setEncoding('utf8');
   stream.on('data', (chunk) => {
     run.lineBuffer[channel] += stripTerminalCodes(chunk);
     const lines = run.lineBuffer[channel].split(/\r?\n/);
     run.lineBuffer[channel] = lines.pop() ?? '';
-    for (const line of lines) appendLog(run, channel, line, stage);
+    for (const [index, line] of lines.entries()) {
+      const omitted = index === 0 ? run.omittedLineCharacters?.[channel] ?? 0 : 0;
+      appendLog(run, channel, omitted > 0
+        ? `[portal omitted ${omitted} oversized output characters] ${line}`
+        : line, stage);
+      if (index === 0 && run.omittedLineCharacters) run.omittedLineCharacters[channel] = 0;
+    }
+    if (run.lineBuffer[channel].length > MAX_CHILD_PARTIAL_LINE_CHARS) {
+      const removed = run.lineBuffer[channel].length - MAX_CHILD_PARTIAL_LINE_CHARS;
+      run.lineBuffer[channel] = run.lineBuffer[channel].slice(removed);
+      run.omittedLineCharacters ??= { stdout: 0, stderr: 0 };
+      run.omittedLineCharacters[channel] += removed;
+    }
   });
+  stream.once('error', (error) => {
+    void failRunClosed(run, `Child ${stage}:${channel} output stream failed: ${error.message}`);
+  });
+  stream.once('close', () => run.outputStreams?.delete(stream));
 }
 
 function flushOutput(run, stage) {
   for (const channel of ['stdout', 'stderr']) {
-    if (run.lineBuffer[channel]) appendLog(run, channel, run.lineBuffer[channel], stage);
+    if (run.lineBuffer[channel]) {
+      const omitted = run.omittedLineCharacters?.[channel] ?? 0;
+      appendLog(run, channel, omitted > 0
+        ? `[portal omitted ${omitted} oversized output characters] ${run.lineBuffer[channel]}`
+        : run.lineBuffer[channel], stage);
+    }
     run.lineBuffer[channel] = '';
+    if (run.omittedLineCharacters) run.omittedLineCharacters[channel] = 0;
   }
 }
 
 function appendLog(run, channel, line, stage = 'system') {
   const cleanLine = redactLogValue(line.slice(0, 20_000));
   const timestamp = new Date().toISOString();
-  run.logStream?.write(`${timestamp} [${stage}:${channel}] ${cleanLine}\n`);
+  const accepted = run.logStream?.write(`${timestamp} [${stage}:${channel}] ${cleanLine}\n`);
+  if (accepted === false && !run.logDrainPending) {
+    run.logDrainPending = true;
+    for (const output of run.outputStreams ?? []) output.pause?.();
+    run.logStream.once('drain', () => {
+      run.logDrainPending = false;
+      for (const output of run.outputStreams ?? []) output.resume?.();
+    });
+  }
   if (stage === 'playwright') {
     if (/Running\s+\d+\s+tests?/i.test(cleanLine)) run.manifest.phase = 'Executing browser checks';
     if (/Audit checklist:/i.test(cleanLine)) run.manifest.phase = 'Writing initial checklist';
@@ -1251,7 +1385,7 @@ async function authoritativeReleaseForRun(run) {
 }
 
 function applyCompletedRelease(run, release, context = 'Evidence pipeline complete') {
-  applyCompletedReleaseEligibility(run.manifest, release, context, PROJECTS.length);
+  applyCompletedReleaseEligibility(run.manifest, release, context, FULL_PROJECT_COUNT);
 }
 
 function applyPipelineFailure(run, reason) {
@@ -1288,9 +1422,10 @@ async function runPostTestStages(run) {
       {
         AUDIT_ARTIFACT_DIR: run.directory,
         ANTHROPIC_MODEL: run.manifest.options.aiModel,
-        ANTHROPIC_API_KEY: run.aiApiKey,
+        ...(run.aiApiKey ? { ANTHROPIC_KEY_STDIN: '1' } : {}),
         AI_REVIEW_DRY_RUN: process.env.AI_REVIEW_DRY_RUN,
       },
+      { identity: AI_WORKER_IDENTITY, secretInput: run.aiApiKey },
     );
     run.manifest.stages.aiReview.summary = await readAiReviewSummary(run.directory);
     appendEvent(run, 'stage', {
@@ -1303,20 +1438,10 @@ async function runPostTestStages(run) {
   }
   if (run.manifest.stopRequestedAt) return finishStoppedRun(run);
 
-  await executeStage(
+  await rebuildChecklistInPrivateStaging(
     run,
     'reportRebuild',
     'Rebuilding checklist with final evidence links',
-    resolveToolExecutable('tsx'),
-    [
-      'scripts/rebuild-report.ts',
-      join(run.directory, 'results.json'),
-      join(run.directory, 'checklist'),
-    ],
-    {
-      AUDIT_ARTIFACT_DIR: run.directory,
-      AUDIT_OUTPUT_DIR: join(run.directory, 'checklist'),
-    },
   );
   if (run.manifest.stopRequestedAt) return finishStoppedRun(run);
 
@@ -1335,7 +1460,7 @@ async function runPostTestStages(run) {
   await finishRun(run);
 }
 
-async function executeStage(run, stageName, label, executable, args, extraEnv) {
+async function executeStage(run, stageName, label, executable, args, extraEnv, execution = {}) {
   const stage = run.manifest.stages[stageName];
   if (run.manifest.stopRequestedAt) {
     stage.status = 'skipped';
@@ -1360,37 +1485,86 @@ async function executeStage(run, stageName, label, executable, args, extraEnv) {
   run.manifest.phase = label;
   stage.status = 'running';
   stage.startedAt = new Date().toISOString();
+  const timeoutMs = stageDeadlineMs(stageName);
+  stage.timeoutMs = timeoutMs;
   appendEvent(run, 'stage', { name: stageName, status: 'running', label, stage: structuredClone(stage) });
   appendLog(run, 'stdout', `Command started: ${stage.command.join(' ')}`, stageName);
   await persistManifest(run);
+  // A stop request can arrive while the stage-start manifest is being
+  // persisted. Recheck at the final await boundary; spawn and run.child
+  // registration below are then synchronous, so an acknowledged stop either
+  // prevents launch or observes the registered process and terminates it.
+  if (run.manifest.stopRequestedAt) {
+    stage.status = 'skipped';
+    stage.finishedAt = new Date().toISOString();
+    stage.durationMs = 0;
+    stage.error = 'Skipped because a reviewer stopped the run before launch.';
+    appendEvent(run, 'stage', { name: stageName, status: stage.status, label, stage: structuredClone(stage) });
+    await persistManifest(run);
+    return;
+  }
 
   const started = performance.now();
   const result = await new Promise((resolveStage) => {
     let settled = false;
+    let timeoutError = null;
+    let escalationTimer = null;
+    const identity = execution.identity ?? RUNNER_IDENTITY;
+    const hasSecretInput = typeof execution.secretInput === 'string' && execution.secretInput.length > 0;
+    appendLog(
+      run,
+      'stdout',
+      `Execution identity: ${identity.active ? `${identity.user} (uid ${identity.uid}, gid ${identity.gid})` : 'portal process (no POSIX worker configured)'}.`,
+      stageName,
+    );
     const child = spawn(executable, args, {
       cwd: REPOSITORY_ROOT,
       detached: process.platform !== 'win32',
+      ...runnerSpawnIdentity(identity),
       env: {
-        ...sanitizedProcessEnvironment(),
+        ...sanitizedChildEnvironment(sanitizedProcessEnvironment(), identity),
         ...extraEnv,
         AUDIT_RUN_ID: run.manifest.id,
         AUDIT_PROFILE: run.manifest.options.profile,
       },
       shell: false,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: [hasSecretInput ? 'pipe' : 'ignore', 'pipe', 'pipe'],
     });
+    if (hasSecretInput && child.stdin) {
+      child.stdin.on('error', (error) => {
+        appendLog(run, 'stderr', `The isolated secret-input pipe closed before delivery completed: ${error.message}`, stageName);
+      });
+      child.stdin.end(execution.secretInput, 'utf8');
+    }
     run.child = child;
     consumeOutput(run, child.stdout, 'stdout', stageName);
     consumeOutput(run, child.stderr, 'stderr', stageName);
-    child.once('error', (error) => {
+    const deadlineTimer = setTimeout(() => {
+      timeoutError = `${label} exceeded its ${timeoutMs}ms deadline.`;
+      appendLog(run, 'stderr', `${timeoutError} Sending SIGTERM to the process group.`, stageName);
+      signalChild(child, 'SIGTERM');
+      escalationTimer = setTimeout(() => {
+        if (!settled) {
+          appendLog(run, 'stderr', `${label} did not stop within ${STOP_GRACE_MS}ms; sending SIGKILL to the process group.`, stageName);
+          signalChild(child, 'SIGKILL');
+        }
+      }, STOP_GRACE_MS);
+      escalationTimer.unref();
+    }, timeoutMs);
+    deadlineTimer.unref();
+    const finishStage = (value) => {
       if (settled) return;
       settled = true;
-      resolveStage({ code: 127, signal: null, error: error.message });
+      clearTimeout(deadlineTimer);
+      if (escalationTimer) clearTimeout(escalationTimer);
+      resolveStage({ ...value, error: value.error ?? timeoutError });
+    };
+    child.once('error', (error) => {
+      finishStage({ code: 127, signal: null, error: error.message });
     });
     child.once('close', (code, signal) => {
-      if (settled) return;
-      settled = true;
-      resolveStage({ code, signal, error: null });
+      if (process.platform !== 'win32') signalChild(child, 'SIGKILL');
+      finishStage({ code, signal, error: null });
     });
   });
 
@@ -1400,7 +1574,7 @@ async function executeStage(run, stageName, label, executable, args, extraEnv) {
   completeStage(stage, result.code, result.signal, result.error, elapsedMs);
   appendLog(
     run,
-    result.code === 0 ? 'stdout' : 'stderr',
+    result.code === 0 && !result.error ? 'stdout' : 'stderr',
     `Command finished: exit=${result.code ?? 'null'} signal=${result.signal ?? 'none'} duration=${elapsedMs}ms`,
     stageName,
   );
@@ -1427,7 +1601,7 @@ function stageRecord(status, command) {
 }
 
 function completeStage(stage, exitCode, signal, error = null, durationMs = null) {
-  stage.status = exitCode === 0 ? 'completed' : 'failed';
+  stage.status = exitCode === 0 && !error ? 'completed' : 'failed';
   stage.finishedAt = new Date().toISOString();
   stage.durationMs = durationMs ?? (stage.startedAt
     ? Math.max(0, new Date(stage.finishedAt).getTime() - new Date(stage.startedAt).getTime())
@@ -1477,18 +1651,120 @@ function finishStoppedRun(run) {
 
 async function finishRun(run) {
   if (run.killTimer) clearTimeout(run.killTimer);
+  clearRunChildDeadline(run);
   run.child = null;
+  // Terminal truth must be durable before clients are told that the run is
+  // finished or its lifecycle streams are sealed.
+  await persistManifest(run);
   appendEvent(run, 'status', {
     status: run.manifest.status,
     message: terminalMessage(run.manifest),
     manifest: publicManifest(run.manifest),
   });
-  run.logStream?.end();
-  run.lifecycleStream?.end();
+  const streams = [run.logStream, run.lifecycleStream].filter(Boolean);
+  await Promise.all(streams.map(closeWritableStream));
+  const streamFailure = streams.find((stream) => stream.auditWriteError)?.auditWriteError;
   run.logStream = null;
   run.lifecycleStream = null;
   run.aiApiKey = null;
-  await persistManifest(run);
+  if (streamFailure) throw new Error(`Terminal evidence stream could not be sealed: ${streamFailure.message}`);
+}
+
+function stageDeadlineMs(stageName) {
+  if (stageName === 'videoProcessing') return VIDEO_STAGE_DEADLINE_MS;
+  if (stageName === 'aiReview') return AI_STAGE_DEADLINE_MS;
+  return REPORT_STAGE_DEADLINE_MS;
+}
+
+function armRunChildDeadline(run, label, timeoutMs) {
+  clearRunChildDeadline(run);
+  run.childTimeoutError = null;
+  run.childDeadlineTimer = setTimeout(() => {
+    if (!run.child || TERMINAL_STATUSES.has(run.manifest.status)) return;
+    run.childTimeoutError = `${label} exceeded its ${timeoutMs}ms deadline.`;
+    appendLog(run, 'stderr', `${run.childTimeoutError} Stopping the process group.`, label);
+    stopChild(run, run.childTimeoutError);
+  }, timeoutMs);
+  run.childDeadlineTimer.unref();
+}
+
+function clearRunChildDeadline(run) {
+  if (run?.childDeadlineTimer) clearTimeout(run.childDeadlineTimer);
+  if (run) run.childDeadlineTimer = null;
+}
+
+async function runLifecycleCallback(run, label, callback) {
+  try {
+    await callback();
+  } catch (error) {
+    await failRunClosed(run, `${label} failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function attachRunStreamFailureGuards(run) {
+  for (const [streamName, stream] of [['runner log', run.logStream], ['lifecycle log', run.lifecycleStream]]) {
+    stream?.on('error', (error) => {
+      void failRunClosed(run, `${streamName} write failed: ${error.message}`);
+    });
+  }
+}
+
+async function failRunClosed(run, rawReason) {
+  if (!run || run.infrastructureFailure) return;
+  const reason = redactLogValue(rawReason).slice(0, 1_000);
+  run.infrastructureFailure = reason;
+  clearRunChildDeadline(run);
+  if (run.child) {
+    try {
+      stopChild(run, 'Evidence infrastructure failed; stopping active work.');
+    } catch (error) {
+      console.error(`Could not stop ${run.manifest.id} after infrastructure failure: ${error.message}`);
+    }
+  }
+  const finishedAt = new Date().toISOString();
+  run.manifest.status = 'evidence-failed';
+  run.manifest.phase = 'Evidence infrastructure failed';
+  run.manifest.finishedAt = finishedAt;
+  run.manifest.error = reason;
+  run.manifest.pipeline = { status: 'failed', completed: false, reason, finishedAt };
+  run.manifest.release = unavailableRelease(`No authoritative release decision exists because ${reason.toLowerCase()}`);
+  for (const stage of Object.values(run.manifest.stages ?? {})) {
+    if (stage?.status !== 'running') continue;
+    completeStage(stage, 1, null, reason);
+  }
+  let persisted = Boolean(run.externalManaged);
+  try {
+    if (!run.externalManaged) {
+      await persistManifest(run);
+      persisted = true;
+    }
+  } catch (error) {
+    console.error(`Could not persist fail-closed outcome for ${run.manifest.id}: ${error.message}`);
+  }
+  if (persisted) {
+    const terminal = {
+      id: ++run.sequence,
+      type: 'status',
+      data: {
+        status: run.manifest.status,
+        message: terminalMessage(run.manifest),
+        manifest: publicManifest(run.manifest),
+      },
+    };
+    for (const client of run.clients ?? []) writeSse(client, terminal);
+    for (const client of run.galleryClients ?? []) writeSse(client, terminal);
+  } else {
+    // Do not announce a terminal state that cannot survive restart. Closing
+    // streams forces clients to reconnect and prevents a false durable result.
+    for (const client of [...(run.clients ?? []), ...(run.galleryClients ?? [])]) client.end();
+  }
+  await Promise.all([
+    closeWritableStream(run.logStream),
+    closeWritableStream(run.lifecycleStream),
+  ]);
+  run.logStream = null;
+  run.lifecycleStream = null;
+  run.aiApiKey = null;
 }
 
 function stopChild(run, reason) {
@@ -1519,6 +1795,14 @@ function streamRunEvents(request, response, run) {
     'X-Accel-Buffering': 'no',
   });
   response.write('retry: 2000\n\n');
+  configureSseClient(response, {
+    overflowData: { reason: 'Client backpressure.', reloadLogs: true },
+    snapshot: () => ({
+      id: run.sequence,
+      type: 'snapshot',
+      data: { manifest: publicManifest(run.manifest) },
+    }),
+  });
   const streamUrl = new URL(request.url ?? '/', 'http://portal.local');
   const headerEventId = Number.parseInt(request.headers['last-event-id'] ?? '0', 10) || 0;
   const queryEventId = Number.parseInt(streamUrl.searchParams.get('after') ?? '0', 10) || 0;
@@ -1547,9 +1831,7 @@ function streamRunEvents(request, response, run) {
     type: 'snapshot',
     data: { manifest: publicManifest(run.manifest) },
   };
-  if (!writeSse(response, snapshot)) {
-    response.once('drain', () => writeSse(response, snapshot));
-  }
+  writeSse(response, snapshot);
   run.clients.add(response);
   const heartbeat = setInterval(() => {
     if (!response.writableNeedDrain && !response.writableEnded) response.write(': heartbeat\n\n');
@@ -1570,6 +1852,14 @@ function streamGalleryEvents(request, response, run) {
     'X-Accel-Buffering': 'no',
   });
   response.write('retry: 2000\n\n');
+  configureSseClient(response, {
+    overflowData: { reason: 'Client backpressure.', reloadHead: true },
+    snapshot: () => ({
+      id: run.sequence,
+      type: 'snapshot',
+      data: { manifest: galleryStreamManifest(run.manifest), galleryOnly: true },
+    }),
+  });
   const streamUrl = new URL(request.url ?? '/', 'http://portal.local');
   const headerEventId = Number.parseInt(request.headers['last-event-id'] ?? '0', 10) || 0;
   const queryEventId = Number.parseInt(streamUrl.searchParams.get('after') ?? '0', 10) || 0;
@@ -1649,21 +1939,65 @@ function appendEvent(run, type, data) {
 
 function writeSse(response, event) {
   if (response.writableEnded || response.destroyed) return false;
-  if (response.writableNeedDrain) {
+  if (response.writableNeedDrain || response.auditBackpressured) {
     response.auditDroppedEvents = (response.auditDroppedEvents ?? 0) + 1;
+    armSseDrain(response);
     return false;
   }
-  const dropped = response.auditDroppedEvents ?? 0;
-  if (dropped > 0) {
-    response.auditDroppedEvents = 0;
-    response.write(`event: overflow\ndata: ${JSON.stringify({ dropped, reason: 'Client backpressure.', reloadLogs: true })}\n\n`);
-    if (response.writableNeedDrain) return false;
+  const accepted = response.write(serializeSseEvent(event));
+  if (!accepted) {
+    // Node has accepted this event into its bounded socket buffer. Only later
+    // events are collapsed; replaying this event on drain would duplicate it.
+    response.auditBackpressured = true;
+    armSseDrain(response);
   }
-  return response.write(`id: ${event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event.data)}\n\n`);
+  return accepted;
+}
+
+function configureSseClient(response, { overflowData, snapshot }) {
+  response.auditDroppedEvents = 0;
+  response.auditBackpressured = false;
+  response.auditDrainArmed = false;
+  response.auditOverflowData = overflowData;
+  response.auditSnapshot = snapshot;
+}
+
+function armSseDrain(response) {
+  if (response.auditDrainArmed || response.writableEnded || response.destroyed) return;
+  response.auditDrainArmed = true;
+  response.once('drain', () => {
+    response.auditDrainArmed = false;
+    response.auditBackpressured = false;
+    flushSseRecovery(response);
+  });
+}
+
+function flushSseRecovery(response) {
+  if (response.writableEnded || response.destroyed) return;
+  const dropped = response.auditDroppedEvents ?? 0;
+  if (dropped === 0) return;
+  response.auditDroppedEvents = 0;
+  const overflowAccepted = response.write(`event: overflow\ndata: ${JSON.stringify({
+    dropped,
+    ...(response.auditOverflowData ?? { reason: 'Client backpressure.' }),
+  })}\n\n`);
+  // The authoritative snapshot is deliberately enqueued even if the overflow
+  // write fills the socket again. This bounded pair is the recovery contract:
+  // omitted log/detail events are followed by the newest durable run state.
+  const snapshot = response.auditSnapshot?.();
+  const snapshotAccepted = snapshot ? response.write(serializeSseEvent(snapshot)) : true;
+  if (!overflowAccepted || !snapshotAccepted) {
+    response.auditBackpressured = true;
+    armSseDrain(response);
+  }
+}
+
+function serializeSseEvent(event) {
+  return `id: ${event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event.data)}\n\n`;
 }
 
 function sseEventBytes(event) {
-  return Buffer.byteLength(`id: ${event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event.data)}\n\n`);
+  return Buffer.byteLength(serializeSseEvent(event));
 }
 
 async function servePortalAsset(request, response, pathname) {
@@ -1675,6 +2009,10 @@ async function servePortalAsset(request, response, pathname) {
 
 async function serveArtifact(request, response, runId, requestedPath) {
   const run = requireRun(runId);
+  // Persisted execution logs can contain arbitrary child-process output. They
+  // are available only through the bounded, redacting logs API and must never
+  // inherit the generic artifact download path.
+  if (isRawLogArtifactPath(requestedPath)) throw httpError(404, 'Artifact not found.');
   let file = safeResolve(run.directory, requestedPath || '.');
   if (!file) throw httpError(404, 'Artifact not found.');
   const stat = await safeStat(file);
@@ -1682,10 +2020,24 @@ async function serveArtifact(request, response, runId, requestedPath) {
   if (stat.isDirectory()) file = join(file, 'index.html');
   const verifiedFile = await resolveContainedRealPath(run.directory, file);
   if (!verifiedFile) throw httpError(404, 'Artifact not found.');
-  return sendFile(request, response, verifiedFile, "default-src 'self' data: blob:; connect-src 'self'; img-src 'self' data: blob:; media-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; worker-src 'self' blob:; frame-src 'self' blob:; font-src 'self' data:; base-uri 'self'; frame-ancestors 'self'");
+  const relativeArtifactPath = relative(run.directory, verifiedFile).split(sep).join('/');
+  // Revision-pinned archive wrappers are inert data envelopes loaded into a
+  // second sandboxed opaque-origin iframe. They must accept that opaque parent;
+  // every other artifact document retains frame-ancestors 'self'.
+  const opaqueArchiveWrapper = /(?:^|\/)checklist\/gallery\/revisions\/export_[a-f0-9]{16}\/(?:flags\.html|(?:query|items|raw)\/.+\.html)$/.test(relativeArtifactPath);
+  const opaqueArchiveSurface = /(?:^|\/)checklist\/gallery\.html$/.test(relativeArtifactPath);
+  const artifactOrigin = `http://${assertAllowedRequestHost(request)}`;
+  const sandboxSources = opaqueArchiveSurface
+    ? `default-src 'self' data: blob:; connect-src 'self'; img-src 'self' data: blob: ${artifactOrigin}; media-src 'self' data: blob: ${artifactOrigin}; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; worker-src 'self' blob:; frame-src 'self' blob: ${artifactOrigin}; font-src 'self' data:; base-uri 'none'`
+    : "default-src 'self' data: blob:; connect-src 'self'; img-src 'self' data: blob:; media-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; worker-src 'self' blob:; frame-src 'self' blob:; font-src 'self' data:; base-uri 'none'";
+  const activeContentIsolation = extname(verifiedFile).toLowerCase() === '.html'
+    ? `sandbox allow-scripts allow-forms allow-downloads allow-popups; ${sandboxSources}${opaqueArchiveWrapper ? '' : "; frame-ancestors 'self'"}`
+    : "default-src 'none'; frame-ancestors 'self'";
+  const opaqueArchiveModule = /(?:^|\/)checklist\/assets\/gallery-(?:archive|core)\.js$/.test(relativeArtifactPath);
+  return sendFile(request, response, verifiedFile, activeContentIsolation, { opaqueArchiveModule });
 }
 
-async function sendFile(request, response, file, contentSecurityPolicy) {
+async function sendFile(request, response, file, contentSecurityPolicy, { opaqueArchiveModule = false } = {}) {
   let handle;
   try {
     handle = await fs.open(file, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
@@ -1721,6 +2073,13 @@ async function sendFile(request, response, file, contentSecurityPolicy) {
     'X-Content-Type-Options': 'nosniff',
     'Referrer-Policy': 'no-referrer',
   };
+  if (opaqueArchiveModule) {
+    // Archive HTML intentionally has an opaque origin so it cannot inherit
+    // portal authority. Only these inert, generated module assets opt into
+    // CORS; run data and mutation APIs remain unavailable to that origin.
+    headers['Access-Control-Allow-Origin'] = '*';
+    headers['Cross-Origin-Resource-Policy'] = 'cross-origin';
+  }
   if (range) headers['Content-Range'] = `bytes ${range.start}-${range.end}/${stat.size}`;
   response.writeHead(range ? 206 : 200, headers);
   if (request.method === 'HEAD') {
@@ -1915,12 +2274,17 @@ function isUnvalidatedVideoArtifact(index, value) {
 
 function ignoredArtifactPath(value) {
   const segments = String(value).split('/');
-  return segments.some((segment) =>
+  return isRawLogArtifactPath(value) || segments.some((segment) =>
     segment === '.DS_Store'
     || segment === '.last-run.json'
     || segment.startsWith('.playwright-artifacts-')
     || segment.endsWith('.tmp')
     || segment.endsWith('.partial'));
+}
+
+function isRawLogArtifactPath(value) {
+  const segments = String(value).replaceAll('\\', '/').split('/').filter(Boolean);
+  return segments.includes('logs') || segments.some((segment) => segment.toLowerCase().endsWith('.log'));
 }
 
 function artifactKind(path) {
@@ -1957,7 +2321,8 @@ async function readBoundedReportJson(run, relativePath, maximumBytes) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw httpError(422, 'Compact report data must be a JSON object.');
   }
-  reportDataCache.set(verifiedPath, { mtimeMs: stat.mtimeMs, size: stat.size, value });
+  reportDataCache.delete(verifiedPath);
+  reportDataCache.set(verifiedPath, { mtimeMs: stat.mtimeMs, size: stat.size, value }, stat.size);
   return structuredClone(value);
 }
 
@@ -2036,24 +2401,6 @@ function reportFilter(requestUrl, name, maximumLength) {
   return normalized;
 }
 
-async function loadCatalog() {
-  const source = await fs.readFile(join(REPOSITORY_ROOT, 'audit', 'catalog.ts'), 'utf8');
-  const entries = [];
-  const pattern = /audit\(\s*'([A-Z0-9-]+)'\s*,\s*'([a-z]+)'\s*,\s*'((?:[^'\\]|\\.)*)'/g;
-  for (const match of source.matchAll(pattern)) {
-    const callEnd = source.indexOf('),', match.index ?? 0);
-    const callSource = source.slice(match.index ?? 0, callEnd === -1 ? undefined : callEnd + 1);
-    entries.push({
-      id: match[1],
-      area: match[2],
-      title: match[3].replaceAll("\\'", "'"),
-      manual: /,\s*true\s*\)$/.test(callSource.trim()),
-    });
-  }
-  if (entries.length === 0) throw new Error('The audit catalog could not be loaded.');
-  return entries;
-}
-
 async function loadPluginRegistry(coreDefinitions) {
   const registryPath = join(REPOSITORY_ROOT, 'audit', 'plugins.generated.json');
   let document;
@@ -2066,6 +2413,7 @@ async function loadPluginRegistry(coreDefinitions) {
   return validatePortalPluginRegistryDocument(document, {
     coreDefinitions,
     projectIds: PROJECT_IDS,
+    localTargets: PROJECTS,
     resolveEntrySpec: (spec) => Boolean(safeResolve(REPOSITORY_ROOT, spec)),
   });
 }
@@ -2096,10 +2444,17 @@ async function refreshExternalShardedRuns() {
       safeStat(join(directory, 'logs', 'coordinator.log')),
       safeStat(join(directory, 'sharded-run.json')),
       safeStat(join(directory, 'merge-lifecycle.json')),
+      safeStat(join(directory, 'sharded-heartbeat.json')),
     ]).then((stats) => stats.some((stat) => stat?.isFile()));
     if (!discoverable) continue;
     const run = existing ?? await createExternalRun(entry.name, directory);
+    if (existing && Date.now() < (run.externalState.nextRefreshAt ?? 0)) continue;
     await refreshExternalRun(run, !existing);
+    run.externalState.nextRefreshAt = Date.now() + (
+      TERMINAL_STATUSES.has(run.manifest.status) && !run.externalState.leaseFailed
+        ? EXTERNAL_TERMINAL_REFRESH_MS
+        : EXTERNAL_RUN_SYNC_MS
+    );
     if (!existing) runs.set(entry.name, run);
   }
 }
@@ -2125,7 +2480,8 @@ async function createExternalRun(id, directory) {
       source: 'external-sharded',
       options: {
         profile: 'release',
-        projects: PROJECTS.map(({ id: projectId }) => projectId),
+        projects: [...targetRegistry.defaultTargetIds],
+        targetIds: [...targetRegistry.defaultTargetIds],
         pluginIds: plugins.map(({ id: pluginId }) => pluginId),
         areas: [],
         auditIds: [],
@@ -2169,6 +2525,9 @@ async function createExternalRun(id, directory) {
       performanceExpectedExecutions: null,
       started: null,
       lifecycleCache: new Map(),
+      lastActivityMs: stat.mtimeMs,
+      nextRefreshAt: 0,
+      leaseFailed: false,
     },
   };
 }
@@ -2232,6 +2591,7 @@ async function consumeExternalLogFile(run, path, emit, completedOnDiscovery = fa
   const stat = await safeStat(path);
   if (!stat?.isFile()) return;
   const state = run.externalState;
+  state.lastActivityMs = Math.max(state.lastActivityMs ?? 0, stat.mtimeMs);
   // A restarted portal normally tails large logs to stay responsive. Seed the
   // immutable header first so totals, shard identity, and coordinator start
   // metadata survive that restart instead of reverting to an unknown total.
@@ -2437,6 +2797,23 @@ async function refreshExternalManifest(run) {
   const state = run.externalState;
   const lifecycle = await readCachedExternalJson(run, 'sharded-run.json');
   const mergeLifecycle = await readCachedExternalJson(run, 'merge-lifecycle.json');
+  const heartbeat = await readCachedExternalJson(run, 'sharded-heartbeat.json');
+  const heartbeatStat = await safeStat(join(run.directory, 'sharded-heartbeat.json'));
+  if (heartbeatStat?.isFile()) state.lastActivityMs = Math.max(state.lastActivityMs ?? 0, heartbeatStat.mtimeMs);
+  const invalidDocument = [lifecycle, mergeLifecycle, heartbeat]
+    .find((value) => typeof value?.__portalExternalJsonError === 'string');
+  if (invalidDocument) {
+    state.leaseFailed = true;
+    const finishedAt = new Date().toISOString();
+    const reason = `External sharded lifecycle evidence is invalid: ${invalidDocument.__portalExternalJsonError}`;
+    run.manifest.status = 'evidence-failed';
+    run.manifest.phase = 'External sharded run published invalid lifecycle evidence';
+    run.manifest.finishedAt = finishedAt;
+    run.manifest.exitCode = null;
+    run.manifest.pipeline = { status: 'failed', completed: false, reason, finishedAt };
+    run.manifest.release = unavailableRelease(`No authoritative release decision exists because ${reason.toLowerCase()}`);
+    return;
+  }
   const startedAt = lifecycle?.startedAt ?? state.started?.startedAt ?? mergeLifecycle?.startedAt ?? run.manifest.createdAt;
   const shardTotal = lifecycle?.shardTotal ?? state.started?.shardTotal ?? mergeLifecycle?.shardTotal
     ?? state.shardProgress.size;
@@ -2452,6 +2829,7 @@ async function refreshExternalManifest(run) {
   run.manifest.progress = externalProgress(state);
 
   if (lifecycle) {
+    state.leaseFailed = false;
     const pipeline = lifecycle.pipeline ?? {
       status: 'failed', completed: false, reason: 'The sharded lifecycle is missing pipeline truth.', finishedAt: lifecycle.finishedAt ?? null,
     };
@@ -2467,6 +2845,7 @@ async function refreshExternalManifest(run) {
   }
 
   if (mergeLifecycle?.finishedAt) {
+    state.leaseFailed = false;
     let release = mergeLifecycle.release ?? null;
     if (!release) {
       try {
@@ -2493,6 +2872,38 @@ async function refreshExternalManifest(run) {
     return;
   }
 
+  const heartbeatIssue = heartbeatStat?.isFile() ? malformedExternalHeartbeat(heartbeat, run.manifest.id) : null;
+  if (heartbeatIssue) {
+    state.leaseFailed = true;
+    const finishedAt = new Date().toISOString();
+    const reason = `External sharded coordinator heartbeat is malformed: ${heartbeatIssue}`;
+    run.manifest.status = 'evidence-failed';
+    run.manifest.phase = 'External sharded run published an invalid heartbeat';
+    run.manifest.finishedAt = finishedAt;
+    run.manifest.exitCode = null;
+    run.manifest.pipeline = { status: 'failed', completed: false, reason, finishedAt };
+    run.manifest.release = unavailableRelease(`No authoritative release decision exists because ${reason.toLowerCase()}`);
+    return;
+  }
+
+  const leaseExpiresAt = Date.parse(String(heartbeat?.leaseExpiresAt ?? ''));
+  const heartbeatExpired = Number.isFinite(leaseExpiresAt) && Date.now() > leaseExpiresAt;
+  const legacyActivityExpired = !heartbeat && Date.now() - (state.lastActivityMs ?? Date.parse(startedAt)) > EXTERNAL_STALE_LEASE_MS;
+  if (heartbeatExpired || legacyActivityExpired) {
+    state.leaseFailed = true;
+    const lastHeartbeat = heartbeat?.updatedAt ?? (state.lastActivityMs ? new Date(state.lastActivityMs).toISOString() : 'unknown');
+    const reason = `External sharded coordinator lease expired; last activity ${lastHeartbeat}. No terminal lifecycle was published.`;
+    const finishedAt = new Date().toISOString();
+    run.manifest.status = 'evidence-failed';
+    run.manifest.phase = 'External sharded run stopped reporting progress';
+    run.manifest.finishedAt = finishedAt;
+    run.manifest.exitCode = null;
+    run.manifest.pipeline = { status: 'failed', completed: false, reason, finishedAt };
+    run.manifest.release = unavailableRelease(`No authoritative release decision exists because ${reason.toLowerCase()}`);
+    return;
+  }
+
+  state.leaseFailed = false;
   run.manifest.status = 'running';
   run.manifest.finishedAt = null;
   run.manifest.exitCode = null;
@@ -2516,13 +2927,49 @@ async function refreshExternalManifest(run) {
               : 'Preparing isolated performance container';
 }
 
+function malformedExternalHeartbeat(heartbeat, expectedRunId) {
+  if (!heartbeat || typeof heartbeat !== 'object' || Array.isArray(heartbeat)) return 'the file is not valid JSON object data.';
+  if (heartbeat.schemaVersion !== 1) return 'schemaVersion must be 1.';
+  if (heartbeat.runId !== expectedRunId) return 'runId does not match the evidence directory.';
+  if (!['running', 'stopping'].includes(heartbeat.status)) return 'an active run heartbeat must report running or stopping.';
+  const updatedAt = Date.parse(String(heartbeat.updatedAt ?? ''));
+  const leaseExpiresAt = Date.parse(String(heartbeat.leaseExpiresAt ?? ''));
+  if (!Number.isFinite(updatedAt) || !Number.isFinite(leaseExpiresAt)) return 'updatedAt and leaseExpiresAt must be valid timestamps.';
+  if (leaseExpiresAt <= updatedAt || leaseExpiresAt - updatedAt > 15 * 60_000) return 'the lease interval is invalid or unbounded.';
+  if (updatedAt > Date.now() + 5 * 60_000) return 'updatedAt is implausibly far in the future.';
+  if (!Number.isSafeInteger(heartbeat.activeCommands) || heartbeat.activeCommands < 0 || heartbeat.activeCommands > 1_000) {
+    return 'activeCommands must be a bounded non-negative integer.';
+  }
+  return null;
+}
+
 function applyExternalFinalTruth(run, { pipeline, release, reportedStatus, finishedAt, source }) {
+  if (pipeline?.status === 'stopped' && pipeline?.completed === false && reportedStatus === 'stopped') {
+    const terminalAt = finishedAt ?? pipeline.finishedAt ?? new Date().toISOString();
+    delete run.manifest.lifecycleDiagnostics;
+    run.manifest.finishedAt = terminalAt;
+    run.manifest.pipeline = {
+      status: 'stopped',
+      completed: false,
+      reason: pipeline.reason || 'The external sharded run was stopped.',
+      finishedAt: terminalAt,
+    };
+    run.manifest.release = unavailableRelease(
+      'No authoritative release decision exists because the external sharded run was stopped.',
+      source,
+    );
+    run.manifest.reviewReasons = [];
+    run.manifest.status = 'stopped';
+    run.manifest.exitCode = 130;
+    run.manifest.phase = 'External sharded run stopped';
+    return;
+  }
   const pipelineComplete = pipeline?.status === 'completed' && pipeline?.completed === true;
   let normalizedRelease = null;
   let releaseValidationError = null;
   try {
     normalizedRelease = {
-      ...parseChecklistRelease({ release }, source),
+      ...parseChecklistRelease({ schemaVersion: 1, release }, source),
       evaluatedAt: typeof release?.evaluatedAt === 'string' ? release.evaluatedAt : finishedAt,
     };
   } catch (error) {
@@ -2573,7 +3020,7 @@ function applyExternalFinalTruth(run, { pipeline, release, reportedStatus, finis
 
   delete run.manifest.lifecycleDiagnostics;
   run.manifest.pipeline = pipeline;
-  const reviews = releaseReviewReasons(run.manifest, PROJECTS.length);
+  const reviews = releaseReviewReasons(run.manifest, FULL_PROJECT_COUNT);
   run.manifest.reviewReasons = reviews;
   run.manifest.status = normalizedRelease.decision === 'NOT_READY'
     ? 'not-ready'
@@ -2711,12 +3158,24 @@ async function readCachedExternalJson(run, relativePath) {
   if (!stat?.isFile()) return null;
   const cached = run.externalState.lifecycleCache.get(path);
   if (cached?.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.value;
+  const maximumBytes = relativePath === 'sharded-heartbeat.json'
+    ? MAX_EXTERNAL_HEARTBEAT_JSON_BYTES
+    : MAX_EXTERNAL_LIFECYCLE_JSON_BYTES;
+  if (stat.size > maximumBytes) {
+    const value = {
+      __portalExternalJsonError: `${relativePath} exceeds its ${maximumBytes}-byte safety limit.`,
+    };
+    run.externalState.lifecycleCache.set(path, { mtimeMs: stat.mtimeMs, size: stat.size, value });
+    return value;
+  }
   try {
     const value = JSON.parse(await fs.readFile(path, 'utf8'));
     run.externalState.lifecycleCache.set(path, { mtimeMs: stat.mtimeMs, size: stat.size, value });
     return value;
   } catch {
-    return null;
+    const value = { __portalExternalJsonError: `${relativePath} is not valid JSON.` };
+    run.externalState.lifecycleCache.set(path, { mtimeMs: stat.mtimeMs, size: stat.size, value });
+    return value;
   }
 }
 
@@ -2953,6 +3412,7 @@ async function purgeRun(run, body, response) {
   }
   if (purgingRunIds.has(id)) throw httpError(409, 'This run is already being purged.');
   if (manualMutationRunIds.has(id)) throw httpError(409, 'Manual evidence is being saved for this run. Wait for it to finish before purging.');
+  if (galleryMutationRunIds.has(id)) throw httpError(409, 'A gallery review update is being saved for this run. Wait for it to finish before purging.');
 
   purgingRunIds.add(id);
   try {
@@ -2971,13 +3431,12 @@ async function purgeRun(run, body, response) {
     }
     runs.delete(id);
     closePurgedRunStreams(run, id);
-    console.log(`Purged ${run.externalManaged ? 'external sharded' : 'portal-managed'} run ${id}: ${reclaimed.files} files, ${reclaimed.bytes} allocated bytes reclaimed, ${reclaimed.logicalBytes} logical bytes removed.`);
+    console.log(`Purged ${run.externalManaged ? 'external sharded' : 'portal-managed'} run ${id}: ${reclaimed.files} file references and ${reclaimed.logicalBytes} logical bytes removed (hardlinks make physical reclaimed-byte claims unreliable).`);
     return sendJson(response, 200, {
       id,
       purged: true,
       source: run.externalManaged ? 'external-sharded' : 'portal-managed',
-      filesReclaimed: reclaimed.files,
-      bytesReclaimed: reclaimed.bytes,
+      filesRemoved: reclaimed.files,
       logicalBytesRemoved: reclaimed.logicalBytes,
     });
   } catch (error) {
@@ -2986,6 +3445,21 @@ async function purgeRun(run, body, response) {
     throw httpError(500, 'The run could not be completely purged. Its portal record was retained; inspect the portal service log and evidence directory before retrying.');
   } finally {
     purgingRunIds.delete(id);
+  }
+}
+
+async function withGalleryMutationLock(run, callback) {
+  const id = run.manifest.id;
+  if (purgingRunIds.has(id)) throw httpError(409, 'This run is being purged and cannot accept gallery review updates.');
+  if (galleryMutationRunIds.has(id)) throw httpError(409, 'Another gallery review update is already being saved for this run.');
+  galleryMutationRunIds.add(id);
+  try {
+    if (purgingRunIds.has(id) || runs.get(id) !== run) {
+      throw httpError(409, 'This run is no longer available for gallery review updates.');
+    }
+    return await callback();
+  } finally {
+    galleryMutationRunIds.delete(id);
   }
 }
 
@@ -3141,6 +3615,116 @@ function resolveToolExecutable(name) {
   return join(REPOSITORY_ROOT, 'node_modules', '.bin', `${name}${suffix}`);
 }
 
+async function prepareRunDirectoryForRunner(directory) {
+  if (!RUNNER_IDENTITY.active) return;
+  await fs.chown(directory, RUNNER_IDENTITY.uid, RUNNER_IDENTITY.gid);
+  await fs.chmod(directory, 0o770);
+}
+
+async function sealRunDirectoryForReporting(run, stageName = 'reportRebuild') {
+  if (!REPORT_WORKER_IDENTITY.active) return;
+  let removedSymlinks = 0;
+  let files = 0;
+  let directories = 0;
+  async function visit(directory) {
+    const entries = await fs.readdir(directory, { withFileTypes: true });
+    for (const entry of entries) {
+      const itemPath = join(directory, entry.name);
+      const details = await fs.lstat(itemPath);
+      if (details.isSymbolicLink()) {
+        await fs.unlink(itemPath);
+        removedSymlinks += 1;
+        continue;
+      }
+      if (details.isDirectory()) {
+        await visit(itemPath);
+        await fs.chown(itemPath, 0, RUNNER_IDENTITY.gid);
+        await fs.chmod(itemPath, 0o750);
+        directories += 1;
+        continue;
+      }
+      if (!details.isFile()) {
+        throw new Error(`Run sealing rejected a non-regular artifact: ${relative(run.directory, itemPath)}`);
+      }
+      if (details.nlink > 1) {
+        throw new Error(`Run sealing rejected a hard-linked artifact: ${relative(run.directory, itemPath)}`);
+      }
+      await fs.chown(itemPath, 0, RUNNER_IDENTITY.gid);
+      await fs.chmod(itemPath, 0o640);
+      files += 1;
+    }
+  }
+  await visit(run.directory);
+  await fs.chown(run.directory, 0, RUNNER_IDENTITY.gid);
+  await fs.chmod(run.directory, 0o750);
+  appendLog(
+    run,
+    'stdout',
+    `Run evidence sealed for private report generation: ${files} regular files, ${directories} directories, ${removedSymlinks} symlinks removed.`,
+    stageName,
+  );
+}
+
+async function createPrivateReportStaging(run) {
+  const staging = await fs.mkdtemp(join(run.directory, '.checklist-staging-'));
+  if (REPORT_WORKER_IDENTITY.active) {
+    await fs.chown(staging, REPORT_WORKER_IDENTITY.uid, REPORT_WORKER_IDENTITY.gid);
+  }
+  await fs.chmod(staging, 0o750);
+  return staging;
+}
+
+async function publishPrivateChecklist(run, staging, stageName) {
+  const destination = join(run.directory, 'checklist');
+  const backup = join(run.directory, `.checklist-backup-${randomBytes(6).toString('hex')}`);
+  let backedUp = false;
+  try {
+    await fs.rename(destination, backup);
+    backedUp = true;
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+  try {
+    await fs.rename(staging, destination);
+  } catch (error) {
+    if (backedUp) await fs.rename(backup, destination).catch(() => undefined);
+    throw error;
+  }
+  if (backedUp) await fs.rm(backup, { recursive: true, force: true });
+  await sealRunDirectoryForReporting(run, stageName);
+}
+
+async function rebuildChecklistInPrivateStaging(run, stageName, label) {
+  await sealRunDirectoryForReporting(run, stageName);
+  const staging = await createPrivateReportStaging(run);
+  const args = [
+    'scripts/rebuild-report.ts',
+    join(run.directory, 'results.json'),
+    staging,
+  ];
+  run.manifest.stages[stageName].command = ['tsx', ...args];
+  try {
+    await executeStage(
+      run,
+      stageName,
+      label,
+      resolveToolExecutable('tsx'),
+      args,
+      {
+        AUDIT_ARTIFACT_DIR: run.directory,
+        AUDIT_OUTPUT_DIR: staging,
+      },
+      { identity: REPORT_WORKER_IDENTITY },
+    );
+    if (run.manifest.stages[stageName].status === 'completed') {
+      await publishPrivateChecklist(run, staging, stageName);
+      appendLog(run, 'stdout', 'Privately staged checklist published atomically.', stageName);
+    }
+  } finally {
+    await fs.rm(staging, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
 async function initializeSecretVault() {
   await fs.mkdir(SECRET_ROOT, { recursive: true, mode: 0o700 });
   await fs.chmod(SECRET_ROOT, 0o700);
@@ -3161,6 +3745,12 @@ async function initializeSecretVault() {
 
   const environmentKey = process.env.ANTHROPIC_API_KEY;
   if (environmentKey) sensitiveLogValues.add(environmentKey);
+  if (!CREDENTIAL_ISOLATION_ACTIVE) {
+    if (environmentKey || await safeStat(ANTHROPIC_CREDENTIAL_PATH)) {
+      console.warn('Anthropic credentials are disabled because the portal requires separate Playwright, AI, and report worker identities.');
+    }
+    return;
+  }
   try {
     const envelope = JSON.parse(await fs.readFile(ANTHROPIC_CREDENTIAL_PATH, 'utf8'));
     const apiKey = decryptCredentialEnvelope(envelope);
@@ -3178,6 +3768,7 @@ async function initializeSecretVault() {
 }
 
 function currentAnthropicApiKey() {
+  if (!CREDENTIAL_ISOLATION_ACTIVE) return null;
   return savedAnthropicCredential?.apiKey ?? process.env.ANTHROPIC_API_KEY ?? null;
 }
 
@@ -3186,10 +3777,17 @@ function anthropicCredentialState() {
   return {
     configured: Boolean(apiKey),
     fingerprint: apiKey ? credentialFingerprint(apiKey) : null,
+    storageEnabled: CREDENTIAL_ISOLATION_ACTIVE,
+    unavailableReason: CREDENTIAL_ISOLATION_ACTIVE
+      ? null
+      : 'Credential storage requires separate isolated Playwright, AI, and report worker identities.',
   };
 }
 
 async function saveAnthropicCredential(input) {
+  if (!CREDENTIAL_ISOLATION_ACTIVE) {
+    throw httpError(503, 'Anthropic credential storage is disabled until the portal has separate Playwright, AI, and report worker identities.');
+  }
   const apiKey = input.trim();
   if (!ANTHROPIC_KEY_PATTERN.test(apiKey)) {
     throw httpError(400, 'The Anthropic API key format is invalid. Use a newly rotated sk-ant key.');
@@ -3197,9 +3795,12 @@ async function saveAnthropicCredential(input) {
   const updatedAt = new Date().toISOString();
   const envelope = encryptCredentialEnvelope(apiKey, updatedAt);
   const temporaryPath = `${ANTHROPIC_CREDENTIAL_PATH}.${randomBytes(4).toString('hex')}.tmp`;
-  await fs.writeFile(temporaryPath, `${JSON.stringify(envelope, null, 2)}\n`, { mode: 0o600 });
-  await fs.rename(temporaryPath, ANTHROPIC_CREDENTIAL_PATH);
-  await fs.chmod(ANTHROPIC_CREDENTIAL_PATH, 0o600);
+  await publishCredentialEnvelope(
+    fs,
+    ANTHROPIC_CREDENTIAL_PATH,
+    temporaryPath,
+    `${JSON.stringify(envelope, null, 2)}\n`,
+  );
   savedAnthropicCredential = { apiKey, updatedAt, fingerprint: credentialFingerprint(apiKey) };
   sensitiveLogValues.add(apiKey);
   console.log(`Anthropic credential saved in the portal vault (${savedAnthropicCredential.fingerprint}).`);
@@ -3209,14 +3810,18 @@ async function deleteAnthropicCredential() {
   if (!savedAnthropicCredential && process.env.ANTHROPIC_API_KEY) {
     throw httpError(409, 'The configured Anthropic key is managed by the runtime environment and cannot be deleted in the portal. Restart the container without ANTHROPIC_API_KEY to remove it.');
   }
+  // Delete durable state first. If unlink fails, the in-memory credential must
+  // remain aligned with what a restart will load.
+  await removeCredentialEnvelope(fs, ANTHROPIC_CREDENTIAL_PATH);
   if (savedAnthropicCredential?.apiKey) sensitiveLogValues.add(savedAnthropicCredential.apiKey);
   savedAnthropicCredential = null;
-  try {
-    await fs.unlink(ANTHROPIC_CREDENTIAL_PATH);
-  } catch (error) {
-    if (error?.code !== 'ENOENT') throw error;
-  }
   console.log('Portal-saved Anthropic credential deleted.');
+}
+
+function serializeCredentialMutation(callback) {
+  const operation = credentialMutationPromise.then(callback, callback);
+  credentialMutationPromise = operation.catch(() => undefined);
+  return operation;
 }
 
 function encryptCredentialEnvelope(apiKey, updatedAt) {
@@ -3258,9 +3863,7 @@ function credentialFingerprint(apiKey) {
 }
 
 function sanitizedProcessEnvironment() {
-  const environment = { ...process.env };
-  delete environment.ANTHROPIC_API_KEY;
-  return environment;
+  return sanitizedChildEnvironment(process.env);
 }
 
 function redactLogValue(value) {
@@ -3310,11 +3913,17 @@ function assertManualRunReady(run) {
 
 async function withManualMutation(run, operation) {
   const id = run.manifest.id;
+  if (purgingRunIds.has(id)) {
+    throw httpError(409, 'This run is being purged and cannot accept manual evidence updates.');
+  }
   if (manualMutationRunIds.has(id)) {
     throw httpError(409, 'Another manual evidence upload or attestation rebuild is already running for this run.');
   }
   manualMutationRunIds.add(id);
   try {
+    if (purgingRunIds.has(id) || runs.get(id) !== run) {
+      throw httpError(409, 'This run is no longer available for manual evidence updates.');
+    }
     return await operation();
   } finally {
     manualMutationRunIds.delete(id);
@@ -3578,6 +4187,7 @@ async function rebuildAfterManualEvidence(run, auditId) {
   }
   run.logStream = logStream;
   run.lifecycleStream = lifecycleStream;
+  attachRunStreamFailureGuards(run);
   run.manifest.stages.manualEvidenceRebuild = stageRecord('pending', [
     'tsx', 'scripts/rebuild-report.ts', '--run-dir', run.directory,
   ]);
@@ -3598,13 +4208,10 @@ async function rebuildAfterManualEvidence(run, auditId) {
   });
   let unexpectedError = null;
   try {
-    await executeStage(
+    await rebuildChecklistInPrivateStaging(
       run,
       'manualEvidenceRebuild',
       run.manifest.phase,
-      resolveToolExecutable('tsx'),
-      ['scripts/rebuild-report.ts', '--run-dir', run.directory],
-      { AUDIT_ARTIFACT_DIR: run.directory, AUDIT_OUTPUT_DIR: join(run.directory, 'checklist') },
     );
     if (run.manifest.stages.manualEvidenceRebuild.status !== 'completed') {
       applyPipelineFailure(run, `manual evidence checklist rebuild failed for ${auditId}`);
@@ -3692,6 +4299,9 @@ function queryInteger(value, name, defaultValue, minimum, maximum) {
 }
 
 function assertMutationRequest(request) {
+  if (request.headers.origin === 'null') {
+    throw httpError(403, 'Sandboxed artifact documents cannot call portal mutation APIs.');
+  }
   const contentType = request.headers['content-type'] ?? '';
   if (!contentType.toLowerCase().startsWith('application/json')) {
     throw httpError(415, 'Mutation requests must use application/json.');

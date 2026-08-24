@@ -9,8 +9,10 @@ const state = {
   openingRunId: null,
   openController: null,
   openRequest: 0,
+  overflowController: null,
+  overflowGeneration: 0,
   liveLogBatch: { lines: [], characters: 0, dropped: 0, timer: null, runId: null, progress: null, phase: null },
-  keySettings: { known: false, configured: false, fingerprint: null },
+  keySettings: { known: false, configured: false, fingerprint: null, storageEnabled: false, unavailableReason: null },
   keyDeleteArmed: false,
   keyDeleteTimer: null,
   artifactPage: { runId: null, nextOffset: 0, total: 0 },
@@ -134,7 +136,6 @@ async function init() {
   renderManualAudits();
   bindEvents();
   await Promise.all([loadRuns({ initial: true }), loadAnthropicKeySettings()]);
-  state.poll = window.setInterval(() => void loadRuns({ background: true }), 5_000);
   window.setInterval(refreshElapsedTime, 1_000);
 }
 
@@ -149,9 +150,10 @@ function bindEvents() {
   elements.form.addEventListener('change', (event) => {
     if (event.target.name === 'scope') {
       elements.targetControls.hidden = event.target.value === 'all';
+      if (event.target.value === 'all') resetDefaultTargets();
     }
     if (event.target.name === 'profile' && event.target.value === 'release' && elements.form.elements.scope.value === 'all') {
-      elements.projects.querySelectorAll('input[name="project"]').forEach((input) => { input.checked = true; });
+      resetDefaultTargets();
     }
     updateSelectedCount();
   });
@@ -168,10 +170,20 @@ function bindEvents() {
   elements.loadMoreArtifacts.addEventListener('click', () => {
     if (state.activeRunId) void loadArtifacts(state.activeRunId, { append: true });
   });
+  document.addEventListener('visibilitychange', () => {
+    scheduleRunsPoll();
+    if (document.visibilityState === 'visible') void loadRuns({ background: true });
+  });
   elements.keyInput.addEventListener('input', () => {
     clearKeyDeleteConfirmation();
     elements.keyMessage.textContent = '';
     elements.keyMessage.classList.remove('error', 'success');
+  });
+}
+
+function resetDefaultTargets() {
+  elements.projects.querySelectorAll('input[name="targetId"]').forEach((input) => {
+    input.checked = !input.disabled && input.dataset.defaultSelected === 'true';
   });
 }
 
@@ -187,23 +199,38 @@ function renderManualAudits() {
 }
 
 function renderProjects() {
-  state.config.projects.forEach((project) => {
+  elements.projects.replaceChildren();
+  const addHeading = (copy) => {
+    const heading = document.createElement('p');
+    heading.className = 'target-group-heading muted';
+    heading.textContent = copy;
+    elements.projects.append(heading);
+  };
+  const renderTarget = (project, providerOnly = false) => {
     const label = document.createElement('label');
-    label.className = 'choice-card';
+    label.className = `choice-card${project.available ? '' : ' unavailable-target'}`;
     const input = document.createElement('input');
     input.type = 'checkbox';
-    input.name = 'project';
+    input.name = 'targetId';
     input.value = project.id;
-    input.checked = ['production-mobile-chromium', 'candidate-mobile-chromium', 'production-desktop-chromium', 'candidate-desktop-chromium'].includes(project.id);
+    input.checked = project.available && project.defaultSelected;
+    input.disabled = !project.available;
+    input.dataset.defaultSelected = String(project.defaultSelected === true);
     const copy = document.createElement('span');
     const title = document.createElement('strong');
     title.textContent = project.label;
     const detail = document.createElement('small');
-    detail.textContent = project.environment === 'candidate' ? 'New redesign' : 'Current reference';
+    detail.textContent = project.available
+      ? `${humanize(project.fidelity)} · ${project.qualification}`
+      : `Unavailable${providerOnly ? ' · provider adapter required' : ''} · ${project.unavailableReason ?? project.qualification}`;
     copy.append(title, detail);
     label.append(input, copy);
     elements.projects.append(label);
-  });
+  };
+  addHeading('Docker-local browser and device-emulation targets');
+  state.config.targets.localTargets.forEach((target) => renderTarget(target));
+  addHeading('Real-device provider targets · shown for planning only');
+  state.config.targets.providerTargets.forEach((target) => renderTarget(target, true));
 }
 
 function renderAreas() {
@@ -275,7 +302,7 @@ async function launchRun(event) {
   const targeted = elements.form.elements.scope.value === 'targeted';
   const body = {
     profile: elements.form.elements.profile.value,
-    projects: checkedValues('project'),
+    targetIds: checkedValues('targetId'),
     pluginIds: targeted ? checkedValues('pluginId') : [],
     areas: targeted ? checkedValues('area') : [],
     auditIds: targeted ? [...state.selectedAuditIds] : [],
@@ -316,6 +343,9 @@ async function loadRuns({ initial = false, userInitiated = false, background = f
       elements.runsStatus.textContent = 'A refresh is already in progress.';
       announce('Run list refresh is already in progress.');
     }
+    // A timer can fire while a user refresh is in flight. Keep exactly one
+    // future poll armed instead of letting that harmless overlap stop polling.
+    scheduleRunsPoll();
     return;
   }
   setRegionBusy(elements.runsPanel, true);
@@ -348,7 +378,18 @@ async function loadRuns({ initial = false, userInitiated = false, background = f
     setRegionBusy(elements.runsPanel, false);
     if (userInitiated) setButtonBusy(elements.refreshRuns, false);
     endOperation('runs');
+    scheduleRunsPoll();
   }
+}
+
+function scheduleRunsPoll() {
+  if (state.poll) window.clearTimeout(state.poll);
+  const hasActiveRun = state.runs.some(({ status }) => ['starting', 'running'].includes(status));
+  const delay = document.visibilityState === 'visible' && hasActiveRun ? 2_000 : 30_000;
+  state.poll = window.setTimeout(() => {
+    state.poll = null;
+    void loadRuns({ background: true });
+  }, delay);
 }
 
 function renderRunSkeleton() {
@@ -659,12 +700,30 @@ function connectEventStream(id, afterSequence = 0) {
     if (state.activeRunId !== id) return;
     const item = JSON.parse(event.data);
     queueLiveLogLine(id, `\n[portal] ${item.dropped ?? 'Some'} live log events were omitted to keep the stream responsive. Loading a bounded recent tail…\n`);
+    flushLiveLog();
+    state.overflowController?.abort();
+    const controller = new AbortController();
+    const generation = ++state.overflowGeneration;
+    state.overflowController = controller;
+    const beforeRecovery = elements.liveLog.textContent;
     try {
-      const history = await fetchJson(`/api/runs/${encodeURIComponent(id)}/logs?maxBytes=65536`);
-      if (state.activeRunId !== id) return;
-      resetLiveLog(`[portal] Live stream caught up from a bounded recent tail.\n${history.log}`, id);
-    } catch {
+      const history = await fetchJson(`/api/runs/${encodeURIComponent(id)}/logs?maxBytes=65536`, { signal: controller.signal });
+      if (controller.signal.aborted || generation !== state.overflowGeneration || state.activeRunId !== id) return;
+      flushLiveLog();
+      const current = elements.liveLog.textContent;
+      if (current.startsWith(beforeRecovery)) {
+        const newerLines = current.slice(beforeRecovery.length);
+        resetLiveLog(`[portal] Live stream caught up from a bounded recent tail.\n${history.log}${newerLines}`, id);
+      } else if (current === beforeRecovery) {
+        resetLiveLog(`[portal] Live stream caught up from a bounded recent tail.\n${history.log}`, id);
+      } else {
+        queueLiveLogLine(id, '[portal] A recent tail was loaded, but newer live lines were retained instead of being overwritten.\n');
+      }
+    } catch (error) {
+      if (error?.name === 'AbortError') return;
       // The EventSource retry and normal run-list polling provide the next recovery opportunity.
+    } finally {
+      if (state.overflowController === controller) state.overflowController = null;
     }
   });
   state.events.addEventListener('status', async (event) => {
@@ -975,15 +1034,15 @@ async function purgeActiveRun() {
       body: JSON.stringify({ confirmation }),
       timeoutMs: 10 * 60_000,
     });
-    const bytesReclaimed = Number.isFinite(result.bytesReclaimed) ? result.bytesReclaimed : 0;
-    const filesReclaimed = Number.isFinite(result.filesReclaimed) ? result.filesReclaimed : 0;
-    const reclaimed = `${formatBytes(bytesReclaimed)} across ${filesReclaimed.toLocaleString()} file${filesReclaimed === 1 ? '' : 's'}`;
+    const logicalBytesRemoved = Number.isFinite(result.logicalBytesRemoved) ? result.logicalBytesRemoved : 0;
+    const filesRemoved = Number.isFinite(result.filesRemoved) ? result.filesRemoved : 0;
+    const removed = `${formatBytes(logicalBytesRemoved)} of logical references across ${filesRemoved.toLocaleString()} file${filesRemoved === 1 ? '' : 's'}`;
     closeEventStream();
     if (elements.runDialog.open) elements.runDialog.close();
     state.runs = state.runs.filter(({ id }) => id !== runId);
     renderRuns();
-    elements.runsStatus.textContent = `Run deleted · reclaimed ${reclaimed}.`;
-    announce(`Run ${runId} deleted. Reclaimed ${reclaimed}.`);
+    elements.runsStatus.textContent = `Run deleted · removed ${removed}. Physical disk reclamation can differ when evidence is hard-linked.`;
+    announce(`Run ${runId} deleted. Removed ${removed}.`);
     void loadRuns({ background: true });
   } catch (error) {
     const message = friendlyError(error);
@@ -1118,6 +1177,8 @@ function applyKeySettings(value) {
     known: true,
     configured: Boolean(value?.configured),
     fingerprint: typeof value?.fingerprint === 'string' ? value.fingerprint.slice(0, 80) : null,
+    storageEnabled: value?.storageEnabled === true,
+    unavailableReason: typeof value?.unavailableReason === 'string' ? value.unavailableReason.slice(0, 300) : null,
   };
   renderKeySettings();
   updateAiAvailability();
@@ -1125,12 +1186,15 @@ function applyKeySettings(value) {
 
 function renderKeySettings() {
   if (!state.keySettings.known) return;
-  const { configured, fingerprint } = state.keySettings;
+  const { configured, fingerprint, storageEnabled, unavailableReason } = state.keySettings;
   elements.keyState.className = `settings-state ${configured ? 'configured' : 'unconfigured'}`;
-  elements.keyState.textContent = configured
+  elements.keyState.textContent = !storageEnabled ? 'Isolation required' : configured
     ? `Configured${fingerprint ? ` · ${fingerprint}` : ''}`
     : 'Not configured';
+  elements.keyInput.disabled = !storageEnabled;
+  elements.saveKey.disabled = !storageEnabled || state.pending.has('key-save');
   elements.deleteKey.disabled = !configured || state.pending.has('key-delete') || state.pending.has('key-save');
+  if (!storageEnabled && unavailableReason) elements.keyMessage.textContent = unavailableReason;
 }
 
 function updateAiAvailability() {
@@ -1142,7 +1206,7 @@ function updateAiAvailability() {
   elements.aiModel.disabled = !available;
   if (!available) {
     elements.aiReview.checked = false;
-    elements.aiReviewHelp.textContent = 'Unavailable until an API key is saved with the portal service.';
+    elements.aiReviewHelp.textContent = state.keySettings.unavailableReason ?? 'Unavailable until an API key is saved with the portal service.';
     elements.aiReviewCard.title = 'No runtime API key is configured.';
   } else if (state.config.aiReview.dryRun) {
     elements.aiReviewHelp.textContent = 'Dry-run mode is active. Evidence selection and reports will run without an API request.';
@@ -1168,6 +1232,9 @@ function closeDialog() {
 function closeEventStream({ clearActive = true } = {}) {
   state.events?.close();
   state.events = null;
+  state.overflowController?.abort();
+  state.overflowController = null;
+  state.overflowGeneration += 1;
   if (state.liveLogBatch.timer) window.clearTimeout(state.liveLogBatch.timer);
   state.liveLogBatch = { lines: [], characters: 0, dropped: 0, timer: null, runId: null, progress: null, phase: null };
   state.openController?.abort();

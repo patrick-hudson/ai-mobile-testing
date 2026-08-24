@@ -10,6 +10,7 @@ interface ParsedArguments {
   selfTest: boolean;
   help: boolean;
   limits: AiReviewLimits;
+  request: { deadlineMs: number; maxAttempts: number; maxRetryDelayMs: number };
 }
 
 function integer(value: string | undefined, fallback: number, minimum: number, maximum: number): number {
@@ -33,6 +34,11 @@ function parseArguments(argv: string[]): ParsedArguments {
       maxScreenshots: integer(process.env.AI_REVIEW_MAX_SCREENSHOTS, 4, 0, 12),
       maxImageBytes: integer(process.env.AI_REVIEW_MAX_IMAGE_BYTES, 2 * 1_024 * 1_024, 1_024, 10 * 1_024 * 1_024),
       maxTotalImageBytes: integer(process.env.AI_REVIEW_MAX_TOTAL_IMAGE_BYTES, 6 * 1_024 * 1_024, 1_024, 24 * 1_024 * 1_024),
+    },
+    request: {
+      deadlineMs: integer(process.env.AI_REVIEW_REQUEST_DEADLINE_MS, 120_000, 1_000, 10 * 60_000),
+      maxAttempts: integer(process.env.AI_REVIEW_MAX_ATTEMPTS, 3, 1, 4),
+      maxRetryDelayMs: integer(process.env.AI_REVIEW_MAX_RETRY_DELAY_MS, 10_000, 0, 60_000),
     },
   };
   for (let index = 0; index < argv.length; index += 1) {
@@ -62,10 +68,26 @@ Options:
 
 Runtime environment:
   ANTHROPIC_API_KEY          Optional; absent means a safe skipped result
+  ANTHROPIC_KEY_STDIN=1      Read the key once from stdin instead of exposing it in the child environment
   ANTHROPIC_MODEL            Defaults to claude-sonnet-5
   AI_REVIEW_DRY_RUN=1        Equivalent to --dry-run
+  AI_REVIEW_REQUEST_DEADLINE_MS  Overall API attempt/retry budget (default: 120000)
+  AI_REVIEW_MAX_ATTEMPTS      Bounded total API attempts (default: 3)
+  AI_REVIEW_MAX_RETRY_DELAY_MS  Maximum Retry-After/backoff delay (default: 10000)
 
 Exit codes: 0 completed/skipped/dry-run; 2 invalid input; 3 API or response failure.`;
+}
+
+async function readSecretFromStdin(): Promise<string> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of process.stdin) {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    total += bytes.length;
+    if (total > 1_024) throw new Error('The isolated Anthropic secret-input pipe exceeded its byte limit.');
+    chunks.push(bytes);
+  }
+  return Buffer.concat(chunks).toString('utf8').trim();
 }
 
 let parsed: ParsedArguments;
@@ -81,7 +103,7 @@ try {
 if (parsed.help) {
   console.log(usage());
 } else if (parsed.selfTest) {
-  deterministicSelfTest();
+  await deterministicSelfTest();
   console.log('AI evidence-review self-test passed.');
 } else if (!parsed.runDir) {
   console.error('A run directory is required. Pass --run-dir or set AUDIT_ARTIFACT_DIR.');
@@ -89,12 +111,20 @@ if (parsed.help) {
   process.exitCode = 2;
 } else {
   try {
+    const apiKey = process.env.ANTHROPIC_KEY_STDIN === '1'
+      ? await readSecretFromStdin()
+      : process.env.ANTHROPIC_API_KEY;
+    if (process.env.ANTHROPIC_KEY_STDIN === '1' && !apiKey) {
+      throw new Error('The isolated Anthropic secret-input pipe was empty.');
+    }
     const outcome = await reviewEvidence({
       runDir: path.resolve(parsed.runDir),
       ...(parsed.outputDir ? { outputDir: path.resolve(parsed.outputDir) } : {}),
+      ...(apiKey ? { apiKey } : {}),
       dryRun: parsed.dryRun,
       model: process.env.ANTHROPIC_MODEL ?? 'claude-sonnet-5',
       limits: parsed.limits,
+      request: parsed.request,
     });
     console.log(`AI evidence review: ${outcome.document.status}; advisory findings: ${outcome.document.review.findings.length}.`);
     process.exitCode = outcome.exitCode;

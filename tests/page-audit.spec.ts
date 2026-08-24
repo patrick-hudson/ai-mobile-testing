@@ -17,7 +17,7 @@ interface LinkEvidence {
 for (const route of CANDIDATE_HTML_ROUTES) {
   const definition = pageAuditDefinition(route.path);
 
-  staticTest(`[${definition.id}] ${route.kind} route renders a complete, usable document`, staticEvidence(`Capture ${route.path} at representative scroll positions with its structure, links, network, and accessibility evidence.`), async ({ page, audit }, testInfo) => {
+  staticTest(`[${definition.id}] ${route.kind} route renders a complete, usable document`, staticEvidence(`Capture ${route.path} at representative scroll positions with its structure, links, network, and accessibility evidence.`, 'full-sweep-projects'), async ({ page, audit }, testInfo) => {
     audit.setDefinition(definition);
     const metadata = projectMetadata(testInfo.project.metadata);
     test.skip(!metadata.fullSweep, 'The complete route inventory runs only in full-sweep projects.');

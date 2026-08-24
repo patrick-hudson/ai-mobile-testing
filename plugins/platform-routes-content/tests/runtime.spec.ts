@@ -1,7 +1,6 @@
-import { expect, staticEvidence, staticTest, test } from '../../../fixtures/test.js';
+import { expect, staticEvidence, staticTest } from '../../../fixtures/test.js';
 
-staticTest('[ENV-001] enabled plugin-local runtime entry executes inside the reviewed harness', staticEvidence('Capture the rendered site-architecture page and plugin-local structured evidence proving this entry executed.'), async ({ page, audit }, testInfo) => {
-  test.skip(testInfo.project.name !== 'candidate-desktop-chromium', 'One candidate project proves plugin-local discovery and execution.');
+staticTest('[ENV-001] enabled plugin-local runtime entry executes inside the reviewed harness', staticEvidence('Capture the rendered site-architecture page and plugin-local structured evidence proving this entry executed.', 'candidate-desktop-chromium'), async ({ page, audit }) => {
   await audit.goto('/about/site-architecture');
   await expect(page.getByRole('heading', { level: 1 })).toContainText(/architecture/i);
   const pluginEvidence = await page.locator('main').evaluate((main) => ({

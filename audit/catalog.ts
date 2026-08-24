@@ -20,6 +20,7 @@ const INTERACTION_VIDEO_RATIONALES = new Map<string, string>([
   ['SEARCH-004', 'Apply search filters and show the result set and URL state updating together.'],
   ['SEARCH-005', 'Enter a query with no results and use the recovery suggestions that appear.'],
   ['SEARCH-006', 'Enter a search while its index request fails and show the usable sitemap fallback.'],
+  ['ENV-007', 'Open an unknown URL, use its accessible search, and activate a known recovery destination.'],
   ['HOME-001', 'Activate a primary homepage starting path and show the intended guide destination loading.'],
   ['CONTENT-007', 'Scroll progressively through long references and show that reading and navigation remain responsive.'],
   ['CALC-001', 'Select calculator inputs and show derived dose totals updating coherently.'],
@@ -48,16 +49,16 @@ const INTERACTION_VIDEO_RATIONALES = new Map<string, string>([
 ]);
 
 const STATIC_SCREENSHOT_AUDIT_IDS = new Set([
-  'ENV-001', 'ENV-002', 'ENV-005', 'ENV-006', 'ENV-007',
+  'ENV-001', 'ENV-002', 'ENV-005', 'ENV-006',
   'SHELL-002', 'SHELL-004', 'SHELL-006', 'NAV-008', 'THEME-003', 'THEME-004',
   'HOME-002', 'HOME-003', 'HOME-004', 'CRISIS-001', 'CRISIS-002',
   'CONTENT-001', 'CONTENT-002', 'CONTENT-004', 'CONTENT-005', 'CONTENT-006',
   'CONTENT-008', 'CALC-009', 'MEET-001', 'MEET-002', 'MEET-007', 'A11Y-001', 'A11Y-005',
-  'REL-001', 'REL-003', 'PERF-001', 'PERF-002', 'SEO-001',
+  'REL-001', 'REL-003', 'PERF-002', 'SEO-001',
 ]);
 
 const STRUCTURED_DATA_AUDIT_IDS = new Set([
-  'ENV-003', 'ENV-004', 'ENV-008', 'CONTENT-003', 'SEO-002',
+  'ENV-003', 'ENV-004', 'ENV-008', 'CONTENT-003', 'PERF-001', 'SEO-002',
 ]);
 
 function coreEvidencePolicy(id: string, expected: string): AuditDefinition['evidencePolicy'] {
@@ -100,11 +101,11 @@ function audit(
 export const AUDIT_CATALOG: AuditDefinition[] = [
   audit('ENV-001', 'environment', 'Environment availability', 'Readers can reach the site securely.', 'Both configured origins return usable HTML over HTTPS.', 'P0', ['video', 'network', 'json']),
   audit('ENV-002', 'routes', 'Candidate route inventory', 'Every published guide remains reachable.', 'Every candidate route returns successful HTML with the expected canonical route.', 'P0', ['video', 'screenshot', 'network', 'json']),
-  audit('ENV-003', 'routes', 'Production route mapping', 'Renamed pages keep working after launch.', 'Every legacy production route maps to a candidate destination or an approved removal.', 'P0', ['video', 'network', 'json']),
+  audit('ENV-003', 'routes', 'Production-first migration ledger', 'Renamed pages keep working after launch.', 'Every route discovered in the production sitemap maps to a live candidate destination or an explicit approved removal, and every candidate-only route is approved.', 'P0', ['network', 'json']),
   audit('ENV-004', 'routes', 'Redirect integrity', 'Bookmarks and search results do not break.', 'Legacy routes use a single permanent redirect without loops or chains.', 'P1', ['network', 'json']),
   audit('ENV-005', 'seo', 'Preview indexing controls', 'The beta environment does not compete with production in search.', 'Preview indexing policy is explicit and candidate canonical metadata is internally consistent.', 'P1', ['video', 'json']),
   audit('ENV-006', 'environment', 'Security and cache headers', 'Readers receive secure, correctly cached assets.', 'Required security headers exist and immutable assets use long-lived caching.', 'P1', ['network', 'json']),
-  audit('ENV-007', 'routes', 'Custom not-found page', 'A bad link gives the reader a useful recovery path.', 'Unknown URLs return the intended status and render search plus recovery destinations.', 'P1'),
+  audit('ENV-007', 'routes', 'Custom not-found recovery', 'A bad link gives the reader a useful recovery path.', 'Unknown URLs return HTTP 404, expose the named accessible search, and let a reader reach a known recovery destination.', 'P1'),
   audit('ENV-008', 'environment', 'Static assets and data endpoints', 'The interface loads without missing fonts, images, icons, or data.', 'All first-party assets and JSON endpoints load with correct status and content type.', 'P0', ['video', 'network', 'json']),
 
   audit('SHELL-001', 'shell', 'Scheduling notice', 'Readers see current scheduling information without losing access to the page.', 'The notice renders, links correctly, dismisses, and remains dismissed after reload.', 'P1'),
@@ -146,10 +147,10 @@ export const AUDIT_CATALOG: AuditDefinition[] = [
   audit('CONTENT-002', 'content', 'Content rendering', 'No medically important text is hidden by a layout defect.', 'Text, lists, callouts, tables, code, blockquotes, and disclosures render without clipping.', 'P0'),
   audit('CONTENT-003', 'content', 'Internal links', 'Readers do not hit broken paths while seeking help.', 'All internal links resolve and fragments identify existing targets.', 'P0', ['network', 'json']),
   audit('CONTENT-004', 'content', 'External-link safety', 'Third-party destinations open without exposing the source tab.', 'External links use a new tab with noopener and noreferrer; internal links do not.', 'P1', ['json']),
-  audit('CONTENT-005', 'content', 'Images and diagrams', 'Reference visuals remain legible and meaningful.', 'All images load, have alternative text, fit the viewport, and work in both themes.', 'P1'),
+  audit('CONTENT-005', 'content', 'Images and diagrams', 'Reference visuals remain legible and meaningful.', 'Every declared image, picture, SVG, and CSS diagram exists in its reviewed count, loads or renders, is labeled appropriately, fits the viewport, and works in both themes.', 'P1'),
   audit('CONTENT-006', 'content', 'Wide reference pages', 'Dense calculators and diagrams remain usable on narrow and wide screens.', 'Wide layout, responsive grids, and intentional table scrollers behave correctly.', 'P1'),
   audit('CONTENT-007', 'content', 'Long-page stability', 'Very long references remain responsive and navigable.', 'The changelog and long medical guides load, scroll, and update TOC state without lockups.', 'P2'),
-  audit('CONTENT-008', 'content', 'Content parity ledger', 'Intentional redesign edits are distinguished from accidental omissions.', 'Critical headings and calls to action are present or documented as approved differences.', 'P0', ['video', 'screenshot', 'json']),
+  audit('CONTENT-008', 'content', 'Content parity ledger', 'Intentional redesign edits are distinguished from accidental omissions.', 'Critical headings, safety warnings, and CTA destinations remain present; every missing production heading must match the exact reviewed-difference ledger.', 'P0', ['screenshot', 'json']),
 
   audit('CALC-001', 'calculators', 'Taper defaults and derived totals', 'Calculator defaults produce an internally coherent plan.', 'Defaults and total-daily math match each selected substance.', 'P0'),
   audit('CALC-002', 'calculators', 'Taper input boundaries', 'Unexpected input cannot create a misleading or broken plan.', 'Blank, decimal, minimum, maximum, and malformed input are handled visibly and safely.', 'P0'),
@@ -158,7 +159,7 @@ export const AUDIT_CATALOG: AuditDefinition[] = [
   audit('CALC-005', 'calculators', 'Calculator persistence and reset', 'Work survives an accidental reload and can be deliberately cleared.', 'Inputs persist per calculator, do not leak between tools, and reset to documented defaults.', 'P1'),
   audit('CALC-006', 'calculators', 'Calculator export actions', 'A plan can be copied or printed with understandable confirmation.', 'Schedule copy, AI-prompt copy, print window, and popup-blocked fallback behave correctly.', 'P1'),
   audit('CALC-007', 'calculators', 'SR-17 simple protocol', 'Simple mode produces the documented 7, 10, and 14-day protocols.', 'Dose tiers, schedule phases, totals, and 50 mg tablet supply calculations are correct.', 'P0'),
-  audit('CALC-008', 'calculators', 'SR-17 advanced protocol', 'Advanced controls produce a coherent cross-taper.', 'Allergy, preload, source reduction, hold, and SR step-down modes update the schedule correctly.', 'P0'),
+  audit('CALC-008', 'calculators', 'SR-17 advanced protocol', 'Advanced controls produce a coherent cross-taper.', 'Independent golden schedules prove allergy, preload, source reduction, hold, custom milligram, percentage, and jump-off boundaries update exact rows, duration, and supply.', 'P0'),
   audit('CALC-009', 'calculators', 'Calculator arithmetic unit coverage', 'Interface evidence is backed by deterministic numeric tests.', 'Pure schedule generators pass representative, edge, and invariant-based unit cases.', 'P0', ['json']),
 
   audit('SOWS-001', 'sows', 'SOWS scoring interaction', 'A reader can score every withdrawal symptom accurately.', 'All 16 items accept values zero through four and totals update after each answer.', 'P0'),
@@ -169,12 +170,12 @@ export const AUDIT_CATALOG: AuditDefinition[] = [
   audit('MEET-001', 'meetings', 'Meeting state transitions', 'Live and upcoming meeting labels are time-accurate.', 'Frozen pre-live, live, end-boundary, and no-specific-meeting states are correct.', 'P0'),
   audit('MEET-002', 'meetings', 'Meeting timezone conversion', 'Readers see times in their own timezone.', 'Times remain correct across US zones, Europe, India, and daylight-saving boundaries.', 'P0'),
   audit('MEET-003', 'meetings', 'Meeting history', 'Recently joined rooms remain easy to find and can be removed.', 'Join actions persist, update across pages, and support individual and full clearing.', 'P1'),
-  audit('MEET-004', 'meetings', 'NA meeting discovery', 'A reader can narrow the large NA directory.', 'Search, tag, platform, access, and expansion filters combine and clear correctly.', 'P1'),
-  audit('MEET-005', 'meetings', 'SMART meeting discovery', 'A reader can narrow the SMART directory.', 'Search, program, audience, and history filters combine and clear correctly.', 'P1'),
+  audit('MEET-004', 'meetings', 'NA meeting discovery', 'A reader can narrow the large NA directory.', 'A known nonempty meeting set proves search, tag, platform, and access filters each exclude incompatible records, combine to the exact destination set, and clear back to baseline.', 'P1'),
+  audit('MEET-005', 'meetings', 'SMART meeting discovery', 'A reader can narrow the SMART directory.', 'A known nonempty meeting set proves search, program, audience, and language filters each exclude incompatible records, combine to the exact destination set, and clear back to baseline.', 'P1'),
   audit('MEET-006', 'meetings', 'Meeting copy and join links', 'Meeting details can be copied and opened accurately.', 'Copy text, platform labels, phone links, and external join destinations match displayed details.', 'P0'),
-  audit('MEET-007', 'reliability', 'Meeting data failure', 'A temporary data problem does not create false availability.', 'Failure and empty states are explicit, usable, and free of indefinite loading.', 'P1', ['video', 'screenshot', 'network', 'json']),
+  audit('MEET-007', 'reliability', 'Meeting data failure', 'A temporary data problem does not create false availability.', 'Transport aborts, HTTP errors, malformed payloads, and valid empty data settle without a spinner; failures are visibly distinct from a truthful empty result.', 'P1', ['screenshot', 'network', 'json']),
 
-  audit('A11Y-001', 'accessibility', 'Automated WCAG scan', 'Common accessibility barriers are caught before release.', 'Representative pages and every opened overlay have no unapproved WCAG A/AA axe violations.', 'P0', ['video', 'axe', 'json']),
+  audit('A11Y-001', 'accessibility', 'Automated WCAG scan', 'Common accessibility barriers are caught before release.', 'Representative pages and every opened overlay have no unapproved WCAG 2.0/2.1/2.2 A/AA axe violations, and every non-allowlisted incomplete result becomes a review finding.', 'P0', ['video', 'axe', 'json']),
   audit('A11Y-002', 'accessibility', 'Keyboard-only journeys', 'Critical tasks can be completed without a pointer.', 'Navigation, search, calculators, disclosures, and meeting filters have logical focus order and visible focus.', 'P0', ['video', 'screenshot', 'json']),
   audit('A11Y-003', 'accessibility', 'Zoom and text reflow', 'Low-vision readers retain all content and controls.', 'Critical pages work at 200% and 400% zoom without two-dimensional page scrolling.', 'P0', ['video', 'screenshot', 'json'], true),
   audit('A11Y-004', 'accessibility', 'Screen-reader acceptance', 'Live updates and controls make sense without sight.', 'VoiceOver announces dialogs, search results, copy feedback, scores, and live meeting changes.', 'P0', ['video', 'json'], true),
@@ -184,7 +185,7 @@ export const AUDIT_CATALOG: AuditDefinition[] = [
   audit('REL-002', 'reliability', 'Blocked browser storage', 'Privacy settings do not make core controls unusable.', 'Theme, sidebar, calculator, and history controls still work for the current page when storage is unavailable.', 'P1'),
   audit('REL-003', 'reliability', 'Slow and failed dependencies', 'Third-party outages do not block urgent site content.', 'Analytics, Discord, and meeting dependency failures degrade locally and visibly where needed.', 'P1', ['video', 'network', 'json']),
 
-  audit('PERF-001', 'performance', 'Page performance budgets', 'Core guidance appears quickly on ordinary mobile connections.', 'Representative templates meet agreed Lighthouse and resource budgets without regression.', 'P1', ['lighthouse', 'json']),
+  audit('PERF-001', 'performance', 'Page performance budgets', 'Core guidance appears quickly on ordinary mobile connections.', 'After the load event and a bounded network-quiet window, Navigation Timing, late resources, transfer budgets, and Lighthouse metrics are present and within budget.', 'P1', ['lighthouse', 'json']),
   audit('PERF-002', 'performance', 'Layout stability', 'Late hydration does not move controls out from under the reader.', 'Observed layout shift and post-load geometry remain within the configured budget.', 'P1', ['video', 'json']),
   audit('SEO-001', 'seo', 'Metadata completeness', 'Search and sharing previews identify every page correctly.', 'Title, description, canonical, robots, Open Graph, and Twitter metadata are complete and valid.', 'P1', ['json']),
   audit('SEO-002', 'seo', 'Sitemap integrity', 'Search engines receive only valid canonical pages.', 'Sitemap entries resolve, are canonical, and exclude drafts, aliases, and error pages.', 'P1', ['network', 'json']),

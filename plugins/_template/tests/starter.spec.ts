@@ -16,7 +16,7 @@ const starterDefinition = {
   },
 } satisfies AuditDefinition;
 
-staticTest('[STARTER-001] replace this starter with an evidence-rich user outcome', staticEvidence('Capture the rendered sample state with its heading and structured observation.'), async ({ page, audit }) => {
+staticTest('[STARTER-001] replace this starter with an evidence-rich user outcome', staticEvidence('Capture the rendered sample state with its heading and structured observation.', 'candidate-mobile-chromium'), async ({ page, audit }) => {
   audit.setDefinition(starterDefinition);
   await audit.goto('/');
   await expect(page.locator('main')).toBeVisible();

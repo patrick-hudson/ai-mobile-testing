@@ -19,7 +19,7 @@
           "area": "accessibility",
           "title": "Automated WCAG scan",
           "userPromise": "Common accessibility barriers are caught before release.",
-          "expected": "Representative pages and every opened overlay have no unapproved WCAG A/AA axe violations.",
+          "expected": "Representative pages and every opened overlay have no unapproved WCAG 2.0/2.1/2.2 A/AA axe violations, and every non-allowlisted incomplete result becomes a review finding.",
           "severity": "P0",
           "releaseBlocking": true,
           "evidence": [
@@ -29,7 +29,7 @@
           ],
           "evidencePolicy": {
             "mode": "static-screenshot",
-            "rationale": "Capture the rendered state and structured evidence proving: Representative pages and every opened overlay have no unapproved WCAG A/AA axe violations."
+            "rationale": "Capture the rendered state and structured evidence proving: Representative pages and every opened overlay have no unapproved WCAG 2.0/2.1/2.2 A/AA axe violations, and every non-allowlisted incomplete result becomes a review finding."
           },
           "manual": false
         },
@@ -147,17 +147,16 @@
           "area": "performance",
           "title": "Page performance budgets",
           "userPromise": "Core guidance appears quickly on ordinary mobile connections.",
-          "expected": "Representative templates meet agreed Lighthouse and resource budgets without regression.",
+          "expected": "After the load event and a bounded network-quiet window, Navigation Timing, late resources, transfer budgets, and Lighthouse metrics are present and within budget.",
           "severity": "P1",
           "releaseBlocking": true,
           "evidence": [
-            "screenshot",
             "lighthouse",
             "json"
           ],
           "evidencePolicy": {
-            "mode": "static-screenshot",
-            "rationale": "Capture the rendered state and structured evidence proving: Representative templates meet agreed Lighthouse and resource budgets without regression."
+            "mode": "structured-data",
+            "rationale": "Retain machine-readable request and assertion evidence proving: After the load event and a bounded network-quiet window, Navigation Timing, late resources, transfer budgets, and Lighthouse metrics are present and within budget."
           },
           "manual": false
         },
@@ -246,7 +245,108 @@
         "candidate-desktop-chromium",
         "candidate-mobile-webkit",
         "candidate-tablet-webkit",
-        "candidate-desktop-firefox"
+        "candidate-desktop-firefox",
+        "candidate-mobile-webkit-iphone-17-ios18",
+        "candidate-mobile-webkit-iphone-15-ios17",
+        "candidate-mobile-chromium-pixel-10-android16",
+        "candidate-mobile-chromium-pixel-8-android14",
+        "candidate-mobile-chromium-galaxy-s24-android14",
+        "candidate-desktop-chromium-edge-compat",
+        "candidate-desktop-chromium-msedge"
+      ],
+      "auditCases": [
+        {
+          "auditId": "A11Y-001",
+          "entrySpec": "tests/accessibility.spec.ts",
+          "applicability": "candidate-chromium-projects",
+          "supportedProjects": [
+            "candidate-mobile-chromium",
+            "candidate-desktop-chromium",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "A11Y-001",
+          "entrySpec": "tests/accessibility.spec.ts",
+          "applicability": "full-sweep-projects",
+          "supportedProjects": [
+            "production-mobile-chromium",
+            "candidate-mobile-chromium",
+            "candidate-desktop-chromium"
+          ]
+        },
+        {
+          "auditId": "A11Y-002",
+          "entrySpec": "tests/accessibility.spec.ts",
+          "applicability": "candidate-chromium-projects",
+          "supportedProjects": [
+            "candidate-mobile-chromium",
+            "candidate-desktop-chromium",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "A11Y-005",
+          "entrySpec": "tests/accessibility.spec.ts",
+          "applicability": "candidate-chromium-projects",
+          "supportedProjects": [
+            "candidate-mobile-chromium",
+            "candidate-desktop-chromium",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "PERF-001",
+          "entrySpec": "tests/performance.spec.ts",
+          "applicability": "full-sweep-projects",
+          "supportedProjects": [
+            "production-mobile-chromium",
+            "candidate-mobile-chromium",
+            "candidate-desktop-chromium"
+          ]
+        },
+        {
+          "auditId": "PERF-002",
+          "entrySpec": "tests/performance.spec.ts",
+          "applicability": "full-sweep-projects",
+          "supportedProjects": [
+            "production-mobile-chromium",
+            "candidate-mobile-chromium",
+            "candidate-desktop-chromium"
+          ]
+        },
+        {
+          "auditId": "REL-002",
+          "entrySpec": "tests/shell-content.spec.ts",
+          "applicability": "candidate-desktop-chromium",
+          "supportedProjects": [
+            "candidate-desktop-chromium",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "REL-003",
+          "entrySpec": "tests/shell-content.spec.ts",
+          "applicability": "candidate-desktop-chromium",
+          "supportedProjects": [
+            "candidate-desktop-chromium",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        }
       ]
     },
     {
@@ -392,7 +492,7 @@
           "area": "calculators",
           "title": "SR-17 advanced protocol",
           "userPromise": "Advanced controls produce a coherent cross-taper.",
-          "expected": "Allergy, preload, source reduction, hold, and SR step-down modes update the schedule correctly.",
+          "expected": "Independent golden schedules prove allergy, preload, source reduction, hold, custom milligram, percentage, and jump-off boundaries update exact rows, duration, and supply.",
           "severity": "P0",
           "releaseBlocking": true,
           "evidence": [
@@ -508,7 +608,187 @@
         "candidate-desktop-chromium",
         "candidate-mobile-webkit",
         "candidate-tablet-webkit",
-        "candidate-desktop-firefox"
+        "candidate-desktop-firefox",
+        "candidate-mobile-webkit-iphone-17-ios18",
+        "candidate-mobile-webkit-iphone-15-ios17",
+        "candidate-mobile-chromium-pixel-10-android16",
+        "candidate-mobile-chromium-pixel-8-android14",
+        "candidate-mobile-chromium-galaxy-s24-android14",
+        "candidate-desktop-chromium-edge-compat",
+        "candidate-desktop-chromium-msedge"
+      ],
+      "auditCases": [
+        {
+          "auditId": "CALC-001",
+          "entrySpec": "tests/calculators.spec.ts",
+          "applicability": "candidate-chromium-projects",
+          "supportedProjects": [
+            "candidate-mobile-chromium",
+            "candidate-desktop-chromium",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "CALC-002",
+          "entrySpec": "tests/calculators.spec.ts",
+          "applicability": "candidate-chromium-projects",
+          "supportedProjects": [
+            "candidate-mobile-chromium",
+            "candidate-desktop-chromium",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "CALC-003",
+          "entrySpec": "tests/calculators.spec.ts",
+          "applicability": "candidate-chromium-projects",
+          "supportedProjects": [
+            "candidate-mobile-chromium",
+            "candidate-desktop-chromium",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "CALC-004",
+          "entrySpec": "tests/calculators.spec.ts",
+          "applicability": "candidate-mobile-chromium",
+          "supportedProjects": [
+            "candidate-mobile-chromium",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14"
+          ]
+        },
+        {
+          "auditId": "CALC-005",
+          "entrySpec": "tests/calculators.spec.ts",
+          "applicability": "candidate-chromium-projects",
+          "supportedProjects": [
+            "candidate-mobile-chromium",
+            "candidate-desktop-chromium",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "CALC-006",
+          "entrySpec": "tests/calculators.spec.ts",
+          "applicability": "candidate-chromium-projects",
+          "supportedProjects": [
+            "candidate-mobile-chromium",
+            "candidate-desktop-chromium",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "CALC-007",
+          "entrySpec": "tests/calculators.spec.ts",
+          "applicability": "candidate-chromium-projects",
+          "supportedProjects": [
+            "candidate-mobile-chromium",
+            "candidate-desktop-chromium",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "CALC-008",
+          "entrySpec": "tests/calculators.spec.ts",
+          "applicability": "candidate-chromium-projects",
+          "supportedProjects": [
+            "candidate-mobile-chromium",
+            "candidate-desktop-chromium",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "CALC-009",
+          "entrySpec": "tests/calculators.spec.ts",
+          "applicability": "candidate-desktop-chromium",
+          "supportedProjects": [
+            "candidate-desktop-chromium",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "SHARE-001",
+          "entrySpec": "tests/shell-content.spec.ts",
+          "applicability": "candidate-chromium-projects",
+          "supportedProjects": [
+            "candidate-mobile-chromium",
+            "candidate-desktop-chromium",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "SOWS-001",
+          "entrySpec": "tests/sows.spec.ts",
+          "applicability": "candidate-chromium-projects",
+          "supportedProjects": [
+            "candidate-mobile-chromium",
+            "candidate-desktop-chromium",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "SOWS-002",
+          "entrySpec": "tests/sows.spec.ts",
+          "applicability": "candidate-desktop-chromium",
+          "supportedProjects": [
+            "candidate-desktop-chromium",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "SOWS-003",
+          "entrySpec": "tests/sows.spec.ts",
+          "applicability": "candidate-chromium-projects",
+          "supportedProjects": [
+            "candidate-mobile-chromium",
+            "candidate-desktop-chromium",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        }
       ]
     },
     {
@@ -582,7 +862,7 @@
           "area": "meetings",
           "title": "NA meeting discovery",
           "userPromise": "A reader can narrow the large NA directory.",
-          "expected": "Search, tag, platform, access, and expansion filters combine and clear correctly.",
+          "expected": "A known nonempty meeting set proves search, tag, platform, and access filters each exclude incompatible records, combine to the exact destination set, and clear back to baseline.",
           "severity": "P1",
           "releaseBlocking": true,
           "evidence": [
@@ -600,7 +880,7 @@
           "area": "meetings",
           "title": "SMART meeting discovery",
           "userPromise": "A reader can narrow the SMART directory.",
-          "expected": "Search, program, audience, and history filters combine and clear correctly.",
+          "expected": "A known nonempty meeting set proves search, program, audience, and language filters each exclude incompatible records, combine to the exact destination set, and clear back to baseline.",
           "severity": "P1",
           "releaseBlocking": true,
           "evidence": [
@@ -636,7 +916,7 @@
           "area": "reliability",
           "title": "Meeting data failure",
           "userPromise": "A temporary data problem does not create false availability.",
-          "expected": "Failure and empty states are explicit, usable, and free of indefinite loading.",
+          "expected": "Transport aborts, HTTP errors, malformed payloads, and valid empty data settle without a spinner; failures are visibly distinct from a truthful empty result.",
           "severity": "P1",
           "releaseBlocking": true,
           "evidence": [
@@ -646,7 +926,7 @@
           ],
           "evidencePolicy": {
             "mode": "static-screenshot",
-            "rationale": "Capture the rendered state and structured evidence proving: Failure and empty states are explicit, usable, and free of indefinite loading."
+            "rationale": "Capture the rendered state and structured evidence proving: Transport aborts, HTTP errors, malformed payloads, and valid empty data settle without a spinner; failures are visibly distinct from a truthful empty result."
           },
           "manual": false
         }
@@ -661,7 +941,94 @@
         "candidate-desktop-chromium",
         "candidate-mobile-webkit",
         "candidate-tablet-webkit",
-        "candidate-desktop-firefox"
+        "candidate-desktop-firefox",
+        "candidate-mobile-webkit-iphone-17-ios18",
+        "candidate-mobile-webkit-iphone-15-ios17",
+        "candidate-mobile-chromium-pixel-10-android16",
+        "candidate-mobile-chromium-pixel-8-android14",
+        "candidate-mobile-chromium-galaxy-s24-android14",
+        "candidate-desktop-chromium-edge-compat",
+        "candidate-desktop-chromium-msedge"
+      ],
+      "auditCases": [
+        {
+          "auditId": "MEET-001",
+          "entrySpec": "tests/meetings.spec.ts",
+          "applicability": "candidate-desktop-chromium",
+          "supportedProjects": [
+            "candidate-desktop-chromium",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "MEET-002",
+          "entrySpec": "tests/meetings.spec.ts",
+          "applicability": "candidate-desktop-chromium",
+          "supportedProjects": [
+            "candidate-desktop-chromium",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "MEET-003",
+          "entrySpec": "tests/meetings.spec.ts",
+          "applicability": "candidate-chromium-projects",
+          "supportedProjects": [
+            "candidate-mobile-chromium",
+            "candidate-desktop-chromium",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "MEET-004",
+          "entrySpec": "tests/meetings.spec.ts",
+          "applicability": "candidate-desktop-chromium",
+          "supportedProjects": [
+            "candidate-desktop-chromium",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "MEET-005",
+          "entrySpec": "tests/meetings.spec.ts",
+          "applicability": "candidate-desktop-chromium",
+          "supportedProjects": [
+            "candidate-desktop-chromium",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "MEET-006",
+          "entrySpec": "tests/meetings.spec.ts",
+          "applicability": "candidate-chromium-projects",
+          "supportedProjects": [
+            "candidate-mobile-chromium",
+            "candidate-desktop-chromium",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "MEET-007",
+          "entrySpec": "tests/meetings.spec.ts",
+          "applicability": "candidate-desktop-chromium",
+          "supportedProjects": [
+            "candidate-desktop-chromium",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        }
       ]
     },
     {
@@ -718,9 +1085,9 @@
         {
           "id": "ENV-003",
           "area": "routes",
-          "title": "Production route mapping",
+          "title": "Production-first migration ledger",
           "userPromise": "Renamed pages keep working after launch.",
-          "expected": "Every legacy production route maps to a candidate destination or an approved removal.",
+          "expected": "Every route discovered in the production sitemap maps to a live candidate destination or an explicit approved removal, and every candidate-only route is approved.",
           "severity": "P0",
           "releaseBlocking": true,
           "evidence": [
@@ -729,7 +1096,7 @@
           ],
           "evidencePolicy": {
             "mode": "structured-data",
-            "rationale": "Retain machine-readable request and assertion evidence proving: Every legacy production route maps to a candidate destination or an approved removal."
+            "rationale": "Retain machine-readable request and assertion evidence proving: Every route discovered in the production sitemap maps to a live candidate destination or an explicit approved removal, and every candidate-only route is approved."
           },
           "manual": false
         },
@@ -791,18 +1158,18 @@
         {
           "id": "ENV-007",
           "area": "routes",
-          "title": "Custom not-found page",
+          "title": "Custom not-found recovery",
           "userPromise": "A bad link gives the reader a useful recovery path.",
-          "expected": "Unknown URLs return the intended status and render search plus recovery destinations.",
+          "expected": "Unknown URLs return HTTP 404, expose the named accessible search, and let a reader reach a known recovery destination.",
           "severity": "P1",
           "releaseBlocking": true,
           "evidence": [
-            "screenshot",
+            "video",
             "json"
           ],
           "evidencePolicy": {
-            "mode": "static-screenshot",
-            "rationale": "Capture the rendered state and structured evidence proving: Unknown URLs return the intended status and render search plus recovery destinations."
+            "mode": "interaction-video",
+            "rationale": "Open an unknown URL, use its accessible search, and activate a known recovery destination."
           },
           "manual": false
         },
@@ -1010,7 +1377,7 @@
           "area": "content",
           "title": "Images and diagrams",
           "userPromise": "Reference visuals remain legible and meaningful.",
-          "expected": "All images load, have alternative text, fit the viewport, and work in both themes.",
+          "expected": "Every declared image, picture, SVG, and CSS diagram exists in its reviewed count, loads or renders, is labeled appropriately, fits the viewport, and works in both themes.",
           "severity": "P1",
           "releaseBlocking": true,
           "evidence": [
@@ -1019,7 +1386,7 @@
           ],
           "evidencePolicy": {
             "mode": "static-screenshot",
-            "rationale": "Capture the rendered state and structured evidence proving: All images load, have alternative text, fit the viewport, and work in both themes."
+            "rationale": "Capture the rendered state and structured evidence proving: Every declared image, picture, SVG, and CSS diagram exists in its reviewed count, loads or renders, is labeled appropriately, fits the viewport, and works in both themes."
           },
           "manual": false
         },
@@ -1064,7 +1431,7 @@
           "area": "content",
           "title": "Content parity ledger",
           "userPromise": "Intentional redesign edits are distinguished from accidental omissions.",
-          "expected": "Critical headings and calls to action are present or documented as approved differences.",
+          "expected": "Critical headings, safety warnings, and CTA destinations remain present; every missing production heading must match the exact reviewed-difference ledger.",
           "severity": "P0",
           "releaseBlocking": true,
           "evidence": [
@@ -1073,7 +1440,7 @@
           ],
           "evidencePolicy": {
             "mode": "static-screenshot",
-            "rationale": "Capture the rendered state and structured evidence proving: Critical headings and calls to action are present or documented as approved differences."
+            "rationale": "Capture the rendered state and structured evidence proving: Critical headings, safety warnings, and CTA destinations remain present; every missing production heading must match the exact reviewed-difference ledger."
           },
           "manual": false
         },
@@ -1149,7 +1516,393 @@
         "candidate-desktop-chromium",
         "candidate-mobile-webkit",
         "candidate-tablet-webkit",
-        "candidate-desktop-firefox"
+        "candidate-desktop-firefox",
+        "candidate-mobile-webkit-iphone-17-ios18",
+        "candidate-mobile-webkit-iphone-15-ios17",
+        "candidate-mobile-chromium-pixel-10-android16",
+        "candidate-mobile-chromium-pixel-8-android14",
+        "candidate-mobile-chromium-galaxy-s24-android14",
+        "candidate-desktop-chromium-edge-compat",
+        "candidate-desktop-chromium-msedge"
+      ],
+      "auditCases": [
+        {
+          "auditId": "CONTENT-001",
+          "entrySpec": "tests/content-system.spec.ts",
+          "applicability": "candidate-desktop-chromium",
+          "supportedProjects": [
+            "candidate-desktop-chromium",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "CONTENT-002",
+          "entrySpec": "tests/visual-regression.spec.ts",
+          "applicability": "candidate-projects",
+          "supportedProjects": [
+            "candidate-mobile-chromium",
+            "candidate-desktop-chromium",
+            "candidate-mobile-webkit",
+            "candidate-tablet-webkit",
+            "candidate-desktop-firefox",
+            "candidate-mobile-webkit-iphone-17-ios18",
+            "candidate-mobile-webkit-iphone-15-ios17",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "CONTENT-003",
+          "entrySpec": "tests/content-system.spec.ts",
+          "applicability": "candidate-desktop-chromium",
+          "supportedProjects": [
+            "candidate-desktop-chromium",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "CONTENT-004",
+          "entrySpec": "tests/content-system.spec.ts",
+          "applicability": "candidate-desktop-chromium",
+          "supportedProjects": [
+            "candidate-desktop-chromium",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "CONTENT-005",
+          "entrySpec": "tests/content-system.spec.ts",
+          "applicability": "candidate-desktop-chromium",
+          "supportedProjects": [
+            "candidate-desktop-chromium",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "CONTENT-006",
+          "entrySpec": "tests/content-system.spec.ts",
+          "applicability": "candidate-desktop-chromium",
+          "supportedProjects": [
+            "candidate-desktop-chromium",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "CONTENT-007",
+          "entrySpec": "tests/content-system.spec.ts",
+          "applicability": "candidate-desktop-chromium",
+          "supportedProjects": [
+            "candidate-desktop-chromium",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "CONTENT-008",
+          "entrySpec": "tests/content-system.spec.ts",
+          "applicability": "candidate-desktop-chromium",
+          "supportedProjects": [
+            "candidate-desktop-chromium",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "CRISIS-001",
+          "entrySpec": "tests/shell-content.spec.ts",
+          "applicability": "candidate-mobile-chromium",
+          "supportedProjects": [
+            "candidate-mobile-chromium",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14"
+          ]
+        },
+        {
+          "auditId": "CRISIS-002",
+          "entrySpec": "tests/smoke.spec.ts",
+          "applicability": "all-projects",
+          "supportedProjects": [
+            "production-mobile-chromium",
+            "candidate-mobile-chromium",
+            "production-desktop-chromium",
+            "candidate-desktop-chromium",
+            "candidate-mobile-webkit",
+            "candidate-tablet-webkit",
+            "candidate-desktop-firefox",
+            "candidate-mobile-webkit-iphone-17-ios18",
+            "candidate-mobile-webkit-iphone-15-ios17",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "ENV-001",
+          "entrySpec": "plugins/platform-routes-content/tests/runtime.spec.ts",
+          "applicability": "candidate-desktop-chromium",
+          "supportedProjects": [
+            "candidate-desktop-chromium",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "ENV-001",
+          "entrySpec": "tests/contracts.spec.ts",
+          "applicability": "all-projects",
+          "supportedProjects": [
+            "production-mobile-chromium",
+            "candidate-mobile-chromium",
+            "production-desktop-chromium",
+            "candidate-desktop-chromium",
+            "candidate-mobile-webkit",
+            "candidate-tablet-webkit",
+            "candidate-desktop-firefox",
+            "candidate-mobile-webkit-iphone-17-ios18",
+            "candidate-mobile-webkit-iphone-15-ios17",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "ENV-002",
+          "entrySpec": "tests/contracts.spec.ts",
+          "applicability": "full-sweep-projects",
+          "supportedProjects": [
+            "production-mobile-chromium",
+            "candidate-mobile-chromium",
+            "candidate-desktop-chromium"
+          ]
+        },
+        {
+          "auditId": "ENV-003",
+          "entrySpec": "tests/contracts.spec.ts",
+          "applicability": "candidate-desktop-chromium",
+          "supportedProjects": [
+            "candidate-desktop-chromium",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "ENV-004",
+          "entrySpec": "tests/contracts.spec.ts",
+          "applicability": "candidate-chromium-projects",
+          "supportedProjects": [
+            "candidate-mobile-chromium",
+            "candidate-desktop-chromium",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "ENV-005",
+          "entrySpec": "tests/contracts.spec.ts",
+          "applicability": "all-projects",
+          "supportedProjects": [
+            "production-mobile-chromium",
+            "candidate-mobile-chromium",
+            "production-desktop-chromium",
+            "candidate-desktop-chromium",
+            "candidate-mobile-webkit",
+            "candidate-tablet-webkit",
+            "candidate-desktop-firefox",
+            "candidate-mobile-webkit-iphone-17-ios18",
+            "candidate-mobile-webkit-iphone-15-ios17",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "ENV-006",
+          "entrySpec": "tests/contracts.spec.ts",
+          "applicability": "all-projects",
+          "supportedProjects": [
+            "production-mobile-chromium",
+            "candidate-mobile-chromium",
+            "production-desktop-chromium",
+            "candidate-desktop-chromium",
+            "candidate-mobile-webkit",
+            "candidate-tablet-webkit",
+            "candidate-desktop-firefox",
+            "candidate-mobile-webkit-iphone-17-ios18",
+            "candidate-mobile-webkit-iphone-15-ios17",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "ENV-007",
+          "entrySpec": "tests/contracts.spec.ts",
+          "applicability": "all-projects",
+          "supportedProjects": [
+            "production-mobile-chromium",
+            "candidate-mobile-chromium",
+            "production-desktop-chromium",
+            "candidate-desktop-chromium",
+            "candidate-mobile-webkit",
+            "candidate-tablet-webkit",
+            "candidate-desktop-firefox",
+            "candidate-mobile-webkit-iphone-17-ios18",
+            "candidate-mobile-webkit-iphone-15-ios17",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "ENV-008",
+          "entrySpec": "tests/contracts.spec.ts",
+          "applicability": "all-projects",
+          "supportedProjects": [
+            "production-mobile-chromium",
+            "candidate-mobile-chromium",
+            "production-desktop-chromium",
+            "candidate-desktop-chromium",
+            "candidate-mobile-webkit",
+            "candidate-tablet-webkit",
+            "candidate-desktop-firefox",
+            "candidate-mobile-webkit-iphone-17-ios18",
+            "candidate-mobile-webkit-iphone-15-ios17",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "HOME-001",
+          "entrySpec": "tests/smoke.spec.ts",
+          "applicability": "all-projects",
+          "supportedProjects": [
+            "production-mobile-chromium",
+            "candidate-mobile-chromium",
+            "production-desktop-chromium",
+            "candidate-desktop-chromium",
+            "candidate-mobile-webkit",
+            "candidate-tablet-webkit",
+            "candidate-desktop-firefox",
+            "candidate-mobile-webkit-iphone-17-ios18",
+            "candidate-mobile-webkit-iphone-15-ios17",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "HOME-002",
+          "entrySpec": "tests/content-system.spec.ts",
+          "applicability": "candidate-desktop-chromium",
+          "supportedProjects": [
+            "candidate-desktop-chromium",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "HOME-003",
+          "entrySpec": "tests/shell-content.spec.ts",
+          "applicability": "candidate-desktop-chromium",
+          "supportedProjects": [
+            "candidate-desktop-chromium",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "HOME-004",
+          "entrySpec": "tests/shell-content.spec.ts",
+          "applicability": "candidate-desktop-chromium",
+          "supportedProjects": [
+            "candidate-desktop-chromium",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "REL-001",
+          "entrySpec": "tests/smoke.spec.ts",
+          "applicability": "all-projects",
+          "supportedProjects": [
+            "production-mobile-chromium",
+            "candidate-mobile-chromium",
+            "production-desktop-chromium",
+            "candidate-desktop-chromium",
+            "candidate-mobile-webkit",
+            "candidate-tablet-webkit",
+            "candidate-desktop-firefox",
+            "candidate-mobile-webkit-iphone-17-ios18",
+            "candidate-mobile-webkit-iphone-15-ios17",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "SEO-001",
+          "entrySpec": "tests/contracts.spec.ts",
+          "applicability": "all-projects",
+          "supportedProjects": [
+            "production-mobile-chromium",
+            "candidate-mobile-chromium",
+            "production-desktop-chromium",
+            "candidate-desktop-chromium",
+            "candidate-mobile-webkit",
+            "candidate-tablet-webkit",
+            "candidate-desktop-firefox",
+            "candidate-mobile-webkit-iphone-17-ios18",
+            "candidate-mobile-webkit-iphone-15-ios17",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "SEO-002",
+          "entrySpec": "tests/contracts.spec.ts",
+          "applicability": "candidate-chromium-projects",
+          "supportedProjects": [
+            "candidate-mobile-chromium",
+            "candidate-desktop-chromium",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        }
       ]
     },
     {
@@ -1614,7 +2367,329 @@
         "candidate-desktop-chromium",
         "candidate-mobile-webkit",
         "candidate-tablet-webkit",
-        "candidate-desktop-firefox"
+        "candidate-desktop-firefox",
+        "candidate-mobile-webkit-iphone-17-ios18",
+        "candidate-mobile-webkit-iphone-15-ios17",
+        "candidate-mobile-chromium-pixel-10-android16",
+        "candidate-mobile-chromium-pixel-8-android14",
+        "candidate-mobile-chromium-galaxy-s24-android14",
+        "candidate-desktop-chromium-edge-compat",
+        "candidate-desktop-chromium-msedge"
+      ],
+      "auditCases": [
+        {
+          "auditId": "NAV-001",
+          "entrySpec": "tests/navigation.spec.ts",
+          "applicability": "candidate-mobile-projects",
+          "supportedProjects": [
+            "candidate-mobile-chromium",
+            "candidate-mobile-webkit",
+            "candidate-mobile-webkit-iphone-17-ios18",
+            "candidate-mobile-webkit-iphone-15-ios17",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14"
+          ]
+        },
+        {
+          "auditId": "NAV-002",
+          "entrySpec": "tests/navigation.spec.ts",
+          "applicability": "candidate-mobile-chromium",
+          "supportedProjects": [
+            "candidate-mobile-chromium",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14"
+          ]
+        },
+        {
+          "auditId": "NAV-003",
+          "entrySpec": "tests/navigation.spec.ts",
+          "applicability": "candidate-desktop-chromium",
+          "supportedProjects": [
+            "candidate-desktop-chromium",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "NAV-004",
+          "entrySpec": "tests/navigation.spec.ts",
+          "applicability": "candidate-chromium-projects",
+          "supportedProjects": [
+            "candidate-mobile-chromium",
+            "candidate-desktop-chromium",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "NAV-005",
+          "entrySpec": "tests/navigation.spec.ts",
+          "applicability": "candidate-chromium-projects",
+          "supportedProjects": [
+            "candidate-mobile-chromium",
+            "candidate-desktop-chromium",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "NAV-006",
+          "entrySpec": "tests/shell-content.spec.ts",
+          "applicability": "candidate-chromium-projects",
+          "supportedProjects": [
+            "candidate-mobile-chromium",
+            "candidate-desktop-chromium",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "NAV-007",
+          "entrySpec": "tests/shell-content.spec.ts",
+          "applicability": "candidate-desktop-chromium",
+          "supportedProjects": [
+            "candidate-desktop-chromium",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "NAV-008",
+          "entrySpec": "tests/shell-content.spec.ts",
+          "applicability": "candidate-desktop-chromium",
+          "supportedProjects": [
+            "candidate-desktop-chromium",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "SEARCH-001",
+          "entrySpec": "tests/search.spec.ts",
+          "applicability": "candidate-projects",
+          "supportedProjects": [
+            "candidate-mobile-chromium",
+            "candidate-desktop-chromium",
+            "candidate-mobile-webkit",
+            "candidate-tablet-webkit",
+            "candidate-desktop-firefox",
+            "candidate-mobile-webkit-iphone-17-ios18",
+            "candidate-mobile-webkit-iphone-15-ios17",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "SEARCH-002",
+          "entrySpec": "tests/search.spec.ts",
+          "applicability": "candidate-projects",
+          "supportedProjects": [
+            "candidate-mobile-chromium",
+            "candidate-desktop-chromium",
+            "candidate-mobile-webkit",
+            "candidate-tablet-webkit",
+            "candidate-desktop-firefox",
+            "candidate-mobile-webkit-iphone-17-ios18",
+            "candidate-mobile-webkit-iphone-15-ios17",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "SEARCH-003",
+          "entrySpec": "tests/search.spec.ts",
+          "applicability": "candidate-non-tablet-projects",
+          "supportedProjects": [
+            "candidate-mobile-chromium",
+            "candidate-desktop-chromium",
+            "candidate-mobile-webkit",
+            "candidate-desktop-firefox",
+            "candidate-mobile-webkit-iphone-17-ios18",
+            "candidate-mobile-webkit-iphone-15-ios17",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "SEARCH-004",
+          "entrySpec": "tests/search.spec.ts",
+          "applicability": "candidate-chromium-projects",
+          "supportedProjects": [
+            "candidate-mobile-chromium",
+            "candidate-desktop-chromium",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "SEARCH-005",
+          "entrySpec": "tests/search.spec.ts",
+          "applicability": "candidate-projects",
+          "supportedProjects": [
+            "candidate-mobile-chromium",
+            "candidate-desktop-chromium",
+            "candidate-mobile-webkit",
+            "candidate-tablet-webkit",
+            "candidate-desktop-firefox",
+            "candidate-mobile-webkit-iphone-17-ios18",
+            "candidate-mobile-webkit-iphone-15-ios17",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "SEARCH-006",
+          "entrySpec": "tests/search.spec.ts",
+          "applicability": "candidate-chromium-projects",
+          "supportedProjects": [
+            "candidate-mobile-chromium",
+            "candidate-desktop-chromium",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "SHELL-001",
+          "entrySpec": "tests/shell-content.spec.ts",
+          "applicability": "candidate-chromium-projects",
+          "supportedProjects": [
+            "candidate-mobile-chromium",
+            "candidate-desktop-chromium",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "SHELL-002",
+          "entrySpec": "tests/theme-responsive.spec.ts",
+          "applicability": "candidate-desktop-chromium",
+          "supportedProjects": [
+            "candidate-desktop-chromium",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "SHELL-003",
+          "entrySpec": "tests/shell-content.spec.ts",
+          "applicability": "candidate-chromium-projects",
+          "supportedProjects": [
+            "candidate-mobile-chromium",
+            "candidate-desktop-chromium",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "SHELL-004",
+          "entrySpec": "tests/shell-content.spec.ts",
+          "applicability": "candidate-desktop-chromium",
+          "supportedProjects": [
+            "candidate-desktop-chromium",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "SHELL-005",
+          "entrySpec": "tests/shell-content.spec.ts",
+          "applicability": "candidate-chromium-projects",
+          "supportedProjects": [
+            "candidate-mobile-chromium",
+            "candidate-desktop-chromium",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "SHELL-006",
+          "entrySpec": "tests/shell-content.spec.ts",
+          "applicability": "candidate-mobile-chromium",
+          "supportedProjects": [
+            "candidate-mobile-chromium",
+            "candidate-mobile-chromium-pixel-10-android16",
+            "candidate-mobile-chromium-pixel-8-android14",
+            "candidate-mobile-chromium-galaxy-s24-android14"
+          ]
+        },
+        {
+          "auditId": "THEME-001",
+          "entrySpec": "tests/theme-responsive.spec.ts",
+          "applicability": "candidate-desktop-chromium",
+          "supportedProjects": [
+            "candidate-desktop-chromium",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "THEME-002",
+          "entrySpec": "tests/shell-content.spec.ts",
+          "applicability": "candidate-desktop-chromium",
+          "supportedProjects": [
+            "candidate-desktop-chromium",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "THEME-003",
+          "entrySpec": "tests/theme-responsive.spec.ts",
+          "applicability": "candidate-desktop-chromium",
+          "supportedProjects": [
+            "candidate-desktop-chromium",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        },
+        {
+          "auditId": "THEME-004",
+          "entrySpec": "tests/theme-responsive.spec.ts",
+          "applicability": "candidate-desktop-chromium",
+          "supportedProjects": [
+            "candidate-desktop-chromium",
+            "candidate-desktop-chromium-edge-compat",
+            "candidate-desktop-chromium-msedge"
+          ]
+        }
       ]
     }
   ]

@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   createFreshShardedRunDirectory,
   expectedShardedBlobs,
@@ -89,7 +92,103 @@ try {
   assert.equal(freshRun, join(shardedRoot, freshRunId));
   assert.deepEqual(await fs.readdir(freshRun), []);
 
-  process.stdout.write('Sharded isolation self-test passed: dedicated evidence is required, stale blobs are rejected, run IDs are portal-compatible, and existing run evidence is never reused or mutated.\n');
+  await assertShardedCoordinatorStopsAndTimesOut(temporaryRoot);
+
+  process.stdout.write('Sharded isolation self-test passed: dedicated evidence is required, stale blobs are rejected, run IDs are portal-compatible, existing evidence is never reused, cancellation skips later stages, and command deadlines fail closed.\n');
 } finally {
   await fs.rm(temporaryRoot, { recursive: true, force: true });
+}
+
+async function assertShardedCoordinatorStopsAndTimesOut(temporaryRoot) {
+  const repositoryRoot = fileURLToPath(new URL('..', import.meta.url));
+  const fakeBin = join(temporaryRoot, 'fake-bin');
+  const fakeDocker = join(fakeBin, 'docker');
+  const invocations = join(temporaryRoot, 'docker-invocations.log');
+  await fs.mkdir(fakeBin, { recursive: true });
+  await fs.writeFile(fakeDocker, `#!/bin/sh
+printf '%s\\n' "$*" >> "$FAKE_DOCKER_INVOCATIONS"
+case " $* " in
+  *" build "*)
+    if [ "$FAKE_DOCKER_BUILD_FAST" = "1" ]; then exit 0; fi
+    ;;
+esac
+trap 'exit 143' INT TERM
+sleep 30 &
+wait $!
+`, { mode: 0o700 });
+
+  const commonEnvironment = {
+    ...process.env,
+    PATH: `${fakeBin}${delimiter}${process.env.PATH ?? ''}`,
+    FAKE_DOCKER_INVOCATIONS: invocations,
+    AUDIT_SHARD_TOTAL: '2',
+    AUDIT_SHARDED_HEARTBEAT_MS: '1000',
+    AUDIT_SHARDED_LEASE_MS: '10000',
+    AUDIT_COMMAND_STOP_GRACE_MS: '1000',
+  };
+
+  const cancelledId = `cancel-test-${process.pid}`;
+  const cancelled = spawn(process.execPath, ['scripts/run-sharded-release.mjs'], {
+    cwd: repositoryRoot,
+    env: { ...commonEnvironment, AUDIT_SHARDED_RUN_ID: cancelledId, FAKE_DOCKER_BUILD_FAST: '1' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let cancelledOutput = '';
+  cancelled.stdout.on('data', (chunk) => { cancelledOutput += chunk.toString(); });
+  cancelled.stderr.on('data', (chunk) => { cancelledOutput += chunk.toString(); });
+  await waitForFileMatch(invocations, /run --rm.*audit-release-shard/, 10_000);
+  cancelled.kill('SIGTERM');
+  await Promise.race([
+    once(cancelled, 'exit'),
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`Cancelled coordinator did not exit: ${cancelledOutput.slice(-2_000)}`)), 10_000)),
+  ]);
+  const cancelledLifecycle = JSON.parse(await fs.readFile(
+    join(repositoryRoot, 'artifacts', 'sharded', cancelledId, 'sharded-run.json'),
+    'utf8',
+  ));
+  assert.equal(cancelledLifecycle.status, 'stopped');
+  assert.equal(cancelledLifecycle.pipeline.status, 'stopped');
+  assert.equal(cancelledLifecycle.pipeline.completed, false);
+  const cancelledInvocations = await fs.readFile(invocations, 'utf8');
+  assert.doesNotMatch(cancelledInvocations, /run --rm.*(?:audit-release-performance|audit-release-merge)/);
+
+  await fs.writeFile(invocations, '');
+  const timeoutId = `timeout-test-${process.pid}`;
+  const timed = spawn(process.execPath, ['scripts/run-sharded-release.mjs'], {
+    cwd: repositoryRoot,
+    env: {
+      ...commonEnvironment,
+      AUDIT_SHARDED_RUN_ID: timeoutId,
+      AUDIT_BUILD_DEADLINE_MS: '1000',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let timeoutOutput = '';
+  timed.stdout.on('data', (chunk) => { timeoutOutput += chunk.toString(); });
+  timed.stderr.on('data', (chunk) => { timeoutOutput += chunk.toString(); });
+  await Promise.race([
+    once(timed, 'exit'),
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`Timed coordinator did not exit: ${timeoutOutput.slice(-2_000)}`)), 10_000)),
+  ]);
+  const timeoutLifecycle = JSON.parse(await fs.readFile(
+    join(repositoryRoot, 'artifacts', 'sharded', timeoutId, 'sharded-run.json'),
+    'utf8',
+  ));
+  assert.equal(timeoutLifecycle.pipeline.status, 'failed');
+  assert.match(timeoutLifecycle.build.error, /deadline/i);
+  assert.equal(timeoutLifecycle.performance.command.length, 0);
+  assert.equal(timeoutLifecycle.merge.command.length, 0);
+
+  await fs.rm(join(repositoryRoot, 'artifacts', 'sharded', cancelledId), { recursive: true, force: true });
+  await fs.rm(join(repositoryRoot, 'artifacts', 'sharded', timeoutId), { recursive: true, force: true });
+}
+
+async function waitForFileMatch(path, pattern, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const content = await fs.readFile(path, 'utf8').catch(() => '');
+    if (pattern.test(content)) return;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`Timed out waiting for ${pattern} in ${path}.`);
 }

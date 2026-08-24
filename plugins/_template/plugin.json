@@ -23,5 +23,10 @@
     }
   ],
   "entrySpecs": ["plugins/_template/tests/starter.spec.ts"],
-  "supportedProjects": ["candidate-mobile-chromium"]
+  "supportedProjects": [
+    "candidate-mobile-chromium",
+    "candidate-mobile-chromium-pixel-10-android16",
+    "candidate-mobile-chromium-pixel-8-android14",
+    "candidate-mobile-chromium-galaxy-s24-android14"
+  ]
 }
