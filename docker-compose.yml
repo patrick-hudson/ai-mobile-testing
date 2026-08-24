@@ -46,6 +46,8 @@ services:
   portal-e2e:
     <<: *audit-base
     profiles: [portal-test]
+    healthcheck:
+      disable: true
     cpus: "2.0"
     mem_limit: 4g
     command: ["npm", "run", "portal:e2e:container"]
@@ -62,6 +64,8 @@ services:
   audit-smoke:
     <<: *audit-base
     profiles: [audit]
+    healthcheck:
+      disable: true
     command: ["npm", "run", "audit:smoke:container"]
     environment:
       PRODUCTION_URL: ${PRODUCTION_URL:-https://quitting7oh.org}
@@ -75,6 +79,8 @@ services:
   audit-release:
     <<: *audit-base
     profiles: [audit]
+    healthcheck:
+      disable: true
     command: ["npm", "run", "audit:release:container"]
     environment:
       PRODUCTION_URL: ${PRODUCTION_URL:-https://quitting7oh.org}
@@ -88,6 +94,8 @@ services:
   audit-release-shard:
     <<: *audit-base
     profiles: [audit-sharded]
+    healthcheck:
+      disable: true
     command: ["npm", "run", "audit:release:shard:container"]
     environment:
       PRODUCTION_URL: ${PRODUCTION_URL:-https://quitting7oh.org}
@@ -107,6 +115,8 @@ services:
   audit-release-performance:
     <<: *audit-base
     profiles: [audit-sharded]
+    healthcheck:
+      disable: true
     command: ["npm", "run", "audit:release:performance:container"]
     environment:
       PRODUCTION_URL: ${PRODUCTION_URL:-https://quitting7oh.org}
@@ -123,6 +133,8 @@ services:
 
   audit-release-merge:
     <<: *audit-base
+    healthcheck:
+      disable: true
     profiles: [audit-sharded]
     command: ["npm", "run", "audit:release:merge:container"]
     environment:
@@ -139,6 +151,8 @@ services:
   audit-update-visuals:
     <<: *audit-base
     profiles: [audit]
+    healthcheck:
+      disable: true
     command: ["npm", "run", "audit:update-visuals:container"]
     volumes:
       - ./artifacts:/work/artifacts

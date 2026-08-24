@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { appendFile, chmod, mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { createConnection, createServer } from 'node:net';
 import { once } from 'node:events';
 import { tmpdir } from 'node:os';
@@ -77,6 +77,7 @@ assert.ok(blockedWithReviews.reviewReasons.length >= 2);
 
 await assertRunnerIsolationContracts();
 await assertCredentialTransactions();
+await assertComposeJobHealthPolicy();
 assertBoundedReportCache();
 
 const temporary = await mkdtemp(join(tmpdir(), 'portal-security-self-test-'));
@@ -92,7 +93,30 @@ try {
   await rm(temporary, { recursive: true, force: true });
 }
 
-console.log('Portal security self-test passed: release authority, runner/vault isolation, transactional credentials, byte-bounded report caching, target availability, invalid and stale leases, active-content isolation, redacted logs, canonical metadata, and SSE recovery are enforced.');
+console.log('Portal security self-test passed: release authority, runner/vault isolation, transactional credentials, truthful Docker health policy, byte-bounded report caching, target availability, invalid and stale leases, active-content isolation, redacted logs, canonical metadata, and SSE recovery are enforced.');
+
+async function assertComposeJobHealthPolicy() {
+  const compose = await readFile(new URL('../docker-compose.yml', import.meta.url), 'utf8');
+  const serviceBlock = (service) => {
+    const match = compose.match(new RegExp(`\\n  ${service}:\\n([\\s\\S]*?)(?=\\n  [a-z][a-z0-9-]*:\\n|$)`));
+    assert.ok(match, `Compose service ${service} must exist.`);
+    return match[1];
+  };
+  assert.doesNotMatch(serviceBlock('portal'), /healthcheck:\s*\n\s+disable:\s*true/,
+    'The long-running portal must retain the image health probe.');
+  for (const service of [
+    'portal-e2e',
+    'audit-smoke',
+    'audit-release',
+    'audit-release-shard',
+    'audit-release-performance',
+    'audit-release-merge',
+    'audit-update-visuals',
+  ]) {
+    assert.match(serviceBlock(service), /healthcheck:\s*\n\s+disable:\s*true/,
+      `${service} is a one-shot job and must not inherit the portal-only health probe.`);
+  }
+}
 
 async function assertRunnerIsolationContracts() {
   const unset = resolvePortalRunnerIdentity({}, process.platform, typeof process.getuid === 'function' ? process.getuid() : null);
