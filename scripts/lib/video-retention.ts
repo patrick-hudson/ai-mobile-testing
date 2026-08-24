@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
@@ -31,6 +31,7 @@ export interface VideoRetentionPlan {
   qualityRejectedClips: number;
   diagnosticRetainedClips: number;
   qualityAssessments: VideoQualityAssessment[];
+  normalizations: VideoNormalizationResult[];
   errors: string[];
 }
 
@@ -39,9 +40,11 @@ export interface VideoQualityMetrics {
   sampledFrames: number;
   maxFrameDifference: number | null;
   changedFrames: number | null;
+  postContentChangedFrames: number | null;
   blankFrameRatio: number | null;
   initialNonBlankRatio: number | null;
   finalNonBlankRatio: number | null;
+  leadingBlankSeconds: number | null;
 }
 
 export interface VideoQualityAssessment extends VideoQualityMetrics {
@@ -49,6 +52,16 @@ export interface VideoQualityAssessment extends VideoQualityMetrics {
   usable: boolean;
   reasons: string[];
   probeError?: string;
+}
+
+export interface VideoNormalizationResult {
+  originalPath: string;
+  normalizedPath: string;
+  trimStartSeconds: number;
+  originalDurationSeconds: number;
+  normalizedDurationSeconds: number;
+  originalAssessment: VideoQualityAssessment;
+  assessment: VideoQualityAssessment;
 }
 
 export interface VideoProbeCommandEvent {
@@ -64,6 +77,7 @@ export const MAX_BLANK_FRAME_RATIO = 0.5;
 export const MIN_WINDOW_NONBLANK_RATIO = 0.5;
 
 interface SampledVideoFrame {
+  timestampSeconds: number | null;
   averageLuma: number | null;
   lowLuma: number | null;
   highLuma: number | null;
@@ -79,6 +93,12 @@ function finiteMetric(block: string, name: string): number | null {
 
 function sampledFrames(output: string): SampledVideoFrame[] {
   return [...output.matchAll(/frame:\d+[\s\S]*?(?=frame:\d+|$)/g)].map(([block]) => ({
+    timestampSeconds: (() => {
+      const match = block.match(/pts_time:([0-9.eE+-]+)/);
+      if (!match) return null;
+      const value = Number(match[1]);
+      return Number.isFinite(value) ? value : null;
+    })(),
     averageLuma: finiteMetric(block, 'YAVG'),
     lowLuma: finiteMetric(block, 'YLOW') ?? finiteMetric(block, 'YMIN'),
     highLuma: finiteMetric(block, 'YHIGH') ?? finiteMetric(block, 'YMAX'),
@@ -109,14 +129,37 @@ function metricsFromProbeOutput(durationSeconds: number, output: string): VideoQ
   const differences = frames.map(({ difference }) => difference).filter((value): value is number => value !== null);
   const nonBlank = frames.map((frame) => !isBlankFrame(frame));
   const windowSize = Math.max(1, Math.ceil(frames.length / 4));
+  let leadingBlankSeconds: number | null = null;
+  let firstSustainedContentIndex: number | null = null;
+  const sustainedFrames = 3;
+  for (let index = 0; index <= nonBlank.length - sustainedFrames; index += 1) {
+    if (!nonBlank.slice(index, index + sustainedFrames).every(Boolean)) continue;
+    firstSustainedContentIndex = index;
+    leadingBlankSeconds = frames[index]?.timestampSeconds ?? index / 4;
+    break;
+  }
+  const settledContentIndex = firstSustainedContentIndex === null
+    ? null
+    : firstSustainedContentIndex + sustainedFrames;
+  const postContentChangedFrames = settledContentIndex === null
+    ? null
+    : frames.filter((frame, index) => (
+        index >= settledContentIndex
+        && nonBlank[index]
+        && nonBlank[index - 1]
+        && frame.difference !== null
+        && frame.difference >= MIN_ACTION_FRAME_DIFFERENCE
+      )).length;
   return {
     durationSeconds: Number.isFinite(durationSeconds) ? durationSeconds : null,
     sampledFrames: frames.length,
     maxFrameDifference: differences.length > 0 ? Math.max(...differences) : null,
     changedFrames: differences.filter((value) => value >= MIN_ACTION_FRAME_DIFFERENCE).length,
+    postContentChangedFrames,
     blankFrameRatio: ratio(nonBlank.map((value) => !value)),
     initialNonBlankRatio: ratio(nonBlank.slice(0, windowSize)),
     finalNonBlankRatio: ratio(nonBlank.slice(-windowSize)),
+    leadingBlankSeconds,
   };
 }
 
@@ -152,6 +195,28 @@ export function assessVideoMetrics(metrics: VideoQualityMetrics): Pick<VideoQual
     reasons.push('the final-response window does not contain sustained page content');
   }
   return { usable: reasons.length === 0, reasons };
+}
+
+export function recommendedLeadingBlankTrimSeconds(assessment: VideoQualityAssessment): number | null {
+  if (assessment.usable || assessment.probeError) return null;
+  if (assessment.reasons.length !== 1
+    || assessment.reasons[0] !== 'the initial-state window does not contain sustained page content') return null;
+  if (assessment.durationSeconds === null
+    || assessment.leadingBlankSeconds === null
+    || assessment.blankFrameRatio === null
+    || assessment.finalNonBlankRatio === null
+    || assessment.maxFrameDifference === null
+    || assessment.changedFrames === null
+    || assessment.postContentChangedFrames === null) return null;
+  if (assessment.blankFrameRatio > MAX_BLANK_FRAME_RATIO
+    || assessment.finalNonBlankRatio < MIN_WINDOW_NONBLANK_RATIO
+    || assessment.maxFrameDifference < MIN_ACTION_FRAME_DIFFERENCE
+    || assessment.changedFrames < 1
+    || assessment.postContentChangedFrames < 1) return null;
+  const trimStartSeconds = Math.max(0, assessment.leadingBlankSeconds - 0.5);
+  if (trimStartSeconds < 0.25
+    || assessment.durationSeconds - trimStartSeconds < MIN_ACTION_VIDEO_SECONDS) return null;
+  return Math.round(trimStartSeconds * 1_000) / 1_000;
 }
 
 function isShortDynamicFailure(status: string | undefined, assessment: VideoQualityAssessment): boolean {
@@ -207,9 +272,11 @@ export function probeVideoQuality(
       sampledFrames: 0,
       maxFrameDifference: null,
       changedFrames: null,
+      postContentChangedFrames: null,
       blankFrameRatio: null,
       initialNonBlankRatio: null,
       finalNonBlankRatio: null,
+      leadingBlankSeconds: null,
       usable: false,
       reasons: ['video metadata probe failed'],
       probeError,
@@ -327,9 +394,11 @@ export async function probeVideoQualityAsync(
       sampledFrames: 0,
       maxFrameDifference: null,
       changedFrames: null,
+      postContentChangedFrames: null,
       blankFrameRatio: null,
       initialNonBlankRatio: null,
       finalNonBlankRatio: null,
+      leadingBlankSeconds: null,
       usable: false,
       reasons: ['video metadata probe failed'],
       probeError: durationProbe.timedOut
@@ -371,6 +440,81 @@ export async function probeVideoQualityAsync(
         }
       : {}),
   };
+}
+
+export async function normalizeLeadingBlankVideoAsync(
+  file: string,
+  assessment: VideoQualityAssessment,
+  artifactRootValue: string,
+  ffmpeg: string,
+  onCommand?: (event: VideoProbeCommandEvent) => void,
+): Promise<VideoNormalizationResult | null> {
+  const trimStartSeconds = recommendedLeadingBlankTrimSeconds(assessment);
+  if (trimStartSeconds === null || assessment.durationSeconds === null) return null;
+  const artifactRoot = path.resolve(artifactRootValue);
+  const source = path.resolve(file);
+  if (!isInside(artifactRoot, source)) throw new Error('Leading-blank normalization source is outside the artifact root.');
+  const sourceDetails = await fs.lstat(source);
+  if (!sourceDetails.isFile() || sourceDetails.isSymbolicLink()) {
+    throw new Error('Leading-blank normalization requires a regular, non-symbolic-link source video.');
+  }
+  const normalizedRoot = path.join(artifactRoot, 'normalized-videos');
+  await fs.mkdir(normalizedRoot, { recursive: true });
+  const normalizedRootDetails = await fs.lstat(normalizedRoot);
+  if (!normalizedRootDetails.isDirectory() || normalizedRootDetails.isSymbolicLink()) {
+    throw new Error('Leading-blank normalization output must be a regular directory.');
+  }
+  const [realArtifactRoot, realNormalizedRoot] = await Promise.all([
+    fs.realpath(artifactRoot),
+    fs.realpath(normalizedRoot),
+  ]);
+  if (!isInside(realArtifactRoot, realNormalizedRoot)) {
+    throw new Error('Leading-blank normalization output resolves outside the artifact root.');
+  }
+  const temporary = path.join(normalizedRoot, `.normalizing-${randomUUID()}.webm`);
+  const args = [
+    '-hide_banner', '-loglevel', 'warning', '-y',
+    '-ss', trimStartSeconds.toFixed(3), '-i', source,
+    '-map', '0:v:0', '-an', '-sn', '-dn',
+    '-c:v', 'libvpx', '-deadline', 'realtime', '-cpu-used', '5',
+    '-crf', '10', '-b:v', '1M', '-pix_fmt', 'yuv420p',
+    '-f', 'webm', temporary,
+  ];
+  onCommand?.({ event: 'Command started', command: [ffmpeg, ...args] });
+  try {
+    const encoded = await spawnBuffered(ffmpeg, args, 120_000);
+    onCommand?.({
+      event: 'Command finished',
+      command: [ffmpeg, ...args],
+      exitCode: encoded.status,
+      signal: encoded.signal,
+    });
+    if (encoded.status !== 0 || encoded.timedOut) return null;
+    const normalizedAssessment = await probeVideoQualityAsync(temporary, ffmpeg, onCommand);
+    if (!normalizedAssessment.usable
+      || normalizedAssessment.durationSeconds === null
+      || normalizedAssessment.postContentChangedFrames === null
+      || normalizedAssessment.postContentChangedFrames < 1) return null;
+    const hash = await sha256File(temporary);
+    const normalizedPath = path.join(normalizedRoot, `${hash}.webm`);
+    // Replace atomically even if another worker produced the same named
+    // derivative. Reusing an unverified pre-existing path would let stale or
+    // hostile run content masquerade as the bytes assessed above.
+    await fs.rename(temporary, normalizedPath);
+    return {
+      originalPath: source,
+      normalizedPath,
+      trimStartSeconds,
+      originalDurationSeconds: assessment.durationSeconds,
+      normalizedDurationSeconds: normalizedAssessment.durationSeconds,
+      originalAssessment: { ...assessment, path: source },
+      assessment: { ...normalizedAssessment, path: normalizedPath },
+    };
+  } finally {
+    await fs.unlink(temporary).catch((error) => {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    });
+  }
 }
 
 interface JsonAttachment {
@@ -448,6 +592,10 @@ export async function buildVideoRetentionPlan(
   resultsFileValue: string,
   options: {
     probeVideo?: (file: string) => VideoQualityAssessment | Promise<VideoQualityAssessment>;
+    normalizeVideo?: (
+      file: string,
+      assessment: VideoQualityAssessment,
+    ) => VideoNormalizationResult | null | Promise<VideoNormalizationResult | null>;
     probeConcurrency?: number;
   } = {},
 ): Promise<VideoRetentionPlan> {
@@ -467,6 +615,7 @@ export async function buildVideoRetentionPlan(
     qualityRejectedClips: 0,
     diagnosticRetainedClips: 0,
     qualityAssessments: [],
+    normalizations: [],
     errors: [],
   };
 
@@ -494,6 +643,7 @@ export async function buildVideoRetentionPlan(
   // Decode each unique eligible clip once. The main reconciliation pass stays
   // deterministic, while FFmpeg work runs through a small CPU-aware pool.
   const qualityBySource = new Map<string, VideoQualityAssessment>();
+  const normalizedBySource = new Map<string, string>();
   if (options.probeVideo) {
     const sources = new Set<string>();
     for (const { test } of tests) {
@@ -517,15 +667,45 @@ export async function buildVideoRetentionPlan(
           sampledFrames: 0,
           maxFrameDifference: null,
           changedFrames: null,
+          postContentChangedFrames: null,
           blankFrameRatio: null,
           initialNonBlankRatio: null,
           finalNonBlankRatio: null,
+          leadingBlankSeconds: null,
           usable: false,
           reasons: ['video quality probe failed'],
           probeError: error instanceof Error ? error.message : String(error),
         });
       }
     });
+    if (options.normalizeVideo) {
+      await boundedForEach([...sources].sort(), options.probeConcurrency ?? 2, async (source) => {
+        const assessment = qualityBySource.get(source);
+        if (!assessment || assessment.usable) return;
+        try {
+          const normalization = await options.normalizeVideo!(source, assessment);
+          if (!normalization?.assessment.usable) return;
+          const normalizedPath = path.resolve(normalization.normalizedPath);
+          if (!isInside(artifactRoot, normalizedPath)) {
+            throw new Error('normalized video is outside the generated artifact roots');
+          }
+          normalizedBySource.set(source, normalizedPath);
+          qualityBySource.set(normalizedPath, { ...normalization.assessment, path: normalizedPath });
+          plan.normalizations.push({
+            ...normalization,
+            originalPath: source,
+            normalizedPath,
+            assessment: { ...normalization.assessment, path: normalizedPath },
+          });
+        } catch (error) {
+          qualityBySource.set(source, {
+            ...assessment,
+            reasons: [...assessment.reasons, 'leading-blank normalization failed'],
+            probeError: error instanceof Error ? error.message : String(error),
+          });
+        }
+      });
+    }
   }
   const hashBySource = new Map<string, Promise<string>>();
 
@@ -551,7 +731,9 @@ export async function buildVideoRetentionPlan(
           if (eligible) plan.errors.push(`${label}: its video attachment has no filesystem path.`);
           continue;
         }
-        const source = resolveAttachmentPath(attachment.path, artifactRoot, resultsDirectory);
+        const originalSource = resolveAttachmentPath(attachment.path, artifactRoot, resultsDirectory);
+        const source = originalSource ? normalizedBySource.get(originalSource) ?? originalSource : null;
+        if (source && source !== originalSource) attachment.path = path.relative(resultsDirectory, source);
         if (!source) {
           if (eligible) plan.errors.push(`${label}: its video attachment is outside the generated artifact roots.`);
           continue;
@@ -580,9 +762,11 @@ export async function buildVideoRetentionPlan(
                 sampledFrames: 0,
                 maxFrameDifference: null,
                 changedFrames: null,
+                postContentChangedFrames: null,
                 blankFrameRatio: null,
                 initialNonBlankRatio: null,
                 finalNonBlankRatio: null,
+                leadingBlankSeconds: null,
                 usable: false,
                 reasons: ['video quality probe was not completed'],
                 probeError: 'eligible clip was absent from the bounded probe inventory',
@@ -593,9 +777,11 @@ export async function buildVideoRetentionPlan(
                 sampledFrames: 0,
                 maxFrameDifference: null,
                 changedFrames: null,
+                postContentChangedFrames: null,
                 blankFrameRatio: null,
                 initialNonBlankRatio: null,
                 finalNonBlankRatio: null,
+                leadingBlankSeconds: null,
                 usable: true,
                 reasons: ['quality probe was not requested'],
               };
@@ -703,6 +889,7 @@ function generatedVideoRoots(artifactRoot: string): Array<{
   sharedContentAddressed: boolean;
 }> {
   return [
+    { root: path.join(artifactRoot, 'normalized-videos'), pruneUnknown: true, sharedContentAddressed: false },
     { root: path.join(artifactRoot, 'raw'), pruneUnknown: true, sharedContentAddressed: false },
     { root: path.join(artifactRoot, 'shards'), pruneUnknown: true, sharedContentAddressed: false },
     { root: path.join(artifactRoot, 'blob-reports', 'resources'), pruneUnknown: true, sharedContentAddressed: true },

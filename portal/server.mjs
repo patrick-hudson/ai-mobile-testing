@@ -24,6 +24,10 @@ import {
   unavailableRelease,
 } from '../scripts/lib/release-truth.mjs';
 import {
+  DEFAULT_RELEASE_SHARD_TOTAL,
+  DEFAULT_RELEASE_SHARD_WORKERS,
+} from '../scripts/lib/sharded-defaults.mjs';
+import {
   GalleryHttpError,
   galleryQueryFromUrl,
   gallerySnapshotFingerprints,
@@ -289,6 +293,8 @@ async function routeRequest(request, response) {
         candidateUrl: process.env.CANDIDATE_URL ?? 'https://beta.quitting7oh-org.pages.dev',
         profile: 'smoke',
         candidateIgnoreHTTPSErrors: DEFAULT_CANDIDATE_IGNORE_HTTPS_ERRORS,
+        releaseShardTotal: DEFAULT_RELEASE_SHARD_TOTAL,
+        releaseShardWorkers: DEFAULT_RELEASE_SHARD_WORKERS,
       },
       limits: { maxConcurrentRuns: MAX_CONCURRENT_RUNS },
       externalSync: externalRunSyncDiagnostics,

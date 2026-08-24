@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { bracketedAuditIds, firstBracketedAuditId } from '../audit/audit-id.js';
@@ -14,6 +14,7 @@ import {
   buildAuditManifest,
   buildAuditModels,
   projectReviewedExecutionTruth,
+  writeAuditReport,
   type ReportTestInput,
 } from '../reporters/report-model.js';
 
@@ -340,6 +341,38 @@ try {
   assert.equal(unknownManifest.audits.some(({ id }) => id === 'TYPO-999'), false);
   assert.equal(unknownManifest.unmappedTests.length, 1);
 
+  const pipelineFailureManifest = await buildAuditManifest({
+    outputDir: path.join(root, 'pipeline-failure-checklist'),
+    tests: [reportTest(
+      definitions[0]!,
+      '[A11Y-001] passing evidence cannot erase a terminated shard',
+      'tests/accessibility.spec.ts',
+    )],
+    run: {
+      status: 'failed',
+      source: 'playwright-json',
+      profile: 'self-test',
+      errors: [{ message: 'Pipeline integrity failure in SHARD 1/8: terminated by SIGTERM.' }],
+      integrityFailures: [{
+        stage: 'SHARD 1/8',
+        reason: 'SHARD 1/8 was terminated by SIGTERM.',
+        exitCode: 143,
+        signal: 'SIGTERM',
+        logPath: 'logs/shard-1-of-8.log',
+      }],
+    },
+    definitionCatalog: [definitions[0]!],
+  });
+  assert.equal(pipelineFailureManifest.release.decision, 'UNAVAILABLE');
+  assert.equal(pipelineFailureManifest.release.ready, false);
+  assert.equal(pipelineFailureManifest.release.runIntegrityFailure, true);
+  assert.equal(pipelineFailureManifest.release.blockingFailures, 0);
+  assert.equal(pipelineFailureManifest.release.diagnosticCountsAuthoritative, false);
+  assert.equal(pipelineFailureManifest.release.authoritativeReleaseSource, 'sharded-run.json');
+  assert.equal(pipelineFailureManifest.run.integrityFailures.length, 1);
+  assert.match(pipelineFailureManifest.release.decisionBasis, /diagnostic.*sharded-run\.json/i);
+  assert.match(pipelineFailureManifest.warnings.join('\n'), /counts.*diagnostic only/i);
+
   const productionSkipped = reportTest(
     definitions[0]!,
     '[A11Y-001] production selection is skipped',
@@ -469,6 +502,64 @@ try {
     definitionCatalog: [definitions[0]!],
   });
   assert.equal(expectedRuntimeManifest.audits[0]!.status, 'PASS');
+
+  const telemetryReportDirectory = path.join(root, 'telemetry-report');
+  const telemetryMessage = `Expected Cloudflare RUM diagnostic ${'<script>not executable</script>'.repeat(40)}`;
+  const telemetryRecord = evidence(definitions[0]!, {
+    thirdPartyTelemetryDiagnostics: [{
+      provider: 'cloudflare-rum',
+      surface: 'console-error',
+      message: telemetryMessage,
+      sourceUrl: 'https://cloudflareinsights.com/cdn-cgi/rum',
+      status: null,
+    }],
+  });
+  const telemetryManifest = await writeAuditReport({
+    outputDir: telemetryReportDirectory,
+    tests: [reportTest(
+      definitions[0]!,
+      '[A11Y-001] classified telemetry remains visible without becoming a runtime defect',
+      'tests/runtime-regression.spec.ts',
+      [],
+      { record: telemetryRecord },
+    )],
+    run: { status: 'passed', source: 'playwright-json', profile: 'self-test' },
+    definitionCatalog: [definitions[0]!],
+  });
+  assert.equal(telemetryManifest.audits[0]!.status, 'PASS');
+  const telemetryDetail = JSON.parse(await readFile(
+    path.join(telemetryReportDirectory, 'data', 'audits', 'A11Y-001.json'),
+    'utf8',
+  )) as {
+    executions: Array<{ evidence: {
+      totals: { thirdPartyTelemetryDiagnostics: number };
+      thirdPartyTelemetryDiagnostics: Array<{ message: string; provider: string; sourceUrl: string | null; status: number | null }>;
+    } }>;
+  };
+  const portalTelemetry = telemetryDetail.executions[0]!.evidence.thirdPartyTelemetryDiagnostics;
+  assert.equal(telemetryDetail.executions[0]!.evidence.totals.thirdPartyTelemetryDiagnostics, 1);
+  assert.equal(portalTelemetry.length, 1);
+  assert.equal(portalTelemetry[0]!.provider, 'cloudflare-rum');
+  assert.equal(portalTelemetry[0]!.sourceUrl, 'https://cloudflareinsights.com/cdn-cgi/rum');
+  assert.equal(portalTelemetry[0]!.status, null);
+  assert(portalTelemetry[0]!.message.length <= 700, 'Portal telemetry messages must remain byte-safe and bounded for large runs');
+
+  const analyticsNearMissRecord = evidence(definitions[0]!, {
+    consoleErrors: ['Application says Cookie “_ga” has been rejected for invalid domain.'],
+  });
+  const analyticsNearMissManifest = await buildAuditManifest({
+    outputDir: path.join(root, 'analytics-near-miss-checklist'),
+    tests: [reportTest(
+      definitions[0]!,
+      '[A11Y-001] analytics-shaped application errors remain release failures',
+      'tests/runtime-regression.spec.ts',
+      [],
+      { record: analyticsNearMissRecord },
+    )],
+    run: { status: 'passed', source: 'playwright-json', profile: 'self-test' },
+    definitionCatalog: [definitions[0]!],
+  });
+  assert.equal(analyticsNearMissManifest.audits[0]!.status, 'FAIL');
 
   const interactionDefinition: AuditDefinition = {
     ...definitions[0]!,

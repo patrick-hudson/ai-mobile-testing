@@ -42,6 +42,19 @@ assert.equal(pipelineOnlyOutcome('completed', notReady).exitCode, 1);
 assert.equal(pipelineOnlyOutcome('failed', notReady).status, 'pipeline-failed');
 assert.equal(pipelineOnlyOutcome('failed', notReady).exitCode, 1);
 assert.equal(releaseOutcome('failed', ready).status, 'pipeline-failed');
+assert.throws(() => parseChecklistRelease({
+  schemaVersion: 1,
+  release: {
+    ready: false,
+    decision: 'UNAVAILABLE',
+    reason: 'Pipeline integrity failed; counts are diagnostic only.',
+    decisionBasis: 'sharded-run.json remains authoritative.',
+    blockingFailures: 0,
+    blockingIncomplete: 0,
+    baselineIssues: 0,
+    runIntegrityFailure: true,
+  },
+}), /READY or NOT_READY/, 'a diagnostic checklist must never become authoritative release truth');
 
 const incompleteSmoke = parseChecklistRelease({
   schemaVersion: 1,

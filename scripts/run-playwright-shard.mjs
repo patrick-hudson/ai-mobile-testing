@@ -2,10 +2,11 @@ import { promises as fs } from 'node:fs';
 import { dirname, join, resolve, sep } from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { MAX_RELEASE_SHARD_TOTAL } from './lib/sharded-defaults.mjs';
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const shardIndex = integerEnvironment('AUDIT_SHARD_INDEX', 1, 64);
-const shardTotal = integerEnvironment('AUDIT_SHARD_TOTAL', 1, 64);
+const shardIndex = integerEnvironment('AUDIT_SHARD_INDEX', 1, MAX_RELEASE_SHARD_TOTAL);
+const shardTotal = integerEnvironment('AUDIT_SHARD_TOTAL', 1, MAX_RELEASE_SHARD_TOTAL);
 if (shardIndex > shardTotal) throw new Error('AUDIT_SHARD_INDEX cannot exceed AUDIT_SHARD_TOTAL.');
 
 const artifactRoot = containedArtifactPath(process.env.AUDIT_ARTIFACT_DIR, 'AUDIT_ARTIFACT_DIR');

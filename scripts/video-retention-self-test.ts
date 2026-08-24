@@ -8,7 +8,9 @@ import {
   applyVideoRetentionPlan,
   assessVideoMetrics,
   buildVideoRetentionPlan,
+  normalizeLeadingBlankVideoAsync,
   probeVideoQuality,
+  recommendedLeadingBlankTrimSeconds,
   removeRejectedVideoAttachments,
   reportableAttachments,
 } from './lib/video-retention.js';
@@ -100,9 +102,11 @@ const plan = await buildVideoRetentionPlan(report, root, resultsFile, {
         sampledFrames: 3,
         maxFrameDifference: 0.4,
         changedFrames: 0,
+        postContentChangedFrames: 0,
         blankFrameRatio: 1,
         initialNonBlankRatio: 0,
         finalNonBlankRatio: 0,
+        leadingBlankSeconds: null,
         usable: false,
         reasons: ['representative blank helper clip'],
       }
@@ -112,9 +116,11 @@ const plan = await buildVideoRetentionPlan(report, root, resultsFile, {
         sampledFrames: 12,
         maxFrameDifference: 7,
         changedFrames: 3,
+        postContentChangedFrames: 3,
         blankFrameRatio: 0,
         initialNonBlankRatio: 1,
         finalNonBlankRatio: 1,
+        leadingBlankSeconds: 0,
         usable: true,
         reasons: [],
       },
@@ -166,19 +172,115 @@ assert.equal(assessVideoMetrics({
   sampledFrames: 3,
   maxFrameDifference: 0.4,
   changedFrames: 0,
+  postContentChangedFrames: 0,
   blankFrameRatio: 1,
   initialNonBlankRatio: 0,
   finalNonBlankRatio: 0,
+  leadingBlankSeconds: null,
 }).usable, false);
 assert.equal(assessVideoMetrics({
   durationSeconds: 4,
   sampledFrames: 8,
   maxFrameDifference: 6,
   changedFrames: 1,
+  postContentChangedFrames: 1,
   blankFrameRatio: 0,
   initialNonBlankRatio: 1,
   finalNonBlankRatio: 1,
+  leadingBlankSeconds: 0,
 }).usable, true);
+
+const leadingBlankAssessment = {
+  path: path.join(root, 'leading-blank.webm'),
+  durationSeconds: 6,
+  sampledFrames: 24,
+  maxFrameDifference: 12,
+  changedFrames: 4,
+  postContentChangedFrames: 2,
+  blankFrameRatio: 0.5,
+  initialNonBlankRatio: 0,
+  finalNonBlankRatio: 1,
+  leadingBlankSeconds: 3,
+  usable: false,
+  reasons: ['the initial-state window does not contain sustained page content'],
+};
+assert.equal(recommendedLeadingBlankTrimSeconds(leadingBlankAssessment), 2.5);
+assert.equal(recommendedLeadingBlankTrimSeconds({
+  ...leadingBlankAssessment,
+  blankFrameRatio: 0.75,
+}), null, 'A mostly blank clip must not be laundered by trimming.');
+assert.equal(recommendedLeadingBlankTrimSeconds({
+  ...leadingBlankAssessment,
+  postContentChangedFrames: 0,
+}), null, 'A delayed first paint without a later action must not be laundered into interaction evidence.');
+assert.equal(recommendedLeadingBlankTrimSeconds({
+  ...leadingBlankAssessment,
+  finalNonBlankRatio: 0,
+  reasons: ['the initial-state window does not contain sustained page content', 'the final-response window does not contain sustained page content'],
+}), null, 'A clip ending blank must not be normalized into release evidence.');
+
+const normalizationRoot = path.join(root, 'normalization-plan');
+await fs.mkdir(path.join(normalizationRoot, 'normalized-videos'), { recursive: true });
+const normalizationSource = path.join(normalizationRoot, 'leading-original.webm');
+const normalizationTarget = path.join(normalizationRoot, 'normalized-videos', 'normalized.webm');
+await fs.writeFile(normalizationSource, Buffer.from('leading blank original'));
+await fs.writeFile(normalizationTarget, Buffer.from('normalized visible action'));
+const normalizationReport = {
+  suites: [{ specs: [{
+    title: 'leading blank interaction',
+    tests: [{ annotations: [interaction], results: [{ status: 'passed', attachments: [video(normalizationSource)] }] }],
+  }] }],
+};
+const normalizationResults = path.join(normalizationRoot, 'results.json');
+await fs.writeFile(normalizationResults, JSON.stringify(normalizationReport));
+const normalizedPlan = await buildVideoRetentionPlan(normalizationReport, normalizationRoot, normalizationResults, {
+  probeVideo: () => leadingBlankAssessment,
+  normalizeVideo: () => ({
+    originalPath: normalizationSource,
+    normalizedPath: normalizationTarget,
+    trimStartSeconds: 2.5,
+    originalDurationSeconds: 6,
+    normalizedDurationSeconds: 3.5,
+    originalAssessment: leadingBlankAssessment,
+    assessment: {
+      ...leadingBlankAssessment,
+      path: normalizationTarget,
+      durationSeconds: 3.5,
+      blankFrameRatio: 0,
+      initialNonBlankRatio: 1,
+      leadingBlankSeconds: 0,
+      usable: true,
+      reasons: [],
+    },
+  }),
+});
+assert.equal(normalizedPlan.normalizations.length, 1);
+assert.equal(normalizedPlan.qualityRejectedClips, 0);
+assert.deepEqual(normalizedPlan.errors, []);
+assert.equal(
+  normalizationReport.suites[0]?.specs[0]?.tests[0]?.results[0]?.attachments[0]?.path,
+  path.join('normalized-videos', 'normalized.webm'),
+  'The canonical results attachment must point at the normalized derivative, not a mutated content-addressed blob.',
+);
+const symlinkNormalizationRoot = path.join(root, 'normalization-symlink-root');
+const symlinkNormalizationOutside = path.join(root, 'normalization-symlink-outside');
+await Promise.all([
+  fs.mkdir(symlinkNormalizationRoot, { recursive: true }),
+  fs.mkdir(symlinkNormalizationOutside, { recursive: true }),
+]);
+const symlinkNormalizationSource = path.join(symlinkNormalizationRoot, 'source.webm');
+await fs.writeFile(symlinkNormalizationSource, Buffer.from('source'));
+await fs.symlink(symlinkNormalizationOutside, path.join(symlinkNormalizationRoot, 'normalized-videos'), 'dir');
+await assert.rejects(
+  normalizeLeadingBlankVideoAsync(
+    symlinkNormalizationSource,
+    { ...leadingBlankAssessment, path: symlinkNormalizationSource },
+    symlinkNormalizationRoot,
+    'ffmpeg-is-never-spawned',
+  ),
+  /output must be a regular directory/,
+  'A generated run must not redirect normalized evidence through a symbolic-link directory.',
+);
 
 const ffmpegAvailable = spawnSync('ffmpeg', ['-version'], { encoding: 'utf8' }).status === 0;
 if (ffmpegAvailable) {
@@ -187,6 +289,8 @@ if (ffmpegAvailable) {
   const transientOverlayVideo = path.join(root, 'transient-overlay-then-white.webm');
   const transientDarkOverlayVideo = path.join(root, 'transient-overlay-then-black.webm');
   const lowMotionActionVideo = path.join(root, 'low-motion-action.webm');
+  const leadingBlankActionVideo = path.join(root, 'leading-blank-then-action.webm');
+  const actionThenBlankVideo = path.join(root, 'action-then-blank.webm');
   const generateWhite = spawnSync('ffmpeg', [
     '-hide_banner', '-loglevel', 'error', '-y',
     '-f', 'lavfi', '-i', 'color=c=white:s=320x240:r=25',
@@ -212,16 +316,34 @@ if (ffmpegAvailable) {
     '-f', 'lavfi', '-i', "color=c=gray:s=320x240:r=25:d=4,drawbox=x=80:y=80:w=160:h=80:color=red:t=fill:enable='lt(t,2)',drawbox=x=80:y=80:w=160:h=80:color=blue:t=fill:enable='gte(t,2)'",
     '-t', '4', '-an', '-c:v', 'libvpx', '-deadline', 'realtime', lowMotionActionVideo,
   ], { encoding: 'utf8' });
+  const generateLeadingBlankAction = spawnSync('ffmpeg', [
+    '-hide_banner', '-loglevel', 'error', '-y',
+    '-f', 'lavfi', '-i', 'color=c=white:s=320x240:r=25:d=3',
+    '-f', 'lavfi', '-i', 'testsrc2=s=320x240:r=25:d=3',
+    '-filter_complex', '[0:v][1:v]concat=n=2:v=1:a=0[v]', '-map', '[v]',
+    '-an', '-c:v', 'libvpx', '-deadline', 'realtime', leadingBlankActionVideo,
+  ], { encoding: 'utf8' });
+  const generateActionThenBlank = spawnSync('ffmpeg', [
+    '-hide_banner', '-loglevel', 'error', '-y',
+    '-f', 'lavfi', '-i', 'testsrc2=s=320x240:r=25:d=3',
+    '-f', 'lavfi', '-i', 'color=c=white:s=320x240:r=25:d=3',
+    '-filter_complex', '[0:v][1:v]concat=n=2:v=1:a=0[v]', '-map', '[v]',
+    '-an', '-c:v', 'libvpx', '-deadline', 'realtime', actionThenBlankVideo,
+  ], { encoding: 'utf8' });
   assert.equal(generateWhite.status, 0, generateWhite.stderr);
   assert.equal(generateAction.status, 0, generateAction.stderr);
   assert.equal(generateTransientOverlay.status, 0, generateTransientOverlay.stderr);
   assert.equal(generateTransientDarkOverlay.status, 0, generateTransientDarkOverlay.stderr);
   assert.equal(generateLowMotionAction.status, 0, generateLowMotionAction.stderr);
+  assert.equal(generateLeadingBlankAction.status, 0, generateLeadingBlankAction.stderr);
+  assert.equal(generateActionThenBlank.status, 0, generateActionThenBlank.stderr);
   const whiteAssessment = probeVideoQuality(whiteVideo, 'ffmpeg');
   const actionAssessment = probeVideoQuality(actionVideo, 'ffmpeg');
   const transientOverlayAssessment = probeVideoQuality(transientOverlayVideo, 'ffmpeg');
   const transientDarkOverlayAssessment = probeVideoQuality(transientDarkOverlayVideo, 'ffmpeg');
   const lowMotionActionAssessment = probeVideoQuality(lowMotionActionVideo, 'ffmpeg');
+  const leadingBlankActionAssessment = probeVideoQuality(leadingBlankActionVideo, 'ffmpeg');
+  const actionThenBlankAssessment = probeVideoQuality(actionThenBlankVideo, 'ffmpeg');
   assert.equal(whiteAssessment.usable, false, JSON.stringify(whiteAssessment));
   assert.equal(actionAssessment.usable, true, JSON.stringify(actionAssessment));
   assert.equal(
@@ -239,6 +361,20 @@ if (ffmpegAvailable) {
     true,
     `One legitimate visible state transition must survive the white-video gate: ${JSON.stringify(lowMotionActionAssessment)}`,
   );
+  assert.equal(leadingBlankActionAssessment.usable, false, JSON.stringify(leadingBlankActionAssessment));
+  assert.ok(recommendedLeadingBlankTrimSeconds(leadingBlankActionAssessment) !== null,
+    `A real action after a harmless leading capture gap should be normalizable: ${JSON.stringify(leadingBlankActionAssessment)}`);
+  const normalizedLeadingBlank = await normalizeLeadingBlankVideoAsync(
+    leadingBlankActionVideo,
+    leadingBlankActionAssessment,
+    root,
+    'ffmpeg',
+  );
+  assert.equal(normalizedLeadingBlank?.assessment.usable, true, JSON.stringify(normalizedLeadingBlank));
+  assert.equal(recommendedLeadingBlankTrimSeconds(actionThenBlankAssessment), null,
+    'A video whose final response is blank must remain rejected.');
+  assert.equal(recommendedLeadingBlankTrimSeconds(whiteAssessment), null,
+    'An all-white video must remain rejected.');
 }
 
 const missingReport = {
@@ -261,9 +397,11 @@ const helperOnlyPlan = await buildVideoRetentionPlan(helperOnlyReport, root, res
     sampledFrames: 3,
     maxFrameDifference: 0.4,
     changedFrames: 0,
+    postContentChangedFrames: 0,
     blankFrameRatio: 1,
     initialNonBlankRatio: 0,
     finalNonBlankRatio: 0,
+    leadingBlankSeconds: null,
     usable: false,
     reasons: ['short, visually static helper page'],
   }),
@@ -305,9 +443,11 @@ const diagnosticPlan = await buildVideoRetentionPlan(diagnosticReport, diagnosti
         sampledFrames: 3,
         maxFrameDifference: 6,
         changedFrames: 1,
+        postContentChangedFrames: 1,
         blankFrameRatio: 0,
         initialNonBlankRatio: 1,
         finalNonBlankRatio: 1,
+        leadingBlankSeconds: 0,
         usable: false,
         reasons: ['duration 1.200s is below 2.0s'],
       }
@@ -317,9 +457,11 @@ const diagnosticPlan = await buildVideoRetentionPlan(diagnosticReport, diagnosti
         sampledFrames: 3,
         maxFrameDifference: 0.4,
         changedFrames: 0,
+        postContentChangedFrames: 0,
         blankFrameRatio: 1,
         initialNonBlankRatio: 0,
         finalNonBlankRatio: 0,
+        leadingBlankSeconds: null,
         usable: false,
         reasons: ['duration 1.200s is below 2.0s', 'maximum frame change 0.400 is below 0.75'],
       },

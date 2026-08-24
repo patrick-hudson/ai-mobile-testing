@@ -16,13 +16,13 @@ on:
       workers:
         description: Playwright workers in each shard
         required: true
-        default: '3'
+        default: '1'
         type: choice
         options: ['1', '2', '3', '4']
       shards:
         description: Parallel Docker shard containers
         required: true
-        default: '4'
+        default: '8'
         type: choice
         options: ['2', '3', '4', '6', '8']
 

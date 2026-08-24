@@ -81,6 +81,13 @@ export interface ReportRunInput {
   source: 'playwright-reporter' | 'playwright-json';
   profile?: string;
   errors?: ReportErrorInput[];
+  integrityFailures?: Array<{
+    stage: string;
+    reason: string;
+    exitCode: number | null;
+    signal: string | null;
+    logPath: string | null;
+  }>;
 }
 
 export interface ReportArtifact {
@@ -202,16 +209,19 @@ export interface AuditManifest {
     source: ReportRunInput['source'];
     profile: string;
     errors: ReportErrorInput[];
+    integrityFailures: NonNullable<ReportRunInput['integrityFailures']>;
   };
   release: {
     ready: boolean;
-    decision: 'READY' | 'NOT_READY';
+    decision: 'READY' | 'NOT_READY' | 'UNAVAILABLE';
     blockingFailures: number;
     blockingIncomplete: number;
     baselineIssues: number;
     runIntegrityFailure: boolean;
     reason: string;
     decisionBasis: string;
+    diagnosticCountsAuthoritative: boolean;
+    authoritativeReleaseSource: 'checklist/manifest.json' | 'sharded-run.json';
   };
   summary: {
     total: number;
@@ -394,25 +404,8 @@ function stableId(value: string): string {
 }
 
 function recordHasUnexpectedRuntimeFailure(record: AuditEvidenceRecord): boolean {
-  const allRuntimeMessages = [...record.pageErrors, ...record.consoleErrors];
-  const cloudflareRumFailure = allRuntimeMessages.some((message) => /cloudflareinsights\.com\/cdn-cgi\/rum/i.test(message))
-    || record.httpResponses.some(({ firstParty, status, url }) => (
-      !firstParty && status >= 400 && /cloudflareinsights\.com\/cdn-cgi\/rum/i.test(url)
-    ));
-  const isKnownAnalyticsNoise = (message: string): boolean => {
-    if (/cloudflareinsights\.com\/cdn-cgi\/rum/i.test(message)) return true;
-    if (cloudflareRumFailure && /(?:Failed to load resource:\s*(?:net::ERR_FAILED|Origin https?:\/\/[^ ]+ is not allowed by Access-Control-Allow-Origin\. Status code: 404)|Origin https?:\/\/[^ ]+ is not allowed by Access-Control-Allow-Origin\. Status code: 404)/i.test(message)) return true;
-    if (/Cookie [“\"]_ga(?:_[A-Z0-9]+)?[”\"] has been rejected for invalid domain/i.test(message)) return true;
-    return false;
-  };
-  const consoleErrors = record.auditId === 'REL-001'
-    ? record.consoleErrors
-    : record.consoleErrors.filter((message) => !isKnownAnalyticsNoise(message));
-  const pageErrors = record.auditId === 'REL-001'
-    ? record.pageErrors
-    : record.pageErrors.filter((message) => !isKnownAnalyticsNoise(message));
-  return pageErrors.length > 0
-    || consoleErrors.length > 0
+  return record.pageErrors.length > 0
+    || record.consoleErrors.length > 0
     || record.failedRequests.length > 0
     || record.badResponses.length > 0
     || (record.runtimeExpectations ?? []).some(({ matched }) => !matched);
@@ -848,16 +841,24 @@ export async function buildAuditModels(options: GenerateReportOptions): Promise<
   const unknownAuditPresent = unmapped.length > 0;
   const knownTerminalFailure = allExecutions.some((execution) => ['failed', 'timedOut'].includes(execution.rawStatus));
   const unexplainedRunFailure = options.run.status !== 'passed' && !knownTerminalFailure;
+  const pipelineIntegrityFailures = options.run.integrityFailures ?? [];
   const runIntegrityFailure = unknownAuditPresent
     || allExecutions.length === 0
     || (options.run.errors?.length ?? 0) > 0
+    || pipelineIntegrityFailures.length > 0
     || unexplainedRunFailure;
-  const ready = blockingFailures === 0 && blockingIncomplete === 0 && !runIntegrityFailure;
+  const diagnosticOnly = pipelineIntegrityFailures.length > 0;
+  const ready = !diagnosticOnly && blockingFailures === 0 && blockingIncomplete === 0 && !runIntegrityFailure;
   const generatedAt = new Date().toISOString();
   const startedAt = options.run.startedAt ?? null;
   const finishedAt = startedAt && options.run.durationMs != null
     ? new Date(new Date(startedAt).getTime() + options.run.durationMs).toISOString()
     : generatedAt;
+  if (diagnosticOnly) {
+    warnings.push(
+      `Pipeline integrity failed in ${pipelineIntegrityFailures.map(({ stage }) => stage).join(', ')}. Audit counts in this checklist are diagnostic only; sharded-run.json remains the authoritative external release truth.`,
+    );
+  }
 
   const manifest: AuditManifest = {
     schemaVersion: 1,
@@ -870,18 +871,25 @@ export async function buildAuditModels(options: GenerateReportOptions): Promise<
       source: options.run.source,
       profile: options.run.profile ?? process.env.AUDIT_PROFILE ?? 'release',
       errors: options.run.errors ?? [],
+      integrityFailures: pipelineIntegrityFailures,
     },
     release: {
       ready,
-      decision: ready ? 'READY' : 'NOT_READY',
+      decision: diagnosticOnly ? 'UNAVAILABLE' : ready ? 'READY' : 'NOT_READY',
       blockingFailures,
       blockingIncomplete,
       baselineIssues,
       runIntegrityFailure,
-      reason: ready
+      reason: diagnosticOnly
+        ? `No authoritative release decision is available because the evidence pipeline failed in ${pipelineIntegrityFailures.map(({ stage }) => stage).join(', ')}. The ${blockingFailures} blocking-failure and ${blockingIncomplete} incomplete-audit counts remain visible for diagnosis only.`
+        : ready
         ? 'Every release-blocking audit has complete passing evidence.'
         : `${blockingFailures} blocking audit${blockingFailures === 1 ? '' : 's'} failed or need review; ${blockingIncomplete} blocking audit${blockingIncomplete === 1 ? '' : 's'} remain incomplete.${runIntegrityFailure ? ' The run also has an infrastructure or unknown-audit integrity failure.' : ''}`,
-      decisionBasis: 'Release gating uses applicable candidate and environment-unknown executions. Production failures are non-gating baseline context except for ENV-001, ENV-003, ENV-005, and CONTENT-008, whose contracts explicitly compare environments or declare paired-origin coverage. Skipped selections do not count as tested. Development TLS bypass withholds evidence authority without erasing the observed functional status. Unknown executed audit IDs fail run integrity.',
+      decisionBasis: diagnosticOnly
+        ? 'This generated checklist is diagnostic and cannot authorize release. sharded-run.json is the authoritative external lifecycle truth; it must report a completed pipeline and a validated READY or NOT_READY checklist decision. Diagnostic audit counts cannot override a coordinator termination, deadline, or required media-stage failure.'
+        : 'Release gating uses applicable candidate and environment-unknown executions. Production failures are non-gating baseline context except for ENV-001, ENV-003, ENV-005, and CONTENT-008, whose contracts explicitly compare environments or declare paired-origin coverage. Skipped selections do not count as tested. Development TLS bypass withholds evidence authority without erasing the observed functional status. Unknown executed audit IDs fail run integrity.',
+      diagnosticCountsAuthoritative: !diagnosticOnly,
+      authoritativeReleaseSource: diagnosticOnly ? 'sharded-run.json' : 'checklist/manifest.json',
     },
     summary: {
       total: audits.length,
@@ -1060,6 +1068,7 @@ function portalEvidence(record: AuditEvidenceRecord | null): Record<string, unkn
       httpResponses: record.httpResponses.length,
       failedRequests: record.failedRequests.length,
       badResponses: record.badResponses.length,
+      thirdPartyTelemetryDiagnostics: record.thirdPartyTelemetryDiagnostics?.length ?? 0,
     },
     steps: record.steps.slice(0, PORTAL_REPORT_MAX_EVIDENCE_ITEMS).map((step) => ({
       name: portalText(step.name, 500),
@@ -1090,6 +1099,17 @@ function portalEvidence(record: AuditEvidenceRecord | null): Record<string, unkn
     consoleErrors: record.consoleErrors.slice(0, 8).map((value) => portalText(value, 700)),
     consoleWarnings: record.consoleWarnings.slice(0, 8).map((value) => portalText(value, 700)),
     pageErrors: record.pageErrors.slice(0, 8).map((value) => portalText(value, 700)),
+    thirdPartyTelemetryDiagnostics: (record.thirdPartyTelemetryDiagnostics ?? [])
+      .slice(0, PORTAL_REPORT_MAX_EVIDENCE_ITEMS)
+      .map((diagnostic) => ({
+        provider: portalText(diagnostic.provider, 80),
+        surface: portalText(diagnostic.surface, 80),
+        message: portalText(diagnostic.message, 700),
+        sourceUrl: diagnostic.sourceUrl ? portalText(diagnostic.sourceUrl, 700) : null,
+        status: typeof diagnostic.status === 'number' && Number.isFinite(diagnostic.status)
+          ? diagnostic.status
+          : null,
+      })),
     http: {
       statusCounts: httpStatusCounts,
       failedRequests: record.failedRequests.slice(0, 8).map((request) => ({

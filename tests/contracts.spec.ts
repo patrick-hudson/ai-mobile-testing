@@ -334,7 +334,16 @@ interactionTest('[ENV-007] unknown routes provide working search and recovery na
   });
 
   await audit.step('Use a recovery destination', 'Complete site map opens as a successful document.', async () => {
-    await recovery.getByRole('link', { name: 'Complete site map' }).click();
+    await search.clear();
+    await expect(search).toHaveValue('');
+    await expect(page.getByRole('option'), 'Clearing recovery search must remove the results layer before another destination is activated')
+      .toHaveCount(0);
+    const recoveryLink = page
+      .getByRole('navigation', { name: 'Common destinations' })
+      .getByRole('link', { name: 'Complete site map' });
+    await recoveryLink.scrollIntoViewIfNeeded();
+    await expect(recoveryLink).toBeVisible();
+    await recoveryLink.click();
     await expect(page).toHaveURL(/\/sitemap\/?$/);
     await expect(page.getByRole('heading', { level: 1 })).toContainText(/Site map/i);
   });

@@ -79,6 +79,7 @@
       consoleErrors: evidence.consoleErrors,
       consoleWarnings: evidence.consoleWarnings,
       pageErrors: evidence.pageErrors,
+      expectedThirdPartyTelemetry: evidence.thirdPartyTelemetryDiagnostics,
       failedRequests: evidence.failedRequests,
       badResponses: evidence.badResponses,
     };

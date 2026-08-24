@@ -903,10 +903,6 @@ function renderStages(stages) {
   const labels = {
     build: 'Docker image build',
     browserShards: 'Parallel browser shards',
-    shard1: 'Browser shard 1',
-    shard2: 'Browser shard 2',
-    shard3: 'Browser shard 3',
-    shard4: 'Browser shard 4',
     performanceIsolation: 'Isolated Lighthouse + performance',
     merge: 'Docker merge coordinator',
     mergeReports: 'Shard report merge',
@@ -930,7 +926,8 @@ function renderStages(stages) {
     status.className = 'stage-status';
     status.textContent = stage.status;
     const title = document.createElement('strong');
-    title.textContent = labels[name] ?? humanize(name);
+    const shard = name.match(/^shard(\d+)$/);
+    title.textContent = labels[name] ?? (shard ? `Browser shard ${shard[1]}` : humanize(name));
     const timing = document.createElement('small');
     const duration = stage.durationMs === null ? 'Waiting' : `${(stage.durationMs / 1000).toFixed(1)}s`;
     const exit = stage.exitCode === null ? '' : ` · exit ${stage.exitCode}`;

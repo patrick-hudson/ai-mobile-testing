@@ -4,10 +4,22 @@ import { randomBytes } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { readChecklistRelease, releaseOutcome, unavailableRelease } from './lib/release-truth.mjs';
+import {
+  commandIntegrityFailures,
+  PIPELINE_DIAGNOSTICS_FILENAME,
+  pipelineDiagnosticsDocument,
+} from './lib/pipeline-diagnostics.mjs';
+import {
+  DEFAULT_RELEASE_SHARD_TOTAL,
+  DEFAULT_RELEASE_SHARD_WORKERS,
+  MAX_RELEASE_SHARD_TOTAL,
+  MAX_RELEASE_SHARD_WORKERS,
+} from './lib/sharded-defaults.mjs';
 import { createFreshShardedRunDirectory, validatedShardedRunId } from './lib/sharded-evidence.mjs';
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const shardTotal = integerEnvironment('AUDIT_SHARD_TOTAL', 4, 1, 16);
+const shardTotal = integerEnvironment('AUDIT_SHARD_TOTAL', DEFAULT_RELEASE_SHARD_TOTAL, 1, MAX_RELEASE_SHARD_TOTAL);
+const shardWorkers = integerEnvironment('AUDIT_SHARD_WORKERS', DEFAULT_RELEASE_SHARD_WORKERS, 1, MAX_RELEASE_SHARD_WORKERS);
 const performanceExpectedExecutions = integerEnvironment('AUDIT_PERFORMANCE_EXPECTED_EXECUTIONS', 70, 1, 10_000);
 const heartbeatIntervalMs = integerEnvironment('AUDIT_SHARDED_HEARTBEAT_MS', 5_000, 1_000, 60_000);
 const heartbeatLeaseMs = integerEnvironment('AUDIT_SHARDED_LEASE_MS', 30_000, 10_000, 10 * 60_000);
@@ -22,6 +34,7 @@ const logDirectory = join(hostRunDirectory, 'logs');
 const containerRunDirectory = `/work/artifacts/sharded/${runId}`;
 const lifecyclePath = join(hostRunDirectory, 'sharded-run.json');
 const heartbeatPath = join(hostRunDirectory, 'sharded-heartbeat.json');
+const pipelineDiagnosticsPath = join(hostRunDirectory, PIPELINE_DIAGNOSTICS_FILENAME);
 const activeChildren = new Set();
 const commandProgress = new Map();
 const startedAt = new Date().toISOString();
@@ -47,7 +60,7 @@ writeCoordinator('sharded-release-started', {
   shardTotal,
   hostRunDirectory,
   containerRunDirectory,
-  shardWorkers: process.env.AUDIT_SHARD_WORKERS ?? '2',
+  shardWorkers,
   performanceWorkers: 1,
   performanceExpectedExecutions,
   performanceIsolation: 'dedicated-container-after-functional-shards',
@@ -61,6 +74,7 @@ let buildResult = skippedResult('BUILD', 'The coordinator stopped before the Doc
 let shardResults = [];
 let performanceResult = skippedResult('PERFORMANCE', 'The coordinator stopped before isolated performance checks started.');
 let mergeResult = skippedResult('MERGE', 'The coordinator stopped before the merge started.');
+let coordinatorIntegrityFailures = [];
 try {
   if (!stopRequest) buildResult = await runBuild();
   if (!stopRequest && buildResult.exitCode === 0) {
@@ -68,6 +82,12 @@ try {
   }
   if (!stopRequest && buildResult.exitCode === 0) performanceResult = await runPerformance();
   else if (!stopRequest) performanceResult = skippedResult('PERFORMANCE', 'Docker image build failed; isolated performance checks were not started.');
+  coordinatorIntegrityFailures = commandIntegrityFailures([...shardResults, performanceResult]);
+  await atomicWriteJson(pipelineDiagnosticsPath, pipelineDiagnosticsDocument({
+    runId,
+    failures: coordinatorIntegrityFailures,
+    source: 'coordinator',
+  }));
   if (!stopRequest && buildResult.exitCode === 0) mergeResult = await runMerge();
   else if (!stopRequest) mergeResult = skippedResult('MERGE', 'Docker image build failed; shards, isolated performance checks, and merge were not started.');
 } catch (error) {
@@ -82,6 +102,7 @@ if (stopRequest) {
 } else if (buildResult.exitCode !== 0) {
   pipelineFailures.push('Docker image build failed');
 } else {
+  pipelineFailures.push(...coordinatorIntegrityFailures.map(({ stage, reason }) => `${stage}: ${reason}`));
   const mergeLifecyclePath = join(hostRunDirectory, 'merge-lifecycle.json');
   if (!(await isFreshFile(mergeLifecyclePath, startedAt))) {
     pipelineFailures.push('merge lifecycle is missing or stale');
@@ -122,7 +143,7 @@ const lifecycle = {
   startedAt,
   finishedAt: new Date().toISOString(),
   shardTotal,
-  shardWorkers: integerEnvironment('AUDIT_SHARD_WORKERS', 2, 1, 16),
+  shardWorkers,
   performanceExpectedExecutions,
   productionUrl: process.env.PRODUCTION_URL ?? 'https://quitting7oh.org',
   candidateUrl: process.env.CANDIDATE_URL ?? 'https://beta.quitting7oh-org.pages.dev',
@@ -135,6 +156,16 @@ const lifecycle = {
     .filter(({ exitCode }) => exitCode !== 0)
     .map(({ index, exitCode }) => ({ index, exitCode })),
   performanceNonzeroExitCode: performanceResult.exitCode === 0 ? null : performanceResult.exitCode,
+  diagnostics: {
+    authoritative: false,
+    authoritativeReleaseSource: 'sharded-run.json',
+    diagnosticCountsAuthoritative: false,
+    shardNonzeroExitCodes: shardResults
+      .filter(({ exitCode }) => exitCode !== 0)
+      .map(({ index, exitCode }) => ({ index, exitCode })),
+    performanceNonzeroExitCode: performanceResult.exitCode === 0 ? null : performanceResult.exitCode,
+    integrityFailures: coordinatorIntegrityFailures,
+  },
   mergePipeline: mergeLifecycle?.pipeline ?? null,
   pipeline: {
     status: pipelineStatus,

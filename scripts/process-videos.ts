@@ -4,7 +4,9 @@ import { spawn, spawnSync } from 'node:child_process';
 import {
   applyVideoRetentionPlan,
   buildVideoRetentionPlan,
+  normalizeLeadingBlankVideoAsync,
   probeVideoQualityAsync,
+  recommendedLeadingBlankTrimSeconds,
   removeRejectedVideoAttachments,
   sha256File,
 } from './lib/video-retention.js';
@@ -151,6 +153,35 @@ try {
   retentionPlan = await buildVideoRetentionPlan(results, artifactRoot, resultsPath, {
     ...(ffmpeg ? {
       probeVideo: (file) => probeVideoQualityAsync(file, ffmpeg, ({ event, ...detail }) => log(event, detail)),
+      normalizeVideo: async (file, assessment) => {
+        const trimStartSeconds = recommendedLeadingBlankTrimSeconds(assessment);
+        if (trimStartSeconds === null) return null;
+        log('Leading-blank normalization started', {
+          video: relative(artifactRoot, file),
+          durationSeconds: assessment.durationSeconds,
+          leadingBlankSeconds: assessment.leadingBlankSeconds,
+          trimStartSeconds,
+          reasons: assessment.reasons,
+        });
+        const normalized = await normalizeLeadingBlankVideoAsync(
+          file,
+          assessment,
+          artifactRoot,
+          ffmpeg,
+          ({ event, ...detail }) => log(event, detail),
+        );
+        log(normalized ? 'Leading-blank normalization finished' : 'Leading-blank normalization rejected', {
+          video: relative(artifactRoot, file),
+          trimStartSeconds,
+          ...(normalized ? {
+            normalizedVideo: relative(artifactRoot, normalized.normalizedPath),
+            normalizedDurationSeconds: normalized.normalizedDurationSeconds,
+          } : {
+            reason: 'The trimmed clip did not pass the complete action-video quality gate.',
+          }),
+        });
+        return normalized;
+      },
       probeConcurrency: mediaWorkers,
     } : {}),
   });
@@ -175,6 +206,7 @@ log('Video retention policy applied', {
   auditProfile,
   requireExecutedInteractionVideo,
   qualityRejectedClips: retentionPlan.qualityRejectedClips,
+  normalizedLeadingBlankClips: retentionPlan.normalizations.length,
   diagnosticRetainedClips: retentionPlan.diagnosticRetainedClips,
   removedVideoAttachments,
   retainedFiles: retention.retained.length,
@@ -279,7 +311,7 @@ const manifest = {
   failedCount: evidence.filter(({ processingStatus }) => processingStatus === 'failed').length,
   unavailableCount: evidence.filter(({ processingStatus }) => processingStatus === 'ffmpeg-unavailable').length,
   retention: {
-    policy: 'Only usable videos attached to explicitly declared interaction-video attempts whose status is not skipped are retained as release media. Usable clips are at least 2 seconds long, decode representative center-crop frames, contain sustained non-blank initial and final states, remain below the blank-frame limit, and show measurable page-content change. A shorter decodable and visibly changing failed or timed-out interaction is retained only as diagnostic evidence and does not satisfy release integrity. Blank, transient-overlay-only, static, corrupt, skipped, and non-interaction clips are pruned. Every executed interaction in every profile must retain at least one usable clip.',
+    policy: 'Only usable videos attached to explicitly declared interaction-video attempts whose status is not skipped are retained as release media. A leading blank browser-capture prefix may be trimmed only when the original clip has a sustained final page state, stays within the overall blank-frame limit, contains a measurable action, and the normalized result independently passes the complete quality gate. Usable clips are at least 2 seconds long, decode representative center-crop frames, contain sustained non-blank initial and final states, remain below the blank-frame limit, and show measurable page-content change. A shorter decodable and visibly changing failed or timed-out interaction is retained only as diagnostic evidence and does not satisfy release integrity. Entirely blank, blank-ending, transient-overlay-only, static, corrupt, skipped, and non-interaction clips are pruned. Every executed interaction in every profile must retain at least one usable clip.',
     auditProfile,
     requireExecutedInteractionVideo,
     eligibleExecutions: retentionPlan.eligibleExecutions,
@@ -287,6 +319,7 @@ const manifest = {
     skippedExecutions: retentionPlan.skippedExecutions,
     policyRejectedExecutions: retentionPlan.policyRejectedExecutions,
     qualityRejectedClips: retentionPlan.qualityRejectedClips,
+    normalizedLeadingBlankClips: retentionPlan.normalizations.length,
     diagnosticRetainedClips: retentionPlan.diagnosticRetainedClips,
     removedVideoAttachments,
     eligibleHashes: retentionPlan.eligibleHashes.size,
@@ -300,12 +333,27 @@ const manifest = {
       sampledFrames: assessment.sampledFrames,
       maxFrameDifference: assessment.maxFrameDifference,
       changedFrames: assessment.changedFrames,
+      postContentChangedFrames: assessment.postContentChangedFrames,
       blankFrameRatio: assessment.blankFrameRatio,
       initialNonBlankRatio: assessment.initialNonBlankRatio,
       finalNonBlankRatio: assessment.finalNonBlankRatio,
+      leadingBlankSeconds: assessment.leadingBlankSeconds,
       usable: assessment.usable,
       reasons: assessment.reasons,
       ...(assessment.probeError ? { probeError: assessment.probeError } : {}),
+    })),
+    normalizations: retentionPlan.normalizations.map((normalization) => ({
+      originalVideo: relative(artifactRoot, normalization.originalPath),
+      normalizedVideo: relative(artifactRoot, normalization.normalizedPath),
+      trimStartSeconds: normalization.trimStartSeconds,
+      originalDurationSeconds: normalization.originalDurationSeconds,
+      normalizedDurationSeconds: normalization.normalizedDurationSeconds,
+      originalLeadingBlankSeconds: normalization.originalAssessment.leadingBlankSeconds,
+      originalPostContentChangedFrames: normalization.originalAssessment.postContentChangedFrames,
+      originalBlankFrameRatio: normalization.originalAssessment.blankFrameRatio,
+      originalInitialNonBlankRatio: normalization.originalAssessment.initialNonBlankRatio,
+      originalFinalNonBlankRatio: normalization.originalAssessment.finalNonBlankRatio,
+      originalReasons: normalization.originalAssessment.reasons,
     })),
     pruned: retention.pruned.map(({ relativePath, bytes, sha256, reason }) => ({ relativePath, bytes, sha256, reason })),
   },
@@ -322,6 +370,7 @@ log('Video evidence processing finished', {
   prunedFiles: manifest.retention.prunedFiles,
   prunedBytes: manifest.retention.prunedBytes,
   qualityRejectedClips: manifest.retention.qualityRejectedClips,
+  normalizedLeadingBlankClips: manifest.retention.normalizedLeadingBlankClips,
   diagnosticRetainedClips: manifest.retention.diagnosticRetainedClips,
   removedVideoAttachments: manifest.retention.removedVideoAttachments,
   integrityErrors: manifest.retention.integrityErrors,

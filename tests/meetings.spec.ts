@@ -5,6 +5,8 @@ import type { Locator, Page } from '@playwright/test';
 const NEXT_PATH = '/next-kratom-support-meeting';
 const NA_PATH = '/virtual-na-meetings-now';
 const SMART_PATH = '/virtual-smart-meetings-now';
+const MEET_FILTER_TOTAL_TIMEOUT_MS = 180_000;
+const MEET_FILTER_PREPARATION_BUDGET_MS = 120_000;
 
 function candidateChromium(testInfo: Parameters<typeof meta>[0]): boolean {
   return meta(testInfo).environment === 'candidate' && testInfo.project.name.includes('chromium');
@@ -122,22 +124,42 @@ staticTest('[MEET-002] the same occurrence is converted across representative ti
   await audit.checkpoint('meeting-timezone-central-reference');
 });
 
-interactionTest('[MEET-003] a joined room persists across pages and can be cleared', interactionEvidence('Join a featured room, navigate to meeting history, and clear it while showing persistence and removal.', 'candidate-chromium-projects'), async ({ page, audit }, testInfo) => {
+interactionTest('[MEET-003] a joined room persists across pages and can be cleared', interactionEvidence('Join a featured room, navigate to meeting history, and clear it while showing persistence and removal.', 'candidate-chromium-projects'), async ({ page, context, audit }, testInfo) => {
   test.skip(!candidateChromium(testInfo), 'Candidate Chromium meeting-history audit.');
   await page.clock.setFixedTime(new Date('2026-08-24T13:30:00Z'));
   await audit.goto(NEXT_PATH);
 
   await audit.step('Join the featured room', 'The external destination opens and the interaction is recorded locally.', async () => {
-    const popupPromise = page.waitForEvent('popup');
     const join = page.getByRole('link', { name: /Join in/ }).first();
     const expectedDestination = await join.getAttribute('href');
     expect(expectedDestination).toMatch(/^https:\/\//);
-    await join.click();
-    const popup = await popupPromise;
-    await popup.waitForURL((url) => url.protocol === 'https:');
-    audit.observe('opened meeting destination', popup.url(), expectedDestination!);
-    await audit.holdSecondaryPageOutcome(popup, 'external meeting destination');
-    await popup.close();
+    if (!expectedDestination) throw new Error('Featured meeting join action has no destination.');
+    let capturedDestination: string | null = null;
+    const routeMatcher = (url: URL) => url.href === expectedDestination;
+    await context.route(routeMatcher, async (route) => {
+      expect(route.request().isNavigationRequest(), 'The join action must initiate a document navigation').toBe(true);
+      capturedDestination = route.request().url();
+      await route.fulfill({
+        status: 200,
+        contentType: 'text/html',
+        body: '<!doctype html><title>Meeting destination captured</title><h1>External meeting destination requested</h1>',
+      });
+    });
+
+    let popup: Page | null = null;
+    try {
+      const popupPromise = page.waitForEvent('popup');
+      [popup] = await Promise.all([popupPromise, join.click()]);
+      await popup.waitForLoadState('domcontentloaded', { timeout: 10_000 });
+      expect(capturedDestination, 'The popup navigation request must exactly match the rendered meeting link').toBe(expectedDestination);
+      expect(popup.url(), 'The popup must retain the exact requested meeting destination').toBe(expectedDestination);
+      await expect(popup.getByRole('heading', { name: 'External meeting destination requested' })).toBeVisible();
+      audit.observe('opened meeting destination', capturedDestination, expectedDestination);
+      await audit.holdSecondaryPageOutcome(popup, 'external meeting destination request');
+    } finally {
+      if (popup && !popup.isClosed()) await popup.close();
+      await context.unroute(routeMatcher);
+    }
   });
 
   await audit.step('Open another meeting page', 'The previously joined section shows the same saved room.', async () => {
@@ -158,6 +180,8 @@ interactionTest('[MEET-003] a joined room persists across pages and can be clear
 
 interactionTest('[MEET-004] NA search, type, access, and platform filters combine and clear', interactionEvidence('Combine NA meeting search and filter controls, then clear them and show the result list returning.', 'candidate-desktop-chromium'), async ({ page, audit }, testInfo) => {
   test.skip(!candidateChromium(testInfo) || meta(testInfo).deviceClass !== 'desktop', 'One candidate desktop NA directory audit.');
+  testInfo.setTimeout(MEET_FILTER_TOTAL_TIMEOUT_MS);
+  const preparationStartedAt = Date.now();
   await page.clock.setFixedTime(new Date('2026-08-24T12:30:00Z'));
   await audit.goto(NA_PATH);
   const search = page.getByLabel('Search meetings');
@@ -192,6 +216,16 @@ interactionTest('[MEET-004] NA search, type, access, and platform filters combin
   expect(wrongTag, 'Oracle record needs a nonmatching meeting-type control').toBeDefined();
   expect(wrongPlatform, 'Oracle record needs a nonmatching platform control').toBeDefined();
   if (!correctTag || !wrongTag || !wrongPlatform) throw new Error('NA control oracle is incomplete.');
+  const preparationDurationMs = Date.now() - preparationStartedAt;
+  audit.observe(
+    'NA filter oracle preparation duration (ms)',
+    preparationDurationMs,
+    `< ${MEET_FILTER_PREPARATION_BUDGET_MS}ms, leaving a dedicated interaction budget`,
+  );
+  expect(
+    preparationDurationMs,
+    'Meeting-data hydration and deterministic oracle preparation must leave the reserved interaction window intact',
+  ).toBeLessThan(MEET_FILTER_PREPARATION_BUDGET_MS);
 
   await audit.step('Prove each NA filter changes an exact nonempty result set', 'Search isolates one reviewed record; every wrong control removes it and every matching control restores exactly it.', async () => {
     await search.fill(target.name);

@@ -31,6 +31,7 @@ import type {
   AuditFinding,
   AuditObservation,
   AuditRuntimeExpectation,
+  AuditThirdPartyTelemetryDiagnostic,
   AuditStepRecord,
   AuditEnvironment,
   PageInspection,
@@ -78,6 +79,111 @@ export function expectedResponseConsoleDerivative(
   return chromiumOrWebKit.test(event.text.trim()) || firefox.test(event.text.trim()) ? expectation : null;
 }
 
+const CLOUDFLARE_RUM_ENDPOINT = 'https://cloudflareinsights.com/cdn-cgi/rum';
+const GOOGLE_TAG_ID = 'G-1ZPHE0EXTM';
+
+function urlMatches(value: string | null, expectedOrigin: string, expectedPath: string): boolean {
+  if (!value) return false;
+  try {
+    const url = new URL(value);
+    return url.origin === expectedOrigin && url.pathname === expectedPath;
+  } catch {
+    return false;
+  }
+}
+
+function cloudflareRumResponse(
+  responses: readonly AuditEvidenceRecord['httpResponses'][number][],
+): AuditEvidenceRecord['httpResponses'][number] | null {
+  return responses.find(({ firstParty, status, url }) => (
+    !firstParty
+    && status >= 400
+    && urlMatches(url, 'https://cloudflareinsights.com', '/cdn-cgi/rum')
+  )) ?? null;
+}
+
+function googleTagResponse(
+  responses: readonly AuditEvidenceRecord['httpResponses'][number][],
+): AuditEvidenceRecord['httpResponses'][number] | null {
+  return responses.find(({ firstParty, url }) => {
+    if (firstParty) return false;
+    try {
+      const parsed = new URL(url);
+      return parsed.origin === 'https://www.googletagmanager.com'
+        && parsed.pathname === '/gtag/js'
+        && parsed.searchParams.get('id') === GOOGLE_TAG_ID;
+    } catch {
+      return false;
+    }
+  }) ?? null;
+}
+
+export function expectedThirdPartyTelemetryResponseDiagnostic(
+  response: AuditEvidenceRecord['httpResponses'][number],
+): AuditThirdPartyTelemetryDiagnostic | null {
+  if (
+    response.firstParty
+    || response.status < 400
+    || !urlMatches(response.url, 'https://cloudflareinsights.com', '/cdn-cgi/rum')
+  ) return null;
+  return {
+    provider: 'cloudflare-rum',
+    surface: 'http-response',
+    message: `${response.method} ${response.status} ${CLOUDFLARE_RUM_ENDPOINT}`,
+    sourceUrl: response.url,
+    status: response.status,
+  };
+}
+
+export function classifyExpectedThirdPartyTelemetryDiagnostic(
+  event: { text: string; sourceUrl: string | null; surface: 'console-error' | 'page-error' },
+  responses: readonly AuditEvidenceRecord['httpResponses'][number][],
+  context: { cloudflareRumCausallyObserved?: boolean } = {},
+): AuditThirdPartyTelemetryDiagnostic | null {
+  const text = event.text.trim();
+  const rumResponse = cloudflareRumResponse(responses);
+  const sourceIsRum = urlMatches(event.sourceUrl, 'https://cloudflareinsights.com', '/cdn-cgi/rum');
+  const exactCloudflareNativeDiagnostic = (
+    /^Access to (?:XMLHttpRequest|resource) at 'https:\/\/cloudflareinsights\.com\/cdn-cgi\/rum' from origin 'https?:\/\/[^']+' has been blocked by CORS policy:/i.test(text)
+    || /^(?:\[JavaScript Error: ")?Cross-Origin Request Blocked: The Same Origin Policy disallows reading the remote resource at https:\/\/cloudflareinsights\.com\/cdn-cgi\/rum\./i.test(text)
+    || /^\/cloudflareinsights\.com\/cdn-cgi\/rum due to access control checks\.$/i.test(text)
+    || /^Beacon API cannot load https:\/\/cloudflareinsights\.com\/cdn-cgi\/rum\. Origin https?:\/\/[^ ]+ is not allowed by Access-Control-Allow-Origin\. Status code: 404$/i.test(text)
+  );
+  const exactSourceBoundDiagnostic = sourceIsRum && (
+    /^Failed to load resource:\s*net::ERR_FAILED$/i.test(text)
+    || /^(?:Failed to load resource:\s*)?Origin https?:\/\/[^ ]+ is not allowed by Access-Control-Allow-Origin\. Status code: 404$/i.test(text)
+  );
+  const exactCausallyPairedWebKitDiagnostic = context.cloudflareRumCausallyObserved === true
+    && /^(?:Failed to load resource:\s*)?Origin https?:\/\/[^ ]+ is not allowed by Access-Control-Allow-Origin\. Status code: 404$/i.test(text);
+  if (exactCloudflareNativeDiagnostic || exactSourceBoundDiagnostic || exactCausallyPairedWebKitDiagnostic) {
+    return {
+      provider: 'cloudflare-rum',
+      surface: event.surface,
+      message: text,
+      sourceUrl: event.sourceUrl,
+      status: rumResponse?.status ?? null,
+    };
+  }
+
+  const gtagResponse = googleTagResponse(responses);
+  if (gtagResponse) {
+    const unwrapped = text
+      .replace(/^\[JavaScript Error:\s*"/, '')
+      .replace(/"\s+\{file:\s+"https?:\/\/[^"\r\n]+"\s+line:\s+\d+\}\]$/, '');
+    if (/^Cookie [“"]_ga(?:_[A-Z0-9]+)?[”"] has been rejected for invalid domain\.$/i.test(unwrapped)) {
+      return {
+        provider: 'google-analytics',
+        surface: event.surface,
+        message: text,
+        sourceUrl: event.sourceUrl,
+        status: gtagResponse.status,
+      };
+    }
+  }
+
+  return null;
+}
+
 function verboseLog(event: string, detail: Record<string, unknown>): void {
   if (process.env.AUDIT_VERBOSE !== '1') return;
   process.stdout.write(`${new Date().toISOString()} [AUDIT_${event}] ${JSON.stringify(detail)}\n`);
@@ -95,6 +201,7 @@ export class AuditRun {
   private readonly runtimeExpectations: AuditRuntimeExpectation[] = [];
   private lastRuntimeActivityAt = Date.now();
   private readonly galleryAttachmentOccurrences = new Map<string, number>();
+  private readonly loggedTelemetryDiagnostics = new Set<string>();
   readonly startedAt = timestamp();
   readonly steps: AuditStepRecord[] = [];
   readonly observations: AuditObservation[] = [];
@@ -106,7 +213,14 @@ export class AuditRun {
   readonly httpResponses: AuditEvidenceRecord['httpResponses'] = [];
   readonly failedRequests: Array<{ url: string; reason: string }> = [];
   readonly badResponses: Array<{ url: string; status: number }> = [];
-  private readonly consoleErrorEvents: Array<{ rendered: string; text: string; locationUrl: string | null }> = [];
+  readonly thirdPartyTelemetryDiagnostics: AuditThirdPartyTelemetryDiagnostic[] = [];
+  private readonly consoleErrorEvents: Array<{
+    rendered: string;
+    text: string;
+    locationUrl: string | null;
+    sourceUrl: string | null;
+  }> = [];
+  private readonly pageErrorEvents: Array<{ text: string; sourceUrl: null }> = [];
 
   constructor(page: Page, testInfo: TestInfo, evidencePolicy: AuditEvidencePolicy) {
     this.page = page;
@@ -126,18 +240,22 @@ export class AuditRun {
       const rendered = `${message.type()}: ${message.text()}`;
       if (message.type() === 'error' && !this.matchRuntimeExpectation('console-error', 'console', message.text())) {
         this.consoleErrors.push(rendered);
-        const locationUrl = message.location().url;
+        const rawLocationUrl = message.location().url;
         this.consoleErrorEvents.push({
           rendered,
           text: message.text(),
-          locationUrl: locationUrl && this.isFirstParty(locationUrl) ? redactUrl(locationUrl) : null,
+          locationUrl: rawLocationUrl && this.isFirstParty(rawLocationUrl) ? redactUrl(rawLocationUrl) : null,
+          sourceUrl: rawLocationUrl ? redactUrl(rawLocationUrl) : null,
         });
       }
       if (message.type() === 'warning') this.consoleWarnings.push(rendered);
       if (message.type() === 'error' || message.type() === 'warning') this.markRuntimeActivity();
     });
     page.on('pageerror', (error) => {
-      if (!this.matchRuntimeExpectation('page-error', 'page', error.message)) this.pageErrors.push(error.message);
+      if (!this.matchRuntimeExpectation('page-error', 'page', error.message)) {
+        this.pageErrors.push(error.message);
+        this.pageErrorEvents.push({ text: error.message, sourceUrl: null });
+      }
       this.markRuntimeActivity();
     });
     page.on('request', (request) => {
@@ -542,27 +660,76 @@ export class AuditRun {
     );
   }
 
+  private synchronizeThirdPartyTelemetryDiagnostics(
+    diagnostics: AuditThirdPartyTelemetryDiagnostic[],
+  ): void {
+    const deduplicated = [...new Map(diagnostics.map((diagnostic) => [JSON.stringify(diagnostic), diagnostic])).values()];
+    this.thirdPartyTelemetryDiagnostics.splice(0, this.thirdPartyTelemetryDiagnostics.length, ...deduplicated);
+    const label = 'Expected third-party telemetry diagnostics';
+    const existingObservation = this.observations.find((observation) => observation.label === label);
+    if (deduplicated.length > 0) {
+      if (existingObservation) {
+        existingObservation.value = deduplicated.length;
+        existingObservation.expected = 'Classified separately; first-party runtime defects remain release blocking';
+      } else {
+        this.observations.push({
+          label,
+          value: deduplicated.length,
+          expected: 'Classified separately; first-party runtime defects remain release blocking',
+          timestamp: timestamp(),
+        });
+      }
+    }
+    for (const diagnostic of deduplicated) {
+      const key = JSON.stringify(diagnostic);
+      if (this.loggedTelemetryDiagnostics.has(key)) continue;
+      this.loggedTelemetryDiagnostics.add(key);
+      verboseLog('THIRD_PARTY_TELEMETRY', { ...diagnostic });
+    }
+  }
+
   private async assertRuntimeHealthyState(): Promise<void> {
     await this.waitForRuntimeQuiet();
-    const retainedConsoleErrors = this.consoleErrorEvents.filter((event) => !this.isExpectedResponseConsoleDerivative(event));
-    this.consoleErrors.splice(0, this.consoleErrors.length, ...unique(retainedConsoleErrors.map(({ rendered }) => rendered)));
-    this.pageErrors.splice(0, this.pageErrors.length, ...unique(this.pageErrors));
-    const auditId = this.definition?.id ?? 'UNMAPPED';
-    const allRuntimeMessages = [...this.pageErrors, ...this.consoleErrors];
-    const cloudflareRumFailure = allRuntimeMessages.some((message) => /cloudflareinsights\.com\/cdn-cgi\/rum/i.test(message))
-      || this.httpResponses.some(({ firstParty, status, url }) => !firstParty && status >= 400 && /cloudflareinsights\.com\/cdn-cgi\/rum/i.test(url));
-    const isKnownAnalyticsNoise = (message: string): boolean => {
-      if (/cloudflareinsights\.com\/cdn-cgi\/rum/i.test(message)) return true;
-      if (cloudflareRumFailure && /(?:Failed to load resource:\s*(?:net::ERR_FAILED|Origin https?:\/\/[^ ]+ is not allowed by Access-Control-Allow-Origin\. Status code: 404)|Origin https?:\/\/[^ ]+ is not allowed by Access-Control-Allow-Origin\. Status code: 404)/i.test(message)) return true;
-      if (/Cookie [“\"]_ga(?:_[A-Z0-9]+)?[”\"] has been rejected for invalid domain/i.test(message)) return true;
-      return false;
-    };
-    const pageErrors = auditId === 'REL-001'
-      ? this.pageErrors
-      : this.pageErrors.filter((message) => !isKnownAnalyticsNoise(message));
-    const consoleErrors = auditId === 'REL-001'
-      ? this.consoleErrors
-      : this.consoleErrors.filter((message) => !isKnownAnalyticsNoise(message));
+    const telemetryDiagnostics = this.httpResponses
+      .map((response) => expectedThirdPartyTelemetryResponseDiagnostic(response))
+      .filter((diagnostic): diagnostic is AuditThirdPartyTelemetryDiagnostic => diagnostic !== null);
+    const consoleEvents = this.consoleErrorEvents.filter((event) => !this.isExpectedResponseConsoleDerivative(event));
+    const directConsoleDiagnostics = consoleEvents.map((event) => classifyExpectedThirdPartyTelemetryDiagnostic({
+      text: event.text,
+      sourceUrl: event.sourceUrl,
+      surface: 'console-error',
+    }, this.httpResponses));
+    const directPageDiagnostics = this.pageErrorEvents.map((event) => classifyExpectedThirdPartyTelemetryDiagnostic({
+      ...event,
+      surface: 'page-error',
+    }, this.httpResponses));
+    const cloudflareRumCausallyObserved = [
+      ...telemetryDiagnostics,
+      ...directConsoleDiagnostics,
+      ...directPageDiagnostics,
+    ].some((diagnostic) => diagnostic?.provider === 'cloudflare-rum');
+    const consoleErrors: string[] = [];
+    for (const [index, event] of consoleEvents.entries()) {
+      const diagnostic = directConsoleDiagnostics[index] ?? classifyExpectedThirdPartyTelemetryDiagnostic({
+        text: event.text,
+        sourceUrl: event.sourceUrl,
+        surface: 'console-error',
+      }, this.httpResponses, { cloudflareRumCausallyObserved });
+      if (diagnostic) telemetryDiagnostics.push(diagnostic);
+      else consoleErrors.push(event.rendered);
+    }
+    const pageErrors: string[] = [];
+    for (const [index, event] of this.pageErrorEvents.entries()) {
+      const diagnostic = directPageDiagnostics[index] ?? classifyExpectedThirdPartyTelemetryDiagnostic({
+        ...event,
+        surface: 'page-error',
+      }, this.httpResponses, { cloudflareRumCausallyObserved });
+      if (diagnostic) telemetryDiagnostics.push(diagnostic);
+      else pageErrors.push(event.text);
+    }
+    this.consoleErrors.splice(0, this.consoleErrors.length, ...unique(consoleErrors));
+    this.pageErrors.splice(0, this.pageErrors.length, ...unique(pageErrors));
+    this.synchronizeThirdPartyTelemetryDiagnostics(telemetryDiagnostics);
     const unmetExpectations = this.runtimeExpectations.filter(({ matched }) => !matched);
     expect(unmetExpectations, 'Declared expected runtime events must actually occur').toEqual([]);
     expect(pageErrors, 'Unhandled page errors').toEqual([]);
@@ -642,6 +809,7 @@ export class AuditRun {
       failedRequests: this.failedRequests,
       badResponses: this.badResponses,
       runtimeExpectations: this.runtimeExpectations.map((expectation) => ({ ...expectation })),
+      thirdPartyTelemetryDiagnostics: this.thirdPartyTelemetryDiagnostics.map((diagnostic) => ({ ...diagnostic })),
     };
     await this.testInfo.attach('audit-result', {
       body: Buffer.from(JSON.stringify(record, null, 2)),
@@ -653,6 +821,7 @@ export class AuditRun {
           httpResponses: record.httpResponses,
           failedRequests: record.failedRequests,
           badResponses: record.badResponses,
+          thirdPartyTelemetryDiagnostics: record.thirdPartyTelemetryDiagnostics,
         }, null, 2)),
         contentType: 'application/json',
       });
@@ -664,6 +833,7 @@ export class AuditRun {
       findings: record.findings.length,
       httpResponses: record.httpResponses.length,
       consoleErrors: record.consoleErrors.length,
+      thirdPartyTelemetryDiagnostics: record.thirdPartyTelemetryDiagnostics?.length ?? 0,
       failedRequests: record.failedRequests.length,
       evidencePolicy: record.evidencePolicy,
     });

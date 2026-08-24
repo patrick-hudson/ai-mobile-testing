@@ -1,5 +1,8 @@
 .git
-.github
+.github/*
+!.github/workflows
+.github/workflows/*
+!.github/workflows/release-audit.yml
 .DS_Store
 .env
 .env.*

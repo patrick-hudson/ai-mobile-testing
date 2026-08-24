@@ -36,7 +36,12 @@ interactionTest('[SEARCH-002] known medical query returns a relevant destination
 
   await audit.step('Search for clonidine', 'Helper Medications appears as a relevant result.', async () => {
     await input.fill('clonidine');
-    await expect(page.getByRole('link', { name: /helper medications/i }).first()).toBeVisible();
+    const result = page.getByRole('option', { name: /helper medications.*clonidine/i }).first();
+    await expect(result).toBeVisible();
+    const helperPath = audit.environmentPath('/medications-supplements/helper-meds');
+    expect(helperPath, 'The candidate search contract must map the reviewed helper-medications route').not.toBeNull();
+    await expect(result, 'The clonidine result must target the reviewed section, not merely contain relevant text')
+      .toHaveAttribute('href', `${helperPath}#clonidine`);
     await expect(page.getByRole('status')).toContainText(/page.*matched/i);
   });
   const resultCount = await page.getByRole('option').count();

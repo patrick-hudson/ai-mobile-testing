@@ -170,12 +170,38 @@ interactionTest('[CALC-006] taper schedule copy and printable export contain the
   });
 
   await audit.step('Open the printable plan', 'A same-origin print view opens with the current schedule and no app controls.', async () => {
+    await page.evaluate(() => {
+      const nativeOpen = window.open.bind(window);
+      window.open = ((url?: string | URL, target?: string, features?: string) => {
+        const popup = nativeOpen(url, target, features);
+        if (popup) {
+          Object.defineProperty(popup, 'print', {
+            configurable: true,
+            value: () => {
+              popup.document.documentElement.dataset.auditPrintRequested = 'true';
+            },
+          });
+        }
+        return popup;
+      }) as typeof window.open;
+    });
     const popupPromise = page.waitForEvent('popup');
     await page.getByRole('button', { name: 'Save as PDF' }).click();
     const popup = await popupPromise;
-    await popup.waitForLoadState('domcontentloaded');
-    await expect(popup.getByRole('heading', { name: 'Taper schedule — 7-OH' })).toBeVisible();
-    await expect(popup.getByText(/60 mg\/day/).first()).toBeVisible();
+    await popup.waitForLoadState('load');
+    await popup.waitForFunction(
+      () => document.documentElement.dataset.auditPrintRequested === 'true',
+      undefined,
+      { timeout: 5_000 },
+    );
+    await expect(popup.getByRole('heading', { level: 1, name: 'Taper Schedule', exact: true })).toBeVisible();
+    await expect(popup.locator('p.subtitle')).toHaveText(
+      '7-OH · 15 mg × 4/day → jump-off at 5 mg over 30 days',
+    );
+    expect(
+      await popup.evaluate(() => document.documentElement.dataset.auditPrintRequested),
+      'The printable document must finish loading and request print before it is accepted as evidence',
+    ).toBe('true');
     await audit.holdSecondaryPageOutcome(popup, 'printable taper plan');
     await popup.close();
   });

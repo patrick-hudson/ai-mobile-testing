@@ -307,6 +307,48 @@ function runMutationCanaries(): void {
 runMutationCanaries();
 
 const repositoryRoot = process.cwd();
+
+function auditDeclarationSource(file: string, auditId: string): string {
+  const source = readFileSync(path.join(repositoryRoot, file), 'utf8');
+  const start = source.indexOf(`[${auditId}]`);
+  assert.notEqual(start, -1, `${file} must retain the ${auditId} executable declaration`);
+  const followingDeclarations = [
+    source.indexOf('\ninteractionTest(', start + auditId.length + 2),
+    source.indexOf('\nstaticTest(', start + auditId.length + 2),
+    source.indexOf('\nstructuredTest(', start + auditId.length + 2),
+  ].filter((index) => index >= 0);
+  const end = followingDeclarations.length > 0 ? Math.min(...followingDeclarations) : source.length;
+  return source.slice(start, end);
+}
+
+function runEvidenceBackedOracleCanaries(): void {
+  const search = auditDeclarationSource('tests/search.spec.ts', 'SEARCH-002');
+  assert.match(search, /getByRole\('option',\s*\{ name: \/helper medications\.\*clonidine\/i \}\)/, 'SEARCH-002 must use the rendered listbox option role');
+  assert.match(search, /toHaveAttribute\('href', `\$\{helperPath\}#clonidine`\)/, 'SEARCH-002 must assert the reviewed destination exactly');
+
+  const notFound = auditDeclarationSource('tests/contracts.spec.ts', 'ENV-007');
+  const clearIndex = notFound.indexOf('await search.clear()');
+  const recoveryClickIndex = notFound.indexOf('await recoveryLink.click()');
+  assert(clearIndex >= 0 && recoveryClickIndex > clearIndex, 'ENV-007 must clear the results layer and reacquire the recovery link before clicking it');
+
+  const calculator = auditDeclarationSource('tests/calculators.spec.ts', 'CALC-006');
+  assert.match(calculator, /dataset\.auditPrintRequested/, 'CALC-006 must wait for the print document’s own load-to-print signal');
+  assert.match(calculator, /name: 'Taper Schedule', exact: true/, 'CALC-006 must assert the actual print H1');
+  assert.match(calculator, /7-OH · 15 mg × 4\/day → jump-off at 5 mg over 30 days/, 'CALC-006 must assert the exact reviewed default print subtitle');
+
+  const meetingIntent = auditDeclarationSource('tests/meetings.spec.ts', 'MEET-003');
+  assert.match(meetingIntent, /url\.href === expectedDestination/, 'MEET-003 must intercept only the exact rendered external destination');
+  assert.match(meetingIntent, /route\.fulfill\(/, 'MEET-003 must terminate the third-party request deterministically');
+  assert.match(meetingIntent, /capturedDestination[\s\S]*toBe\(expectedDestination\)/, 'MEET-003 must compare the requested destination exactly');
+  assert.doesNotMatch(meetingIntent, /popup\.waitForURL/, 'MEET-003 must not wait for third-party navigation completion');
+
+  const meetingFilters = auditDeclarationSource('tests/meetings.spec.ts', 'MEET-004');
+  assert.match(meetingFilters, /setTimeout\(MEET_FILTER_TOTAL_TIMEOUT_MS\)/, 'MEET-004 must retain its explicit end-to-end budget');
+  assert.match(meetingFilters, /preparationDurationMs[\s\S]*toBeLessThan\(MEET_FILTER_PREPARATION_BUDGET_MS\)/, 'MEET-004 must preserve a bounded preparation partition');
+}
+
+runEvidenceBackedOracleCanaries();
+
 const entrySpecs = [...new Set(INSTALLED_PLUGIN_REGISTRY.plugins.flatMap(({ entrySpecs }) => entrySpecs))].sort();
 const declarations: DeclarationSummary[] = [];
 const findings: SourceFinding[] = [];

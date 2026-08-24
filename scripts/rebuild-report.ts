@@ -5,6 +5,10 @@ import { AUDIT_EVIDENCE_POLICY_ANNOTATION, serializeEvidencePolicy } from '../au
 import type { AuditEvidenceRecord, AuditProjectMetadata } from '../audit/types.js';
 import type { GalleryArchiveDescriptor } from '../shared/gallery-contract.mjs';
 import {
+  validatePipelineDiagnostics,
+  type PipelineIntegrityFailure,
+} from './lib/pipeline-diagnostics.mjs';
+import {
   AttachmentSourceContainmentError,
   createAttachmentSourceBoundary,
   readContainedAttachmentSource,
@@ -289,18 +293,21 @@ async function collectManualTests(
 interface RebuildArguments {
   resultsFile: string;
   outputDir: string;
+  pipelineDiagnosticsFile?: string;
 }
 
 function rebuildArguments(argv: string[]): RebuildArguments {
   let runDir: string | undefined;
   let resultsFile: string | undefined;
   let outputDir: string | undefined;
+  let pipelineDiagnosticsFile: string | undefined;
   const positional: string[] = [];
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
     if (argument === '--run-dir') runDir = argv[++index];
     else if (argument === '--results-file') resultsFile = argv[++index];
     else if (argument === '--output-dir') outputDir = argv[++index];
+    else if (argument === '--pipeline-diagnostics-file') pipelineDiagnosticsFile = argv[++index];
     else if (argument?.startsWith('--')) throw new Error(`Unknown argument: ${argument}`);
     else if (argument) positional.push(argument);
   }
@@ -311,7 +318,11 @@ function rebuildArguments(argv: string[]): RebuildArguments {
   }
   resultsFile ??= positional[0] ?? process.env.AUDIT_RESULTS_FILE ?? './artifacts/results.json';
   outputDir ??= positional[1] ?? resolveReportOutputDir();
-  return { resultsFile: path.resolve(resultsFile), outputDir: path.resolve(outputDir) };
+  return {
+    resultsFile: path.resolve(resultsFile),
+    outputDir: path.resolve(outputDir),
+    ...(pipelineDiagnosticsFile ? { pipelineDiagnosticsFile: path.resolve(pipelineDiagnosticsFile) } : {}),
+  };
 }
 
 const rebuild = rebuildArguments(process.argv.slice(2));
@@ -324,21 +335,36 @@ const report = JSON.parse((await readContainedAttachmentSource(
   sourceBoundary,
   { maximumBytes: 512 * 1024 * 1024 },
 )).toString('utf8')) as PlaywrightJsonReport;
+let integrityFailures: PipelineIntegrityFailure[] = [];
+if (rebuild.pipelineDiagnosticsFile) {
+  const expectedRunId = process.env.AUDIT_SHARDED_RUN_ID;
+  if (!expectedRunId) throw new Error('AUDIT_SHARDED_RUN_ID is required with --pipeline-diagnostics-file.');
+  const diagnostics = validatePipelineDiagnostics(JSON.parse((await readContainedAttachmentSource(
+    rebuild.pipelineDiagnosticsFile,
+    sourceBoundary,
+    { maximumBytes: 256 * 1024 },
+  )).toString('utf8')), expectedRunId);
+  integrityFailures = diagnostics.failures;
+}
 const tests = [
   ...await collectTests(report, sourceBoundary),
   ...await collectManualTests(runDirectory, sourceBoundary),
 ];
 const unexpected = report.stats?.unexpected ?? 0;
+const pipelineErrors = integrityFailures.map(({ stage, reason }) => ({
+  message: `Pipeline integrity failure in ${stage}: ${reason}`,
+}));
 const reportOptions = {
   outputDir,
   tests,
   run: {
-    status: unexpected > 0 ? 'failed' as const : 'passed' as const,
+    status: unexpected > 0 || integrityFailures.length > 0 ? 'failed' as const : 'passed' as const,
     ...(report.stats?.startTime ? { startedAt: report.stats.startTime } : {}),
     ...(report.stats?.duration != null ? { durationMs: report.stats.duration } : {}),
     source: 'playwright-json' as const,
     profile: process.env.AUDIT_PROFILE ?? 'release',
-    errors: report.errors ?? [],
+    errors: [...(report.errors ?? []), ...pipelineErrors],
+    integrityFailures,
   },
   // GenerateReportOptions is intentionally narrower, but buildAuditModels
   // forwards this runtime property to the gallery boundary.

@@ -43,6 +43,14 @@ export interface AuditRuntimeExpectation {
   matched: boolean;
 }
 
+export interface AuditThirdPartyTelemetryDiagnostic {
+  provider: 'cloudflare-rum' | 'google-analytics';
+  surface: 'console-error' | 'page-error' | 'http-response';
+  message: string;
+  sourceUrl: string | null;
+  status: number | null;
+}
+
 export type AuditArea =
   | 'environment'
   | 'routes'
@@ -147,6 +155,7 @@ export interface AuditEvidenceRecord {
   failedRequests: Array<{ url: string; reason: string }>;
   badResponses: Array<{ url: string; status: number }>;
   runtimeExpectations?: AuditRuntimeExpectation[];
+  thirdPartyTelemetryDiagnostics?: AuditThirdPartyTelemetryDiagnostic[];
 }
 
 export interface AuditProjectMetadata {

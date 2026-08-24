@@ -2,17 +2,36 @@ import { promises as fs } from 'node:fs';
 import { dirname, join, resolve, sep } from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import {
+  PIPELINE_DIAGNOSTICS_FILENAME,
+  pipelineDiagnosticsDocument,
+  readPipelineDiagnostics,
+} from './lib/pipeline-diagnostics.mjs';
 import { readChecklistRelease, releaseOutcome, unavailableRelease } from './lib/release-truth.mjs';
+import { MAX_RELEASE_SHARD_TOTAL } from './lib/sharded-defaults.mjs';
 import { expectedShardedBlobs, inspectShardedBlobs } from './lib/sharded-evidence.mjs';
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const shardTotal = integerEnvironment('AUDIT_SHARD_TOTAL', 1, 64);
+const shardTotal = integerEnvironment('AUDIT_SHARD_TOTAL', 1, MAX_RELEASE_SHARD_TOTAL);
+const runId = requiredEnvironment('AUDIT_SHARDED_RUN_ID');
 const artifactRoot = containedArtifactPath(process.env.AUDIT_ARTIFACT_DIR, 'AUDIT_ARTIFACT_DIR');
 const blobDirectory = join(artifactRoot, 'blob-reports');
 const lifecyclePath = join(artifactRoot, 'merge-lifecycle.json');
+const pipelineDiagnosticsPath = join(artifactRoot, PIPELINE_DIAGNOSTICS_FILENAME);
 const startedAt = new Date().toISOString();
 const shardedRunStartedAt = timestampEnvironment('AUDIT_SHARDED_STARTED_AT');
 await fs.mkdir(artifactRoot, { recursive: true });
+
+let coordinatorDiagnostics;
+try {
+  coordinatorDiagnostics = await readPipelineDiagnostics(pipelineDiagnosticsPath, runId);
+} catch (error) {
+  coordinatorDiagnostics = pipelineDiagnosticsDocument({
+    runId,
+    source: 'coordinator',
+    failures: [integrityFailure('COORDINATOR', `Coordinator integrity diagnostics are unavailable: ${error.message}`)],
+  });
+}
 
 const expectedBlobEvidence = expectedShardedBlobs(blobDirectory, shardTotal);
 const blobPreflight = await inspectShardedBlobs(expectedBlobEvidence, shardedRunStartedAt);
@@ -56,24 +75,50 @@ if (resultsAreFresh) {
     tsx,
     ['scripts/process-videos.ts', '--run-dir', artifactRoot],
   ));
-  stages.push(await runStage(
-    'rebuild-checklist',
-    tsx,
-    ['scripts/rebuild-report.ts', join(artifactRoot, 'results.json'), join(artifactRoot, 'checklist')],
-  ));
 } else {
   stages.push(skippedFailure('process-media', 'Fresh merged structured results are unavailable.'));
-  stages.push(skippedFailure('rebuild-checklist', 'Fresh merged structured results are unavailable.'));
 }
 
 const mediaStage = stages.find(({ name }) => name === 'process-media');
+const mediaIntegrityFailures = resultsAreFresh && (mediaStage.exitCode !== 0 || mediaStage.signal)
+  ? [integrityFailure(
+      'PROCESS_MEDIA',
+      mediaStage.signal
+        ? `Media processing was terminated by ${mediaStage.signal}.`
+        : `Media processing failed with exit code ${mediaStage.exitCode}.`,
+      mediaStage,
+    )]
+  : [];
+const reportIntegrityFailures = [...coordinatorDiagnostics.failures, ...mediaIntegrityFailures];
+await atomicWriteJson(pipelineDiagnosticsPath, pipelineDiagnosticsDocument({
+  runId,
+  source: 'merge',
+  failures: reportIntegrityFailures,
+}));
+
+if (resultsAreFresh) {
+  stages.push(await runStage(
+    'rebuild-checklist',
+    tsx,
+    [
+      'scripts/rebuild-report.ts',
+      join(artifactRoot, 'results.json'),
+      join(artifactRoot, 'checklist'),
+      '--pipeline-diagnostics-file',
+      pipelineDiagnosticsPath,
+    ],
+  ));
+} else {
+  stages.push(skippedFailure('rebuild-checklist', 'Fresh merged structured results are unavailable.'));
+}
+
 const rebuildStage = stages.find(({ name }) => name === 'rebuild-checklist');
 const checklistIsFresh = await isFreshFile(join(artifactRoot, 'checklist', 'manifest.json'), startedAt);
 const pipelineFailures = [];
+pipelineFailures.push(...reportIntegrityFailures.map(({ stage, reason }) => `${stage}: ${reason}`));
 if (missingBlobs.length > 0) pipelineFailures.push(`${missingBlobs.length} required blob report(s) are missing`);
 if (staleBlobs.length > 0) pipelineFailures.push(`${staleBlobs.length} required blob report(s) are stale`);
 if (!resultsAreFresh) pipelineFailures.push('report merge did not produce fresh structured results');
-if (mediaStage.exitCode !== 0) pipelineFailures.push('media processing failed');
 if (rebuildStage.exitCode !== 0) pipelineFailures.push('checklist rebuild failed');
 if (rebuildStage.exitCode === 0 && !checklistIsFresh) {
   pipelineFailures.push('checklist rebuild did not produce a fresh authoritative manifest');
@@ -108,6 +153,13 @@ const lifecycle = {
   },
   stages,
   browserTestFailuresObserved: mergeStage.exitCode !== 0 && resultsAreFresh,
+  diagnostics: {
+    authoritative: false,
+    authoritativeReleaseSource: 'sharded-run.json',
+    diagnosticCountsAuthoritative: false,
+    browserTestFailuresObserved: mergeStage.exitCode !== 0 && resultsAreFresh,
+    integrityFailures: reportIntegrityFailures,
+  },
   pipeline: {
     status: pipelineStatus,
     completed: pipelineStatus === 'completed',
@@ -224,6 +276,22 @@ function integerEnvironment(name, minimum, maximum) {
     throw new Error(`${name} must be an integer from ${minimum} to ${maximum}.`);
   }
   return value;
+}
+
+function requiredEnvironment(name) {
+  const value = process.env[name];
+  if (!value) throw new Error(`${name} is required.`);
+  return value;
+}
+
+function integrityFailure(stage, reason, result = {}) {
+  return {
+    stage,
+    reason,
+    exitCode: Number.isInteger(result.exitCode) ? result.exitCode : null,
+    signal: typeof result.signal === 'string' ? result.signal : null,
+    logPath: null,
+  };
 }
 
 function timestampEnvironment(name) {
