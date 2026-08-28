@@ -7,9 +7,13 @@ import {
   normalizeLeadingBlankVideoAsync,
   probeVideoQualityAsync,
   recommendedLeadingBlankTrimSeconds,
+  recommendedPosterSeekSeconds,
   removeRejectedVideoAttachments,
   sha256File,
+  type VideoQualityAssessment,
 } from './lib/video-retention.js';
+import { mergeVideoRetentionHistory } from './lib/video-manifest-history.js';
+import { MAX_MEDIA_WORKERS } from './lib/concurrency-defaults.mjs';
 
 interface VideoEvidence {
   video: string;
@@ -18,6 +22,8 @@ interface VideoEvidence {
   evidenceRole: 'usable-interaction' | 'diagnostic' | 'unclassified';
   poster: string | null;
   posterBytes: number | null;
+  posterTimestampSeconds: number | null;
+  posterSelection: 'final-response' | null;
   processor: string | null;
   processingStatus: 'created' | 'already-existed' | 'ffmpeg-unavailable' | 'failed';
   error?: string;
@@ -35,9 +41,15 @@ const artifactRoot = resolve(
   ?? './artifacts',
 );
 const manifestPath = join(artifactRoot, 'video-manifest.json');
+const previousManifestRetention = await fs.readFile(manifestPath, 'utf8')
+  .then((value) => (JSON.parse(value) as { retention?: unknown }).retention ?? null)
+  .catch((error) => {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  });
 const requestedMediaWorkers = Number(process.env.AUDIT_MEDIA_WORKERS ?? '2');
 const mediaWorkers = Number.isInteger(requestedMediaWorkers)
-  ? Math.max(1, Math.min(requestedMediaWorkers, 8))
+  ? Math.max(1, Math.min(requestedMediaWorkers, MAX_MEDIA_WORKERS))
   : 2;
 
 function log(event: string, detail: Record<string, unknown> = {}): void {
@@ -230,6 +242,20 @@ const shardRawRoots = rawExists ? [] : await fs.readdir(shardRoot, { withFileTyp
   .catch(() => [] as string[]);
 const videoRoots = rawExists ? [rawRoot] : shardRawRoots.length > 0 ? shardRawRoots : [artifactRoot];
 const videos = (await Promise.all(videoRoots.map(filesUnder))).flat().filter((path) => path.endsWith('.webm')).sort();
+const assessmentByHash = new Map<string, VideoQualityAssessment>();
+const assessmentHashes = await mapWithConcurrency(
+  retentionPlan.qualityAssessments,
+  mediaWorkers,
+  async (assessment) => {
+    const available = await fs.stat(assessment.path).then((value) => value.isFile()).catch(() => false);
+    return available ? { hash: await sha256File(assessment.path), assessment } : null;
+  },
+);
+for (const entry of assessmentHashes) {
+  if (!entry) continue;
+  const existing = assessmentByHash.get(entry.hash);
+  if (!existing || (!existing.usable && entry.assessment.usable)) assessmentByHash.set(entry.hash, entry.assessment);
+}
 log('Video evidence processing started', {
   artifactRoot,
   videoRoots,
@@ -238,10 +264,12 @@ log('Video evidence processing started', {
   mediaWorkers,
 });
 
-const evidence = await mapWithConcurrency(videos, mediaWorkers, async (video): Promise<VideoEvidence> => {
+const evidence = await mapWithConcurrency(videos, mediaWorkers, async (video, index): Promise<VideoEvidence> => {
   const videoStat = await fs.stat(video);
   const poster = join(dirname(video), `${basename(video, '.webm')}-poster.jpg`);
+  const temporaryPoster = `${poster}.tmp-${process.pid}-${index}.jpg`;
   const sha256 = await sha256File(video);
+  const posterTimestampSeconds = recommendedPosterSeekSeconds(assessmentByHash.get(sha256) ?? null);
   const evidenceRole = retentionPlan.eligiblePaths.has(resolve(video)) || retentionPlan.eligibleHashes.has(sha256)
     ? 'usable-interaction'
     : retentionPlan.diagnosticPaths.has(resolve(video)) || retentionPlan.diagnosticHashes.has(sha256)
@@ -257,6 +285,8 @@ const evidence = await mapWithConcurrency(videos, mediaWorkers, async (video): P
     evidenceRole,
     poster: null,
     posterBytes: null,
+    posterTimestampSeconds,
+    posterSelection: 'final-response',
     processor: ffmpeg,
   };
 
@@ -264,19 +294,15 @@ const evidence = await mapWithConcurrency(videos, mediaWorkers, async (video): P
     return { ...base, processingStatus: 'ffmpeg-unavailable' };
   }
   try {
-    const existing = await fs.stat(poster).catch(() => null);
-    if (existing) {
-      return {
-        ...base,
-        poster: relative(artifactRoot, poster),
-        posterBytes: existing.size,
-        processingStatus: 'already-existed',
-      };
-    }
     const args = [
-      '-hide_banner', '-loglevel', 'warning', '-y', '-ss', '0.5', '-i', video,
-      '-frames:v', '1', '-update', '1', '-vf', 'scale=480:-1', poster,
+      '-hide_banner', '-loglevel', 'warning', '-y', '-ss', posterTimestampSeconds.toFixed(3), '-i', video,
+      '-frames:v', '1', '-update', '1', '-vf', 'scale=480:-1', temporaryPoster,
     ];
+    log('Poster selection', {
+      video: relative(artifactRoot, video),
+      strategy: 'final-response',
+      seekSeconds: posterTimestampSeconds,
+    });
     log('Command started', { command: [ffmpeg, ...args] });
     const started = performance.now();
     const result = await runBuffered(ffmpeg, args);
@@ -290,12 +316,14 @@ const evidence = await mapWithConcurrency(videos, mediaWorkers, async (video): P
       stderr: result.stderr.trim().slice(-2_000),
     });
     if (result.status !== 0 || result.timedOut) {
+      await fs.unlink(temporaryPoster).catch(() => undefined);
       return {
         ...base,
         processingStatus: 'failed',
         error: result.timedOut ? 'poster generation exceeded its 60 second deadline' : result.stderr.trim().slice(-2_000),
       };
     }
+    await fs.rename(temporaryPoster, poster);
     const posterStat = await fs.stat(poster);
     return {
       ...base,
@@ -304,6 +332,7 @@ const evidence = await mapWithConcurrency(videos, mediaWorkers, async (video): P
       processingStatus: 'created',
     };
   } catch (error) {
+    await fs.unlink(temporaryPoster).catch(() => undefined);
     return {
       ...base,
       processingStatus: 'failed',
@@ -311,6 +340,51 @@ const evidence = await mapWithConcurrency(videos, mediaWorkers, async (video): P
     };
   }
 });
+
+const retentionHistory = mergeVideoRetentionHistory({
+  eligibleExecutions: retentionPlan.eligibleExecutions,
+  rejectedExecutions: retentionPlan.rejectedExecutions,
+  skippedExecutions: retentionPlan.skippedExecutions,
+  policyRejectedExecutions: retentionPlan.policyRejectedExecutions,
+  qualityRejectedClips: retentionPlan.qualityRejectedClips,
+  normalizedLeadingBlankClips: retentionPlan.normalizations.length,
+  diagnosticRetainedClips: retentionPlan.diagnosticRetainedClips,
+  removedVideoAttachments,
+  eligibleHashes: retentionPlan.eligibleHashes.size,
+  retainedFiles: retention.retained.length,
+  prunedFiles: retention.pruned.length,
+  prunedBytes: retention.prunedBytes,
+  integrityErrors: retentionPlan.errors,
+  qualityAssessments: retentionPlan.qualityAssessments.map((assessment) => ({
+    video: relative(artifactRoot, assessment.path),
+    durationSeconds: assessment.durationSeconds,
+    sampledFrames: assessment.sampledFrames,
+    maxFrameDifference: assessment.maxFrameDifference,
+    changedFrames: assessment.changedFrames,
+    postContentChangedFrames: assessment.postContentChangedFrames,
+    blankFrameRatio: assessment.blankFrameRatio,
+    initialNonBlankRatio: assessment.initialNonBlankRatio,
+    finalNonBlankRatio: assessment.finalNonBlankRatio,
+    leadingBlankSeconds: assessment.leadingBlankSeconds,
+    usable: assessment.usable,
+    reasons: assessment.reasons,
+    ...(assessment.probeError ? { probeError: assessment.probeError } : {}),
+  })),
+  normalizations: retentionPlan.normalizations.map((normalization) => ({
+    originalVideo: relative(artifactRoot, normalization.originalPath),
+    normalizedVideo: relative(artifactRoot, normalization.normalizedPath),
+    trimStartSeconds: normalization.trimStartSeconds,
+    originalDurationSeconds: normalization.originalDurationSeconds,
+    normalizedDurationSeconds: normalization.normalizedDurationSeconds,
+    originalLeadingBlankSeconds: normalization.originalAssessment.leadingBlankSeconds,
+    originalPostContentChangedFrames: normalization.originalAssessment.postContentChangedFrames,
+    originalBlankFrameRatio: normalization.originalAssessment.blankFrameRatio,
+    originalInitialNonBlankRatio: normalization.originalAssessment.initialNonBlankRatio,
+    originalFinalNonBlankRatio: normalization.originalAssessment.finalNonBlankRatio,
+    originalReasons: normalization.originalAssessment.reasons,
+  })),
+  pruned: retention.pruned.map(({ relativePath, bytes, sha256, reason }) => ({ relativePath, bytes, sha256, reason })),
+}, previousManifestRetention);
 
 const manifest = {
   schemaVersion: 2,
@@ -324,51 +398,10 @@ const manifest = {
   failedCount: evidence.filter(({ processingStatus }) => processingStatus === 'failed').length,
   unavailableCount: evidence.filter(({ processingStatus }) => processingStatus === 'ffmpeg-unavailable').length,
   retention: {
-    policy: 'Only usable videos attached to explicitly declared interaction-video attempts whose status is not skipped are retained as release media. A leading blank browser-capture prefix may be trimmed only when the original clip has a sustained final page state, stays within the overall blank-frame limit, contains a measurable action, and the normalized result independently passes the complete quality gate. Usable clips are at least 2 seconds long, decode representative center-crop frames, contain sustained non-blank initial and final states, remain below the blank-frame limit, and show measurable page-content change. A shorter decodable and visibly changing failed or timed-out interaction is retained only as diagnostic evidence and does not satisfy release integrity. Entirely blank, blank-ending, transient-overlay-only, static, corrupt, skipped, and non-interaction clips are pruned. Every executed interaction in every profile must retain at least one usable clip.',
+    policy: 'Only usable videos attached to explicitly declared interaction-video attempts whose status is not skipped are retained as release media. A leading blank browser-capture prefix may be trimmed only when the original clip has a sustained final page state, stays within the overall blank-frame limit, contains a measurable action, and the normalized result independently passes the complete quality gate. Usable clips are at least 2 seconds long, decode representative center-crop frames, contain sustained non-blank initial and final states, remain below the blank-frame limit, and show measurable page-content change. A failed interaction whose asserted visual response does not occur may retain a sufficiently long, nonblank clip with a measured action as diagnostic evidence; it satisfies evidence integrity for that failed attempt while the failed assertion remains authoritative. A shorter decodable and visibly changing failed or timed-out interaction is retained only as diagnostic evidence and does not satisfy evidence integrity. Entirely blank, blank-ending, transient-overlay-only, static, corrupt, skipped, and non-interaction clips are pruned. Every executed interaction in every profile must retain qualifying action or failed-nonresponse evidence.',
     auditProfile,
     requireExecutedInteractionVideo,
-    eligibleExecutions: retentionPlan.eligibleExecutions,
-    rejectedExecutions: retentionPlan.rejectedExecutions,
-    skippedExecutions: retentionPlan.skippedExecutions,
-    policyRejectedExecutions: retentionPlan.policyRejectedExecutions,
-    qualityRejectedClips: retentionPlan.qualityRejectedClips,
-    normalizedLeadingBlankClips: retentionPlan.normalizations.length,
-    diagnosticRetainedClips: retentionPlan.diagnosticRetainedClips,
-    removedVideoAttachments,
-    eligibleHashes: retentionPlan.eligibleHashes.size,
-    retainedFiles: retention.retained.length,
-    prunedFiles: retention.pruned.length,
-    prunedBytes: retention.prunedBytes,
-    integrityErrors: retentionPlan.errors,
-    qualityAssessments: retentionPlan.qualityAssessments.map((assessment) => ({
-      video: relative(artifactRoot, assessment.path),
-      durationSeconds: assessment.durationSeconds,
-      sampledFrames: assessment.sampledFrames,
-      maxFrameDifference: assessment.maxFrameDifference,
-      changedFrames: assessment.changedFrames,
-      postContentChangedFrames: assessment.postContentChangedFrames,
-      blankFrameRatio: assessment.blankFrameRatio,
-      initialNonBlankRatio: assessment.initialNonBlankRatio,
-      finalNonBlankRatio: assessment.finalNonBlankRatio,
-      leadingBlankSeconds: assessment.leadingBlankSeconds,
-      usable: assessment.usable,
-      reasons: assessment.reasons,
-      ...(assessment.probeError ? { probeError: assessment.probeError } : {}),
-    })),
-    normalizations: retentionPlan.normalizations.map((normalization) => ({
-      originalVideo: relative(artifactRoot, normalization.originalPath),
-      normalizedVideo: relative(artifactRoot, normalization.normalizedPath),
-      trimStartSeconds: normalization.trimStartSeconds,
-      originalDurationSeconds: normalization.originalDurationSeconds,
-      normalizedDurationSeconds: normalization.normalizedDurationSeconds,
-      originalLeadingBlankSeconds: normalization.originalAssessment.leadingBlankSeconds,
-      originalPostContentChangedFrames: normalization.originalAssessment.postContentChangedFrames,
-      originalBlankFrameRatio: normalization.originalAssessment.blankFrameRatio,
-      originalInitialNonBlankRatio: normalization.originalAssessment.initialNonBlankRatio,
-      originalFinalNonBlankRatio: normalization.originalAssessment.finalNonBlankRatio,
-      originalReasons: normalization.originalAssessment.reasons,
-    })),
-    pruned: retention.pruned.map(({ relativePath, bytes, sha256, reason }) => ({ relativePath, bytes, sha256, reason })),
+    ...retentionHistory,
   },
   videos: evidence,
 };

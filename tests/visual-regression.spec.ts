@@ -2,7 +2,15 @@ import { readFile } from 'node:fs/promises';
 import type { Page } from '@playwright/test';
 import { ENVIRONMENTS, projectMetadata, resolveEnvironmentPath } from '../audit/environments.js';
 import { REPRESENTATIVE_VISUAL_ROUTES } from '../audit/routes.js';
-import { expect, staticEvidence, staticTest, test, type AuditRun } from '../fixtures/test.js';
+import {
+  expect,
+  standaloneStaticEvidence,
+  standaloneStaticTest,
+  staticEvidence,
+  staticTest,
+  test,
+  type AuditRun,
+} from '../fixtures/test.js';
 
 const FIXED_TIME = new Date('2026-08-17T15:00:00-05:00');
 const LONG_PAGE_SEGMENTS = [
@@ -15,8 +23,8 @@ const CONTENT_PRIMITIVE_CONTRACTS = [
   {
     path: '/start-here/welcome',
     primitives: [
-      { name: 'prose paragraphs', selector: 'main p', minimum: 8 },
-      { name: 'ordered or unordered list items', selector: 'main li', minimum: 6 },
+      { name: 'prose paragraphs', selector: 'main article.prose-recovery p', minimum: 8 },
+      { name: 'ordered or unordered list items', selector: 'main article.prose-recovery :is(ol, ul) > li', minimum: 6 },
     ],
   },
   {
@@ -99,8 +107,15 @@ async function inspectContentPrimitiveClipping(
           }
           return null;
         })();
-        if (!scrollOwner && (box.left < -1 || box.right > viewportWidth + 1)) {
-          issues.push({ index, reason: 'extends outside the viewport without an owning horizontal scroller', box: box.toJSON(), text: text.slice(0, 160) });
+        const horizontalBoundary = scrollOwner ?? element;
+        const horizontalBoundaryBox = horizontalBoundary.getBoundingClientRect();
+        if (horizontalBoundaryBox.left < -1 || horizontalBoundaryBox.right > viewportWidth + 1) {
+          issues.push({
+            index,
+            reason: scrollOwner ? 'owning horizontal scroller extends outside the viewport' : 'extends outside the viewport without an owning horizontal scroller',
+            boundaryBox: horizontalBoundaryBox.toJSON(),
+            text: text.slice(0, 160),
+          });
         }
         if (/(hidden|clip)/.test(style.overflowX) && element.scrollWidth > element.clientWidth + 1) {
           issues.push({ index, reason: 'clips its own horizontal content', clientWidth: element.clientWidth, scrollWidth: element.scrollWidth, text: text.slice(0, 160) });
@@ -109,18 +124,45 @@ async function inspectContentPrimitiveClipping(
           issues.push({ index, reason: 'clips its own vertical content', clientHeight: element.clientHeight, scrollHeight: element.scrollHeight, text: text.slice(0, 160) });
         }
         const lineClamp = style.getPropertyValue('-webkit-line-clamp');
-        if ((lineClamp && lineClamp !== 'none') || style.textOverflow === 'ellipsis') {
-          issues.push({ index, reason: 'uses line clamping or ellipsis on reviewed content', lineClamp, textOverflow: style.textOverflow, text: text.slice(0, 160) });
+        const measuredLineClamp = Boolean(lineClamp && lineClamp !== 'none') && element.scrollHeight > element.clientHeight + 1;
+        const measuredEllipsis = style.textOverflow === 'ellipsis'
+          && /(hidden|clip)/.test(style.overflowX)
+          && element.scrollWidth > element.clientWidth + 1;
+        if (measuredLineClamp || measuredEllipsis) {
+          issues.push({
+            index,
+            reason: 'measurably truncates reviewed content with line clamping or ellipsis',
+            lineClamp,
+            textOverflow: style.textOverflow,
+            clientWidth: element.clientWidth,
+            scrollWidth: element.scrollWidth,
+            clientHeight: element.clientHeight,
+            scrollHeight: element.scrollHeight,
+            text: text.slice(0, 160),
+          });
         }
-        let ancestor = element.parentElement;
+        let ancestor = horizontalBoundary.parentElement;
         while (ancestor && ancestor !== document.body) {
           const ancestorStyle = getComputedStyle(ancestor);
           const ancestorBox = ancestor.getBoundingClientRect();
-          if (!scrollOwner && /(hidden|clip)/.test(ancestorStyle.overflowX)
-            && (box.left < ancestorBox.left - 1 || box.right > ancestorBox.right + 1)) {
-            issues.push({ index, reason: 'is horizontally clipped by an ancestor', ancestor: ancestor.tagName.toLowerCase(), text: text.slice(0, 160) });
+          if (/(hidden|clip)/.test(ancestorStyle.overflowX)
+            && (horizontalBoundaryBox.left < ancestorBox.left - 1 || horizontalBoundaryBox.right > ancestorBox.right + 1)) {
+            issues.push({
+              index,
+              reason: scrollOwner ? 'owning horizontal scroller is clipped by an outer ancestor' : 'is horizontally clipped by an ancestor',
+              ancestor: ancestor.tagName.toLowerCase(),
+              boundaryBox: horizontalBoundaryBox.toJSON(),
+              ancestorBox: ancestorBox.toJSON(),
+              text: text.slice(0, 160),
+            });
             break;
           }
+          ancestor = ancestor.parentElement;
+        }
+        ancestor = element.parentElement;
+        while (ancestor && ancestor !== document.body) {
+          const ancestorStyle = getComputedStyle(ancestor);
+          const ancestorBox = ancestor.getBoundingClientRect();
           if (/(hidden|clip)/.test(ancestorStyle.overflowY)
             && (box.top < ancestorBox.top - 1 || box.bottom > ancestorBox.bottom + 1)) {
             issues.push({ index, reason: 'is vertically clipped by an ancestor', ancestor: ancestor.tagName.toLowerCase(), text: text.slice(0, 160) });
@@ -143,22 +185,47 @@ async function inspectContentPrimitiveClipping(
 }
 
 async function assertRepresentativeContentPrimitives(page: Page, audit: AuditRun): Promise<void> {
-  const evidence = [];
+  const evidence: Array<{ path: string; primitives: ContentPrimitiveInspection[] }> = [];
   for (const contract of CONTENT_PRIMITIVE_CONTRACTS) {
     await audit.goto(contract.path);
     await waitForStableDocumentHeight(page);
     await page.locator('main details').evaluateAll((details) => details.forEach((detail) => { (detail as HTMLDetailsElement).open = true; }));
     const selected = await inspectContentPrimitiveClipping(page, contract.primitives);
+    await audit.attachJson(`content-primitives-${contract.path.replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '')}`, {
+      path: contract.path,
+      primitives: selected,
+    });
+    evidence.push({ path: contract.path, primitives: selected });
+  }
+  await audit.attachJson('content-primitive-clipping-evidence', evidence);
+  for (const contract of CONTENT_PRIMITIVE_CONTRACTS) {
+    const selected = evidence.find(({ path }) => path === contract.path)!.primitives;
     for (const primitive of contract.primitives) {
       const result = selected.find(({ selector }) => selector === primitive.selector)!;
       expect(result.rendered, `${contract.path} must render ${primitive.name}`).toBeGreaterThanOrEqual(primitive.minimum);
       expect(result.visible, `${contract.path} must visibly render ${primitive.name}`).toBeGreaterThanOrEqual(primitive.minimum);
       expect(result.issues, `${contract.path} must not clip ${primitive.name}`).toEqual([]);
     }
-    evidence.push({ path: contract.path, primitives: selected });
   }
-  await audit.attachJson('content-primitive-clipping-evidence', evidence);
 }
+
+standaloneStaticTest(
+  '[CONTENT-002] standalone content primitive visibility and clipping',
+  standaloneStaticEvidence(
+    'Inspect representative text, lists, callouts, tables, code, blockquotes, and disclosures against an independent visible-layout oracle.',
+    'candidate-chromium-projects',
+    'CONTENT-002:standalone-content-primitives',
+  ),
+  async ({ page, audit }) => {
+    await audit.step(
+      'Inspect critical content primitives',
+      'Representative prose, lists, medical callouts, tables, code, blockquotes, and opened disclosures exist and have no measured clipping.',
+      async () => assertRepresentativeContentPrimitives(page, audit),
+    );
+    await audit.checkpoint('content-primitives-visible-and-unclipped', { fullPage: false });
+    await audit.assertRuntimeHealthy();
+  },
+);
 
 for (const visualRoute of REPRESENTATIVE_VISUAL_ROUTES) {
   staticTest(`[CONTENT-002] candidate visual baseline for ${visualRoute.label}`, staticEvidence(`Capture paired production and candidate screenshots for the ${visualRoute.label} visual baseline in light and dark themes.`, 'candidate-projects'), async ({ browser, page, audit }, testInfo) => {

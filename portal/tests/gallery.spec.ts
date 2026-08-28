@@ -16,6 +16,7 @@ import {
   type LiveGalleryAttemptInput,
 } from '../../reporters/live-gallery-reporter.js';
 import { buildGalleryCatalog, writeGalleryArchive } from '../../reporters/gallery-model.js';
+import { ARCHIVE_ASSET_DIRECTORY } from '../../reporters/archive-bundle.js';
 import {
   GALLERY_SCALE,
   buildGalleryScaleCatalog,
@@ -23,6 +24,8 @@ import {
   materializeGalleryScaleCorpus,
   type GalleryScaleMaterialization,
 } from '../../scripts/gallery-scale-fixture.js';
+// @ts-expect-error gallery-core is the browser-native JavaScript module exercised by this portal test.
+import { createInitialGalleryState, galleryReducer } from '../public/gallery-core.js';
 
 test.describe.configure({ mode: 'serial' });
 const execFileAsync = promisify(execFile);
@@ -39,6 +42,61 @@ function syntheticNotReadyRelease(reason: string, decisionBasis: string) {
     runIntegrityFailure: false,
   };
 }
+
+test('characterization: an identical gallery revision announcement cannot cancel an in-progress apply', () => {
+  const pendingHead = {
+    phase: 'sealed',
+    contentRevision: 'content_b',
+    orderRevision: 'order_b',
+    flagRevision: 'flags_b',
+    facets: { flagStates: ['open', 'unflagged'] },
+  };
+  let state = createInitialGalleryState();
+  state = galleryReducer(state, {
+    type: 'REVISION_AVAILABLE',
+    contentRevision: 'content_b',
+    orderRevision: 'order_b',
+    flagRevision: 'flags_b',
+    head: pendingHead,
+    attentionCount: 2,
+  });
+  state = galleryReducer(state, { type: 'APPLY_PENDING_REVISION' });
+
+  const refreshedHead = { ...pendingHead, lifecycle: { status: 'completed' } };
+  state = galleryReducer(state, {
+    type: 'REVISION_AVAILABLE',
+    contentRevision: 'content_b',
+    orderRevision: 'order_b',
+    flagRevision: 'flags_b',
+    head: refreshedHead,
+    attentionCount: 151,
+  });
+  expect(state.pendingRevision?.applying).toBe(true);
+  expect(state.pendingRevision?.head).toBe(refreshedHead);
+  expect(state.pendingRevision?.attentionCount).toBe(151);
+
+  state = galleryReducer(state, {
+    type: 'REQUEST_STARTED', slot: 'query', generation: 1, semanticKey: 'apply-content-b',
+  });
+  state = galleryReducer(state, {
+    type: 'QUERY_SUCCEEDED',
+    slot: 'query',
+    generation: 1,
+    semanticKey: 'apply-content-b',
+    rows: [],
+    total: 0,
+    contentRevision: 'content_b',
+    orderRevision: 'order_b',
+    flagRevision: 'flags_b',
+    phase: 'sealed',
+    acceptPending: true,
+  });
+  expect(state.accepted).toMatchObject({
+    contentRevision: 'content_b', orderRevision: 'order_b', flagRevision: 'flags_b',
+  });
+  expect(state.pendingRevision).toBeNull();
+  expect(state.descriptor).toBe(refreshedHead);
+});
 
 function galleryAttempt(
   id: string,
@@ -639,21 +697,30 @@ test('live gallery records stay isolated by run and only publish after the repor
   expect(leftDetail.item.attempt).toMatchObject({ ordinal: 2, retry: 1 });
 });
 
-test('portal gallery opens before evidence, progresses asynchronously, and keeps review surfaces bounded', async ({ page, request }) => {
+test('characterization: comparative gallery keeps queue, viewer, context, media, pagination, and keyboard behavior bounded', async ({ page, request }) => {
   const shardedRoot = process.env.PORTAL_E2E_SERVER_SHARDED_ARTIFACT_ROOT;
   expect(shardedRoot).toBeTruthy();
   const runId = `gallery-ui-${Date.now()}`;
   const runDirectory = await discoverExternalRun(shardedRoot!, runId);
   const syntheticSecret = `sk-ant-${'S'.repeat(40)}`;
   const coordinatorLog = join(runDirectory, 'logs', 'coordinator.log');
+  const itemPageRequests: URL[] = [];
+  page.on('request', (browserRequest) => {
+    const url = new URL(browserRequest.url());
+    if (/\/api\/runs\/[^/]+\/gallery\/items$/.test(url.pathname)) itemPageRequests.push(url);
+  });
   await writeFile(coordinatorLog, `${await readFile(coordinatorLog, 'utf8')}\ncredential=${syntheticSecret}\n`);
   await waitForRun(request, runId);
 
-  await page.goto(`/gallery.html?run=${encodeURIComponent(runId)}&from=runs&q=secret-search-value&raw=0&cursor=must-be-ignored`);
-  await expect(page.getByRole('heading', { name: 'Test-first visual review' })).toBeVisible();
+  await page.goto(`/gallery.html?run=${encodeURIComponent(runId)}&from=runs&q=secret-search-value&raw=0&mode=comparative&mode=single-site&view=bogus&unknown=discard&cursor=must-be-ignored`);
+  await expect(page.locator('#gallery-back')).toHaveAttribute('href', `/run.html?mode=comparative&run=${runId}&view=evidence`);
+  await expect(page.getByRole('heading', { name: 'Visual evidence review' })).toBeVisible();
   await expect(page.locator('#gallery-phase')).toHaveText('Waiting for evidence');
   await expect(page.locator('#gallery-workbench')).toContainText('Waiting for finalized visual evidence');
   expect(new URL(page.url()).searchParams.has('cursor')).toBe(false);
+  expect(new URL(page.url()).searchParams.has('unknown')).toBe(false);
+  expect(new URL(page.url()).searchParams.getAll('mode')).toEqual(['comparative']);
+  expect(new URL(page.url()).searchParams.get('view')).toBe('workbench');
 
   const unsafeTitle = '<img src=x onerror="window.galleryInjected=true"> Review title';
   await publishLiveGalleryAttempt({
@@ -670,8 +737,18 @@ test('portal gallery opens before evidence, progresses asynchronously, and keeps
   await page.getByRole('button', { name: 'Clear filters' }).click();
   await expect(page.locator('.gallery-viewer h2')).toContainText('Review title');
   expect(await page.evaluate(() => (window as any).galleryInjected)).toBeUndefined();
+  await expect(page.locator('.gallery-queue')).toHaveCount(1);
+  await expect(page.locator('.gallery-viewer')).toHaveCount(1);
+  await expect(page.locator('.gallery-context')).toHaveCount(1);
   await expect(page.locator('.gallery-selected-image')).toHaveCount(1);
   await expect(page.locator('.gallery-selected-video')).toHaveCount(0);
+  const firstMediaSource = await page.locator('.gallery-selected-image').getAttribute('src');
+  expect(firstMediaSource).toBeTruthy();
+  expect(itemPageRequests.length).toBeGreaterThan(0);
+  expect(itemPageRequests.every((url) => {
+    const limit = Number(url.searchParams.get('limit'));
+    return Number.isInteger(limit) && limit > 0 && limit <= 100;
+  })).toBeTruthy();
   await page.getByRole('button', { name: 'Flag visual issue' }).click();
   await expect(page.getByRole('dialog', { name: 'Flag a visual issue' })).toBeVisible();
   await page.getByLabel('Local reviewer label').fill('Portal reviewer');
@@ -698,10 +775,23 @@ test('portal gallery opens before evidence, progresses asynchronously, and keeps
   await expect(page.locator('#execution-log')).toContainText('[REDACTED]');
   await expect(page.locator('#execution-log')).not.toContainText(syntheticSecret);
 
+  await page.locator('.gallery-viewer').focus();
+  await expect(page.locator('.gallery-viewer')).toBeFocused();
   await page.keyboard.press('ArrowRight');
   await expect(page).toHaveURL(/item=gitem_[a-f0-9]{16}/);
+  await expect.poll(() => page.locator('.gallery-selected-image').getAttribute('src')).not.toBe(firstMediaSource);
+  await expect(page.locator('.gallery-selected-image')).toHaveCount(1);
+  const contextToggle = page.locator('[data-focus-key="context-toggle"]');
+  await contextToggle.focus();
   await page.keyboard.press('i');
+  await expect(page.getByRole('heading', { name: 'Test context' })).toHaveCount(0);
+  await contextToggle.focus();
+  await page.keyboard.press('i');
+  await expect(page.getByRole('heading', { name: 'Test context' })).toBeVisible();
+  await contextToggle.focus();
   await page.keyboard.press('Escape');
+  await expect(page.getByRole('heading', { name: 'Test context' })).toHaveCount(0);
+  await expect(contextToggle).toBeFocused();
   await page.emulateMedia({ reducedMotion: 'reduce' });
   expect(await page.locator('.gallery-page-skeleton span').first().evaluate((node) => getComputedStyle(node).animationName)).toBe('none');
 
@@ -715,14 +805,619 @@ test('portal gallery opens before evidence, progresses asynchronously, and keeps
   expect(controlSizes.length).toBeGreaterThan(0);
   expect(controlSizes.every(({ minHeight }) => minHeight === '44px'), JSON.stringify(controlSizes)).toBeTruthy();
 
-  await page.goto('/');
-  await expect(page.locator(`a.run-gallery-link[aria-label*="${runId}"]`)).toHaveAttribute('href', `/gallery.html?run=${runId}&from=runs`);
+  await page.evaluate(({ mode, run }) => {
+    const channel = new BroadcastChannel('quitting7oh-audit-console-invalidation-v1');
+    channel.postMessage({ schemaVersion: 1, mode, runId: run, reason: 'purged', occurredAt: new Date().toISOString() });
+    channel.close();
+  }, { mode: 'comparative', run: runId });
+  await expect(page.getByRole('heading', { name: 'This run was purged' })).toBeVisible();
+  await expect(page.locator('.gallery-selected-image, .gallery-selected-video')).toHaveCount(0);
+  await expect(page.locator('#gallery-workbench')).toBeEmpty();
+  await expect(page.locator('#gallery-refresh')).toBeDisabled();
+
   await page.goto(`/report.html?run=${encodeURIComponent(runId)}`);
   await expect(page.locator('#visual-gallery-link')).toBeVisible();
   await expect(page.locator('#visual-gallery-link')).toHaveAttribute('href', `/gallery.html?run=${runId}&from=report`);
 });
 
-test('sealed archive gallery is the same bounded read-only workbench over HTTP and file URLs', async ({ page, request }) => {
+test('characterization: single-site gallery reviews attention first and guards exact baseline mutations at wide and narrow widths', async ({ page }) => {
+  const runId = 'single-site-gallery-ui-fixture';
+  const changedId = 'gitem_1111111111111111';
+  const gapId = 'gitem_2222222222222222';
+  const browseId = 'gitem_3333333333333333';
+  const evidenceId = `sha256:${'e'.repeat(64)}`;
+  const baselineId = 'baseline-active-one';
+  const identity = {
+    schemaVersion: 1,
+    mode: 'single-site',
+    deploymentRole: 'preview',
+    route: '/meetings/',
+    targetId: 'single-site-mobile-chromium',
+    viewport: { width: 390, height: 844 },
+    theme: 'dark',
+    auditId: 'MEET-001',
+    capturePoint: 'meeting-list-loaded',
+    renderingFingerprint: `sha256:${'f'.repeat(64)}`,
+  };
+  const changed = {
+    itemId: changedId,
+    title: '<img src=x onerror="window.singleSiteInjected=true"> Meeting layout changed',
+    suite: 'Meetings', auditId: 'MEET-001', caseId: 'MEET-001.mobile', targetId: identity.targetId,
+    severity: 'P1', kind: 'image', findingCount: 0, coverageGap: false,
+    comparison: { status: 'CHANGED', differingPixelRatio: 0.12, reason: 'Material spacing and clipping changed.' },
+    identity, evidenceId, eligible: true, ineligibilityReasons: [],
+    current: { sha256: `sha256:${'c'.repeat(64)}` },
+    baseline: { baselineId, approvedAt: '2026-08-25T12:00:00.000Z' },
+    diff: { sha256: `sha256:${'d'.repeat(64)}` },
+  };
+  const gap = {
+    itemId: gapId, title: 'Search interaction recording', suite: 'Search', auditId: 'SEARCH-001', caseId: 'SEARCH-001.mobile',
+    targetId: 'single-site-mobile-chromium', severity: 'P2', kind: 'video', findingCount: 0, coverageGap: true,
+    comparison: { status: 'absent', reason: 'Interaction videos are reviewed as behavior evidence, not pixel baselines.' },
+    identity: { ...identity, route: '/search/', auditId: 'SEARCH-001', capturePoint: 'search-results' },
+    evidenceId: null, eligible: false, ineligibilityReasons: ['Only PNG checkpoints can become baselines.'], baseline: null,
+  };
+  const browse = {
+    itemId: browseId, title: 'Stable home hero', suite: 'Navigation', auditId: 'NAV-001', caseId: 'NAV-001.desktop',
+    targetId: 'single-site-desktop-chromium', severity: 'P3', kind: 'image', findingCount: 0, coverageGap: false,
+    comparison: { status: 'absent', reason: 'No approved baseline exists.' },
+    identity: { ...identity, route: '/', targetId: 'single-site-desktop-chromium', auditId: 'NAV-001', capturePoint: 'home-hero' },
+    evidenceId: `sha256:${'a'.repeat(64)}`, eligible: true, ineligibilityReasons: [], baseline: null,
+    current: { sha256: `sha256:${'b'.repeat(64)}` },
+  };
+  const rows = [browse, gap, changed];
+  let baselineStoreRevision = 7;
+  const mutations: Array<{ path: string; body: Record<string, unknown> }> = [];
+  const tinyPng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M/wHwAEAQH/2pQmWQAAAABJRU5ErkJggg==', 'base64');
+
+  await page.route('**/api/single-site/**', async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    const galleryRoot = `/api/single-site/runs/${runId}/gallery`;
+    if (request.method() === 'GET' && url.pathname === galleryRoot) {
+      return route.fulfill({ json: {
+        schemaVersion: 1, mode: 'single-site', phase: 'sealed', publicationRevision: '11111111111111111111111111111111',
+        lifecycle: { status: 'completed' }, baselineStoreRevision,
+        mutationCapability: { authorized: true }, summary: { total: rows.length, images: 2, videos: 1 },
+        facets: { suites: ['Meetings', 'Navigation', 'Search'] },
+      } });
+    }
+    if (request.method() === 'GET' && url.pathname === `${galleryRoot}/items`) {
+      const scope = url.searchParams.get('scope') ?? 'all';
+      const kind = url.searchParams.get('kind') ?? '';
+      const suite = url.searchParams.get('suite') ?? '';
+      const anchor = url.searchParams.get('anchor');
+      let items = rows.filter((item) => (scope !== 'attention'
+        || item.comparison.status === 'CHANGED' || item.coverageGap));
+      if (kind) items = items.filter((item) => item.kind === kind);
+      if (suite) items = items.filter((item) => item.suite === suite);
+      const anchored = rows.find(({ itemId }) => itemId === anchor);
+      const anchorExcluded = Boolean(anchored && !items.includes(anchored));
+      if (anchored && anchorExcluded) items = [anchored, ...items];
+      return route.fulfill({ json: {
+        schemaVersion: 1, mode: 'single-site', publicationRevision: '11111111111111111111111111111111',
+        baselineStoreRevision, items, total: rows.length, filteredTotal: items.length,
+        offset: 0, limit: 50, hasMore: false, nextOffset: rows.length, hasPrevious: false,
+        previousOffset: 0, anchorExcluded,
+        queuePosition: anchored ? { itemId: anchored.itemId, sourceOrdinal: rows.indexOf(anchored) + 1, sourceTotal: rows.length, pageOrdinal: 1 } : null,
+        scan: { offset: 0, nextOffset: rows.length, rows: rows.length, complete: true },
+      } });
+    }
+    const itemMatch = url.pathname.match(new RegExp(`^${galleryRoot}/items/([A-Za-z0-9._:-]+)$`));
+    if (request.method() === 'GET' && itemMatch) {
+      const item = rows.find(({ itemId }) => itemId === itemMatch[1]);
+      return item ? route.fulfill({ json: { item: {
+        ...item,
+        urls: item.kind === 'video'
+          ? { current: `${galleryRoot}/items/${item.itemId}/media/current` }
+          : {
+              current: `${galleryRoot}/items/${item.itemId}/media/current`,
+              ...(item.baseline ? { baseline: `/api/single-site/visual-baselines/${baselineId}/media` } : {}),
+              ...('diff' in item && item.diff ? { diff: `${galleryRoot}/items/${item.itemId}/media/diff` } : {}),
+            },
+      } } }) : route.fulfill({ status: 404, json: { error: 'missing' } });
+    }
+    if (request.method() === 'GET' && (url.pathname.endsWith('/media/current') || url.pathname.endsWith('/media/diff') || url.pathname.endsWith('/media'))) {
+      return route.fulfill({ status: 200, contentType: 'image/png', body: tinyPng });
+    }
+    if (request.method() === 'GET' && url.pathname === '/api/single-site/visual-baselines') {
+      return route.fulfill({ json: { schemaVersion: 1, mode: 'single-site', storeRevision: 7, items: [], total: 0 } });
+    }
+    if (request.method() === 'POST' && url.pathname.endsWith('/replace')) {
+      const body = request.postDataJSON();
+      mutations.push({ path: url.pathname, body });
+      baselineStoreRevision = 8;
+      return route.fulfill({ json: { schemaVersion: 1, mode: 'single-site', storeRevision: 8, baseline: changed.baseline } });
+    }
+    return route.fulfill({ status: 404, json: { error: 'unhandled fixture route' } });
+  });
+
+  await page.goto(`/gallery.html?mode=single-site&run=${runId}&from=report`);
+  await expect(page.locator('.single-site-gallery[data-gallery-controller="shared-core"]')).toHaveCount(1);
+  await expect(page.locator('#gallery-back')).toHaveAttribute('href', `/report.html?mode=single-site&run=${runId}`);
+  await expect(page.locator('.single-site-review-queue')).toContainText('2 shown');
+  await expect(page.locator('.single-site-queue-item').first()).toContainText('Meeting layout changed');
+  expect(await page.evaluate(() => (window as any).singleSiteInjected)).toBeUndefined();
+  await expect(page.locator('.single-site-media-pane:visible')).toHaveCount(3);
+  await expect(page.locator('.single-site-review-context')).toContainText('/meetings/');
+  await expect(page.locator('.single-site-review-context')).toContainText('MEET-001.mobile');
+
+  await page.locator('.single-site-gallery').focus();
+  await page.keyboard.press('?');
+  await expect(page.getByRole('dialog', { name: 'Gallery keyboard shortcuts' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Gallery keyboard shortcuts' })).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('dialog', { name: 'Gallery keyboard shortcuts' })).toHaveCount(0);
+  await page.locator('.single-site-gallery').focus();
+  await page.keyboard.press(']');
+  await expect(page.locator('#single-site-baseline-tab')).toHaveAttribute('aria-pressed', 'true');
+  await page.keyboard.press('[');
+  await expect(page.locator('#single-site-current-tab')).toHaveAttribute('aria-pressed', 'true');
+  await page.keyboard.press('ArrowRight');
+  await expect(page).toHaveURL(new RegExp(`item=${gapId}`));
+  await page.getByRole('button', { name: 'Browse all evidence' }).first().click();
+  await expect(page.locator('.single-site-review-queue')).toContainText('3 shown');
+  await page.getByLabel('Suite').selectOption('Navigation');
+  await expect(page.locator('.single-site-queue-item')).toHaveCount(1);
+  await expect(page.locator('.single-site-queue-item')).toContainText('Stable home hero');
+  await page.getByRole('button', { name: 'Clear filters' }).click();
+  await page.getByRole('button', { name: /Meeting layout changed/ }).click();
+
+  await page.getByRole('button', { name: 'Replace with current' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Replace visual baseline' });
+  await expect(dialog).toBeVisible();
+  await expect(dialog).toContainText('/meetings/');
+  await expect(dialog).toContainText('meeting-list-loaded');
+  await expect(dialog).toContainText(evidenceId);
+  const confirmation = `REPLACE ${baselineId} ${evidenceId}`;
+  await expect(page.locator('#baseline-confirmation-copy')).toHaveText(confirmation);
+  await page.getByLabel('Required rationale').fill('Reviewed the redesign and approved this exact visual state.');
+  await page.getByLabel('Type the exact confirmation shown below').fill(confirmation);
+  await page.getByRole('button', { name: 'Replace baseline' }).click();
+  await expect(dialog).toBeHidden();
+  expect(mutations).toHaveLength(1);
+  expect(mutations[0]).toMatchObject({
+    path: `/api/single-site/visual-baselines/${baselineId}/replace`,
+    body: { expectedStoreRevision: 7, runId, evidenceId, confirmation },
+  });
+  expect(mutations[0]!.body).not.toHaveProperty('identity');
+  expect(mutations[0]!.body).not.toHaveProperty('actorId');
+
+  await page.getByRole('button', { name: 'Revoke baseline' }).click();
+  await expect(page.locator('#baseline-confirmation-copy')).toHaveText(`REVOKE ${baselineId}`);
+  await page.getByRole('button', { name: 'Cancel' }).last().click();
+  await page.getByRole('button', { name: 'Delete baseline media' }).click();
+  await expect(page.getByRole('dialog', { name: 'Delete visual baseline' })).toContainText(/tombstoned provenance/i);
+  await page.getByRole('button', { name: 'Cancel' }).last().click();
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(page.locator('.single-site-media-pane:visible')).toHaveCount(1);
+  await page.getByRole('tab', { name: 'Difference' }).click();
+  await expect(page.locator('[data-view="diff"]')).toBeVisible();
+  const touchTargets = await page.locator('.single-site-media-tab').evaluateAll((nodes) => nodes.map((node) => node.getBoundingClientRect().height));
+  expect(touchTargets.every((height) => height >= 44)).toBeTruthy();
+});
+
+test('characterization: single-site gallery retries head and detail failures while consuming the bounded page route', async ({ page }) => {
+  const runId = 'single-site-gallery-retry-fixture';
+  const itemId = 'gitem_4444444444444444';
+  const revision = '44444444444444444444444444444444';
+  const row = {
+    itemId,
+    title: 'Retryable navigation evidence',
+    suite: 'Navigation', auditId: 'NAV-001', caseId: 'NAV-001.retry', targetId: 'single-site-desktop-chromium',
+    severity: 'P1', kind: 'image', findingCount: 1, coverageGap: false,
+    comparison: { status: 'CHANGED', reason: 'The navigation target moved.' },
+    identity: { route: '/', targetId: 'single-site-desktop-chromium', capturePoint: 'navigation-loaded', theme: 'light' },
+    eligible: false, ineligibilityReasons: ['Fixture evidence is read-only.'], baseline: null,
+  };
+  let headAttempts = 0;
+  let detailAttempts = 0;
+  let releaseHead!: () => void;
+  let releaseDetail!: () => void;
+  const headGate = new Promise<void>((resolve) => { releaseHead = resolve; });
+  const detailGate = new Promise<void>((resolve) => { releaseDetail = resolve; });
+  const pageQueries: string[] = [];
+  const tinyPng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M/wHwAEAQH/2pQmWQAAAABJRU5ErkJggg==', 'base64');
+
+  await page.route('**/api/single-site/**', async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    const galleryRoot = `/api/single-site/runs/${runId}/gallery`;
+    if (request.method() === 'GET' && url.pathname === galleryRoot) {
+      headAttempts += 1;
+      if (headAttempts === 1) return route.fulfill({ status: 503, json: { error: 'Finalized gallery index is temporarily unavailable.' } });
+      await headGate;
+      return route.fulfill({ json: {
+        schemaVersion: 1, mode: 'single-site', phase: 'sealed', publicationRevision: revision,
+        lifecycle: { status: 'completed', terminal: true }, baselineStoreRevision: 2,
+        mutationCapability: { authorized: false }, summary: { total: 1, images: 1, videos: 0 }, maximumItems: 10_000,
+      } });
+    }
+    if (request.method() === 'GET' && url.pathname === `${galleryRoot}/items`) {
+      pageQueries.push(url.search);
+      return route.fulfill({ json: {
+        schemaVersion: 1, mode: 'single-site', publicationRevision: revision, baselineStoreRevision: 2,
+        items: [row], total: 1, offset: 0, limit: 100, hasMore: false, nextOffset: 1,
+      } });
+    }
+    if (request.method() === 'GET' && url.pathname === `${galleryRoot}/items/${itemId}`) {
+      detailAttempts += 1;
+      if (detailAttempts === 1) return route.fulfill({ status: 503, json: { error: 'Evidence detail is temporarily unavailable.' } });
+      await detailGate;
+      return route.fulfill({ json: { item: {
+        ...row,
+        urls: { current: `${galleryRoot}/items/${itemId}/media/current`, baseline: null, diff: null, poster: null },
+        testContext: { testId: 'tests/navigation.spec.ts::retry', observed: 'Navigation loaded after retry.' },
+      } } });
+    }
+    if (request.method() === 'GET' && url.pathname === `${galleryRoot}/items/${itemId}/media/current`) {
+      return route.fulfill({ status: 200, contentType: 'image/png', body: tinyPng });
+    }
+    return route.fulfill({ status: 404, json: { error: 'unhandled fixture route' } });
+  });
+
+  await page.goto(`/gallery.html?mode=single-site&run=${runId}`);
+  await expect(page.locator('#gallery-back')).toHaveAttribute('href', `/run.html?mode=single-site&run=${runId}&view=evidence`);
+  await expect(page.locator('#gallery-fatal')).toBeVisible();
+  await expect(page.locator('#gallery-fatal-message')).toContainText('temporarily unavailable');
+  await page.getByRole('button', { name: 'Retry from current status' }).click();
+  await expect(page.locator('#gallery-loading')).toBeVisible();
+  await expect(page.locator('#gallery-connection')).toHaveText('Loading gallery…');
+  releaseHead();
+
+  await expect(page.getByRole('button', { name: /Retryable navigation evidence/ })).toBeVisible();
+  expect(pageQueries).toHaveLength(1);
+  expect(Object.fromEntries(new URLSearchParams(pageQueries[0]))).toEqual({
+    offset: '0', limit: '50', revision, baselineStoreRevision: '2',
+    scope: 'attention', finding: 'all', coverage: 'all', visual: 'all',
+  });
+  await expect(page.getByRole('heading', { name: 'Selected evidence is unavailable' })).toBeVisible();
+  await expect(page.locator('.single-site-review-context')).toContainText('Loading context');
+  await page.getByRole('button', { name: 'Retry selected evidence' }).click();
+  await expect(page.locator('.single-site-review-workspace .gallery-loader')).toContainText('Loading selected evidence');
+  releaseDetail();
+  await expect(page.getByRole('heading', { name: 'Retryable navigation evidence' })).toBeVisible();
+  await expect(page.locator('.single-site-review-context')).toContainText('tests/navigation.spec.ts::retry');
+  expect(headAttempts).toBe(2);
+  expect(detailAttempts).toBe(2);
+});
+
+test('characterization: single-site live gallery deep-links by anchor and supersedes stale bounded filters', async ({ page }) => {
+  const runId = 'single-site-gallery-anchor-race-fixture';
+  const revision = '77777777777777777777777777777777';
+  const itemId = 'gitem_000000000000006e';
+  const imageId = 'gitem_000000000000006f';
+  const tailId = 'gitem_0000000000000078';
+  const galleryRoot = `/api/single-site/runs/${runId}/gallery`;
+  const selected = {
+    itemId, title: 'Anchored interaction evidence', suite: 'Navigation', auditId: 'NAV-110', caseId: 'NAV-110.video',
+    targetId: 'single-site-desktop-chromium', severity: 'P2', kind: 'video', findingCount: 1, coverageGap: false,
+    comparison: { status: 'absent', reason: 'Videos retain interaction evidence without a pixel baseline.' },
+    identity: { route: '/deep/', targetId: 'single-site-desktop-chromium', capturePoint: 'interaction-complete', theme: 'light' },
+    eligible: false, ineligibilityReasons: ['Videos are not baseline candidates.'], baseline: null,
+  };
+  const image = {
+    ...selected, itemId: imageId, title: 'Stale image-filter result', auditId: 'NAV-111', caseId: 'NAV-111.image',
+    kind: 'image', identity: { ...selected.identity, capturePoint: 'static-checkpoint' },
+  };
+  const tail = {
+    ...selected, itemId: tailId, title: 'Final bounded interaction', auditId: 'NAV-120', caseId: 'NAV-120.video',
+    identity: { ...selected.identity, capturePoint: 'final-interaction' },
+  };
+  let releaseStale!: () => void;
+  let markStaleStarted!: () => void;
+  const staleGate = new Promise<void>((resolve) => { releaseStale = resolve; });
+  const staleStarted = new Promise<void>((resolve) => { markStaleStarted = resolve; });
+  const pageQueries: URLSearchParams[] = [];
+
+  const response = (items: typeof selected[], anchorExcluded = false, overrides: Record<string, unknown> = {}) => ({
+    schemaVersion: 1, mode: 'single-site', publicationRevision: revision, baselineStoreRevision: 4, reviewRevision: 2,
+    items, total: 120, filteredTotal: null, offset: 84, limit: 50, hasMore: true, nextOffset: 112,
+    hasPrevious: true, previousOffset: 34, anchorExcluded,
+    queuePosition: { itemId, sourceOrdinal: 110, sourceTotal: 120, pageOrdinal: 2 },
+    scan: { offset: 84, nextOffset: 112, rows: 28, complete: false },
+    ...overrides,
+  });
+
+  await page.route('**/api/single-site/**', async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    if (request.method() === 'GET' && url.pathname === galleryRoot) {
+      return route.fulfill({ json: {
+        schemaVersion: 1, mode: 'single-site', phase: 'sealed', publicationRevision: revision,
+        lifecycle: { status: 'completed', terminal: true }, baselineStoreRevision: 4, reviewRevision: 2,
+        mutationCapability: { authorized: false }, summary: { total: 120, images: 80, videos: 40 },
+        facets: { suites: ['Navigation'] }, maximumItems: 10_000,
+      } });
+    }
+    if (request.method() === 'GET' && url.pathname === `${galleryRoot}/items`) {
+      pageQueries.push(new URLSearchParams(url.search));
+      if (url.searchParams.get('offset') === '112' && !url.searchParams.has('anchor')) {
+        return route.fulfill({ json: response([tail], false, {
+          offset: 112, hasMore: false, nextOffset: 120, previousOffset: 84, queuePosition: null,
+          scan: { offset: 112, nextOffset: 120, rows: 8, complete: false },
+        }) });
+      }
+      if (url.searchParams.get('kind') === 'image') {
+        markStaleStarted();
+        await staleGate;
+        return route.fulfill({ json: response([image], true) }).catch(() => undefined);
+      }
+      if (url.searchParams.get('kind') === 'video') return route.fulfill({ json: response([selected]) });
+      return route.fulfill({ json: response([image, selected]) });
+    }
+    if (request.method() === 'GET' && [itemId, tailId].some((id) => url.pathname === `${galleryRoot}/items/${id}`)) {
+      const detailItem = url.pathname.endsWith(tailId) ? tail : selected;
+      return route.fulfill({ json: { item: {
+        ...detailItem,
+        urls: { current: `${galleryRoot}/items/${detailItem.itemId}/media/current`, baseline: null, diff: null, poster: null },
+        testContext: { testId: 'tests/navigation.spec.ts::deep-link', observed: 'Interaction completed.' },
+      } } });
+    }
+    if (request.method() === 'GET' && url.pathname.endsWith('/media/current')) {
+      return route.fulfill({ status: 200, contentType: 'video/webm', body: Buffer.from([]) });
+    }
+    return route.fulfill({ status: 404, json: { error: 'unhandled fixture route' } });
+  });
+
+  await page.goto(`/gallery.html?mode=single-site&run=${runId}&item=${itemId}`);
+  await expect(page.getByRole('heading', { name: 'Anchored interaction evidence' })).toBeVisible();
+  await expect(page.locator('.single-site-viewer-navigation')).toContainText('110 of 120');
+  expect(pageQueries).toHaveLength(1);
+  expect(pageQueries[0]!.get('anchor')).toBe(itemId);
+  expect(pageQueries[0]!.get('offset')).toBe('0');
+  expect(pageQueries[0]!.get('limit')).toBe('50');
+
+  const evidenceFilter = page.locator('.gallery-filter', { hasText: 'Evidence' }).locator('select');
+  await evidenceFilter.selectOption('image');
+  await staleStarted;
+  await evidenceFilter.selectOption('video');
+  await expect(page.getByRole('heading', { name: 'Anchored interaction evidence' })).toBeVisible();
+  releaseStale();
+  await page.waitForTimeout(100);
+  await expect(page.getByRole('heading', { name: 'Anchored interaction evidence' })).toBeVisible();
+  await expect(page.getByRole('button', { name: /Stale image-filter result/ })).toHaveCount(0);
+  expect(pageQueries).toHaveLength(3);
+  expect(pageQueries.map((query) => query.get('kind'))).toEqual([null, 'image', 'video']);
+  expect(pageQueries.every((query) => query.get('anchor') === itemId)).toBeTruthy();
+  await page.getByRole('button', { name: 'Next →' }).click();
+  await expect(page.getByRole('heading', { name: 'Final bounded interaction' })).toBeVisible();
+  expect(pageQueries).toHaveLength(4);
+  expect(pageQueries[3]!.get('offset')).toBe('112');
+  expect(pageQueries[3]!.has('anchor')).toBe(false);
+});
+
+test('characterization: single-site baseline replacement retains revision binding and removes the stale diff immediately', async ({ page }) => {
+  const runId = 'single-site-gallery-waiver-fixture';
+  const itemId = 'gitem_5555555555555555';
+  const evidenceId = `sha256:${'5'.repeat(64)}`;
+  const oldBaselineId = 'baseline-finding-old';
+  const replacementBaselineId = 'baseline-finding-new';
+  const galleryRoot = `/api/single-site/runs/${runId}/gallery`;
+  const original = {
+    itemId, title: 'Unresolved header overlap', suite: 'Layout', auditId: 'LAYOUT-001', caseId: 'LAYOUT-001.header',
+    targetId: 'single-site-mobile-chromium', route: '/', capturePoint: 'header-open', theme: 'light',
+    severity: 'P1', kind: 'image', findingCount: 1, coverageGap: false,
+    comparison: { status: 'CHANGED', reason: 'Header overlap is visible and remains an unresolved Finding.' },
+    identity: { route: '/', targetId: 'single-site-mobile-chromium', capturePoint: 'header-open', theme: 'light' },
+    evidenceId, eligible: true, ineligibilityReasons: [],
+    baseline: { baselineId: oldBaselineId, approvedAt: '2026-08-25T12:00:00.000Z' },
+    urls: {
+      current: `${galleryRoot}/items/${itemId}/media/current`,
+      baseline: `/api/single-site/visual-baselines/${oldBaselineId}/media`,
+      diff: `${galleryRoot}/items/${itemId}/media/diff`,
+      poster: null,
+    },
+  };
+  const stale = {
+    ...original,
+    comparison: {
+      status: 'unavailable',
+      reason: 'The active baseline changed after this run finalized. A stale difference image is intentionally withheld.',
+    },
+    baseline: { baselineId: replacementBaselineId, approvedAt: '2026-08-25T13:00:00.000Z' },
+    staleComparisonWithheld: true,
+    urls: {
+      current: `${galleryRoot}/items/${itemId}/media/current`,
+      baseline: `/api/single-site/visual-baselines/${replacementBaselineId}/media`,
+      diff: null,
+      poster: null,
+    },
+  };
+  let replaced = false;
+  let detailRequests = 0;
+  let diffRequests = 0;
+  const mutations: Array<Record<string, unknown>> = [];
+  const tinyPng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M/wHwAEAQH/2pQmWQAAAABJRU5ErkJggg==', 'base64');
+
+  await page.route('**/api/single-site/**', async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    if (request.method() === 'GET' && url.pathname === galleryRoot) {
+      return route.fulfill({ json: {
+        schemaVersion: 1, mode: 'single-site', phase: 'sealed', publicationRevision: '5'.repeat(32),
+        lifecycle: { status: 'completed', terminal: true }, baselineStoreRevision: replaced ? 8 : 7,
+        mutationCapability: { authorized: true }, summary: { total: 1, images: 1, videos: 0 }, maximumItems: 10_000,
+      } });
+    }
+    if (request.method() === 'GET' && url.pathname === `${galleryRoot}/items`) {
+      return route.fulfill({ json: {
+        schemaVersion: 1, mode: 'single-site', publicationRevision: '5'.repeat(32), baselineStoreRevision: replaced ? 8 : 7,
+        items: [replaced ? stale : original], total: 1, offset: 0, limit: 100, hasMore: false, nextOffset: 1,
+      } });
+    }
+    if (request.method() === 'GET' && url.pathname === `${galleryRoot}/items/${itemId}`) {
+      detailRequests += 1;
+      return route.fulfill({ json: { item: replaced ? stale : original } });
+    }
+    if (request.method() === 'POST' && url.pathname === `/api/single-site/visual-baselines/${oldBaselineId}/replace`) {
+      mutations.push(request.postDataJSON());
+      replaced = true;
+      return route.fulfill({ json: {
+        schemaVersion: 1, mode: 'single-site', storeRevision: 8,
+        baseline: { baselineId: replacementBaselineId },
+      } });
+    }
+    if (request.method() === 'GET' && url.pathname.endsWith('/media/diff')) diffRequests += 1;
+    if (request.method() === 'GET' && (url.pathname.includes('/media/') || url.pathname.endsWith('/media'))) {
+      return route.fulfill({ status: 200, contentType: 'image/png', body: tinyPng });
+    }
+    return route.fulfill({ status: 404, json: { error: 'unhandled fixture route' } });
+  });
+
+  await page.goto(`/gallery.html?mode=single-site&run=${runId}`);
+  await expect(page.getByText('Visual review: Changed')).toBeVisible();
+  await page.getByRole('button', { name: 'Replace with current' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Replace visual baseline' });
+  await expect(page.getByLabel('Finding waiver rationale')).toBeVisible();
+  await expect(page.getByLabel('Finding waiver rationale')).toHaveAttribute('required', '');
+  const confirmation = `REPLACE ${oldBaselineId} ${evidenceId}`;
+  await page.getByLabel('Required rationale').fill('Accept this exact redesign state while retaining the unresolved Finding.');
+  await page.getByLabel('Type the exact confirmation shown below').fill(confirmation);
+  await page.getByRole('button', { name: 'Replace baseline' }).click();
+  expect(mutations).toHaveLength(0);
+  await expect(page.getByLabel('Finding waiver rationale')).toBeFocused();
+
+  const waiver = 'The header overlap is tracked separately and this visual is intentionally approved for comparison only.';
+  await page.getByLabel('Finding waiver rationale').fill(waiver);
+  await page.getByRole('button', { name: 'Replace baseline' }).click();
+  await expect(dialog).toBeHidden();
+  expect(mutations).toHaveLength(1);
+  expect(mutations[0]).toMatchObject({
+    expectedStoreRevision: 7, runId, evidenceId, findingWaiverReason: waiver, confirmation,
+  });
+  expect(mutations[0]).not.toHaveProperty('identity');
+  expect(mutations[0]).not.toHaveProperty('actorId');
+
+  await expect(page.getByText('Visual review: Unavailable')).toBeVisible();
+  await expect(page.locator('[data-view="diff"] .single-site-media-empty')).toContainText('No visual difference image was published');
+  await expect(page.locator(`img[src*="${encodeURIComponent(itemId)}/media/diff"]`)).toHaveCount(0);
+  expect(detailRequests).toBeGreaterThanOrEqual(2);
+  expect(diffRequests).toBeLessThanOrEqual(1);
+});
+
+test('characterization: single-site visual disposition remains guarded and recovers from stale review CAS', async ({ page }) => {
+  const runId = 'single-site-gallery-review-fixture';
+  const itemId = 'gitem_6666666666666666';
+  const galleryRoot = `/api/single-site/runs/${runId}/gallery`;
+  const rationale = 'The redesigned header spacing is intentional and matches the approved launch composition.';
+  let reviewRevision = 3;
+  let reviewed = false;
+  let releaseReview!: () => void;
+  const reviewGate = new Promise<void>((resolve) => { releaseReview = resolve; });
+  const reviewRequests: Array<Record<string, unknown>> = [];
+  const changed = {
+    itemId, title: 'Changed launch header', suite: 'Layout', auditId: 'LAYOUT-002', caseId: 'LAYOUT-002.header',
+    targetId: 'single-site-desktop-chromium', route: '/', capturePoint: 'header-ready', theme: 'light',
+    severity: 'P1', kind: 'image', findingCount: 2, coverageGap: false,
+    comparison: { status: 'CHANGED', comparisonStatus: 'CHANGED', reason: 'Header spacing differs from the active baseline.', review: null },
+    identity: { route: '/', targetId: 'single-site-desktop-chromium', capturePoint: 'header-ready', theme: 'light' },
+    eligible: true, ineligibilityReasons: [],
+    baseline: { baselineId: 'baseline-review-source', approvedAt: '2026-08-25T12:00:00.000Z' },
+    urls: {
+      current: `${galleryRoot}/items/${itemId}/media/current`,
+      baseline: '/api/single-site/visual-baselines/baseline-review-source/media',
+      diff: `${galleryRoot}/items/${itemId}/media/diff`,
+      poster: null,
+    },
+  };
+  const reviewedItem = {
+    ...changed,
+    comparison: {
+      ...changed.comparison,
+      status: 'REVIEWED',
+      review: {
+        disposition: 'accepted-change', rationale, actorId: 'portal-operator',
+        reviewedAt: '2026-08-25T14:00:00.000Z', reviewRevision: 5, eventId: 'review-event-fixture',
+      },
+    },
+  };
+  const tinyPng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M/wHwAEAQH/2pQmWQAAAABJRU5ErkJggg==', 'base64');
+
+  await page.route('**/api/single-site/**', async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    if (request.method() === 'GET' && url.pathname === galleryRoot) {
+      return route.fulfill({ json: {
+        schemaVersion: 1, mode: 'single-site', phase: 'sealed', publicationRevision: '6'.repeat(32),
+        lifecycle: { status: 'completed', terminal: true }, baselineStoreRevision: 7, reviewRevision,
+        mutationCapability: { authorized: true }, summary: { total: 1, images: 1, videos: 0 }, maximumItems: 10_000,
+      } });
+    }
+    if (request.method() === 'GET' && url.pathname === `${galleryRoot}/items`) {
+      return route.fulfill({ json: {
+        schemaVersion: 1, mode: 'single-site', publicationRevision: '6'.repeat(32), baselineStoreRevision: 7, reviewRevision,
+        items: [reviewed ? reviewedItem : changed], total: 1, offset: 0, limit: 100, hasMore: false, nextOffset: 1,
+      } });
+    }
+    if (request.method() === 'GET' && url.pathname === `${galleryRoot}/items/${itemId}`) {
+      return route.fulfill({ json: { item: reviewed ? reviewedItem : changed } });
+    }
+    if (request.method() === 'POST' && url.pathname === `${galleryRoot}/items/${itemId}/review`) {
+      reviewRequests.push(request.postDataJSON());
+      if (reviewRequests.length === 1) {
+        reviewRevision = 4;
+        return route.fulfill({ status: 409, json: { error: 'Visual review revision changed.', code: 'SINGLE_SITE_VISUAL_REVIEW_CAS' } });
+      }
+      await reviewGate;
+      reviewed = true;
+      reviewRevision = 5;
+      return route.fulfill({ status: 201, json: {
+        schemaVersion: 1, mode: 'single-site', jobId: runId, itemId,
+        baselineStoreRevision: 7, reviewRevision, status: 'REVIEWED', disposition: 'accepted-change',
+        eventId: 'review-event-fixture', reviewKey: 'review-key-fixture', idempotent: false,
+        policyEffects: { deterministicFindings: 'none', siteHealth: 'none', coverage: 'none', immutableRunPublication: 'none' },
+      } });
+    }
+    if (request.method() === 'GET' && (url.pathname.includes('/media/') || url.pathname.endsWith('/media'))) {
+      return route.fulfill({ status: 200, contentType: 'image/png', body: tinyPng });
+    }
+    return route.fulfill({ status: 404, json: { error: 'unhandled fixture route' } });
+  });
+
+  await page.goto(`/gallery.html?mode=single-site&run=${runId}`);
+  await expect(page.getByText('Visual review: Changed')).toBeVisible();
+  await expect(page.getByText(/Findings, coverage, Site Health, and promotion authority remain unchanged/)).toBeVisible();
+  await page.getByRole('button', { name: 'Record visual disposition' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Review changed visual' });
+  await expect(dialog).toContainText(itemId);
+  await dialog.locator('#visual-review-disposition').selectOption('accepted-change');
+  await dialog.getByLabel('Required review rationale').fill(rationale);
+  await dialog.getByLabel('Type the exact visual review confirmation shown below').fill(`REVIEW ${itemId}`);
+  await dialog.getByRole('button', { name: 'Record visual disposition' }).click();
+  await expect(page.locator('#visual-review-dialog-state')).toContainText('Current revisions reloaded');
+  expect(reviewRequests).toHaveLength(1);
+  expect(reviewRequests[0]).toEqual({
+    expectedReviewRevision: 3,
+    expectedBaselineStoreRevision: 7,
+    disposition: 'accepted-change',
+    rationale,
+    idempotencyKey: expect.any(String),
+    confirmation: `REVIEW ${itemId}`,
+  });
+  await expect(dialog.getByLabel('Required review rationale')).toHaveValue(rationale);
+  await expect(dialog.getByLabel('Type the exact visual review confirmation shown below')).toHaveValue(`REVIEW ${itemId}`);
+
+  const retrySubmission = dialog.getByRole('button', { name: 'Record visual disposition' }).click();
+  await expect(dialog).toHaveAttribute('aria-busy', 'true');
+  await expect(page.locator('#visual-review-dialog-state')).toContainText('Saving one guarded');
+  releaseReview();
+  await retrySubmission;
+  await expect(dialog).toBeHidden();
+  await expect(page.getByText('Visual review: Reviewed')).toBeVisible();
+  await expect(page.locator('.single-site-review-actions')).toContainText('Accepted Change');
+  await expect(page.locator('.single-site-review-actions')).toContainText(rationale);
+  await expect(page.locator('.single-site-review-context')).toContainText('2 unresolved');
+  expect(reviewRequests).toHaveLength(2);
+  expect(reviewRequests[1]).toMatchObject({ expectedReviewRevision: 4, expectedBaselineStoreRevision: 7 });
+  expect(reviewRequests[1]!.idempotencyKey).not.toBe(reviewRequests[0]!.idempotencyKey);
+  expect(Object.keys(reviewRequests[1]!).sort()).toEqual([
+    'confirmation', 'disposition', 'expectedBaselineStoreRevision', 'expectedReviewRevision', 'idempotencyKey', 'rationale',
+  ]);
+});
+
+test('characterization: sealed archive has one shared controller over HTTP and offline file URLs', async ({ page, request }) => {
   const shardedRoot = process.env.PORTAL_E2E_SERVER_SHARDED_ARTIFACT_ROOT;
   expect(shardedRoot).toBeTruthy();
   const runId = `gallery-archive-ui-${Date.now()}`;
@@ -773,9 +1468,19 @@ test('sealed archive gallery is the same bounded read-only workbench over HTTP a
   await waitForRun(request, runId);
   await waitForGalleryPhase(request, runId, 'sealed');
 
-  const requests = [] as string[];
+  await page.addInitScript(() => {
+    const runtime = { requests: [] as Array<{ href: string; kind: string; ordinal: number | null; itemId: string | null }> };
+    (window as any).__archiveCharacterization = runtime;
+    window.addEventListener('gallery:archive-request', (event) => {
+      runtime.requests.push({ ...(event as CustomEvent).detail });
+    });
+  });
+  const requests = [] as Array<{ protocol: string; pathname: string }>;
   const consoleErrors = [] as string[];
-  page.on('request', (event) => requests.push(new URL(event.url()).pathname));
+  page.on('request', (event) => {
+    const url = new URL(event.url());
+    requests.push({ protocol: url.protocol, pathname: url.pathname });
+  });
   page.on('console', (event) => { if (event.type() === 'error') consoleErrors.push(event.text()); });
   await page.goto(`/artifacts/${encodeURIComponent(runId)}/checklist/gallery.html`);
   await expect(page.getByRole('heading', { name: 'Visual Evidence Gallery' })).toBeVisible();
@@ -784,8 +1489,28 @@ test('sealed archive gallery is the same bounded read-only workbench over HTTP a
   await expect(page.locator('.gallery-selected-video')).toHaveCount(0);
   await expect(page.locator('#gallery-export-revision')).toHaveText(descriptor.exportRevision.replace('export_', ''));
   await expect(page.locator('button', { hasText: /flag|issue/i })).toHaveCount(0);
-  expect(requests.some((value) => value.endsWith('/manifest.json'))).toBe(false);
-  expect(requests.filter((value) => /\/items\/.*\.html$/.test(value)).length).toBeLessThanOrEqual(10);
+  await expect(page.locator('.gallery-shell')).toHaveCount(1);
+  await expect(page.locator('.gallery-queue')).toHaveCount(1);
+  await expect(page.locator('.gallery-viewer')).toHaveCount(1);
+  await expect(page.locator('.gallery-context')).toHaveCount(1);
+  await expect.poll(() => page.evaluate(() => (
+    (window as any).__archiveCharacterization.requests as Array<{ kind: string }>
+  ).filter(({ kind }) => kind === 'query').length)).toBe(descriptor.query.chunks.length);
+  const httpControllerRequests = await page.evaluate(() => (
+    (window as any).__archiveCharacterization.requests as Array<{
+      href: string; kind: string; ordinal: number | null; itemId: string | null;
+    }>
+  ));
+  const httpControllerRequestKeys = httpControllerRequests.map(({ href, kind, ordinal, itemId }) => (
+    `${kind}|${href}|${ordinal ?? ''}|${itemId ?? ''}`
+  ));
+  expect(new Set(httpControllerRequestKeys).size).toBe(httpControllerRequestKeys.length);
+  expect(requests.filter(({ pathname }) => pathname.endsWith(`/assets/${ARCHIVE_ASSET_DIRECTORY}/gallery-loader.js`))).toHaveLength(1);
+  expect(requests.filter(({ pathname }) => pathname.endsWith(`/assets/${ARCHIVE_ASSET_DIRECTORY}/gallery-archive.js`))).toHaveLength(0);
+  expect(requests.filter(({ pathname }) => pathname.endsWith(`/assets/${ARCHIVE_ASSET_DIRECTORY}/gallery-core.js`))).toHaveLength(0);
+  expect(requests.some(({ pathname }) => pathname.endsWith('/manifest.json'))).toBe(false);
+  expect(requests.some(({ pathname }) => pathname.startsWith('/api/'))).toBe(false);
+  expect(requests.filter(({ pathname }) => /\/items\/.*\.html$/.test(pathname)).length).toBeLessThanOrEqual(10);
 
   await page.locator('#flag-drawer summary').click();
   await expect(page.locator('#flag-state')).toContainText('1 final flag projection');
@@ -794,7 +1519,7 @@ test('sealed archive gallery is the same bounded read-only workbench over HTTP a
   await page.locator('#raw-drawer summary').click();
   await expect(page.locator('#raw-state')).toContainText('raw storage rows');
   await expect(page.locator('.gallery-status')).toContainText('1 of 2');
-  expect(await page.locator('iframe').count()).toBe(0);
+  await expect(page.locator('iframe')).toHaveCount(0);
 
   const search = page.getByLabel('Search tests');
   await search.fill('content success');
@@ -806,6 +1531,8 @@ test('sealed archive gallery is the same bounded read-only workbench over HTTP a
   await expect(page).toHaveURL(/item=gitem_[a-f0-9]{16}/);
 
   consoleErrors.length = 0;
+  requests.length = 0;
+  await page.context().setOffline(true);
   await page.goto(pathToFileURL(join(checklistRoot, 'gallery.html')).href);
   await expect(page.getByRole('heading', { name: 'Visual Evidence Gallery' })).toBeVisible();
   await expect(page.locator('.gallery-viewer h2')).toContainText('Archive navigation failure');
@@ -818,12 +1545,39 @@ test('sealed archive gallery is the same bounded read-only workbench over HTTP a
   await page.getByLabel('Search tests').fill('content success');
   await page.getByLabel('Search tests').press('Enter');
   await expect(page.locator('.gallery-viewer h2')).toContainText('Archive content success');
-  expect(await page.locator('iframe').count()).toBe(0);
+  await page.getByRole('button', { name: 'Clear filters' }).click();
+  await page.locator('.gallery-shell').focus();
+  await page.keyboard.press('ArrowLeft');
+  await expect(page.locator('.gallery-viewer h2')).toContainText('Archive navigation failure');
+  expect(new URL(page.url()).protocol).toBe('file:');
+  await expect(page.locator('button', { hasText: /flag|issue/i })).toHaveCount(0);
+  await expect(page.locator('.gallery-shell')).toHaveCount(1);
+  await expect(page.locator('.gallery-queue')).toHaveCount(1);
+  await expect(page.locator('.gallery-viewer')).toHaveCount(1);
+  await expect(page.locator('.gallery-context')).toHaveCount(1);
+  await expect.poll(() => page.evaluate(() => (
+    (window as any).__archiveCharacterization.requests as Array<{ kind: string }>
+  ).filter(({ kind }) => kind === 'query').length)).toBe(descriptor.query.chunks.length);
+  const fileControllerRequests = await page.evaluate(() => (
+    (window as any).__archiveCharacterization.requests as Array<{
+      href: string; kind: string; ordinal: number | null; itemId: string | null;
+    }>
+  ));
+  const fileControllerRequestKeys = fileControllerRequests.map(({ href, kind, ordinal, itemId }) => (
+    `${kind}|${href}|${ordinal ?? ''}|${itemId ?? ''}`
+  ));
+  expect(new Set(fileControllerRequestKeys).size).toBe(fileControllerRequestKeys.length);
+  expect(requests.filter(({ protocol }) => protocol === 'http:' || protocol === 'https:')).toEqual([]);
+  expect(requests.filter(({ protocol, pathname }) => protocol === 'file:' && pathname.endsWith(`/assets/${ARCHIVE_ASSET_DIRECTORY}/gallery-loader.js`))).toHaveLength(1);
+  expect(requests.filter(({ pathname }) => pathname.endsWith(`/assets/${ARCHIVE_ASSET_DIRECTORY}/gallery-archive.js`))).toHaveLength(0);
+  expect(requests.filter(({ pathname }) => pathname.endsWith(`/assets/${ARCHIVE_ASSET_DIRECTORY}/gallery-core.js`))).toHaveLength(0);
+  await expect(page.locator('iframe')).toHaveCount(0);
   expect(consoleErrors).toEqual([]);
 });
 
 test('canonical reference-scale gallery satisfies KTD10, accessibility, and saved-evidence gates', async ({ playwright, request, baseURL }) => {
   test.skip(process.env.PORTAL_E2E_CANONICAL_PROFILE !== '1', 'Canonical measurements run only in the pinned 2 CPU / 4 GiB Docker service.');
+  test.skip(process.env.PORTAL_E2E_CANONICAL_SCALE !== '1', 'Canonical measurements run in the dedicated fixed-resource scale command.');
   test.setTimeout(720_000);
   expect(baseURL).toBeTruthy();
   const canonicalBaseURL = baseURL!;
@@ -902,6 +1656,11 @@ test('canonical reference-scale gallery satisfies KTD10, accessibility, and save
   await page.goto(route);
   await page.waitForFunction(() => performance.getEntriesByName('gallery:first-usable').length === 1);
   await expect(page.locator('.gallery-viewer h2')).toBeVisible();
+  const initialBoundedPages = await page.evaluate(() => performance.getEntriesByType('resource').filter((entry) => {
+    const url = new URL(entry.name);
+    return /\/api\/runs\/[^/]+\/gallery\/items$/.test(url.pathname);
+  }).length);
+  expect(initialBoundedPages, 'First usable must not trigger an unconditional lookahead page.').toBe(1);
   await page.screenshot({ path: join(outputRoot!, 'gallery-scale-workbench.png'), fullPage: true });
 
   const shell = page.locator('.gallery-shell');
@@ -990,23 +1749,53 @@ test('canonical reference-scale gallery satisfies KTD10, accessibility, and save
   const warmupTransitions = fastIteration ? 0 : 10;
   const warmMeasureCount = fastIteration ? 2 : 100;
   const warmSamples: number[] = [];
+  const browserReadySamples: number[] = [];
   let peakGalleryDomNodes = 0;
   let peakImages = 0;
   let peakVideos = 0;
+  const warmDetailRequestUrls: string[] = [];
+  const captureWarmDetailRequest = (galleryRequest: { url(): string }) => {
+    const url = new URL(galleryRequest.url());
+    if (/\/api\/runs\/[^/]+\/gallery\/items\/gitem_[a-f0-9]{16}$/.test(url.pathname)) {
+      warmDetailRequestUrls.push(url.href);
+    }
+  };
+  page.on('request', captureWarmDetailRequest);
 
   for (let index = 0; index < warmupTransitions + warmMeasureCount; index += 1) {
     const oldItemId = new URL(page.url()).searchParams.get('item');
     const oldTitle = await page.locator('.gallery-viewer h2').textContent();
-    await page.evaluate(() => {
+    const browserReadyMs = await page.evaluate(async () => {
+      const priorTitle = document.querySelector('.gallery-viewer h2')?.textContent ?? '';
       performance.clearMarks('gallery:item-input');
       performance.mark('gallery:item-input');
+      const startedAt = performance.getEntriesByName('gallery:item-input').at(-1)!.startTime;
+      const ready = new Promise<number>((resolve, reject) => {
+        const timeout = window.setTimeout(() => reject(new Error('Gallery selection did not become visually ready.')), 5_000);
+        const check = () => {
+          const title = document.querySelector('.gallery-viewer h2')?.textContent ?? '';
+          const image = document.querySelector<HTMLImageElement>('.gallery-selected-image');
+          const contextReady = Boolean(document.querySelector('.gallery-context-list'));
+          if (title !== priorTitle && contextReady && image?.getAttribute('src')) {
+            window.clearTimeout(timeout);
+            resolve(performance.now() - startedAt);
+            return;
+          }
+          window.requestAnimationFrame(check);
+        };
+        window.requestAnimationFrame(check);
+      });
       document.querySelector('.gallery-shell')?.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+      return ready;
     });
     await expect.poll(() => new URL(page.url()).searchParams.get('item')).not.toBe(oldItemId);
     await expect(page.locator('.gallery-viewer h2')).not.toHaveText(oldTitle ?? '');
     await expect(page.locator('.gallery-selected-image')).toHaveCount(1);
     const elapsed = await page.evaluate(() => performance.now() - performance.getEntriesByName('gallery:item-input').at(-1)!.startTime);
-    if (index >= warmupTransitions) warmSamples.push(elapsed);
+    if (index >= warmupTransitions) {
+      warmSamples.push(elapsed);
+      browserReadySamples.push(browserReadyMs);
+    }
     const counts = await page.locator('#gallery-workbench').evaluate((root) => ({
       dom: root.getElementsByTagName('*').length,
       images: root.querySelectorAll('img').length,
@@ -1016,15 +1805,36 @@ test('canonical reference-scale gallery satisfies KTD10, accessibility, and save
     peakImages = Math.max(peakImages, counts.images);
     peakVideos = Math.max(peakVideos, counts.videos);
   }
+  page.off('request', captureWarmDetailRequest);
+  expect(warmDetailRequestUrls.length,
+    'Foreground traversal must not start additional item-detail requests for filmstrip thumbnails.')
+    .toBeLessThanOrEqual(warmupTransitions + warmMeasureCount);
+  expect(new Set(warmDetailRequestUrls).size,
+    'Selected-detail and thumbnail consumers must share one in-flight item-detail request.')
+    .toBe(warmDetailRequestUrls.length);
+  const traversedBoundedPages = await page.evaluate(() => performance.getEntriesByType('resource').filter((entry) => {
+    const url = new URL(entry.name);
+    return /\/api\/runs\/[^/]+\/gallery\/items$/.test(url.pathname);
+  }).length);
+  expect(traversedBoundedPages, 'Continuation pages load only when navigation reaches the retained boundary.').toBeGreaterThan(initialBoundedPages);
 
   await cdp.send('HeapProfiler.collectGarbage');
+  await expect.poll(async () => page.locator('.gallery-selected-image').evaluate(
+    (image) => (image as HTMLImageElement).naturalWidth,
+  )).toBeGreaterThan(0);
   const heapAfterMetric = (await cdp.send('Performance.getMetrics')).metrics.find(({ name }) => name === 'JSHeapUsedSize')?.value;
   if (typeof heapAfterMetric !== 'number' || !Number.isFinite(heapAfterMetric) || heapAfterMetric <= 0) {
     throw new Error('CDP did not expose a real post-traversal JSHeapUsedSize measurement.');
   }
   const heapAfter = heapAfterMetric;
   const heapGrowthBytes = Math.max(0, heapAfter - heapBefore);
-  console.log(`[GALLERY_SCALE] traversal-complete ${JSON.stringify({ samples: warmSamples.length, p95Ms: percentile95(warmSamples), peakGalleryDomNodes, heapGrowthBytes })}`);
+  console.log(`[GALLERY_SCALE] traversal-complete ${JSON.stringify({
+    samples: warmSamples.length,
+    driverP95Ms: percentile95(warmSamples),
+    browserReadyP95Ms: percentile95(browserReadySamples),
+    peakGalleryDomNodes,
+    heapGrowthBytes,
+  })}`);
 
   let delayedQueries = 0;
   await page.route('**/gallery/items?*', async (intercepted) => {
@@ -1151,7 +1961,7 @@ test('canonical reference-scale gallery satisfies KTD10, accessibility, and save
   };
   expect(archiveCold.wrapperRequests).toBeLessThanOrEqual(3);
   expect(archiveCold.wrapperBytes).toBeLessThanOrEqual(1024 * 1024);
-  expect(await page.locator('iframe').count()).toBe(0);
+  await expect(page.locator('iframe')).toHaveCount(0);
   console.log(`[GALLERY_SCALE] archive-complete ${JSON.stringify(archiveCold)}`);
 
   const profile = await canonicalContainerProfile();
@@ -1163,7 +1973,14 @@ test('canonical reference-scale gallery satisfies KTD10, accessibility, and save
     materialization,
     container: profile,
     cold: { samples: coldSamples, p95Ms: percentile95(coldSamples.map(({ durationMs }) => durationMs)) },
-    warm: { samplesMs: warmSamples, p95Ms: percentile95(warmSamples) },
+    warm: {
+      samplesMs: browserReadySamples,
+      p95Ms: percentile95(browserReadySamples),
+      driverDiagnostics: {
+        samplesMs: warmSamples,
+        p95Ms: percentile95(warmSamples),
+      },
+    },
     bounds: { peakGalleryDomNodes, peakImages, peakVideos, heapBefore, heapAfter, heapGrowthBytes, staleCommits },
     archiveCold,
   };
@@ -1186,6 +2003,7 @@ test('canonical reference-scale gallery satisfies KTD10, accessibility, and save
   expect(coldSamples.every(({ metadataRequests, metadataBytes }) => metadataRequests <= 3 && metadataBytes <= 1024 * 1024)).toBeTruthy();
   expect(metrics.cold.p95Ms).toBeLessThanOrEqual(2_000);
   expect(warmSamples).toHaveLength(warmMeasureCount);
+  expect(browserReadySamples).toHaveLength(warmMeasureCount);
   expect(metrics.warm.p95Ms).toBeLessThanOrEqual(200);
   expect(peakGalleryDomNodes).toBeLessThanOrEqual(500);
   expect(peakVideos).toBe(1);

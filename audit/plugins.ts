@@ -9,7 +9,13 @@ import { AUDIT_BY_ID } from './catalog.js';
 import { AUDIT_ID_PATTERN } from './audit-id.js';
 import { assertEvidencePolicy, validateDefinitionEvidencePolicy } from './evidence-policy.js';
 import { LOCAL_AUDIT_TARGETS } from './targets.js';
-import type { AuditApplicability, AuditArea, AuditDefinition } from './types.js';
+import {
+  PAGE_AUDIT_ENTRY_SPEC,
+  PAGE_AUDIT_FAMILY,
+  pageAuditFamilyMembers,
+} from './page-audit-family.js';
+import { REPRESENTATIVE_A11Y_ROUTES, REPRESENTATIVE_PERFORMANCE_ROUTES } from './routes.js';
+import type { AuditApplicability, AuditArea, AuditDefinition, AuditRunMode } from './types.js';
 import { applicableTargetIds } from '../shared/target-applicability.mjs';
 
 export const PLUGIN_SCHEMA_VERSION = 1 as const;
@@ -49,6 +55,7 @@ const EVIDENCE_TYPES = [
 ] as const satisfies readonly AuditDefinition['evidence'][number][];
 
 const SEVERITIES = ['P0', 'P1', 'P2', 'P3'] as const;
+const SINGLE_SITE_CLASSIFICATIONS = ['standalone-compatible', 'comparison-only', 'standalone-required'] as const;
 const PLUGIN_ID_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
 const TAG_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
 const CORE_TEST_PATTERN = /^tests\/[a-zA-Z0-9_./-]+\.spec\.ts$/;
@@ -57,10 +64,16 @@ const PLUGIN_TEST_PATTERN = /^plugins\/[a-zA-Z0-9_-]+\/tests\/[a-zA-Z0-9_./-]+\.
 type CanonicalProject = (typeof LOCAL_AUDIT_TARGETS)[number]['id'];
 
 export interface PluginAuditCase {
+  caseId: string;
   auditId: string;
   entrySpec: string;
   applicability: AuditApplicability;
   supportedProjects: CanonicalProject[];
+  supportedModes: AuditRunMode[];
+  oracleVariants: {
+    comparative?: string;
+    singleSite?: string;
+  };
 }
 
 export interface CoreAuditReference {
@@ -79,9 +92,14 @@ export interface PluginManifest {
   enabled: boolean;
   tags: string[];
   auditDefinitions: PluginAuditDeclaration[];
+  auditFamilies: PluginAuditFamily[];
   entrySpecs: string[];
   supportedProjects: CanonicalProject[];
 }
+
+export type PluginAuditFamily = typeof PAGE_AUDIT_FAMILY;
+
+const PLUGIN_AUDIT_FAMILIES = new Set<PluginAuditFamily>([PAGE_AUDIT_FAMILY]);
 
 export interface InstalledPlugin {
   directory: string;
@@ -115,6 +133,7 @@ export function cloneAuditDefinition(definition: AuditDefinition): AuditDefiniti
     ...definition,
     evidence: [...definition.evidence],
     evidencePolicy: { ...definition.evidencePolicy },
+    ...(definition.standaloneOracle ? { standaloneOracle: { ...definition.standaloneOracle } } : {}),
   };
 }
 
@@ -128,6 +147,9 @@ export function auditDefinitionsEqual(left: AuditDefinition, right: AuditDefinit
     && left.expected === right.expected
     && left.evidencePolicy.mode === right.evidencePolicy.mode
     && left.evidencePolicy.rationale === right.evidencePolicy.rationale
+    && left.singleSiteClassification === right.singleSiteClassification
+    && left.standaloneOracle?.id === right.standaloneOracle?.id
+    && left.standaloneOracle?.expected === right.standaloneOracle?.expected
     && left.manual === right.manual
     && left.evidence.length === right.evidence.length
     && left.evidence.every((value, index) => value === right.evidence[index]);
@@ -167,11 +189,73 @@ function isInside(root: string, target: string): boolean {
   return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
 }
 
-const AUDIT_TEST_HELPERS = new Set(['interactionTest', 'staticTest', 'structuredTest']);
-const AUDIT_EVIDENCE_HELPERS = new Set(['interactionEvidence', 'staticEvidence', 'structuredEvidence']);
+const AUDIT_TEST_HELPERS = new Set(['interactionTest', 'staticTest', 'structuredTest', 'standaloneStaticTest']);
+const AUDIT_EVIDENCE_HELPERS = new Set(['interactionEvidence', 'staticEvidence', 'structuredEvidence', 'standaloneStaticEvidence']);
 
 function supportedProjectsForApplicability(applicability: AuditApplicability | CanonicalProject): CanonicalProject[] {
   return applicableTargetIds(applicability, LOCAL_AUDIT_TARGETS) as CanonicalProject[];
+}
+
+function caseMetadata(
+  definition: AuditDefinition,
+  entrySpec: string,
+  applicability: AuditApplicability,
+  caseVariant?: string,
+): Pick<PluginAuditCase, 'caseId' | 'supportedModes' | 'oracleVariants'> {
+  const supportedModes: AuditRunMode[] = definition.singleSiteClassification === 'standalone-compatible'
+    ? ['comparative', 'single-site']
+    : ['comparative'];
+  return {
+    caseId: `${definition.id}:${entrySpec}:${applicability}${caseVariant ? `:case:${encodeURIComponent(caseVariant)}` : ''}`,
+    supportedModes,
+    oracleVariants: {
+      comparative: `${definition.id}:comparative`,
+      ...(supportedModes.includes('single-site') && definition.standaloneOracle
+        ? { singleSite: definition.standaloneOracle.id }
+        : {}),
+    },
+  };
+}
+
+function standaloneCaseMetadata(
+  definition: AuditDefinition,
+  entrySpec: string,
+  applicability: AuditApplicability,
+  oracleVariant: string,
+): Pick<PluginAuditCase, 'caseId' | 'supportedModes' | 'oracleVariants'> {
+  if (definition.singleSiteClassification === 'comparison-only') {
+    throw new Error(`${definition.id} is comparison-only and cannot declare a standalone executable case.`);
+  }
+  return {
+    caseId: `${definition.id}:${entrySpec}:${applicability}:single-site:${oracleVariant}`,
+    supportedModes: ['single-site'],
+    oracleVariants: { singleSite: oracleVariant },
+  };
+}
+
+interface AuditFamilyExpansion {
+  definitions: AuditDefinition[];
+  cases: PluginAuditCase[];
+}
+
+function expandAuditFamily(
+  family: PluginAuditFamily,
+): AuditFamilyExpansion {
+  switch (family) {
+    case PAGE_AUDIT_FAMILY: {
+      const members = pageAuditFamilyMembers();
+      return {
+        definitions: members.map(({ definition }) => definition),
+        cases: members.map(({ definition, applicability }) => ({
+          ...caseMetadata(definition, PAGE_AUDIT_ENTRY_SPEC, applicability),
+          auditId: definition.id,
+          entrySpec: PAGE_AUDIT_ENTRY_SPEC,
+          applicability,
+          supportedProjects: supportedProjectsForApplicability(applicability),
+        })),
+      };
+    }
+  }
 }
 
 function callArguments(source: string, openParenthesis: number): { args: string[]; end: number } | null {
@@ -229,13 +313,13 @@ function literalPrefix(value: string | undefined): string | null {
 function auditCasesFromEntrySpec(
   repositoryRoot: string,
   entrySpec: string,
-  ownedAuditIds: ReadonlySet<string>,
+  ownedDefinitions: ReadonlyMap<string, AuditDefinition>,
   issues: string[],
 ): PluginAuditCase[] {
   const file = path.resolve(repositoryRoot, entrySpec);
   const source = readFileSync(file, 'utf8');
   const cases: PluginAuditCase[] = [];
-  const helperPattern = /\b(interactionTest|staticTest|structuredTest)\s*\(/g;
+  const helperPattern = /\b(interactionTest|staticTest|structuredTest|standaloneStaticTest)\s*\(/g;
   for (const match of source.matchAll(helperPattern)) {
     if (!AUDIT_TEST_HELPERS.has(match[1] ?? '')) continue;
     const openParenthesis = (match.index ?? 0) + match[0].lastIndexOf('(');
@@ -248,10 +332,36 @@ function auditCasesFromEntrySpec(
     const auditIds = title ? [...title.matchAll(/\[([A-Z0-9]+(?:-[A-Z0-9]+)+)\]/g)].map((idMatch) => idMatch[1]!) : [];
     const evidence = parsed.args[1] ?? '';
     const evidenceHelper = evidence.match(/^([a-zA-Z]+Evidence)\s*\(/)?.[1] ?? '';
-    const applicability = AUDIT_EVIDENCE_HELPERS.has(evidenceHelper)
-      ? evidence.match(/,\s*(['"])([^'"]+)\1\s*\)\s*$/)?.[2] ?? null
+    const standaloneEvidence = evidenceHelper === 'standaloneStaticEvidence';
+    const standaloneArguments = standaloneEvidence
+      ? evidence.match(/,\s*(['"])([^'"]+)\1\s*,\s*(['"])([^'"]+)\3\s*,?\s*\)\s*$/)
       : null;
-    for (const auditId of auditIds.filter((id) => ownedAuditIds.has(id))) {
+    const standardArguments = !standaloneEvidence
+      ? evidence.match(/,\s*(['"])([^'"]+)\1(?:\s*,\s*([A-Za-z_$][\w$]*|(['"])([^'"]+)\4))?\s*\)\s*$/)
+      : null;
+    const applicability = AUDIT_EVIDENCE_HELPERS.has(evidenceHelper)
+      ? standaloneEvidence
+        ? standaloneArguments?.[2] ?? null
+        : standardArguments?.[2] ?? null
+      : null;
+    const standaloneOracleVariant = standaloneArguments?.[4] ?? null;
+    const literalCaseVariant = standardArguments?.[5] ?? null;
+    const caseVariantIdentifier = literalCaseVariant ? null : standardArguments?.[3] ?? null;
+    let caseVariants: Array<string | undefined> = [undefined];
+    if (literalCaseVariant) caseVariants = [literalCaseVariant];
+    else if (caseVariantIdentifier) {
+      const parameterizedRoutes = entrySpec === 'tests/accessibility.spec.ts' && caseVariantIdentifier === 'candidatePath'
+        ? REPRESENTATIVE_A11Y_ROUTES
+        : entrySpec === 'tests/performance.spec.ts' && caseVariantIdentifier === 'candidatePath'
+          ? REPRESENTATIVE_PERFORMANCE_ROUTES
+          : null;
+      if (!parameterizedRoutes) {
+        issues.push(`${entrySpec} uses unsupported dynamic case variant ${caseVariantIdentifier}; declare reviewed expansion metadata.`);
+        continue;
+      }
+      caseVariants = [...parameterizedRoutes];
+    }
+    for (const auditId of auditIds.filter((id) => ownedDefinitions.has(id))) {
       if (!applicability) {
         issues.push(`${entrySpec} declares ${auditId} without a literal applicability argument.`);
         continue;
@@ -261,7 +371,18 @@ function auditCasesFromEntrySpec(
         issues.push(`${entrySpec} declares ${auditId} with unknown or zero-project applicability "${applicability}".`);
         continue;
       }
-      cases.push({ auditId, entrySpec, applicability: applicability as AuditApplicability, supportedProjects: projects });
+      const definition = ownedDefinitions.get(auditId)!;
+      for (const caseVariant of caseVariants) {
+        cases.push({
+          ...(standaloneEvidence && standaloneOracleVariant
+            ? standaloneCaseMetadata(definition, entrySpec, applicability as AuditApplicability, standaloneOracleVariant)
+            : caseMetadata(definition, entrySpec, applicability as AuditApplicability, caseVariant)),
+          auditId,
+          entrySpec,
+          applicability: applicability as AuditApplicability,
+          supportedProjects: projects,
+        });
+      }
     }
   }
   return cases;
@@ -273,9 +394,17 @@ function resolveAuditCases(
   definitions: readonly AuditDefinition[],
   supportedProjects: readonly CanonicalProject[],
   issues: string[],
+  additionalCases: readonly PluginAuditCase[] = [],
 ): PluginAuditCase[] {
-  const ownedAuditIds = new Set(definitions.map(({ id }) => id));
-  const cases = entrySpecs.flatMap((entrySpec) => auditCasesFromEntrySpec(repositoryRoot, entrySpec, ownedAuditIds, issues));
+  const ownedDefinitions = new Map(definitions.map((definition) => [definition.id, definition]));
+  const cases = [
+    ...entrySpecs.flatMap((entrySpec) => auditCasesFromEntrySpec(repositoryRoot, entrySpec, ownedDefinitions, issues)),
+    ...additionalCases,
+  ];
+  const caseKeys = cases.map((entry) => JSON.stringify(entry));
+  if (duplicateValues(caseKeys).length > 0) {
+    issues.push('Executable audit declarations contain duplicate audit/spec/applicability cases.');
+  }
   const unique = [...new Map(cases.map((entry) => [JSON.stringify(entry), entry])).values()]
     .sort((left, right) => left.auditId.localeCompare(right.auditId)
       || left.entrySpec.localeCompare(right.entrySpec)
@@ -347,6 +476,8 @@ function validateInlineAudit(value: Record<string, unknown>, label: string, issu
     'expected',
     'evidence',
     'evidencePolicy',
+    'singleSiteClassification',
+    'standaloneOracle',
     'manual',
   ]);
   const unknownKeys = Object.keys(value).filter((key) => !allowedKeys.has(key));
@@ -374,6 +505,28 @@ function validateInlineAudit(value: Record<string, unknown>, label: string, issu
     if (duplicates.length > 0) issues.push(`${label}.evidence contains duplicates: ${duplicates.join(', ')}.`);
   }
   if (value.manual !== undefined && typeof value.manual !== 'boolean') issues.push(`${label}.manual must be boolean when provided.`);
+  if (!SINGLE_SITE_CLASSIFICATIONS.includes(value.singleSiteClassification as (typeof SINGLE_SITE_CLASSIFICATIONS)[number])) {
+    issues.push(`${label}.singleSiteClassification is invalid.`);
+  }
+  let standaloneOracle: AuditDefinition['standaloneOracle'];
+  if (value.standaloneOracle !== undefined) {
+    if (!isRecord(value.standaloneOracle)
+      || !nonEmptyString(value.standaloneOracle.id)
+      || !nonEmptyString(value.standaloneOracle.expected)) {
+      issues.push(`${label}.standaloneOracle must contain non-empty id and expected strings.`);
+    } else {
+      standaloneOracle = {
+        id: value.standaloneOracle.id,
+        expected: value.standaloneOracle.expected,
+      };
+    }
+  }
+  if (value.singleSiteClassification === 'standalone-compatible' && !standaloneOracle) {
+    issues.push(`${label}.standaloneOracle is required for standalone-compatible definitions.`);
+  }
+  if (value.singleSiteClassification !== 'standalone-compatible' && standaloneOracle) {
+    issues.push(`${label}.standaloneOracle is allowed only for standalone-compatible definitions.`);
+  }
   let evidencePolicy: AuditDefinition['evidencePolicy'] | null = null;
   try {
     evidencePolicy = assertEvidencePolicy(value.evidencePolicy, `${label}.evidencePolicy`);
@@ -393,7 +546,9 @@ function validateInlineAudit(value: Record<string, unknown>, label: string, issu
     expected: value.expected as string,
     evidence: value.evidence as AuditDefinition['evidence'],
     evidencePolicy: evidencePolicy as AuditDefinition['evidencePolicy'],
+    singleSiteClassification: value.singleSiteClassification as AuditDefinition['singleSiteClassification'],
   };
+  if (standaloneOracle) definition.standaloneOracle = standaloneOracle;
   if (typeof value.manual === 'boolean') definition.manual = value.manual;
   try {
     validateDefinitionEvidencePolicy(definition, label);
@@ -464,6 +619,13 @@ export function validatePluginRegistryDocument(raw: unknown): PluginRegistry {
     if (!Array.isArray(value.auditCases) || (value.auditCases.length === 0 && auditDefinitions.some(({ manual }) => !manual))) {
       throw new Error(`${label}.auditCases must cover every automated audit.`);
     }
+    const rawCaseKeys = value.auditCases.map((rawCase) => isRecord(rawCase)
+      ? String(rawCase.caseId)
+      : JSON.stringify(rawCase));
+    const duplicateCaseKeys = duplicateValues(rawCaseKeys);
+    if (duplicateCaseKeys.length > 0) {
+      throw new Error(`${label}.auditCases contains duplicate executable cases.`);
+    }
     const definitionIds = new Set(auditDefinitions.map(({ id }) => id));
     const auditCases = value.auditCases.map((rawCase, caseIndex): PluginAuditCase => {
       const caseLabel = `${label}.auditCases[${caseIndex}]`;
@@ -474,22 +636,65 @@ export function validatePluginRegistryDocument(raw: unknown): PluginRegistry {
         throw new Error(`${caseLabel}.entrySpec must reference this plugin's executable allowlist.`);
       }
       if (!nonEmptyString(rawCase.applicability)) throw new Error(`${caseLabel}.applicability is invalid.`);
+      if (!nonEmptyString(rawCase.caseId)) throw new Error(`${caseLabel}.caseId must be a stable non-empty string.`);
+      if (!Array.isArray(rawCase.supportedModes)
+        || rawCase.supportedModes.length === 0
+        || rawCase.supportedModes.some((mode) => mode !== 'comparative' && mode !== 'single-site')
+        || duplicateValues(rawCase.supportedModes as string[]).length > 0) {
+        throw new Error(`${caseLabel}.supportedModes is invalid.`);
+      }
+      if (!isRecord(rawCase.oracleVariants)) throw new Error(`${caseLabel}.oracleVariants must be an object.`);
+      const supportsComparative = rawCase.supportedModes.includes('comparative');
+      const supportsSingleSite = rawCase.supportedModes.includes('single-site');
+      if (supportsComparative !== nonEmptyString(rawCase.oracleVariants.comparative)) {
+        throw new Error(`${caseLabel}.comparative Product Oracle variant must match supportedModes.`);
+      }
+      if (supportsSingleSite !== nonEmptyString(rawCase.oracleVariants.singleSite)) {
+        throw new Error(`${caseLabel}.singleSite Product Oracle variant must match supportedModes.`);
+      }
+      const definition = auditDefinitions.find(({ id }) => id === rawCase.auditId)!;
+      if (supportsSingleSite && definition.singleSiteClassification === 'comparison-only') {
+        throw new Error(`${caseLabel} cannot support Single-site mode for a comparison-only definition.`);
+      }
+      if (supportsSingleSite
+        && definition.singleSiteClassification === 'standalone-compatible'
+        && rawCase.oracleVariants.singleSite !== definition.standaloneOracle?.id) {
+        throw new Error(`${caseLabel}.singleSite Product Oracle variant does not match its definition.`);
+      }
       const expectedProjects = supportedProjectsForApplicability(rawCase.applicability as AuditApplicability);
-      if (!Array.isArray(rawCase.supportedProjects)
+      if (expectedProjects.length === 0
+        || !Array.isArray(rawCase.supportedProjects)
         || rawCase.supportedProjects.some((project) => typeof project !== 'string' || !CANONICAL_PROJECTS.includes(project as CanonicalProject))
         || JSON.stringify(rawCase.supportedProjects) !== JSON.stringify(expectedProjects)) {
         throw new Error(`${caseLabel}.supportedProjects does not match its declared applicability.`);
       }
       return {
+        caseId: rawCase.caseId,
         auditId: rawCase.auditId,
         entrySpec: rawCase.entrySpec,
         applicability: rawCase.applicability as AuditApplicability,
         supportedProjects: expectedProjects,
+        supportedModes: [...rawCase.supportedModes] as AuditRunMode[],
+        oracleVariants: {
+          ...(supportsComparative ? { comparative: rawCase.oracleVariants.comparative as string } : {}),
+          ...(supportsSingleSite ? { singleSite: rawCase.oracleVariants.singleSite as string } : {}),
+        },
       };
     });
     const declaredCases = new Set(auditCases.map(({ auditId }) => auditId));
     const missingCases = auditDefinitions.filter(({ id, manual }) => !manual && !declaredCases.has(id)).map(({ id }) => id);
     if (missingCases.length > 0) throw new Error(`${label}.auditCases omit automated audits: ${missingCases.join(', ')}.`);
+    const singleSiteCases = new Set(auditCases
+      .filter(({ supportedModes }) => supportedModes.includes('single-site'))
+      .map(({ auditId }) => auditId));
+    const missingSingleSiteCases = auditDefinitions
+      .filter(({ id, manual, singleSiteClassification }) => !manual
+        && singleSiteClassification === 'standalone-compatible'
+        && !singleSiteCases.has(id))
+      .map(({ id }) => id);
+    if (missingSingleSiteCases.length > 0) {
+      throw new Error(`${label}.auditCases omit Single-site cases for standalone-compatible audits: ${missingSingleSiteCases.join(', ')}.`);
+    }
     return {
       id: value.id,
       version: value.version,
@@ -502,6 +707,45 @@ export function validatePluginRegistryDocument(raw: unknown): PluginRegistry {
       auditCases,
     };
   });
+  const routePlugin = plugins.find(({ id }) => id === 'platform-routes-content');
+  if (routePlugin) {
+    const members = pageAuditFamilyMembers();
+    const expectedDefinitions = members.map(({ definition }) => definition).sort((left, right) => left.id.localeCompare(right.id));
+    const actualDefinitions = routePlugin.auditDefinitions.filter(({ id }) => id.startsWith('PAGE-')).sort((left, right) => left.id.localeCompare(right.id));
+    if (actualDefinitions.length !== expectedDefinitions.length
+      || actualDefinitions.some((definition, index) => !auditDefinitionsEqual(definition, expectedDefinitions[index]!))) {
+      throw new Error('platform-routes-content PAGE definitions must equal the reviewed candidate-html-routes family exactly.');
+    }
+    const expectedCases = members
+      .map(({ definition, applicability }) => {
+        const metadata = caseMetadata(definition, PAGE_AUDIT_ENTRY_SPEC, applicability);
+        return JSON.stringify([
+          metadata.caseId,
+          definition.id,
+          PAGE_AUDIT_ENTRY_SPEC,
+          applicability,
+          supportedProjectsForApplicability(applicability),
+          metadata.supportedModes,
+          metadata.oracleVariants,
+        ]);
+      })
+      .sort();
+    const actualCases = routePlugin.auditCases
+      .filter(({ auditId }) => auditId.startsWith('PAGE-'))
+      .map((auditCase) => JSON.stringify([
+        auditCase.caseId,
+        auditCase.auditId,
+        auditCase.entrySpec,
+        auditCase.applicability,
+        auditCase.supportedProjects,
+        auditCase.supportedModes,
+        auditCase.oracleVariants,
+      ]))
+      .sort();
+    if (JSON.stringify(actualCases) !== JSON.stringify(expectedCases)) {
+      throw new Error('platform-routes-content PAGE cases must contain exactly one route-specific executable case per reviewed family member.');
+    }
+  }
   return { schemaVersion: PLUGIN_SCHEMA_VERSION, plugins };
 }
 
@@ -550,6 +794,7 @@ export function validatePluginManifest(
     'enabled',
     'tags',
     'auditDefinitions',
+    'auditFamilies',
     'entrySpecs',
     'supportedProjects',
   ]);
@@ -572,9 +817,23 @@ export function validatePluginManifest(
 
   const declarationValues = Array.isArray(raw.auditDefinitions) ? raw.auditDefinitions : [];
   if (!Array.isArray(raw.auditDefinitions) || declarationValues.length === 0) issues.push('auditDefinitions must be a non-empty array.');
-  const resolvedAuditDefinitions = declarationValues
+  const declaredAuditDefinitions = declarationValues
     .map((declaration, index) => resolveAuditDeclaration(declaration, index, issues))
     .filter((definition): definition is AuditDefinition => definition !== null);
+  const familyValues = raw.auditFamilies === undefined ? [] : raw.auditFamilies;
+  const auditFamilies = Array.isArray(familyValues)
+    ? familyValues.filter((family): family is PluginAuditFamily => (
+        typeof family === 'string' && PLUGIN_AUDIT_FAMILIES.has(family as PluginAuditFamily)
+      ))
+    : [];
+  if (!Array.isArray(familyValues) || auditFamilies.length !== familyValues.length) {
+    issues.push('auditFamilies must contain only supported generated audit-family IDs.');
+  }
+  const duplicateFamilies = duplicateValues(auditFamilies);
+  if (duplicateFamilies.length > 0) issues.push(`Duplicate audit families: ${duplicateFamilies.join(', ')}.`);
+  const familyExpansions = auditFamilies.map((family) => expandAuditFamily(family));
+  const familyAuditDefinitions = familyExpansions.flatMap(({ definitions }) => definitions);
+  const resolvedAuditDefinitions = [...declaredAuditDefinitions, ...familyAuditDefinitions];
   const duplicateAudits = duplicateValues(resolvedAuditDefinitions.map(({ id }) => id));
   if (duplicateAudits.length > 0) issues.push(`Duplicate audit definitions: ${duplicateAudits.join(', ')}.`);
 
@@ -589,6 +848,9 @@ export function validatePluginManifest(
   ));
   const duplicateEntries = duplicateValues(entrySpecs);
   if (duplicateEntries.length > 0) issues.push(`Duplicate entry specs: ${duplicateEntries.join(', ')}.`);
+  if (auditFamilies.includes(PAGE_AUDIT_FAMILY) && !entrySpecs.includes(PAGE_AUDIT_ENTRY_SPEC)) {
+    issues.push(`${PAGE_AUDIT_FAMILY} requires ${PAGE_AUDIT_ENTRY_SPEC} in entrySpecs.`);
+  }
 
   const projectValues = Array.isArray(raw.supportedProjects) ? raw.supportedProjects : [];
   const supportedProjects = projectValues.filter((item): item is CanonicalProject =>
@@ -602,7 +864,14 @@ export function validatePluginManifest(
 
   const resolvedAuditCases = options.requireEntryFiles === false
     ? []
-    : resolveAuditCases(repositoryRoot, entrySpecs, resolvedAuditDefinitions, supportedProjects, issues);
+    : resolveAuditCases(
+        repositoryRoot,
+        entrySpecs,
+        resolvedAuditDefinitions,
+        supportedProjects,
+        issues,
+        familyExpansions.flatMap(({ cases }) => cases),
+      );
 
   if (issues.length > 0) throw new PluginValidationError(manifestPath, issues);
   return {
@@ -617,6 +886,7 @@ export function validatePluginManifest(
       enabled: raw.enabled as boolean,
       tags,
       auditDefinitions: declarationValues as PluginAuditDeclaration[],
+      auditFamilies,
       entrySpecs,
       supportedProjects,
     },
@@ -684,6 +954,8 @@ export function createPluginRegistry(plugins: readonly InstalledPlugin[]): Plugi
         auditCases: resolvedAuditCases.map((entry) => ({
           ...entry,
           supportedProjects: [...entry.supportedProjects],
+          supportedModes: [...entry.supportedModes],
+          oracleVariants: { ...entry.oracleVariants },
         })),
       })),
   };

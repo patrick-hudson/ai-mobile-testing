@@ -3,16 +3,25 @@ import { readFileSync } from 'node:fs';
 import { devices } from '@playwright/test';
 import {
   DEFAULT_AUDIT_TARGET_IDS,
+  AUDIT_SNAPSHOT_PATH_TEMPLATE,
   LOCAL_AUDIT_TARGETS,
   PROVIDER_TARGET_CATALOG,
+  SINGLE_SITE_FULL_PROFILE_TARGET_IDS,
+  SINGLE_SITE_LOCAL_AUDIT_TARGETS,
   auditTargetRegistryDocument,
+  auditSnapshotFileName,
   detectAuditTargetCapabilities,
   resolveAuditTargetSelection,
+  resolveSingleSiteTargetSelection,
   validateAuditTargetCatalog,
   type AuditTargetCapabilities,
   type AuditTargetDefinition,
 } from '../audit/targets.js';
-import { applicableTargetIds } from '../shared/target-applicability.mjs';
+import {
+  applicableSingleSiteTargetIds,
+  applicableTargetIds,
+  singleSiteTargetMatchesAuditApplicability,
+} from '../shared/target-applicability.mjs';
 
 const unavailableCapabilities: AuditTargetCapabilities = {
   msedge: {
@@ -32,6 +41,12 @@ const availableCapabilities: AuditTargetCapabilities = {
 };
 
 validateAuditTargetCatalog();
+assert.equal(AUDIT_SNAPSHOT_PATH_TEMPLATE, '{testFileDir}/__screenshots__/{arg}-{projectName}{ext}');
+assert.equal(
+  auditSnapshotFileName('homepage-light', 'candidate-desktop-chromium'),
+  'homepage-light-candidate-desktop-chromium.png',
+  'Existing comparative screenshot names must remain byte-for-byte stable.',
+);
 assert.deepEqual(
   JSON.parse(readFileSync(new URL('../audit/targets.generated.json', import.meta.url), 'utf8')),
   auditTargetRegistryDocument(),
@@ -47,6 +62,46 @@ assert.deepEqual(
   [...DEFAULT_AUDIT_TARGET_IDS],
   'Compose may forward an empty target variable; it must retain the established defaults.',
 );
+assert.deepEqual(
+  resolveSingleSiteTargetSelection(undefined, unavailableCapabilities).map(({ id }) => id),
+  [...SINGLE_SITE_FULL_PROFILE_TARGET_IDS],
+  'The Single-site full profile must use only neutral target IDs.',
+);
+assert.ok(
+  SINGLE_SITE_LOCAL_AUDIT_TARGETS.every(({ id, sourceComparativeTargetId }) => (
+    id.startsWith('single-site-')
+    && sourceComparativeTargetId.startsWith('candidate-')
+    && !('environment' in SINGLE_SITE_LOCAL_AUDIT_TARGETS.find((target) => target.id === id)!)
+  )),
+  'Neutral Single-site targets must retain their browser template provenance without an origin role.',
+);
+assert.deepEqual(
+  resolveSingleSiteTargetSelection('single-site-desktop-chromium', unavailableCapabilities).map(({ id }) => id),
+  ['single-site-desktop-chromium'],
+  'A targeted Single-site selection must resolve independently of comparative target IDs.',
+);
+assert.throws(
+  () => resolveSingleSiteTargetSelection('candidate-desktop-chromium', unavailableCapabilities),
+  /Unknown Single-site target/,
+  'Comparative target IDs must not leak into Single-site contracts.',
+);
+const neutralMobileChromium = SINGLE_SITE_LOCAL_AUDIT_TARGETS.find(({ id }) => id === 'single-site-mobile-chromium');
+assert(neutralMobileChromium);
+assert.equal(
+  singleSiteTargetMatchesAuditApplicability('candidate-mobile-chromium', neutralMobileChromium, LOCAL_AUDIT_TARGETS),
+  true,
+  'Neutral targets must reuse candidate browser/device applicability without becoming candidate deployments.',
+);
+assert.deepEqual(
+  applicableSingleSiteTargetIds('candidate-mobile-chromium', SINGLE_SITE_LOCAL_AUDIT_TARGETS, LOCAL_AUDIT_TARGETS),
+  [
+    'single-site-mobile-chromium',
+    'single-site-mobile-chromium-pixel-10-android16',
+    'single-site-mobile-chromium-pixel-8-android14',
+    'single-site-mobile-chromium-galaxy-s24-android14',
+  ],
+);
+assert.equal('environment' in neutralMobileChromium, false);
 
 const optInIds = LOCAL_AUDIT_TARGETS.filter(({ defaultEnabled }) => !defaultEnabled).map(({ id }) => id);
 assert.ok(optInIds.length >= 7, 'Popular opt-in browser/device coverage must be present.');
@@ -67,6 +122,14 @@ assert.match(devices['iPhone 15'].userAgent, /iPhone OS 17_5/, 'The iOS 17 targe
 assert.match(devices['Pixel 10'].userAgent, /Android 16/, 'The Android 16 target label must agree with the pinned descriptor UA.');
 assert.match(devices['Pixel 8'].userAgent, /Android 14/, 'The Android 14 Pixel target label must agree with the pinned descriptor UA.');
 assert.match(devices['Galaxy S24'].userAgent, /Android 14/, 'The Android 14 Galaxy target label must agree with the pinned descriptor UA.');
+assert.deepEqual(
+  applicableTargetIds('candidate-full-sweep-projects', LOCAL_AUDIT_TARGETS),
+  [
+    'candidate-mobile-chromium',
+    'candidate-desktop-chromium',
+  ],
+  'Candidate-only full-sweep applicability must never advertise a production run that will skip.',
+);
 assert.deepEqual(
   applicableTargetIds('candidate-mobile-chromium', LOCAL_AUDIT_TARGETS),
   [

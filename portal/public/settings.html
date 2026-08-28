@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>Settings · Quitting 7-OH audit console</title>
+    <link rel="stylesheet" href="/console-shell.css" />
+    <link rel="stylesheet" href="/settings.css" />
+    <script src="/settings.js" type="module"></script>
+  </head>
+  <body>
+    <div id="settings-console"></div>
+    <div id="global-announcer" class="console-announcer" role="status" aria-live="polite" aria-atomic="true"></div>
+
+    <template id="settings-workspace-template">
+      <nav class="settings-section-nav" aria-label="Settings sections">
+        <button id="settings-tab-credentials" type="button" data-settings-section="credentials">Credentials</button>
+        <button id="settings-tab-test-catalog" type="button" data-settings-section="test-catalog">Test Catalog</button>
+        <button id="settings-tab-baselines" type="button" data-settings-section="baselines">Baselines</button>
+        <button id="settings-tab-environments" type="button" data-settings-section="environments">Environments</button>
+      </nav>
+
+      <section id="settings-credentials" class="settings-region" aria-labelledby="settings-credentials-title">
+        <div class="settings-region-heading">
+          <div><p class="settings-kicker">SECURE CONFIGURATION</p><h2 id="settings-credentials-title" tabindex="-1">Anthropic API access</h2></div>
+          <span id="anthropic-key-state" class="settings-state">Checking…</span>
+        </div>
+        <div id="anthropic-key-settings" class="settings-region-body" aria-busy="true">
+          <p class="settings-muted">Stored by the portal service and never returned to this browser. Reviews use separately billed API credits. Runtime-managed credentials may not be deletable here.</p>
+          <form id="anthropic-key-form" class="key-controls">
+            <label class="settings-field"><span>New or replacement API key</span><input id="anthropic-key-input" type="password" autocomplete="new-password" spellcheck="false" placeholder="Paste once; it will not be shown again" /></label>
+            <button id="save-anthropic-key" class="console-button console-button-secondary" type="submit">Save key</button>
+            <button id="delete-anthropic-key" class="console-button settings-danger-button" type="button" disabled>Delete key</button>
+            <button id="refresh-anthropic-key" class="console-button" type="button">Refresh state</button>
+          </form>
+          <p id="anthropic-key-message" class="settings-message" role="status" aria-live="polite" aria-atomic="true"></p>
+        </div>
+      </section>
+
+      <section id="settings-test-catalog" class="settings-region" aria-labelledby="settings-test-catalog-title" data-async-state="initial-loading" hidden>
+        <div class="settings-region-heading"><div><p class="settings-kicker">RUNTIME SOURCE</p><h2 id="settings-test-catalog-title" tabindex="-1">Test Catalog</h2></div><span data-async-freshness class="console-freshness">Not loaded</span></div>
+        <p data-async-status class="settings-region-status" role="status" aria-live="polite">Waiting to load.</p>
+        <div data-async-content class="settings-region-body"></div>
+        <button data-async-retry class="console-button console-button-secondary settings-retry" type="button" hidden>Retry</button>
+      </section>
+
+      <section id="settings-baselines" class="settings-region" aria-labelledby="settings-baselines-title" data-async-state="initial-loading" hidden>
+        <div class="settings-region-heading"><div><p class="settings-kicker">READ-ONLY INVENTORY</p><h2 id="settings-baselines-title" tabindex="-1">Visual Baselines</h2></div><span data-async-freshness class="console-freshness">Not loaded</span></div>
+        <p data-async-status class="settings-region-status" role="status" aria-live="polite">Waiting to load.</p>
+        <div data-async-content class="settings-region-body"></div>
+        <button data-async-retry class="console-button console-button-secondary settings-retry" type="button" hidden>Retry</button>
+      </section>
+
+      <section id="settings-environments" class="settings-region" aria-labelledby="settings-environments-title" data-async-state="initial-loading" hidden>
+        <div class="settings-region-heading"><div><p class="settings-kicker">RUNTIME SOURCE</p><h2 id="settings-environments-title" tabindex="-1">Environments and Targets</h2></div><span data-async-freshness class="console-freshness">Not loaded</span></div>
+        <p data-async-status class="settings-region-status" role="status" aria-live="polite">Waiting to load.</p>
+        <div data-async-content class="settings-region-body"></div>
+        <button data-async-retry class="console-button console-button-secondary settings-retry" type="button" hidden>Retry</button>
+      </section>
+    </template>
+  </body>
+</html>

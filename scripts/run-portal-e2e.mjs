@@ -15,6 +15,7 @@ const temporaryRoot = await mkdtemp(join(tmpdir(), 'ai-mobile-testing-portal-e2e
 await chmod(temporaryRoot, 0o711);
 const port = await availablePort();
 const baseURL = `http://127.0.0.1:${port}`;
+const operatorToken = randomUUID().replaceAll('-', '') + randomUUID().replaceAll('-', '');
 await resetPortalE2EOutput({ repositoryRoot, outputRoot });
 const invocation = {
   schemaVersion: 1,
@@ -58,10 +59,17 @@ try {
       PORTAL_SHARDED_ARTIFACT_ROOT: join(temporaryRoot, 'sharded'),
       PORTAL_SECRET_ROOT: join(temporaryRoot, 'secrets'),
       PORTAL_MAX_CONCURRENT_RUNS: '1',
-      PORTAL_EXTERNAL_TERMINAL_REFRESH_MS: '1000',
+      // Ordinary browser characterization accelerates terminal-run polling so
+      // refresh behavior is exercised quickly. Once the canonical scale fixture
+      // has been imported, its immutable 17,527-file terminal corpus must stay
+      // out of the timed foreground-navigation window. The ten-minute value is
+      // the server's supported upper bound and changes only this benchmark;
+      // production keeps the documented 30-second default.
+      PORTAL_EXTERNAL_TERMINAL_REFRESH_MS: process.env.PORTAL_E2E_CANONICAL_SCALE === '1' ? '600000' : '1000',
       AI_REVIEW_DRY_RUN: '1',
       PORTAL_ALLOWED_HOSTS: 'shared-review.example.test',
       PORTAL_E2E_FAILURE_INJECTION: '1',
+      PORTAL_E2E_OPERATOR_TOKEN: operatorToken,
       AI_REVIEW_DRY_RUN: '1',
       CANDIDATE_IGNORE_HTTPS_ERRORS: '0',
     },
@@ -70,10 +78,12 @@ try {
   pipe(portal.stdout, 'portal:stdout');
   pipe(portal.stderr, 'portal:stderr');
   await waitForHealth(`${baseURL}/healthz`, portal);
+  const storageStatePath = await bootstrapOperatorSession({ baseURL, operatorToken, temporaryRoot });
 
   const playwrightCli = resolve(repositoryRoot, 'node_modules', '@playwright', 'test', 'cli.js');
   const args = [playwrightCli, 'test', '--config=portal/playwright.portal.config.ts'];
   if (process.env.PORTAL_E2E_GREP) args.push(`--grep=${process.env.PORTAL_E2E_GREP}`);
+  if (process.env.PORTAL_E2E_UPDATE_SNAPSHOTS === '1') args.push('--update-snapshots=all');
   log('test-command', { command: ['node', ...args] });
   const testProcess = spawn(process.execPath, args, {
     cwd: repositoryRoot,
@@ -83,6 +93,9 @@ try {
       PORTAL_E2E_OUTPUT_DIR: outputRoot,
       PORTAL_E2E_SERVER_ARTIFACT_ROOT: join(temporaryRoot, 'runs'),
       PORTAL_E2E_SERVER_SHARDED_ARTIFACT_ROOT: join(temporaryRoot, 'sharded'),
+      PORTAL_E2E_SERVER_PID: String(portal.pid),
+      PORTAL_E2E_OPERATOR_TOKEN: operatorToken,
+      PORTAL_E2E_STORAGE_STATE: storageStatePath,
     },
     stdio: 'inherit',
   });
@@ -156,6 +169,34 @@ async function waitForHealth(url, child) {
     await new Promise((resolveWait) => setTimeout(resolveWait, 200));
   }
   throw new Error(`Portal did not become healthy at ${url}.`);
+}
+
+async function bootstrapOperatorSession({ baseURL, operatorToken, temporaryRoot }) {
+  const response = await fetch(`${baseURL}/operator/bootstrap?token=${encodeURIComponent(operatorToken)}`, {
+    redirect: 'manual',
+  });
+  if (response.status !== 303 || response.headers.get('location') !== '/') {
+    throw new Error(`Portal operator bootstrap failed with HTTP ${response.status}.`);
+  }
+  const setCookie = response.headers.get('set-cookie') ?? '';
+  const value = setCookie.match(/^portal_operator=([^;]+);/)?.[1];
+  if (!value) throw new Error('Portal operator bootstrap did not return the expected HttpOnly session cookie.');
+  const storageStatePath = join(temporaryRoot, 'operator-storage-state.json');
+  await writeFile(storageStatePath, `${JSON.stringify({
+    cookies: [{
+      name: 'portal_operator',
+      value,
+      domain: new URL(baseURL).hostname,
+      path: '/',
+      expires: -1,
+      httpOnly: true,
+      secure: false,
+      sameSite: 'Strict',
+    }],
+    origins: [],
+  })}\n`, { mode: 0o600 });
+  log('operator-session-ready', { mechanism: 'HttpOnly bootstrap cookie', storageStatePath });
+  return storageStatePath;
 }
 
 async function readContainerResourceProfile() {

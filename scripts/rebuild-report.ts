@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { ALL_AUDIT_BY_ID } from '../audit/definitions.js';
 import { AUDIT_EVIDENCE_POLICY_ANNOTATION, serializeEvidencePolicy } from '../audit/evidence-policy.js';
 import type { AuditEvidenceRecord, AuditProjectMetadata } from '../audit/types.js';
@@ -103,7 +104,7 @@ async function attachment(
   };
 }
 
-async function collectTests(
+export async function collectTests(
   report: PlaywrightJsonReport,
   sourceBoundary: AttachmentSourceBoundary,
 ): Promise<ReportTestInput[]> {
@@ -325,63 +326,72 @@ function rebuildArguments(argv: string[]): RebuildArguments {
   };
 }
 
-const rebuild = rebuildArguments(process.argv.slice(2));
-const resultsFile = rebuild.resultsFile;
-const outputDir = rebuild.outputDir;
-const runDirectory = path.dirname(resultsFile);
-const sourceBoundary = await createAttachmentSourceBoundary(runDirectory);
-const report = JSON.parse((await readContainedAttachmentSource(
-  resultsFile,
-  sourceBoundary,
-  { maximumBytes: 512 * 1024 * 1024 },
-)).toString('utf8')) as PlaywrightJsonReport;
-let integrityFailures: PipelineIntegrityFailure[] = [];
-if (rebuild.pipelineDiagnosticsFile) {
-  const expectedRunId = process.env.AUDIT_SHARDED_RUN_ID;
-  if (!expectedRunId) throw new Error('AUDIT_SHARDED_RUN_ID is required with --pipeline-diagnostics-file.');
-  const diagnostics = validatePipelineDiagnostics(JSON.parse((await readContainedAttachmentSource(
-    rebuild.pipelineDiagnosticsFile,
+async function main(argv = process.argv.slice(2)): Promise<void> {
+  const rebuild = rebuildArguments(argv);
+  const resultsFile = rebuild.resultsFile;
+  const outputDir = rebuild.outputDir;
+  const runDirectory = path.dirname(resultsFile);
+  const sourceBoundary = await createAttachmentSourceBoundary(runDirectory);
+  const report = JSON.parse((await readContainedAttachmentSource(
+    resultsFile,
     sourceBoundary,
-    { maximumBytes: 256 * 1024 },
-  )).toString('utf8')), expectedRunId);
-  integrityFailures = diagnostics.failures;
-}
-const tests = [
-  ...await collectTests(report, sourceBoundary),
-  ...await collectManualTests(runDirectory, sourceBoundary),
-];
-const unexpected = report.stats?.unexpected ?? 0;
-const pipelineErrors = integrityFailures.map(({ stage, reason }) => ({
-  message: `Pipeline integrity failure in ${stage}: ${reason}`,
-}));
-const reportOptions = {
-  outputDir,
-  tests,
-  selectedProjects: (report.config?.projects ?? []).map((project) => ({
-    ...(project.id ? { id: project.id } : {}),
-    name: project.name,
-    metadata: project.metadata ?? {},
-  })),
-  run: {
-    status: unexpected > 0 || integrityFailures.length > 0 ? 'failed' as const : 'passed' as const,
-    ...(report.stats?.startTime ? { startedAt: report.stats.startTime } : {}),
-    ...(report.stats?.duration != null ? { durationMs: report.stats.duration } : {}),
-    source: 'playwright-json' as const,
-    profile: process.env.AUDIT_PROFILE ?? 'release',
-    errors: [...(report.errors ?? []), ...pipelineErrors],
-    integrityFailures,
-  },
-  // GenerateReportOptions is intentionally narrower, but buildAuditModels
-  // forwards this runtime property to the gallery boundary.
-  sourceRoot: runDirectory,
-};
-const manifest = await writeAuditReport(reportOptions);
+    { maximumBytes: 512 * 1024 * 1024 },
+  )).toString('utf8')) as PlaywrightJsonReport;
+  let integrityFailures: PipelineIntegrityFailure[] = [];
+  if (rebuild.pipelineDiagnosticsFile) {
+    const expectedRunId = process.env.AUDIT_SHARDED_RUN_ID;
+    if (!expectedRunId) throw new Error('AUDIT_SHARDED_RUN_ID is required with --pipeline-diagnostics-file.');
+    const diagnostics = validatePipelineDiagnostics(JSON.parse((await readContainedAttachmentSource(
+      rebuild.pipelineDiagnosticsFile,
+      sourceBoundary,
+      { maximumBytes: 256 * 1024 },
+    )).toString('utf8')), expectedRunId);
+    integrityFailures = diagnostics.failures;
+  }
+  const tests = [
+    ...await collectTests(report, sourceBoundary),
+    ...await collectManualTests(runDirectory, sourceBoundary),
+  ];
+  const unexpected = report.stats?.unexpected ?? 0;
+  const pipelineErrors = integrityFailures.map(({ stage, reason }) => ({
+    message: `Pipeline integrity failure in ${stage}: ${reason}`,
+  }));
+  const reportOptions = {
+    outputDir,
+    tests,
+    selectedProjects: (report.config?.projects ?? []).map((project) => ({
+      ...(project.id ? { id: project.id } : {}),
+      name: project.name,
+      metadata: project.metadata ?? {},
+    })),
+    run: {
+      status: unexpected > 0 || integrityFailures.length > 0 ? 'failed' as const : 'passed' as const,
+      ...(report.stats?.startTime ? { startedAt: report.stats.startTime } : {}),
+      ...(report.stats?.duration != null ? { durationMs: report.stats.duration } : {}),
+      source: 'playwright-json' as const,
+      profile: process.env.AUDIT_PROFILE ?? 'release',
+      errors: [...(report.errors ?? []), ...pipelineErrors],
+      integrityFailures,
+    },
+    // GenerateReportOptions is intentionally narrower, but buildAuditModels
+    // forwards this runtime property to the gallery boundary.
+    sourceRoot: runDirectory,
+  };
+  const manifest = await writeAuditReport(reportOptions);
 
-console.log(`Rebuilt ${path.resolve(outputDir, 'index.html')}`);
-const galleryDescriptor = JSON.parse(
-  await readFile(path.join(outputDir, 'gallery', 'current.json'), 'utf8'),
-) as GalleryArchiveDescriptor;
-console.log(
-  `Gallery archive ${galleryDescriptor.exportRevision}: ${galleryDescriptor.primaryCounts.total} logical media item${galleryDescriptor.primaryCounts.total === 1 ? '' : 's'} in ${galleryDescriptor.query.chunks.length} bounded query chunk${galleryDescriptor.query.chunks.length === 1 ? '' : 's'}.`,
-);
-console.log(`${manifest.summary.executed}/${manifest.summary.total} checks executed; release decision: ${manifest.release.decision}`);
+  console.log(`Rebuilt ${path.resolve(outputDir, 'index.html')}`);
+  const galleryDescriptor = JSON.parse(
+    await readFile(path.join(outputDir, 'gallery', 'current.json'), 'utf8'),
+  ) as GalleryArchiveDescriptor;
+  console.log(
+    `Gallery archive ${galleryDescriptor.exportRevision}: ${galleryDescriptor.primaryCounts.total} logical media item${galleryDescriptor.primaryCounts.total === 1 ? '' : 's'} in ${galleryDescriptor.query.chunks.length} bounded query chunk${galleryDescriptor.query.chunks.length === 1 ? '' : 's'}.`,
+  );
+  console.log(`${manifest.summary.executed}/${manifest.summary.total} checks executed; release decision: ${manifest.release.decision}`);
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+  });
+}

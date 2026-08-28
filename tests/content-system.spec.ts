@@ -4,9 +4,12 @@ import {
   CRITICAL_CONTENT_CONTRACTS,
   DECLARED_ROUTE_VISUALS,
   REPRESENTATIVE_VISUAL_ROUTES,
+  REVIEWED_HOME_LIVE_MEETING_INDEX,
+  REVIEWED_HOME_SUPPORT_STATES,
 } from '../audit/routes.js';
+import { evaluateHomeSupportStateContract } from '../audit/page-oracles.js';
 import { expect, interactionEvidence, interactionTest, staticEvidence, staticTest, structuredEvidence, structuredTest, test } from '../fixtures/test.js';
-import { dismissSchedulingNotice, extractHtmlElementIds, extractHtmlTagAttributes, inspectHtmlDestination, loggedGet, mapWithConcurrency, meta, pageHasHorizontalOverflow, waitForSettledUI } from './helpers.js';
+import { auditMeta, dismissSchedulingNotice, extractHtmlElementIds, extractHtmlTagAttributes, inspectHtmlDestination, loggedGet, mapWithConcurrency, matchesAuditTargetTemplate, pageHasHorizontalOverflow, waitForSettledUI } from './helpers.js';
 
 const REPRESENTATIVE_DOCUMENTS = [
   '/',
@@ -17,30 +20,54 @@ const REPRESENTATIVE_DOCUMENTS = [
   '/about/changelog',
 ] as const;
 
-function candidateDesktopChromium(testInfo: Parameters<typeof meta>[0]): boolean {
-  return testInfo.project.name === 'candidate-desktop-chromium';
+function candidateDesktopChromium(testInfo: Parameters<typeof auditMeta>[0]): boolean {
+  return matchesAuditTargetTemplate(testInfo, 'candidate-desktop-chromium');
 }
 
-staticTest('[HOME-002] support-right-now panel exposes live, upcoming, and fallback help paths', staticEvidence('Capture the hydrated support panel, its current state labels, and every urgent-help destination.', 'candidate-desktop-chromium'), async ({ page, audit }, testInfo) => {
+staticTest('[HOME-002] support-right-now panel exposes live, upcoming, and fallback help paths', staticEvidence('Capture each deterministic support state with exact clock semantics, labels, destinations, and tab-isolation metadata.', 'candidate-desktop-chromium'), async ({ page, request, audit }, testInfo) => {
   test.skip(!candidateDesktopChromium(testInfo), 'One candidate Chromium project validates the hydrated support panel.');
-  await audit.goto('/');
-  const panel = page.locator('section[aria-labelledby="right-now-title"]');
-  await expect(panel).toBeVisible();
-  await expect(panel.getByRole('heading', { name: 'Support right now' })).toBeVisible();
-  await expect(panel.getByRole('link', { name: /Discord/i })).toHaveAttribute('href', 'https://discord.gg/quitting7oh');
-  await expect(panel.getByRole('link', { name: /active withdrawal/i })).toHaveAttribute('href', '/start-here/7-oh-withdrawal-help');
-  await expect(panel.getByRole('link', { name: /meeting/i }).first()).toBeVisible();
-  await expect(panel.getByRole('link', { name: /Browse NA|Join|Full schedule|All 7-OH/i }).first()).toBeVisible();
-  const links = await panel.locator('a[href]').evaluateAll((anchors) => anchors.map((anchor) => ({
-    text: anchor.textContent?.replace(/\s+/g, ' ').trim() ?? '',
-    href: (anchor as HTMLAnchorElement).href,
-    target: anchor.getAttribute('target'),
-    rel: anchor.getAttribute('rel'),
-  })));
-  audit.observe('Support actions', links.length, 'At least four distinct routes to immediate or peer support');
-  await audit.attachJson('support-right-now-state', { text: await panel.innerText(), links });
-  await audit.checkpoint('support-right-now');
-  expect(links.length).toBeGreaterThanOrEqual(4);
+  await page.route('**/live-meeting-index.json', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify(REVIEWED_HOME_LIVE_MEETING_INDEX),
+  }));
+  const evidence = [];
+  for (const contract of REVIEWED_HOME_SUPPORT_STATES) {
+    await page.clock.setFixedTime(new Date(contract.at));
+    await audit.goto('/');
+    const panel = page.locator('section[aria-labelledby="right-now-title"]');
+    await expect(panel).toBeVisible();
+    await expect(panel.getByRole('heading', { name: 'Support right now', exact: true })).toBeVisible();
+    await expect(panel.locator('a[href]'), `${contract.id} state must finish hydrating its exact reviewed action inventory`)
+      .toHaveCount(contract.actions.length);
+    const observed = await panel.evaluate((element, state) => ({
+      id: state.id,
+      at: state.at,
+      textLines: (element as HTMLElement).innerText.split('\n').map((line) => line.replace(/\s+/g, ' ').trim()).filter(Boolean),
+      actions: [...element.querySelectorAll<HTMLAnchorElement>('a[href]')].map((anchor) => ({
+        accessibleName: (anchor.getAttribute('aria-label') ?? anchor.innerText).replace(/\s+/g, ' ').trim(),
+        href: anchor.getAttribute('href') ?? '',
+        target: anchor.getAttribute('target'),
+        rel: anchor.getAttribute('rel'),
+      })),
+    }), { id: contract.id, at: contract.at });
+    expect(evaluateHomeSupportStateContract(contract, observed), `${contract.id} support state must equal its independent reviewed contract`).toEqual([]);
+    evidence.push(observed);
+    await audit.checkpoint(`support-right-now-${contract.id}`);
+  }
+
+  const destinations = [...new Set(REVIEWED_HOME_SUPPORT_STATES.flatMap(({ actions }) => actions.map(({ href }) => href)))];
+  const destinationHealth = [];
+  for (const destination of destinations) {
+    const response = await loggedGet(request, audit, destination, { maxRedirects: 0, timeout: 15_000 });
+    expect(response.status(), `${destination} must respond as an actionable support destination`).toBeGreaterThanOrEqual(200);
+    expect(response.status(), `${destination} must not be a broken support destination`).toBeLessThan(400);
+    destinationHealth.push({ destination, status: response.status(), location: response.headers().location ?? null });
+  }
+  expect(evidence.map(({ id }) => id), 'Fallback, upcoming, and live states must all produce evidence in reviewed order')
+    .toEqual(REVIEWED_HOME_SUPPORT_STATES.map(({ id }) => id));
+  await audit.attachJson('support-right-now-state-contract', { contract: REVIEWED_HOME_SUPPORT_STATES, evidence, destinationHealth });
+  audit.observe('Deterministic support states', evidence.length, String(REVIEWED_HOME_SUPPORT_STATES.length));
   await audit.assertRuntimeHealthy();
 });
 
@@ -63,34 +90,42 @@ staticTest('[CONTENT-001] representative documents keep valid landmarks and head
         headings,
         skippedLevels,
         landmarks: {
-          header: document.querySelectorAll('body > header, header').length,
+          header: document.querySelectorAll('body > header').length,
           main: document.querySelectorAll('main').length,
-          footer: document.querySelectorAll('body > footer, footer').length,
+          footer: document.querySelectorAll('body > footer').length,
           nav: document.querySelectorAll('nav').length,
         },
       };
     });
     expect(structure.h1Count, `${route} must have one H1`).toBe(1);
     expect(structure.skippedLevels, `${route} must not skip heading levels`).toEqual([]);
+    expect(structure.landmarks.header, `${route} must retain one site header landmark`).toBe(1);
     expect(structure.landmarks.main, `${route} must have one main landmark`).toBe(1);
+    expect(structure.landmarks.footer, `${route} must retain one site footer landmark`).toBe(1);
+    expect(structure.landmarks.nav, `${route} must retain at least one navigation landmark`).toBeGreaterThan(0);
     expect(structure.description.length, `${route} needs a substantive description`).toBeGreaterThan(35);
     expect(structure.canonical, `${route} needs a canonical URL`).toMatch(/^https:\/\//);
     evidence.push({ route, ...structure });
+    if (route === '/') await audit.checkpoint('representative-document-outline');
   }
   expect(REPRESENTATIVE_DOCUMENTS, 'The representative document contract must retain all six reviewed routes').toHaveLength(6);
   expect(evidence.map(({ route }) => route), 'Every declared representative document must produce one inspected record').toEqual([...REPRESENTATIVE_DOCUMENTS]);
   await audit.attachJson('document-structure-ledger', evidence);
   audit.observe('Representative outlines inspected', evidence.length, String(REPRESENTATIVE_DOCUMENTS.length));
-  await audit.checkpoint('representative-document-outline');
 });
 
-structuredTest('[CONTENT-003] every published candidate route resolves without a broken internal destination', structuredEvidence('Retain every resolved internal destination, redirect disposition, status, and content type without unrelated media.', 'candidate-desktop-chromium'), async ({ request, audit }, testInfo) => {
+structuredTest('[CONTENT-003] every published candidate route resolves without a broken internal destination', structuredEvidence('Retain both server-rendered and post-hydration internal destinations with redirect disposition, status, fragment, and content-type evidence.', 'candidate-desktop-chromium'), async ({ context, request, audit }, testInfo) => {
   test.skip(!candidateDesktopChromium(testInfo), 'One candidate project performs the complete internal destination crawl.');
-  test.setTimeout(180_000);
-  const candidateOrigin = new URL(ENVIRONMENTS.candidate.baseURL).origin;
+  test.setTimeout(300_000);
+  const metadata = auditMeta(testInfo);
+  const activeBaseURL = audit.environmentBaseURL();
+  const candidateOrigin = new URL(activeBaseURL).origin;
   const productionOrigin = new URL(ENVIRONMENTS.production.baseURL).origin;
+  const allowedInternalOrigins = new Set(metadata.mode === 'single-site'
+    ? [candidateOrigin]
+    : [candidateOrigin, productionOrigin]);
   const sourceDocuments = await mapWithConcurrency(CANDIDATE_HTML_ROUTES, 8, async (route) => {
-    const url = new URL(route.path, ENVIRONMENTS.candidate.baseURL).href;
+    const url = new URL(route.path, activeBaseURL).href;
     const response = await loggedGet(request, audit, url, { timeout: 10_000 });
     const contentType = response.headers()['content-type'] ?? '';
     const html = await response.text();
@@ -108,25 +143,78 @@ structuredTest('[CONTENT-003] every published candidate route resolves without a
   expect(badSources, 'Every source document must load before its rendered anchor contract can be trusted').toEqual([]);
 
   const malformed: Array<{ sourcePath: string; href: string; issue: string }> = [];
-  const internalReferences = sourceDocuments.flatMap((source) => source.hrefs.flatMap((href) => {
+  const hydratedSourceDocuments = await mapWithConcurrency(CANDIDATE_HTML_ROUTES, 4, async (route) => {
+    const hydratedPage = await context.newPage();
+    try {
+      const url = new URL(route.path, activeBaseURL).href;
+      const response = await hydratedPage.goto(url, { waitUntil: 'load', timeout: 15_000 });
+      await hydratedPage.evaluate(async () => {
+        for (const ratio of [0.25, 0.5, 0.75, 1]) {
+          window.scrollTo({ top: document.documentElement.scrollHeight * ratio, behavior: 'instant' });
+          await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+        }
+        window.scrollTo({ top: 0, behavior: 'instant' });
+      });
+      await hydratedPage.waitForFunction(() => [...document.querySelectorAll<HTMLElement>('astro-island[ssr]')].every((island) => {
+        const strategy = island.getAttribute('client');
+        if (strategy !== 'media') return false;
+        try {
+          const query = (JSON.parse(island.getAttribute('opts') ?? '{}') as { value?: unknown }).value;
+          return typeof query === 'string' && !window.matchMedia(query).matches;
+        } catch {
+          return false;
+        }
+      }), undefined, { timeout: 10_000 });
+      await waitForSettledUI(hydratedPage);
+      const applicableUnhydratedIslands = await hydratedPage.locator('astro-island[ssr]').evaluateAll((islands) => islands.filter((island) => {
+        const strategy = island.getAttribute('client');
+        if (strategy !== 'media') return true;
+        try {
+          const query = (JSON.parse(island.getAttribute('opts') ?? '{}') as { value?: unknown }).value;
+          return typeof query !== 'string' || window.matchMedia(query).matches;
+        } catch {
+          return true;
+        }
+      }).length);
+      return {
+        path: route.path,
+        kind: route.kind,
+        url: hydratedPage.url(),
+        status: response?.status() ?? null,
+        applicableUnhydratedIslands,
+        hrefs: await hydratedPage.locator('a[href]').evaluateAll((anchors) => anchors.map((anchor) =>
+          (anchor as HTMLAnchorElement).getAttribute('href') ?? '')),
+      };
+    } finally {
+      await hydratedPage.close();
+    }
+  });
+  const badHydratedSources = hydratedSourceDocuments.filter(({ status, applicableUnhydratedIslands }) => status !== 200 || applicableUnhydratedIslands !== 0);
+  expect(badHydratedSources, 'Every route must hydrate successfully before client-rewritten destinations can be trusted').toEqual([]);
+
+  const referencesFrom = (sources: Array<{ path: string; url: string; hrefs: string[] }>, source: 'server' | 'hydrated') => sources.flatMap((document) => document.hrefs.flatMap((href) => {
     if (/^(?:mailto|tel|sms):/i.test(href)) return [];
     if (/^(?:javascript|data):/i.test(href)) {
-      malformed.push({ sourcePath: source.path, href, issue: 'Executable or embedded URLs are not valid navigation destinations.' });
+      malformed.push({ sourcePath: document.path, href, issue: `Executable or embedded URLs are not valid ${source} navigation destinations.` });
       return [];
     }
     try {
-      const destination = new URL(href, source.url);
+      const destination = new URL(href, document.url);
       if (!['http:', 'https:'].includes(destination.protocol)) return [];
-      if (destination.origin !== candidateOrigin && destination.origin !== productionOrigin) return [];
+      if (!allowedInternalOrigins.has(destination.origin)) return [];
       const fragment = destination.hash ? decodeURIComponent(destination.hash.slice(1)) : '';
       destination.hash = '';
-      return [{ sourcePath: source.path, renderedHref: href, destination: destination.href, fragment }];
+      return [{ source, sourcePath: document.path, renderedHref: href, destination: destination.href, fragment }];
     } catch (error) {
-      malformed.push({ sourcePath: source.path, href, issue: error instanceof Error ? error.message : String(error) });
+      malformed.push({ sourcePath: document.path, href, issue: error instanceof Error ? error.message : String(error) });
       return [];
     }
   }));
+  const serverInternalReferences = referencesFrom(sourceDocuments, 'server');
+  const hydratedInternalReferences = referencesFrom(hydratedSourceDocuments, 'hydrated');
+  const internalReferences = [...serverInternalReferences, ...hydratedInternalReferences];
   expect(internalReferences.length, 'The crawl must inspect rendered anchors, not merely replay the route registry').toBeGreaterThan(CANDIDATE_HTML_ROUTES.length * 3);
+  expect(hydratedInternalReferences.length, 'Post-hydration extraction must retain a non-trivial client-visible link graph').toBeGreaterThan(CANDIDATE_HTML_ROUTES.length * 3);
 
   const uniqueDestinations = [...new Set(internalReferences.map(({ destination }) => destination))];
   const results = await mapWithConcurrency(uniqueDestinations, 8, async (destination) => ({
@@ -158,6 +246,9 @@ structuredTest('[CONTENT-003] every published candidate route resolves without a
   audit.observe('Fragment targets checked', fragmentChecks.length);
   await audit.attachJson('network-internal-link-ledger', {
     sources: sourceDocuments.map(({ html: _html, ...source }) => source),
+    hydratedSources: hydratedSourceDocuments,
+    serverInternalReferences,
+    hydratedInternalReferences,
     internalReferences,
     results,
     fragmentChecks,
@@ -288,22 +379,73 @@ staticTest('[CONTENT-005] images and diagrams remain loaded, labeled, and viewpo
 
 staticTest('[CONTENT-006] dense reference and tool layouts remain usable across widths', staticEvidence('Capture dense reference and tool layouts at narrow, tablet, and desktop widths with overflow geometry.', 'candidate-desktop-chromium'), async ({ page, audit }, testInfo) => {
   test.skip(!candidateDesktopChromium(testInfo), 'One resizable Chromium project probes narrow, tablet, and desktop geometry.');
-  const routes = ['/resources/7-oh-taper-calculator', '/pharmacology/chemical-structures', '/virtual-na-meetings-now', '/about/changelog'] as const;
+  const routeContracts = [
+    {
+      route: '/resources/7-oh-taper-calculator',
+      surfaces: [
+        { name: 'per-dose control', selector: 'main #per-dose', exactCount: 1 },
+        { name: 'summary cards', selector: 'main .grid.gap-2.sm\\:grid-cols-3 > div', exactCount: 3 },
+        { name: 'schedule chart', selector: 'main .recharts-surface', exactCount: 1 },
+        { name: 'schedule scroller', selector: 'main .taper-schedule-scroll', exactCount: 1 },
+        { name: 'schedule table', selector: 'main table.taper-schedule-table', exactCount: 1 },
+      ],
+    },
+    {
+      route: '/pharmacology/chemical-structures',
+      surfaces: [
+        { name: 'reviewed structure figures', selector: 'main figure img[src^="/images/structures/"]', exactCount: 12 },
+        { name: 'diagram-limit callout', selector: 'main blockquote', exactCount: 1 },
+      ],
+    },
+    {
+      route: '/virtual-na-meetings-now',
+      surfaces: [
+        { name: 'meeting search', selector: 'main input[aria-label="Search meetings"]', exactCount: 1 },
+        { name: 'filter card', selector: 'main .field-card:has(input[aria-label="Search meetings"])', exactCount: 1 },
+        { name: 'live pane', selector: 'main h2:text-is("Live now")', exactCount: 1 },
+        { name: 'starting-soon pane', selector: 'main h2:text-is("Starting soon")', exactCount: 1 },
+      ],
+    },
+    {
+      route: '/about/changelog',
+      surfaces: [
+        { name: 'changelog article', selector: 'main article.prose-recovery', exactCount: 1 },
+        { name: 'changelog release sections', selector: 'main article h2', minimumCount: 10 },
+      ],
+    },
+  ] as const;
   const widths = [320, 768, 1440] as const;
   const evidence = [];
-  for (const route of routes) {
+  for (const contract of routeContracts) {
     for (const width of widths) {
       await page.setViewportSize({ width, height: 900 });
-      await audit.goto(route);
+      await audit.goto(contract.route);
       await waitForSettledUI(page);
       const overflow = await pageHasHorizontalOverflow(page);
-      const controls = await page.locator('main button:visible, main input:visible, main select:visible, main a[href]:visible').count();
-      evidence.push({ route, width, overflow, controls });
-      expect(overflow, `${route} must not create page-level overflow at ${width}px`).toBe(0);
-      expect(controls, `${route} must retain a usable action at ${width}px`).toBeGreaterThan(0);
+      expect(overflow, `${contract.route} must not create page-level overflow at ${width}px`).toBe(0);
+      const surfaces = [];
+      for (const surface of contract.surfaces) {
+        const locator = page.locator(surface.selector);
+        if ('exactCount' in surface) {
+          await expect(locator, `${contract.route} must retain exactly ${surface.exactCount} ${surface.name} at ${width}px`).toHaveCount(surface.exactCount);
+        } else {
+          await expect.poll(() => locator.count(), {
+            message: `${contract.route} must retain at least ${surface.minimumCount} ${surface.name} at ${width}px`,
+          }).toBeGreaterThanOrEqual(surface.minimumCount);
+        }
+        const count = await locator.count();
+        const geometry = await locator.evaluateAll((nodes) => nodes.map((node) => {
+          const box = node.getBoundingClientRect();
+          const style = getComputedStyle(node);
+          return { box: box.toJSON(), display: style.display, visibility: style.visibility };
+        }));
+        expect(geometry.every(({ box, display, visibility }) => box.width > 0 && box.height > 0 && display !== 'none' && visibility !== 'hidden'), `${contract.route} ${surface.name} must remain visibly rendered at ${width}px`).toBe(true);
+        surfaces.push({ ...surface, count, geometry });
+      }
+      evidence.push({ route: contract.route, width, overflow, surfaces });
     }
   }
-  const expectedCoverage = routes.flatMap((route) => widths.map((width) => ({ route, width })));
+  const expectedCoverage = routeContracts.flatMap(({ route }) => widths.map((width) => ({ route, width })));
   expect(expectedCoverage, 'The responsive matrix must retain four routes at three reviewed widths').toHaveLength(12);
   expect(evidence.map(({ route, width }) => ({ route, width })), 'Every declared route/width pair must produce one inspected record').toEqual(expectedCoverage);
   await audit.attachJson('wide-reference-responsive-ledger', evidence);

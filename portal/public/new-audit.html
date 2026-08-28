@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>New audit · Quitting 7-OH audit console</title>
+    <link rel="stylesheet" href="/console-shell.css" />
+    <link rel="stylesheet" href="/new-audit.css" />
+    <script src="/new-audit.js" type="module"></script>
+  </head>
+  <body>
+    <div id="new-audit-console"></div>
+    <div id="global-announcer" class="console-announcer" role="status" aria-live="polite" aria-atomic="true"></div>
+
+    <template id="new-audit-workspace-template">
+      <section class="audit-region" aria-labelledby="launch-title">
+        <div class="audit-region-heading">
+          <div>
+            <p class="audit-kicker">CREATE</p>
+            <h2 id="launch-title">Configure an audit</h2>
+          </div>
+          <p id="catalog-summary" class="audit-muted" role="status"></p>
+        </div>
+
+        <form id="launch-form" aria-busy="true">
+          <fieldset>
+            <legend>Audit mode</legend>
+            <div class="audit-choice-grid audit-two-up">
+              <label class="audit-choice"><input type="radio" name="auditMode" value="comparative" checked /><span><strong>Compare two sites</strong><small>Production-versus-candidate release and migration evidence.</small></span></label>
+              <label class="audit-choice"><input type="radio" name="auditMode" value="single-site" /><span><strong>Audit one site</strong><small>Standalone health evidence for one quitting7oh deployment.</small></span></label>
+            </div>
+          </fieldset>
+
+          <fieldset id="comparative-depth">
+            <legend>Depth</legend>
+            <div class="audit-choice-grid audit-two-up">
+              <label class="audit-choice"><input type="radio" name="profile" value="smoke" checked /><span><strong>Smoke check</strong><small>Fast launch-critical confidence with failure video retention.</small></span></label>
+              <label class="audit-choice"><input type="radio" name="profile" value="release" /><span><strong>Release evidence</strong><small>Full review evidence. Final signoff still requires the isolated sharded release path.</small></span></label>
+            </div>
+            <label class="audit-inline-note"><input id="candidate-ignore-tls" type="checkbox" disabled /> Certificate bypass unavailable <small>Install the development or Netskope CA so candidate and production remain strict.</small></label>
+          </fieldset>
+
+          <fieldset id="comparative-sites">
+            <legend>Sites</legend>
+            <div class="audit-choice-grid audit-two-up">
+              <label class="audit-field"><span>Production baseline</span><input id="production-url" type="url" autocomplete="url" required /></label>
+              <label class="audit-field"><span>Release candidate</span><input id="candidate-url" type="url" autocomplete="url" required /></label>
+            </div>
+          </fieldset>
+
+          <fieldset id="single-site-settings" hidden>
+            <legend>Site and deployment role</legend>
+            <div class="audit-choice-grid audit-two-up">
+              <label class="audit-field"><span>Site to audit</span><input id="single-site-url" type="url" autocomplete="url" /></label>
+              <div class="audit-field">
+                <span>Confirmed deployment role</span>
+                <div class="audit-inline-choices">
+                  <label><input type="radio" name="singleSiteRole" value="preview" checked /> Preview</label>
+                  <label><input type="radio" name="singleSiteRole" value="production" /> Production</label>
+                </div>
+                <small id="single-site-role-suggestion" class="audit-muted" role="status" aria-live="polite"></small>
+                <label class="audit-confirm"><input id="single-site-role-confirmed" type="checkbox" /> I confirm this is the intended deployment role.</label>
+              </div>
+            </div>
+            <details id="single-site-certificate-options" class="audit-disclosure">
+              <summary>Certificate policy</summary>
+              <div class="audit-choice-grid audit-two-up audit-disclosure-body">
+                <label class="audit-choice"><input type="radio" name="singleSiteCertificatePolicy" value="strict" checked /><span><strong>Strict certificates</strong><small>Uses the trusted development chain and keeps evidence authoritative.</small></span></label>
+                <label class="audit-choice" id="single-site-bypass-card"><input id="single-site-bypass" type="radio" name="singleSiteCertificatePolicy" value="preview-bypass" /><span><strong>Preview certificate bypass</strong><small>Exact-origin development fallback. Evidence is marked non-authoritative.</small></span></label>
+              </div>
+            </details>
+            <div class="audit-preflight-actions">
+              <button id="preview-single-site" class="console-button console-button-secondary" type="button">Check site and preview coverage</button>
+              <p id="single-site-preflight-status" class="audit-message" role="status" aria-live="polite" aria-atomic="true">Check the site before launching. No run is created during this step.</p>
+            </div>
+            <section id="single-site-coverage" class="audit-coverage" aria-labelledby="single-site-coverage-title" aria-busy="false" hidden>
+              <div class="audit-subheading"><h3 id="single-site-coverage-title" tabindex="-1">Planned standalone coverage</h3><span id="single-site-coverage-badge" class="audit-state"></span></div>
+              <dl id="single-site-coverage-details" class="audit-definition-list"></dl>
+              <div id="single-site-coverage-gaps"></div>
+            </section>
+          </fieldset>
+
+          <details id="advanced-audit-options" class="audit-disclosure">
+            <summary>Advanced targets, scope, and evidence</summary>
+            <div class="audit-disclosure-body">
+              <fieldset id="browser-targets">
+                <legend>Browsers and devices</legend>
+                <div id="project-options" class="audit-choice-grid audit-project-grid"></div>
+              </fieldset>
+
+              <fieldset>
+                <legend>Test scope</legend>
+                <div class="audit-inline-choices">
+                  <label><input type="radio" name="scope" value="all" checked /> All tests in this profile</label>
+                  <label><input type="radio" name="scope" value="targeted" /> Target selected audit areas or IDs</label>
+                </div>
+                <div id="target-controls" class="audit-target-controls" hidden>
+                  <div class="audit-plugin-selector">
+                    <div class="audit-subheading"><h3>Installed test suites</h3><span class="audit-muted">Validated plugins</span></div>
+                    <div id="plugin-options" class="audit-choice-grid audit-plugin-grid"></div>
+                  </div>
+                  <div>
+                    <div class="audit-subheading"><h3>Audit areas</h3><button type="button" class="audit-text-button" id="clear-areas">Clear</button></div>
+                    <div id="area-options" class="audit-pill-grid"></div>
+                  </div>
+                  <div>
+                    <div class="audit-subheading"><h3>Individual checks</h3><span id="selected-count" class="audit-muted">0 selected</span></div>
+                    <label class="audit-field"><span class="audit-visually-hidden">Filter audit checks</span><input id="audit-filter" type="search" placeholder="Filter by ID or title…" /></label>
+                    <div id="audit-options" class="audit-options"></div>
+                  </div>
+                </div>
+              </fieldset>
+
+              <fieldset>
+                <legend>Evidence analysis</legend>
+                <div class="audit-choice-grid audit-two-up">
+                  <label class="audit-choice" id="ai-review-card"><input id="ai-review" type="checkbox" /><span><strong>AI evidence review</strong><small id="ai-review-help">Advisory analysis only; browser results remain authoritative.</small></span></label>
+                  <label class="audit-field"><span>Review model</span><input id="ai-model" type="text" autocomplete="off" spellcheck="false" /></label>
+                </div>
+                <p class="audit-muted audit-small">Credential availability is managed in <a href="/settings.html?section=credentials">Settings</a>. No credential is stored in this form or URL.</p>
+              </fieldset>
+            </div>
+          </details>
+
+          <div class="audit-launch-footer">
+            <p id="form-message" class="audit-message" role="status" aria-live="polite" aria-atomic="true"></p>
+            <button id="launch-run" class="console-button audit-primary-button" type="submit">Launch comparative audit</button>
+          </div>
+        </form>
+      </section>
+    </template>
+  </body>
+</html>

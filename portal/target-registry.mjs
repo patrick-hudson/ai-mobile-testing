@@ -54,6 +54,38 @@ export function validatePortalTargetRegistryDocument(document, environment = pro
     || document.defaultTargetIds.some((id) => !localTargets.some((target) => target.id === id && target.available))) {
     throw new Error('Generated audit target registry has invalid default target IDs.');
   }
+  const rawSingleSiteTargets = document.singleSiteTargets ?? [];
+  const rawSingleSiteFullProfileTargetIds = document.singleSiteFullProfileTargetIds ?? [];
+  if (!Array.isArray(rawSingleSiteTargets) || !Array.isArray(rawSingleSiteFullProfileTargetIds)) {
+    throw new Error('Generated audit target registry has invalid Single-site target metadata.');
+  }
+  const singleSiteTargets = rawSingleSiteTargets.map((value) => {
+    if (!value || typeof value !== 'object' || !TARGET_ID.test(value.id ?? '') || ids.has(value.id)
+      || !value.id.startsWith('single-site-') || !text(value.sourceComparativeTargetId, 200)
+      || !text(value.label, 200) || !text(value.browserLabel, 300) || !text(value.qualification)
+      || !DEVICE_CLASSES.has(value.deviceClass) || !ENGINES.has(value.engine) || !FIDELITIES.has(value.fidelity)
+      || typeof value.defaultEnabled !== 'boolean' || typeof value.fullSweep !== 'boolean'
+      || typeof value.visual !== 'boolean' || 'environment' in value) {
+      throw new Error('Generated audit target registry contains an invalid neutral Single-site target.');
+    }
+    const source = localTargets.find(({ id }) => id === value.sourceComparativeTargetId);
+    if (!source || source.environment !== 'candidate') {
+      throw new Error('Generated Single-site target references an invalid comparative template.');
+    }
+    ids.add(value.id);
+    const capabilityAvailable = value.requiredCapability !== 'msedge' || (msedgeDeclared && Boolean(msedgePath));
+    return {
+      ...structuredClone(value),
+      runnable: true,
+      available: capabilityAvailable,
+      defaultSelected: rawSingleSiteFullProfileTargetIds.includes(value.id),
+      unavailableReason: capabilityAvailable ? null : 'This Docker-local target requires an unavailable capability.',
+    };
+  });
+  if (new Set(rawSingleSiteFullProfileTargetIds).size !== rawSingleSiteFullProfileTargetIds.length
+    || rawSingleSiteFullProfileTargetIds.some((id) => !singleSiteTargets.some((target) => target.id === id && target.available))) {
+    throw new Error('Generated audit target registry has invalid Single-site full profile IDs.');
+  }
   const providerTargets = document.providerTargets.map((value) => {
     if (!value || typeof value !== 'object' || !TARGET_ID.test(value.id ?? '') || ids.has(value.id)
       || value.runnable !== false || value.fidelity !== 'real-device'
@@ -72,6 +104,8 @@ export function validatePortalTargetRegistryDocument(document, environment = pro
     schemaVersion: 1,
     defaultTargetIds: [...document.defaultTargetIds],
     localTargets,
+    singleSiteFullProfileTargetIds: [...rawSingleSiteFullProfileTargetIds],
+    singleSiteTargets,
     providerTargets,
   };
 }

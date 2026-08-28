@@ -30,6 +30,8 @@ const definitions: AuditDefinition[] = [
     expected: 'Digit-bearing audit prefixes are recognized.',
     evidence: ['json'],
     evidencePolicy: { mode: 'structured-data', rationale: 'Retain the canonical audit mapping as structured evidence.' },
+    singleSiteClassification: 'standalone-compatible',
+    standaloneOracle: { id: 'A11Y-001:standalone', expected: 'Digit-bearing audit prefixes are recognized.' },
   },
   {
     id: 'PAGE-HOME',
@@ -41,6 +43,8 @@ const definitions: AuditDefinition[] = [
     expected: 'The page-audit filename does not create a synthetic audit.',
     evidence: ['json'],
     evidencePolicy: { mode: 'structured-data', rationale: 'Retain the generated page audit mapping as structured evidence.' },
+    singleSiteClassification: 'standalone-compatible',
+    standaloneOracle: { id: 'PAGE-HOME:standalone', expected: 'The page-audit filename does not create a synthetic audit.' },
   },
   {
     id: 'SHELL-006',
@@ -52,6 +56,8 @@ const definitions: AuditDefinition[] = [
     expected: 'The phrase page-level does not create a synthetic audit.',
     evidence: ['json'],
     evidencePolicy: { mode: 'structured-data', rationale: 'Retain the horizontal-overflow mapping as structured evidence.' },
+    singleSiteClassification: 'standalone-compatible',
+    standaloneOracle: { id: 'SHELL-006:standalone', expected: 'The phrase page-level does not create a synthetic audit.' },
   },
   {
     id: 'ENV-003',
@@ -63,6 +69,7 @@ const definitions: AuditDefinition[] = [
     expected: 'Candidate and production are explicitly covered by one structured record.',
     evidence: ['json'],
     evidencePolicy: { mode: 'structured-data', rationale: 'Retain the paired origin route ledger as structured evidence.' },
+    singleSiteClassification: 'comparison-only',
   },
 ];
 
@@ -308,6 +315,222 @@ try {
   assert.equal(statusManifest.audits.find(({ id }) => id === 'A11Y-001')?.status, 'PASS');
   assert.equal(statusManifest.audits.find(({ id }) => id === 'PAGE-HOME')?.status, 'BLOCKED');
   assert.equal(statusManifest.audits.find(({ id }) => id === 'SHELL-006')?.status, 'FAIL');
+
+  const attentionReportDirectory = path.join(root, 'attention-report');
+  const candidateAttentionRecord = evidence(definitions[0]!);
+  const productionAttentionRecord = evidence(definitions[0]!, {
+    environment: 'production',
+    baseURL: 'https://production.example.test',
+    project: 'production-self-test',
+  });
+  await writeAuditReport({
+    outputDir: attentionReportDirectory,
+    tests: [
+      reportTest(definitions[0]!, '[A11Y-001] candidate assertion failure', 'tests/attention.spec.ts', [], {
+        idSuffix: 'candidate-attention',
+        record: candidateAttentionRecord,
+        applicability: 'candidate-projects',
+        results: [{
+          status: 'failed', expectedStatus: 'passed', duration: 1, retry: 0,
+          errors: [{ message: 'Error: Stale first-attempt assertion must not drive final attention' }],
+          attachments: [{
+            name: 'stale-first-attempt-axe', contentType: 'application/json', body: Buffer.from('{"attempt":1}'),
+          }],
+          stdout: [], stderr: [],
+        }, {
+          status: 'failed', expectedStatus: 'passed', duration: 1, retry: 1,
+          errors: [{ message: 'Error: Candidate contrast assertion failed\n+   "candidate button has insufficient contrast",\n    at tests/attention.spec.ts:42:7' }],
+          attachments: [{
+            name: 'audit-result', contentType: 'application/json',
+            body: Buffer.from(JSON.stringify(candidateAttentionRecord)),
+          }, {
+            name: 'final-attempt-axe-page-scan', contentType: 'application/json', body: Buffer.from('{"violations":[]}'),
+          }],
+          stdout: [], stderr: [],
+        }],
+      }),
+      reportTest(definitions[0]!, '[A11Y-001] production baseline failure', 'tests/attention.spec.ts', [], {
+        idSuffix: 'production-attention',
+        projectName: 'production-self-test',
+        record: productionAttentionRecord,
+        applicability: 'production-projects',
+        metadata: {
+          environment: 'production', browserLabel: 'synthetic', deviceClass: 'desktop',
+          fullSweep: false, visual: false, tlsPolicy: 'strict',
+        },
+        results: [{
+          status: 'failed', expectedStatus: 'passed', duration: 1, retry: 0,
+          errors: [{ message: 'Error: Production-only assertion must remain baseline context' }],
+          attachments: [{
+            name: 'audit-result', contentType: 'application/json',
+            body: Buffer.from(JSON.stringify(productionAttentionRecord)),
+          }],
+          stdout: [], stderr: [],
+        }],
+      }),
+    ],
+    run: { status: 'failed', source: 'playwright-json', profile: 'self-test' },
+    definitionCatalog: [definitions[0]!],
+  });
+  const attentionSummary = JSON.parse(await readFile(
+    path.join(attentionReportDirectory, 'data', 'summary.json'),
+    'utf8',
+  )) as {
+    topFindingCount: number;
+    topAttentionCount: number;
+    topAttention: Array<{
+      auditId: string;
+      scope: string;
+      errorContext: string | null;
+      baselineNonGating: boolean;
+      baselineNote: string | null;
+      evidence: Array<{ name: string; href: string; attempt: number; context: string }>;
+    }>;
+  };
+  assert.equal(attentionSummary.topFindingCount, 0);
+  assert.equal(attentionSummary.topAttentionCount, 1);
+  assert.equal(attentionSummary.topAttention[0]?.auditId, 'A11Y-001');
+  assert.equal(attentionSummary.topAttention[0]?.scope, 'candidate');
+  assert.match(attentionSummary.topAttention[0]?.errorContext ?? '', /Candidate contrast assertion failed/);
+  assert.doesNotMatch(attentionSummary.topAttention[0]?.errorContext ?? '', /Production-only/);
+  assert.equal(attentionSummary.topAttention[0]?.baselineNonGating, true);
+  assert.match(attentionSummary.topAttention[0]?.baselineNote ?? '', /baseline context.*do not veto/i);
+  assert(attentionSummary.topAttention[0]?.evidence.length,
+    'The fallback must include a bounded link to available candidate evidence.');
+  assert(attentionSummary.topAttention[0]!.evidence.some(({ name, attempt, context }) => (
+    name === 'final-attempt-axe-page-scan' && attempt === 2 && context === 'final-primary'
+  )), 'Attention evidence must identify the final attempt and its primary-evidence context.');
+  assert(attentionSummary.topAttention[0]!.evidence.every(({ name }) => name !== 'stale-first-attempt-axe'),
+    'Earlier retry artifacts must not be linked beside the final assertion context.');
+  assert(attentionSummary.topAttention[0]!.evidence.every(({ href }) => (
+    !href.startsWith('/') && !href.includes('..') && !/^[A-Za-z][A-Za-z0-9+.-]*:/.test(href)
+  )), 'Fallback evidence links must remain relative paths inside the checklist publication.');
+
+  const manualDefinition: AuditDefinition = {
+    ...definitions[0]!,
+    id: 'DEVICE-001',
+    title: 'Physical iPhone acceptance',
+    manual: true,
+  };
+  const incompleteReportDirectory = path.join(root, 'incomplete-attention-report');
+  await writeAuditReport({
+    outputDir: incompleteReportDirectory,
+    tests: [],
+    run: { status: 'failed', source: 'playwright-json', profile: 'self-test' },
+    definitionCatalog: [definitions[1]!, manualDefinition],
+    selectedProjects: [{
+      name: 'candidate-mobile-chromium',
+      metadata: {
+        environment: 'candidate', browserLabel: 'synthetic', deviceClass: 'mobile',
+        fullSweep: true, visual: false, tlsPolicy: 'strict',
+      },
+    }],
+  });
+  const incompleteSummary = JSON.parse(await readFile(
+    path.join(incompleteReportDirectory, 'data', 'summary.json'),
+    'utf8',
+  )) as {
+    topAttentionCount: number;
+    topAttention: Array<{ auditId: string; auditStatus: string; scope: string; detail: string; evidence: unknown[] }>;
+  };
+  assert.equal(incompleteSummary.topAttentionCount, 2);
+  assert.deepEqual(
+    incompleteSummary.topAttention.map(({ auditId, auditStatus }) => ({ auditId, auditStatus })),
+    [
+      { auditId: 'PAGE-HOME', auditStatus: 'NOT_RUN' },
+      { auditId: 'DEVICE-001', auditStatus: 'MANUAL_REQUIRED' },
+    ],
+    'Both automated coverage gaps and outstanding manual acceptance must be actionable attention outcomes.',
+  );
+  assert.equal(incompleteSummary.topAttention[0]?.scope, 'candidate');
+  assert.match(incompleteSummary.topAttention[0]?.detail ?? '', /no matching automated execution|emitted no completed execution/i);
+  assert.equal(incompleteSummary.topAttention[1]?.evidence.length, 0);
+
+  const blockingFindingRecord = evidence(definitions[0]!, {
+    findings: [{
+      severity: 'P0',
+      title: 'Unapproved clinical policy',
+      detail: 'A named clinical owner must approve this rule before release.',
+      blocking: true,
+    }],
+  });
+  const productionBaselineFindingRecord = evidence(definitions[0]!, {
+    environment: 'production',
+    baseURL: 'https://production.example.test',
+    project: 'production-self-test',
+    findings: [{
+      severity: 'P1',
+      title: 'Production baseline visual defect',
+      detail: 'This synthetic defect is baseline context and must not be presented as a candidate release blocker.',
+      blocking: true,
+    }],
+  });
+  const blockingFindingReportDirectory = path.join(root, 'blocking-finding-checklist');
+  const blockingFindingManifest = await writeAuditReport({
+    outputDir: blockingFindingReportDirectory,
+    tests: [
+      reportTest(
+        definitions[0]!,
+        '[A11Y-001] structured release blocker',
+        'tests/blocking-finding.spec.ts',
+        [],
+        { record: blockingFindingRecord },
+      ),
+      reportTest(
+        definitions[0]!,
+        '[A11Y-001] production baseline structured finding',
+        'tests/blocking-finding.spec.ts',
+        [],
+        {
+          idSuffix: 'production-baseline-finding',
+          projectName: 'production-self-test',
+          record: productionBaselineFindingRecord,
+          applicability: 'production-projects',
+          metadata: {
+            environment: 'production', browserLabel: 'synthetic', deviceClass: 'desktop',
+            fullSweep: false, visual: false, tlsPolicy: 'strict',
+          },
+        },
+      ),
+    ],
+    run: { status: 'passed', source: 'playwright-json', profile: 'self-test' },
+    definitionCatalog: [definitions[0]!],
+  });
+  assert.equal(blockingFindingManifest.audits[0]?.status, 'FAIL',
+    'A passing Playwright result with a structured blocking finding must fail its checklist audit.');
+  assert.equal(blockingFindingManifest.release.ready, false,
+    'A structured P0 blocker must withhold release authority.');
+  const blockingFindingSummary = JSON.parse(await readFile(
+    path.join(blockingFindingReportDirectory, 'data', 'summary.json'),
+    'utf8',
+  )) as {
+    topFindingCount: number;
+    topAttentionCount: number;
+    topFindings: Array<{
+      title: string;
+      environment: string;
+      scope: string;
+      baselineNonGating: boolean;
+      releaseBlocking: boolean;
+    }>;
+  };
+  assert.equal(blockingFindingSummary.topFindingCount, 2,
+    'The portal summary must publish the candidate blocker and labeled production context.');
+  assert.equal(blockingFindingSummary.topAttentionCount, 0,
+    'A structured blocker must not be duplicated as a generic attention outcome.');
+  const candidateFinding = blockingFindingSummary.topFindings.find(({ title }) => title === 'Unapproved clinical policy');
+  const productionFinding = blockingFindingSummary.topFindings.find(({ title }) => title === 'Production baseline visual defect');
+  assert(candidateFinding);
+  assert.equal(candidateFinding.environment, 'candidate');
+  assert.equal(candidateFinding.scope, 'candidate');
+  assert.equal(candidateFinding.baselineNonGating, false);
+  assert.equal(candidateFinding.releaseBlocking, true);
+  assert(productionFinding);
+  assert.equal(productionFinding.environment, 'production');
+  assert.equal(productionFinding.scope, 'production-baseline');
+  assert.equal(productionFinding.baselineNonGating, true);
+  assert.equal(productionFinding.releaseBlocking, false,
+    'Production-only findings must remain visible without masquerading as candidate release blockers.');
 
   const pairedDefinition = definitions[3]!;
   const pairedRecord = evidence(pairedDefinition, { coveredEnvironments: ['candidate', 'production'] });

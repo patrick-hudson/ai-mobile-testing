@@ -1,6 +1,6 @@
 import { constants as fsConstants, createWriteStream, promises as fs } from 'node:fs';
 import { createServer } from 'node:http';
-import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
+import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { spawn } from 'node:child_process';
 import { StringDecoder } from 'node:string_decoder';
@@ -17,9 +17,49 @@ import {
 import { publishCredentialEnvelope, removeCredentialEnvelope } from './credential-store.mjs';
 import { ByteLruCache } from './byte-lru-cache.mjs';
 import { readBoundedFileTail } from './bounded-file.mjs';
+import { openContainedArtifactFile } from './safe-artifact-open.mjs';
+import { createConsoleApi, handleConsoleApiRequest } from './console-api.mjs';
+import {
+  getConsoleCapabilities,
+  resolveConsoleActionAvailability,
+} from './console-contracts.mjs';
+import {
+  DEFAULT_CONSOLE_INDEX_BUDGET,
+  consumeConsoleReadWork,
+  createConsoleIndex,
+  createConsoleReadWork,
+} from './console-index.mjs';
+import {
+  normalizedRunToConsoleIndexRecord,
+  timelineToConsoleIndexRecord,
+} from './console-index-records.mjs';
+import {
+  projectComparativeTimeline,
+  projectSingleSiteTimeline,
+} from './console-run.mjs';
+import {
+  cancelConsoleReportProjectionTask,
+  createConsoleReportProjectionTask,
+  runConsoleReportProjectionTaskSlice,
+} from './console-report-indexer.mjs';
+import {
+  normalizeComparativeConsoleRecord,
+  normalizeSingleSiteConsoleRecord,
+} from './console-view-model.mjs';
+import { assertNoNestedMountPoints } from './mount-boundaries.mjs';
+import {
+  ownershipTransitionUnavailable,
+  prepareRunnerArtifactDirectory,
+  removeValidatedArtifactTree,
+  withPortableArtifactWriteWindow,
+} from './artifact-permissions.mjs';
 import { validatePreferredMediaManifest } from './video-manifest.mjs';
 import { validateExternalTerminalEvidence } from './external-evidence.mjs';
-import { loadReportPublication, readPublishedReportJson } from './report-publication.mjs';
+import {
+  loadReportPublication,
+  loadSingleSiteReportPublication,
+  readPublishedReportJson,
+} from './report-publication.mjs';
 import {
   parseChecklistRelease,
   pendingRelease,
@@ -55,19 +95,105 @@ import {
   portalExecutionProvenance,
   releaseReviewReasons,
 } from './release-eligibility.mjs';
+import { createSingleSiteLaunchCoordinator, SingleSiteLaunchError } from './single-site-launch.mjs';
+import { readSingleSiteFinalizationStatus } from './single-site-finalization.mjs';
+import {
+  openSingleSiteGallery,
+  pageSingleSiteGalleryItems,
+  readSingleSiteGalleryItem,
+  reviewSingleSiteGalleryItem,
+  resolveSingleSiteGalleryMedia,
+  singleSiteGalleryHead,
+} from './single-site-gallery.mjs';
+import {
+  SingleSiteAiReviewError,
+  fenceSingleSiteAiReviewForPurge,
+  openSingleSiteAiReviewSupervisor,
+  readSingleSiteAiReview,
+  readSingleSiteAiReviewResult,
+  recoverSingleSiteAiReviews,
+  requestSingleSiteAiReview,
+  releaseSingleSiteAiReviewPurgeFence,
+} from './single-site-ai-review.mjs';
+import {
+  SingleSitePurgeError,
+  purgeSingleSiteRun,
+  recoverSingleSitePurges,
+  singleSitePurgeConfirmation,
+} from './single-site-purge.mjs';
+import {
+  VisualBaselineStoreError,
+  approveVisualBaseline,
+  deleteVisualBaseline,
+  isVisualBaselineMutationLocked,
+  listVisualBaselineHistory,
+  openVisualBaselineStore,
+  readVisualBaselineStore,
+  replaceVisualBaseline,
+  revokeVisualBaseline,
+} from './visual-baselines.mjs';
+import {
+  VisualReviewStoreError,
+  openVisualReviewStore,
+} from './visual-review-dispositions.mjs';
+import { preflightQuitting7ohSite } from '../shared/site-preflight.mjs';
+import { resolveRunnerRevision } from '../shared/runner-revision.mjs';
+import {
+  parseVisualBaselineEvidence,
+  parseVisualBaselineIdentity,
+  visualBaselineDigest,
+  visualBaselineIdentityKey,
+  visualBaselineSlotKey,
+} from '../shared/visual-baseline-contract.mjs';
+import { verifyPublishedVisualComparatorCalibration } from '../scripts/lib/visual-comparator-calibration.mjs';
+import {
+  JobQueueError,
+  cancelJob as cancelSingleSiteJob,
+  listJobs as listSingleSiteJobs,
+  openJobQueue,
+  readJob as readSingleSiteJob,
+  readJobInput as readSingleSiteJobInput,
+  sha256 as queueSha256,
+  submitJob as submitSingleSiteJob,
+} from '../scripts/lib/job-queue.mjs';
 
 const PORTAL_DIR = dirname(fileURLToPath(import.meta.url));
 const REPOSITORY_ROOT = resolve(PORTAL_DIR, '..');
 const STATIC_ROOT = join(PORTAL_DIR, 'public');
+const CONSOLE_SHELL_FIXTURE_FILES = new Map([
+  ['/console-shell-fixture.html', join(STATIC_ROOT, 'console-shell-fixture.html')],
+  ['/console-shell-fixture.js', join(STATIC_ROOT, 'console-shell-fixture.js')],
+]);
+const CONSOLE_SHELL_FIXTURE_RELATIVE_PATHS = new Set([
+  'console-shell-fixture.html',
+  'console-shell-fixture.js',
+]);
+const CONSOLE_CONTRACT_FIXTURE_PATH = '/__e2e__/console-contracts.mjs';
+const RUN_WORKSPACE_DIAGNOSTICS_PATH = '/__e2e__/run-workspace-diagnostics';
 const ARTIFACT_ROOT = resolve(
   process.env.PORTAL_ARTIFACT_ROOT ?? join(REPOSITORY_ROOT, 'artifacts', 'runs'),
 );
 const SHARDED_ARTIFACT_ROOT = resolve(
   process.env.PORTAL_SHARDED_ARTIFACT_ROOT ?? join(REPOSITORY_ROOT, 'artifacts', 'sharded'),
 );
+const SINGLE_SITE_QUEUE_ROOT = resolve(
+  process.env.PORTAL_SINGLE_SITE_QUEUE_ROOT ?? join(dirname(ARTIFACT_ROOT), 'single-site-jobs'),
+);
+const SINGLE_SITE_FINALIZATION_ROOT = resolve(
+  process.env.PORTAL_SINGLE_SITE_FINALIZATION_ROOT ?? join(dirname(ARTIFACT_ROOT), 'single-site-finalizations'),
+);
+const VISUAL_BASELINE_ROOT = resolve(
+  process.env.PORTAL_VISUAL_BASELINE_ROOT ?? join(dirname(ARTIFACT_ROOT), 'visual-baselines'),
+);
+const VISUAL_REVIEW_ROOT = join(VISUAL_BASELINE_ROOT, 'review-dispositions');
+const SINGLE_SITE_AI_REVIEW_ROOT = resolve(
+  process.env.PORTAL_SINGLE_SITE_AI_REVIEW_ROOT ?? SINGLE_SITE_FINALIZATION_ROOT,
+);
 const SECRET_ROOT = resolve(process.env.PORTAL_SECRET_ROOT ?? join(REPOSITORY_ROOT, '.portal-secrets'));
 const SECRET_MASTER_PATH = join(SECRET_ROOT, 'master.key');
 const ANTHROPIC_CREDENTIAL_PATH = join(SECRET_ROOT, 'anthropic-key.json');
+const PURGE_JOURNAL_ROOT = join(SECRET_ROOT, 'purge-journals');
+const PURGE_QUARANTINE_NAME = '.portal-purge-quarantine';
 const HOST = process.env.HOST ?? '127.0.0.1';
 const PORT = parseInteger(process.env.PORT, 4173, 1, 65_535);
 const MAX_CONCURRENT_RUNS = parseInteger(process.env.PORTAL_MAX_CONCURRENT_RUNS, 1, 1, 4);
@@ -77,7 +203,11 @@ const MAX_LOG_EVENTS = 2_000;
 const MAX_EVENT_BUFFER_BYTES = 2 * 1024 * 1024;
 const MAX_SSE_REPLAY_BYTES = 512 * 1024;
 const MAX_GALLERY_SSE_REPLAY_BYTES = 64 * 1024;
+const MAX_SSE_CLIENTS_PER_RUN = parseInteger(process.env.PORTAL_MAX_SSE_CLIENTS_PER_RUN, 8, 1, 64);
+const MAX_SSE_CLIENTS_TOTAL = parseInteger(process.env.PORTAL_MAX_SSE_CLIENTS_TOTAL, 64, 1, 512);
+const MAX_CONSOLE_TIMELINE_RECORDS_PER_RUN = 99;
 const GALLERY_SSE_EVENT_TYPES = new Set(['gallery', 'gallery-flag', 'snapshot', 'stage', 'status']);
+const sseCapacityDiagnostics = { refused: 0, peak: 0 };
 const MAX_EXTERNAL_LOG_INGEST_BYTES = 512 * 1024;
 const MAX_EXTERNAL_REFRESH_BYTES = parseInteger(
   process.env.PORTAL_EXTERNAL_REFRESH_BYTES,
@@ -103,6 +233,12 @@ const VIDEO_STAGE_DEADLINE_MS = parseInteger(process.env.PORTAL_VIDEO_STAGE_DEAD
 const AI_STAGE_DEADLINE_MS = parseInteger(process.env.PORTAL_AI_STAGE_DEADLINE_MS, 5 * 60_000, 1_000, 24 * 60 * 60_000);
 const REPORT_STAGE_DEADLINE_MS = parseInteger(process.env.PORTAL_REPORT_STAGE_DEADLINE_MS, 15 * 60_000, 1_000, 24 * 60 * 60_000);
 const EXTERNAL_RUN_SYNC_MS = parseInteger(process.env.PORTAL_EXTERNAL_RUN_SYNC_MS, 1_000, 250, 30_000);
+const SINGLE_SITE_AI_REVIEW_SYNC_MS = parseInteger(
+  process.env.PORTAL_SINGLE_SITE_AI_REVIEW_SYNC_MS,
+  2_000,
+  500,
+  60_000,
+);
 const EXTERNAL_TERMINAL_REFRESH_MS = parseInteger(process.env.PORTAL_EXTERNAL_TERMINAL_REFRESH_MS, 30_000, 1_000, 10 * 60_000);
 const EXTERNAL_STALE_LEASE_MS = parseInteger(process.env.PORTAL_EXTERNAL_STALE_LEASE_MS, 90_000, 15_000, 60 * 60_000);
 const MAX_REPORT_SUMMARY_BYTES = 256 * 1024;
@@ -110,6 +246,11 @@ const MAX_REPORT_AUDIT_INDEX_BYTES = 2 * 1024 * 1024;
 const MAX_REPORT_AUDIT_DETAIL_BYTES = 512 * 1024;
 const MAX_REPORT_CACHE_ENTRIES = 256;
 const MAX_REPORT_CACHE_BYTES = 32 * 1024 * 1024;
+const DEFAULT_BASELINE_PAGE_SIZE = 50;
+const MAX_BASELINE_PAGE_SIZE = 200;
+const MAX_BASELINE_ELIGIBILITY_BYTES = 32 * 1024 * 1024;
+const MAX_BASELINE_ELIGIBILITY_ITEMS = 10_000;
+const PORTAL_OPERATOR_ACTOR_ID = 'portal-operator';
 const DEFAULT_AI_MODEL = process.env.ANTHROPIC_MODEL ?? 'claude-sonnet-5';
 const ANTHROPIC_KEY_PATTERN = /^sk-ant-[a-zA-Z0-9_-]{20,512}$/;
 const DEFAULT_CANDIDATE_IGNORE_HTTPS_ERRORS = binaryEnvironmentFlag(
@@ -128,11 +269,24 @@ const ALLOWED_PORTAL_HOSTS = new Set([
 const RESTART_PROGRESS_TAIL_BYTES = 1024 * 1024;
 const MEDIA_VALIDATION_TIMEOUT_MS = 20_000;
 const MAX_MEDIA_VALIDATION_OUTPUT_BYTES = 64 * 1024;
+const COMPARATIVE_CONSOLE_SOURCE_ID = 'comparative-runs';
+const SINGLE_SITE_CONSOLE_SOURCE_ID = 'single-site-jobs';
+const MAX_SINGLE_SITE_CONSOLE_STATE_BYTES = 1024 * 1024;
+const MAX_SINGLE_SITE_CONSOLE_FINALIZATION_BYTES = 64 * 1024;
+const MAX_COMPARATIVE_CONSOLE_MANIFEST_BYTES = 1024 * 1024;
+const MAX_CONSOLE_KNOWN_SINGLE_SITE_JOBS = 10_000;
 
 const targetRegistry = loadPortalTargetRegistry(join(REPOSITORY_ROOT, 'audit', 'targets.generated.json'));
+const targetRegistryDocument = JSON.parse(
+  await fs.readFile(join(REPOSITORY_ROOT, 'audit', 'targets.generated.json'), 'utf8'),
+);
 const PROJECTS = Object.freeze(targetRegistry.localTargets);
 const PROJECT_IDS = new Set(PROJECTS.map(({ id }) => id));
 const RUNNABLE_PROJECT_IDS = new Set(PROJECTS.filter(({ available }) => available).map(({ id }) => id));
+const SINGLE_SITE_TARGET_IDS = new Set(targetRegistry.singleSiteTargets.map(({ id }) => id));
+const RUNNABLE_SINGLE_SITE_TARGET_IDS = new Set(
+  targetRegistry.singleSiteTargets.filter(({ available }) => available).map(({ id }) => id),
+);
 const PROVIDER_PROJECT_IDS = new Set(targetRegistry.providerTargets.map(({ id }) => id));
 const DEFAULT_PROJECT_IDS = new Set(targetRegistry.defaultTargetIds);
 const FULL_PROJECT_COUNT = targetRegistry.defaultTargetIds.length;
@@ -155,8 +309,10 @@ const CREDENTIAL_ISOLATION_ACTIVE = RUNNER_IDENTITY.active
   && REPORT_WORKER_IDENTITY.active;
 const PROFILES = new Set(['smoke', 'release']);
 const TERMINAL_STATUSES = new Set(['passed', 'not-ready', 'review-required', 'failed', 'evidence-failed', 'stopped', 'spawn-failed']);
+const SINGLE_SITE_TERMINAL_STATES = new Set(['completed', 'failed', 'incomplete', 'cancelled']);
 const PURGE_ELIGIBLE_STATUSES = new Set(TERMINAL_STATUSES);
 const SAFE_RUN_ID = /^[a-z0-9][a-z0-9-]{7,79}$/;
+const SAFE_SINGLE_SITE_JOB_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const MIME_TYPES = Object.freeze({
   '.css': 'text/css; charset=utf-8',
   '.gif': 'image/gif',
@@ -180,6 +336,9 @@ const MIME_TYPES = Object.freeze({
 // the test runner and reporters. Loading it directly prevents the portal from
 // publishing a lossy regex projection of audit/catalog.ts.
 const plugins = await loadPluginRegistry([]);
+const pluginRegistryDocument = JSON.parse(
+  await fs.readFile(join(REPOSITORY_ROOT, 'audit', 'plugins.generated.json'), 'utf8'),
+);
 const catalog = mergePortalCatalog([], plugins);
 const AUDIT_IDS = new Set(catalog.map(({ id }) => id));
 const AUDIT_AREAS = new Set(catalog.map(({ area }) => area));
@@ -192,13 +351,70 @@ const preferredMediaValidationCache = new Map();
 const reportDataCache = new ByteLruCache(MAX_REPORT_CACHE_ENTRIES, MAX_REPORT_CACHE_BYTES);
 const galleryRevisionCache = new Map();
 const observedGalleryPublications = new Map();
+const observedSealedGalleryHeads = new Map();
 const purgedGalleryRunIds = new Set();
 const purgingRunIds = new Set();
+const runTransferFences = new Set();
+const activeRunTransfers = new Map();
 const manualMutationRunIds = new Set();
 const galleryMutationRunIds = new Set();
 const launchReservations = new Set();
 const galleryFlagRateWindows = new Map();
+const consolePendingPurgeTokens = new Map();
+const consoleIndexedStateSignatures = new Map();
+const consoleKnownSingleSiteJobIds = [];
+const consoleKnownSingleSiteJobSet = new Set();
+const consoleKnownSingleSiteJobSlots = new Map();
+const consoleKnownSingleSiteFreeSlots = [];
+const consoleKnownSingleSiteRevisions = new Map();
+const consoleKnownSingleSiteFinalizations = new Map();
+const consoleKnownSingleSiteAiOptIn = new Map();
+
+function runTransferKey(mode, runId) {
+  return `${mode}:${runId}`;
+}
+
+async function withRunScopedTransfer(mode, runId, response, operation) {
+  const key = runTransferKey(mode, runId);
+  if (runTransferFences.has(key)) throw httpError(410, 'This run is being permanently purged.');
+  let resolveDone;
+  const done = new Promise((resolve) => { resolveDone = resolve; });
+  const transfer = { response, done };
+  let transfers = activeRunTransfers.get(key);
+  if (!transfers) activeRunTransfers.set(key, transfers = new Set());
+  transfers.add(transfer);
+  if (runTransferFences.has(key)) {
+    transfers.delete(transfer);
+    resolveDone();
+    throw httpError(410, 'This run is being permanently purged.');
+  }
+  try {
+    return await operation();
+  } finally {
+    transfers.delete(transfer);
+    if (transfers.size === 0) activeRunTransfers.delete(key);
+    resolveDone();
+  }
+}
+
+async function fenceAndDrainRunTransfers(mode, runId) {
+  const key = runTransferKey(mode, runId);
+  runTransferFences.add(key);
+  const transfers = [...(activeRunTransfers.get(key) ?? [])];
+  for (const transfer of transfers) transfer.response.destroy();
+  await Promise.all(transfers.map(({ done }) => done));
+}
+
+function releaseRunTransferFence(mode, runId) {
+  runTransferFences.delete(runTransferKey(mode, runId));
+}
+const consoleReportProjectionTasks = new Map();
+const consoleReportProjectionLoads = new Map();
+const consoleReportProjectionCompleted = new Map();
+const consoleReportProjectionFailures = new Map();
 let secretMasterKey;
+let operatorCapabilityToken;
+let operatorSessionToken;
 let savedAnthropicCredential = null;
 let externalRunSyncPromise = null;
 let externalRunSyncDiagnostics = {
@@ -211,12 +427,108 @@ let externalRunSyncDiagnostics = {
   budgetExhausted: false,
 };
 let credentialMutationPromise = Promise.resolve();
+let singleSiteAiReviewSyncPromise = null;
+let consoleIndex = null;
+let consoleMaintenanceAbortController = null;
+let consoleMaintenanceImmediate = null;
+let consoleMaintenanceTimer = null;
+let consoleComparativeBackfillIterator = null;
+let consoleSingleSiteBackfillIterator = null;
+let consoleSingleSitePendingEntry = null;
+let consoleComparativeBackfillRevision = null;
+let consoleSingleSiteBackfillRevision = null;
+let consoleComparativeSourceRevision = 0;
+let consoleSingleSiteSourceRevision = 0;
+let consoleComparativeBackfillDone = false;
+let consoleSingleSiteBackfillDone = false;
+let consoleComparativeBackfillLimited = false;
+let consoleSingleSiteBackfillLimited = false;
+let consoleComparativeBackfillRecords = 0;
+let consoleSingleSiteBackfillRecords = 0;
+let consoleMaintenanceRunning = false;
+let consoleKnownSingleSiteRefreshRunning = false;
+let consoleKnownSingleSiteCursor = 0;
+let consoleComparativeReportWatermark = 0;
+let consoleSingleSiteReportWatermark = 0;
+
+const singleSiteRunnerRevision = await resolveRunnerRevision({ root: REPOSITORY_ROOT });
+const previewTlsBypassOrigins = String(process.env.AUDIT_PREVIEW_TLS_BYPASS_ALLOWLIST ?? '')
+  .split(',')
+  .map((value) => value.trim())
+  .filter(Boolean);
+const singleSiteQueue = await openJobQueue({ root: SINGLE_SITE_QUEUE_ROOT });
+const visualBaselineStore = await openVisualBaselineStore({ root: VISUAL_BASELINE_ROOT });
+const visualReviewStore = await openVisualReviewStore({ root: VISUAL_REVIEW_ROOT });
+const singleSiteAiReview = await openSingleSiteAiReviewSupervisor({
+  root: SINGLE_SITE_AI_REVIEW_ROOT,
+  nestedJobSubdirectory: 'ai-review',
+  aiWorkerIdentity: AI_WORKER_IDENTITY,
+  timeoutMs: AI_STAGE_DEADLINE_MS,
+  onEvent: (event) => {
+    const jobId = typeof event.jobId === 'string' ? event.jobId : 'unknown';
+    const state = typeof event.state === 'string' ? event.state : event.event;
+    console.log(`Single-site AI advisory ${jobId}: ${state}.`);
+    if (SAFE_SINGLE_SITE_JOB_ID.test(jobId)) {
+      void refreshSingleSiteConsoleRun(jobId).catch((error) => {
+        console.error(`[PORTAL_CONSOLE_INDEX_REJECTED] Single-site AI refresh ${jobId}: ${redactLogValue(error.message)}`);
+      });
+    }
+  },
+});
+const singleSiteLaunch = createSingleSiteLaunchCoordinator({
+  pluginRegistry: pluginRegistryDocument,
+  targetRegistry: targetRegistryDocument,
+  runnerRevision: singleSiteRunnerRevision,
+  validateContract: validateSingleSitePortalContract,
+  preflight: (input) => preflightQuitting7ohSite(input, {
+    previewBypassOrigins: previewTlsBypassOrigins,
+    tlsBypassRequestOptions: { rejectUnauthorized: false },
+  }),
+  createJob: createSingleSiteQueueJob,
+});
 
 await fs.mkdir(ARTIFACT_ROOT, { recursive: true });
+await fs.mkdir(SINGLE_SITE_FINALIZATION_ROOT, { recursive: true, mode: 0o700 });
 await initializeSecretVault();
+const recoveredSingleSiteAiReviews = await recoverSingleSiteAiReviews(singleSiteAiReview);
+for (const recovery of recoveredSingleSiteAiReviews) {
+  console.warn(`Recovered Single-site AI advisory ${recovery.jobId} as ${recovery.state}.`);
+}
+const recoveredSingleSitePurges = await recoverSingleSitePurges({
+  queue: singleSiteQueue,
+  finalizationRoot: SINGLE_SITE_FINALIZATION_ROOT,
+  aiReviewRoot: SINGLE_SITE_AI_REVIEW_ROOT,
+  baselineStore: visualBaselineStore,
+}).catch((error) => {
+  console.error(`Single-site purge recovery could not complete: ${error.message}`);
+  return [];
+});
+for (const recovery of recoveredSingleSitePurges) {
+  if (recovery.status === 'purged') {
+    console.log(`Recovered interrupted Single-site purge ${recovery.jobId}; independent baseline bytes were preserved.`);
+  } else {
+    console.error(`Single-site purge ${recovery.jobId} still requires recovery: ${recovery.message}`);
+  }
+}
 await loadPersistedRuns();
 await syncExternalShardedRuns();
+await loadPurgeQuarantines();
 await refreshAllGalleryPublications(false);
+consoleIndex = createConsoleIndex();
+const consoleApi = createConsoleApi({
+  index: consoleIndex,
+  resolveCapabilities: resolveConsoleCapabilities,
+});
+consoleMaintenanceAbortController = new AbortController();
+beginConsoleIndexBackfill();
+await runConsoleIndexMaintenanceSlice();
+scheduleConsoleIndexMaintenance();
+consoleMaintenanceTimer = setInterval(() => {
+  void refreshKnownSingleSiteConsoleIndexSlice().catch((error) => {
+    console.error(`[PORTAL_CONSOLE_REFRESH_FAILED] ${redactLogValue(error.message)}`);
+  });
+}, SINGLE_SITE_AI_REVIEW_SYNC_MS);
+consoleMaintenanceTimer.unref();
 const externalRunSyncTimer = setInterval(() => {
   void (async () => {
     await syncExternalShardedRuns();
@@ -226,6 +538,12 @@ const externalRunSyncTimer = setInterval(() => {
   });
 }, EXTERNAL_RUN_SYNC_MS);
 externalRunSyncTimer.unref();
+triggerSingleSiteAiReviewSync();
+const singleSiteAiReviewSyncTimer = setInterval(
+  triggerSingleSiteAiReviewSync,
+  SINGLE_SITE_AI_REVIEW_SYNC_MS,
+);
+singleSiteAiReviewSyncTimer.unref();
 
 const server = createServer(async (request, response) => {
   try {
@@ -233,10 +551,60 @@ const server = createServer(async (request, response) => {
   } catch (error) {
     if (error?.name === 'AbortError' && error?.message === 'Gallery request disconnected.') return;
     if (response.destroyed || response.writableEnded) return;
-    const status = Number.isInteger(error?.statusCode) ? error.statusCode : 500;
+    const queueStatus = error instanceof JobQueueError
+      ? error.code === 'QUEUE_NOT_FOUND' ? 404
+        : ['QUEUE_TERMINAL', 'QUEUE_STATE_CONFLICT', 'QUEUE_ALREADY_CLAIMED', 'QUEUE_IDEMPOTENCY_CONFLICT'].includes(error.code) ? 409
+          : error.code === 'QUEUE_SCHEMA_INVALID' ? 400
+            : 500
+      : null;
+    const baselineStatus = error instanceof VisualBaselineStoreError
+      ? ['BASELINE_CAS_CONFLICT', 'BASELINE_IDEMPOTENCY_CONFLICT', 'BASELINE_ACTIVE_EXISTS',
+        'BASELINE_ACTIVE_CONFLICT', 'BASELINE_STATE_CONFLICT', 'BASELINE_MUTATION_LOCKED'].includes(error.code) ? 409
+        : ['BASELINE_INPUT_INVALID', 'BASELINE_SOURCE_MISMATCH', 'BASELINE_PATH_UNSAFE'].includes(error.code) ? 422
+          : 500
+      : null;
+    const visualReviewStatus = error instanceof VisualReviewStoreError
+      ? ['VISUAL_REVIEW_CAS_CONFLICT', 'VISUAL_REVIEW_IDEMPOTENCY_CONFLICT',
+        'VISUAL_REVIEW_ALREADY_RECORDED', 'VISUAL_REVIEW_BASELINE_STALE'].includes(error.code) ? 409
+        : ['VISUAL_REVIEW_INPUT_INVALID', 'VISUAL_REVIEW_PATH_UNSAFE'].includes(error.code) ? 422
+          : error.code === 'VISUAL_REVIEW_HISTORY_LIMIT' ? 413
+            : 500
+      : null;
+    const singleSitePurgeStatus = error instanceof SingleSitePurgeError
+      ? ['SINGLE_SITE_PURGE_INVALID', 'SINGLE_SITE_PURGE_CONFIRMATION'].includes(error.code) ? 400
+        : error.code === 'SINGLE_SITE_PURGE_LIMIT' ? 413
+          : ['SINGLE_SITE_PURGE_NOT_TERMINAL', 'SINGLE_SITE_PURGE_FINALIZATION_PENDING',
+            'SINGLE_SITE_PURGE_BASELINE_BUSY', 'SINGLE_SITE_PURGE_INCOMPLETE'].includes(error.code) ? 409
+            : 422
+      : null;
+    const singleSiteAiReviewStatus = error instanceof SingleSiteAiReviewError
+      ? ['AI_REVIEW_CAS_CONFLICT', 'AI_REVIEW_BUSY', 'AI_REVIEW_NOT_READY'].includes(error.code) ? 409
+        : ['AI_REVIEW_INVALID', 'AI_REVIEW_PATH_UNSAFE'].includes(error.code) ? 400
+          : ['AI_REVIEW_REPORT_BINDING', 'AI_REVIEW_INPUT_LIMIT', 'AI_REVIEW_OUTPUT_INVALID',
+            'AI_REVIEW_OUTPUT_SECRET', 'AI_REVIEW_STATUS_INVALID'].includes(error.code) ? 422
+            : 503
+      : null;
+    const status = Number.isInteger(error?.statusCode)
+      ? error.statusCode
+      : queueStatus ?? baselineStatus ?? visualReviewStatus ?? singleSitePurgeStatus ?? singleSiteAiReviewStatus ?? 500;
     if (status >= 500) console.error(error);
-    const body = { error: Number.isInteger(error?.statusCode) ? error.message : 'Internal server error.' };
-    if (typeof error?.code === 'string' && /^GALLERY_[A-Z0-9_]+$/.test(error.code)) body.code = error.code;
+    const body = {
+      error: Number.isInteger(error?.statusCode)
+        || error instanceof JobQueueError
+        || error instanceof VisualBaselineStoreError
+        || error instanceof VisualReviewStoreError
+        || error instanceof SingleSitePurgeError
+        || error instanceof SingleSiteAiReviewError
+        ? error.message
+        : 'Internal server error.',
+    };
+    if (typeof error?.code === 'string' && /^(?:AI_REVIEW|BASELINE|GALLERY|SINGLE_SITE|VISUAL_REVIEW|QUEUE)_[A-Z0-9_]+$/.test(error.code)) {
+      body.code = error.code;
+    }
+    if (error instanceof VisualBaselineStoreError && error.details) body.details = error.details;
+    if (error instanceof VisualReviewStoreError && error.details) body.details = error.details;
+    if (error instanceof SingleSitePurgeError && error.details) body.details = error.details;
+    if (error?.name === 'SingleSiteLaunchError' && error.details) body.details = error.details;
     if (error instanceof GalleryHttpError) {
       if (error.head) body.head = error.head;
       if (error.recovery) body.recovery = error.recovery;
@@ -249,16 +617,850 @@ server.listen(PORT, HOST, () => {
   console.log(`Audit portal listening on http://${HOST}:${PORT}`);
   console.log(`Run evidence will be stored in ${ARTIFACT_ROOT}`);
   console.log(`Externally launched sharded runs will be tracked from ${SHARDED_ARTIFACT_ROOT}`);
+  console.log(`Single-site jobs use the verified ${singleSiteQueue.storage?.filesystemType ?? 'unknown'} queue at ${SINGLE_SITE_QUEUE_ROOT}`);
+  console.log(`Single-site visual baselines use the independent persistent store at ${VISUAL_BASELINE_ROOT}`);
+  console.log(`Operator unlock path (append to the published portal origin): /operator/bootstrap?token=${operatorCapabilityToken}`);
 });
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.once(signal, () => {
     clearInterval(externalRunSyncTimer);
-    for (const run of runs.values()) {
-      if (run.child && !TERMINAL_STATUSES.has(run.manifest.status)) stopChild(run, 'Portal shutting down');
+    clearInterval(singleSiteAiReviewSyncTimer);
+    if (consoleMaintenanceTimer) clearInterval(consoleMaintenanceTimer);
+    if (consoleMaintenanceImmediate) clearImmediate(consoleMaintenanceImmediate);
+    consoleMaintenanceAbortController?.abort();
+    void closeConsoleIndexMaintenance().finally(() => {
+      for (const run of runs.values()) {
+        if (run.child && !TERMINAL_STATUSES.has(run.manifest.status)) stopChild(run, 'Portal shutting down');
+      }
+      server.close(() => process.exit(0));
+      setTimeout(() => process.exit(1), 10_000).unref();
+    });
+  });
+}
+
+function nextConsoleSourceRevision(mode) {
+  if (mode === 'comparative') return `comparative-${++consoleComparativeSourceRevision}`;
+  return `single-site-${++consoleSingleSiteSourceRevision}`;
+}
+
+function consoleSourceUpdatedAt(value) {
+  return typeof value === 'string' && Number.isFinite(Date.parse(value))
+    ? new Date(value).toISOString()
+    : new Date().toISOString();
+}
+
+function comparativeConsoleIndexRecord(run, sourceRevision = nextConsoleSourceRevision('comparative')) {
+  const manifest = run?.manifest;
+  if (!manifest || typeof manifest.id !== 'string') throw new TypeError('Comparative console source is invalid.');
+  const options = manifest.options ?? {};
+  const qualifier = options.auditIds?.length || options.pluginIds?.length || options.areas?.length
+    ? 'TARGETED'
+    : 'FULL';
+  const normalized = normalizeComparativeConsoleRecord({
+    mode: 'comparative',
+    sourceType: run.externalManaged ? 'external-sharded-manifest' : 'portal-run-manifest',
+    sourceIdentity: manifest.id,
+    sourceRevision,
+    sourceUpdatedAt: consoleSourceUpdatedAt(
+      manifest.updatedAt ?? manifest.finishedAt ?? manifest.startedAt ?? manifest.createdAt,
+    ),
+    document: {
+      manifest,
+      runContract: {
+        productionUrl: options.productionUrl,
+        candidateUrl: options.candidateUrl,
+        targetIds: options.targetIds ?? options.projects,
+        scope: {
+          qualifier,
+          pluginIds: options.pluginIds ?? [],
+          auditIds: options.auditIds ?? [],
+          areas: options.areas ?? [],
+        },
+      },
+    },
+  }, { completeness: 'partial', freshness: 'current' });
+  return normalizedRunToConsoleIndexRecord(normalized, { sourceId: COMPARATIVE_CONSOLE_SOURCE_ID });
+}
+
+function comparativeConsoleTimelineRecords(run, indexRecord) {
+  const stages = Object.entries(run?.manifest?.stages ?? {}).map(([stageId, stage]) => ({
+    ...(stage && typeof stage === 'object' && !Array.isArray(stage) ? stage : {}),
+    stageId,
+  }));
+  return projectComparativeTimeline(run.manifest.id, { stages }, {
+    sourceRevision: indexRecord.sourceRevision,
+  }).slice(-MAX_CONSOLE_TIMELINE_RECORDS_PER_RUN).map((timeline) => timelineToConsoleIndexRecord(timeline, {
+    sourceId: COMPARATIVE_CONSOLE_SOURCE_ID,
+    scopeKey: indexRecord.scopeKey,
+    sourceUpdatedAt: indexRecord.sourceUpdatedAt,
+    complete: indexRecord.complete,
+  }));
+}
+
+async function authoritativeComparativeConsoleIndexRecord(run) {
+  const id = run.manifest.id;
+  if (run.externalManaged) {
+    await refreshExternalRun(run, false, {
+      remainingBytes: MAX_EXTERNAL_REFRESH_BYTES,
+      deadline: performance.now() + MAX_EXTERNAL_REFRESH_MS,
+      bytesRead: 0,
+      filesVisited: 0,
+      skippedBytes: 0,
+    });
+    const refreshed = runs.get(id);
+    if (!refreshed || refreshed.purgeQuarantine) throw new Error('Comparative authority is unavailable.');
+    return authoritativeComparativeConsoleRecord(refreshed);
+  }
+  const manifestPath = join(run.directory, 'run.json');
+  const stat = await fs.lstat(manifestPath);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size < 2
+    || stat.size > MAX_COMPARATIVE_CONSOLE_MANIFEST_BYTES) {
+    throw new Error('Comparative authority manifest is unsafe or oversized.');
+  }
+  const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+  if (manifest?.id !== id) throw new Error('Comparative authority manifest identity changed.');
+  return authoritativeComparativeConsoleRecord(run, manifest);
+}
+
+function singleSiteConsoleIndexRecord(
+  state,
+  { input = null, finalization = null, sourceRevision = null } = {},
+) {
+  if (!state || typeof state.jobId !== 'string') throw new TypeError('Single-site console source is invalid.');
+  const document = { state };
+  if (input) document.input = input;
+  if (finalization) document.finalization = finalization;
+  const normalized = normalizeSingleSiteConsoleRecord({
+    mode: 'single-site',
+    sourceType: 'single-site-queue-state',
+    sourceIdentity: state.jobId,
+    sourceRevision: sourceRevision ?? `state-${state.sequence ?? 0}`,
+    sourceUpdatedAt: consoleSourceUpdatedAt(state.updatedAt ?? state.submittedAt),
+    document,
+  }, { completeness: input ? 'complete' : 'partial', freshness: 'current' });
+  return normalizedRunToConsoleIndexRecord(normalized, { sourceId: SINGLE_SITE_CONSOLE_SOURCE_ID });
+}
+
+function singleSiteConsoleTimelineRecords(state, indexRecord) {
+  return projectSingleSiteTimeline(state.jobId, state, {
+    sourceRevision: indexRecord.sourceRevision,
+  }).slice(-MAX_CONSOLE_TIMELINE_RECORDS_PER_RUN).map((timeline) => timelineToConsoleIndexRecord(timeline, {
+    sourceId: SINGLE_SITE_CONSOLE_SOURCE_ID,
+    scopeKey: indexRecord.scopeKey,
+    sourceUpdatedAt: indexRecord.sourceUpdatedAt,
+    complete: indexRecord.complete,
+  }));
+}
+
+function upsertConsoleRecordSet(indexRecord, timelineRecords, options = {}) {
+  const signatureKey = `${indexRecord.mode}\u0000${indexRecord.runId}`;
+  const signature = consoleRecordSetSignature(indexRecord, timelineRecords);
+  if (consoleIndexedStateSignatures.get(signatureKey) === signature) {
+    return Object.freeze({ committed: false, reason: 'unchanged', record: indexRecord });
+  }
+  const primary = consoleIndex.upsert(indexRecord, options);
+  if (!primary.committed) return primary;
+  for (const timelineRecord of timelineRecords) consoleIndex.upsert(timelineRecord, options);
+  consoleIndexedStateSignatures.set(signatureKey, signature);
+  return primary;
+}
+
+function consoleRecordSetSignature(indexRecord, timelineRecords) {
+  return createHash('sha256').update(JSON.stringify([indexRecord, ...timelineRecords], (key, value) => (
+    key === 'sourceRevision' ? null : value
+  ))).digest('hex');
+}
+
+function authoritativeComparativeConsoleRecord(run, manifest = run.manifest) {
+  const authorityRun = manifest === run.manifest ? run : { ...run, manifest };
+  const signatureKey = `comparative\u0000${manifest.id}`;
+  const probe = comparativeConsoleIndexRecord(
+    authorityRun,
+    run.consoleSourceRevision ?? 'comparative-content-probe',
+  );
+  const unchanged = typeof run.consoleSourceRevision === 'string'
+    && consoleIndexedStateSignatures.get(signatureKey)
+      === consoleRecordSetSignature(probe, comparativeConsoleTimelineRecords(authorityRun, probe));
+  const record = comparativeConsoleIndexRecord(
+    authorityRun,
+    unchanged ? run.consoleSourceRevision : nextConsoleSourceRevision('comparative'),
+  );
+  const timeline = comparativeConsoleTimelineRecords(authorityRun, record);
+  run.consoleSourceRevision = record.sourceRevision;
+  consoleIndexedStateSignatures.set(signatureKey, consoleRecordSetSignature(record, timeline));
+  return record;
+}
+
+function upsertComparativeConsoleRun(run) {
+  if (!consoleIndex || run?.purgeQuarantine) return false;
+  try {
+    const probe = comparativeConsoleIndexRecord(run, run.consoleSourceRevision ?? 'comparative-content-probe');
+    const probeTimeline = comparativeConsoleTimelineRecords(run, probe);
+    if (consoleIndexedStateSignatures.get(`comparative\u0000${run.manifest.id}`)
+      === consoleRecordSetSignature(probe, probeTimeline)) {
+      return Object.freeze({ committed: false, reason: 'unchanged', record: probe });
     }
-    server.close(() => process.exit(0));
-    setTimeout(() => process.exit(1), 10_000).unref();
+    const record = comparativeConsoleIndexRecord(run, nextConsoleSourceRevision('comparative'));
+    const result = upsertConsoleRecordSet(record, comparativeConsoleTimelineRecords(run, record));
+    if (result.committed) run.consoleSourceRevision = record.sourceRevision;
+    if (result.committed) queueComparativeConsoleReportProjection(run, record.scopeKey);
+    return result;
+  } catch (error) {
+    console.error(`[PORTAL_CONSOLE_INDEX_REJECTED] comparative ${run?.manifest?.id ?? 'unknown'}: ${redactLogValue(error.message)}`);
+    return false;
+  }
+}
+
+function upsertSingleSiteConsoleState(state, options = {}) {
+  if (!consoleIndex) return false;
+  try {
+    rememberSingleSiteConsoleJob(state.jobId);
+    if (options.finalization) consoleKnownSingleSiteFinalizations.set(state.jobId, options.finalization);
+    if (options.input?.advisory?.aiReview) {
+      consoleKnownSingleSiteAiOptIn.set(state.jobId, options.input.advisory.aiReview.optedIn === true);
+    }
+    const fresh = singleSiteConsoleIndexRecord(state, options);
+    const current = consoleIndex.read({ mode: 'single-site', runId: state.jobId }).value;
+    const record = current ? mergeSingleSiteConsoleIndexRecord(current, fresh) : fresh;
+    const result = upsertConsoleRecordSet(record, singleSiteConsoleTimelineRecords(state, record));
+    if (result.committed && options.finalization) {
+      queueSingleSiteConsoleReportProjection(state, options.finalization, record.scopeKey);
+    }
+    return result;
+  } catch (error) {
+    console.error(`[PORTAL_CONSOLE_INDEX_REJECTED] single-site ${state?.jobId ?? 'unknown'}: ${redactLogValue(error.message)}`);
+    return false;
+  }
+}
+
+function consoleReportProjectionKey(identity) {
+  return `${identity.mode}\u0000${identity.runId}`;
+}
+
+function consoleReportProjectionSignature(publication) {
+  return `${publication.publicationRevision}:${publication.publicationDigest}`;
+}
+
+function updateConsoleReportSourceWatermark(mode) {
+  if (!consoleIndex) return;
+  const sourceId = `${mode}-report-publication`;
+  const prefix = `${mode}\u0000`;
+  const expectedKeys = new Set([
+    ...[...consoleReportProjectionCompleted.keys()].filter((key) => key.startsWith(prefix)),
+    ...[...consoleReportProjectionTasks.keys()].filter((key) => key.startsWith(prefix)),
+    ...[...consoleReportProjectionLoads.keys()].filter((key) => key.startsWith(prefix)),
+    ...[...consoleReportProjectionFailures.keys()].filter((key) => key.startsWith(prefix)),
+  ]);
+  const complete = expectedKeys.size > 0 && [...expectedKeys].every((key) => (
+    !consoleReportProjectionLoads.has(key)
+    && !consoleReportProjectionTasks.has(key)
+    && !consoleReportProjectionFailures.has(key)
+    && consoleReportProjectionCompleted.get(key)?.complete === true
+  ));
+  const sequence = mode === 'comparative'
+    ? ++consoleComparativeReportWatermark
+    : ++consoleSingleSiteReportWatermark;
+  consoleIndex.setSourceWatermark(sourceId, {
+    revision: `${mode}-report-index-${sequence}`,
+    updatedAt: new Date().toISOString(),
+    complete,
+    limitation: complete ? null : expectedKeys.size > 0 ? 'incomplete-publication' : 'source-unavailable',
+  });
+}
+
+function queueConsoleReportProjection(publication, identity, scopeKey) {
+  if (!consoleIndex || consoleMaintenanceAbortController?.signal.aborted) return;
+  const key = consoleReportProjectionKey(identity);
+  const signature = consoleReportProjectionSignature(publication);
+  if (consoleReportProjectionCompleted.get(key)?.signature === signature) return;
+  const current = consoleReportProjectionTasks.get(key);
+  if (current?.signature === signature && current.task.status === 'pending') return;
+  if (current) cancelConsoleReportProjectionTask(current.task);
+  const task = createConsoleReportProjectionTask({
+    index: consoleIndex,
+    publication,
+    identity,
+    scopeKey,
+  });
+  if (task.status !== 'pending') {
+    consoleReportProjectionFailures.set(key, { reason: task.reason ?? 'projection-rejected' });
+    updateConsoleReportSourceWatermark(identity.mode);
+    return;
+  }
+  consoleReportProjectionFailures.delete(key);
+  consoleReportProjectionTasks.set(key, { task, signature });
+  updateConsoleReportSourceWatermark(identity.mode);
+  scheduleConsoleIndexMaintenance();
+}
+
+function queueComparativeConsoleReportProjection(run, scopeKey) {
+  if (!TERMINAL_STATUSES.has(run.manifest.status)
+    || run.manifest.pipeline?.completed !== true
+    || run.manifest.stages?.reportRebuild?.status !== 'completed') return;
+  const identity = { mode: 'comparative', runId: run.manifest.id };
+  const key = consoleReportProjectionKey(identity);
+  if (consoleReportProjectionLoads.has(key)) return;
+  consoleReportProjectionFailures.delete(key);
+  const load = (async () => {
+    const publication = await loadReportPublication(run.directory);
+    if (publication.mode === 'single-site') throw new Error('Comparative run exposed a Single-site report publication.');
+    const current = runs.get(identity.runId);
+    if (!current || current.purgeQuarantine) return;
+    queueConsoleReportProjection(publication, identity, scopeKey);
+  })().catch((error) => {
+    consoleReportProjectionFailures.set(key, { reason: 'load-failed' });
+    updateConsoleReportSourceWatermark(identity.mode);
+    console.error(`[PORTAL_CONSOLE_REPORT_REJECTED] comparative ${identity.runId}: ${redactLogValue(error.message)}`);
+  }).finally(() => {
+    if (consoleReportProjectionLoads.get(key) === load) {
+      consoleReportProjectionLoads.delete(key);
+      updateConsoleReportSourceWatermark(identity.mode);
+    }
+  });
+  consoleReportProjectionLoads.set(key, load);
+  updateConsoleReportSourceWatermark(identity.mode);
+}
+
+function queueSingleSiteConsoleReportProjection(state, finalization, scopeKey) {
+  if (!['complete', 'incomplete'].includes(finalization.status)
+    || typeof finalization.reportRevision !== 'string'
+    || typeof finalization.reportPublicationDigest !== 'string') return;
+  const identity = { mode: 'single-site', runId: state.jobId };
+  const key = consoleReportProjectionKey(identity);
+  if (consoleReportProjectionLoads.has(key)) return;
+  consoleReportProjectionFailures.delete(key);
+  const load = (async () => {
+    const directory = resolve(SINGLE_SITE_FINALIZATION_ROOT, state.jobId, 'report');
+    if (directory !== SINGLE_SITE_FINALIZATION_ROOT
+      && !directory.startsWith(`${SINGLE_SITE_FINALIZATION_ROOT}${sep}`)) {
+      throw new Error('Single-site report directory escaped its configured root.');
+    }
+    const publication = await loadSingleSiteReportPublication(directory, finalization.reportRevision);
+    if (publication.publicationDigest !== finalization.reportPublicationDigest) {
+      throw new Error('Single-site report publication disagrees with finalization authority.');
+    }
+    if (!consoleKnownSingleSiteJobSet.has(identity.runId)) return;
+    queueConsoleReportProjection(publication, identity, scopeKey);
+  })().catch((error) => {
+    consoleReportProjectionFailures.set(key, { reason: 'load-failed' });
+    updateConsoleReportSourceWatermark(identity.mode);
+    console.error(`[PORTAL_CONSOLE_REPORT_REJECTED] single-site ${identity.runId}: ${redactLogValue(error.message)}`);
+  }).finally(() => {
+    if (consoleReportProjectionLoads.get(key) === load) {
+      consoleReportProjectionLoads.delete(key);
+      updateConsoleReportSourceWatermark(identity.mode);
+    }
+  });
+  consoleReportProjectionLoads.set(key, load);
+  updateConsoleReportSourceWatermark(identity.mode);
+}
+
+function forgetConsoleReportProjection(identity) {
+  const key = consoleReportProjectionKey(identity);
+  const current = consoleReportProjectionTasks.get(key);
+  if (current) cancelConsoleReportProjectionTask(current.task);
+  consoleReportProjectionTasks.delete(key);
+  consoleReportProjectionLoads.delete(key);
+  consoleReportProjectionFailures.delete(key);
+  consoleReportProjectionCompleted.delete(key);
+  updateConsoleReportSourceWatermark(identity.mode);
+}
+
+async function runConsoleReportProjectionSlice() {
+  const entry = consoleReportProjectionTasks.entries().next().value;
+  if (!entry) return;
+  const [key, current] = entry;
+  try {
+    await runConsoleReportProjectionTaskSlice(current.task, {
+      signal: consoleMaintenanceAbortController.signal,
+      limit: 50,
+      maximumDocuments: 2,
+      maximumSourceBytes: 1024 * 1024,
+      maximumDocumentBytes: 1024 * 1024,
+    });
+    if (current.task.status === 'pending') return;
+    consoleReportProjectionTasks.delete(key);
+    if (current.task.status === 'committed') {
+      consoleReportProjectionFailures.delete(key);
+      consoleReportProjectionCompleted.set(key, {
+        signature: current.signature,
+        complete: current.task.complete === true,
+      });
+      updateConsoleReportSourceWatermark(current.task.identity.mode);
+      return;
+    }
+    if (current.task.reason === 'stale-capture') {
+      queueConsoleReportProjection(
+        current.task.publication,
+        current.task.identity,
+        current.task.scopeKey,
+      );
+      return;
+    }
+    consoleReportProjectionFailures.set(key, { reason: current.task.reason ?? 'projection-rejected' });
+    updateConsoleReportSourceWatermark(current.task.identity.mode);
+  } catch (error) {
+    consoleReportProjectionTasks.delete(key);
+    if (error?.name !== 'AbortError') {
+      consoleReportProjectionFailures.set(key, { reason: 'projection-failed' });
+      updateConsoleReportSourceWatermark(current.task.identity.mode);
+      console.error(`[PORTAL_CONSOLE_REPORT_REJECTED] ${current.task.identity.mode} ${current.task.identity.runId}: ${redactLogValue(error.message)}`);
+    }
+  }
+}
+
+function mergeSingleSiteConsoleIndexRecord(current, fresh) {
+  const fields = { ...current.fields, ...fresh.fields };
+  for (const key of ['targetIds', 'pluginIds', 'auditIds', 'areas']) {
+    if (Array.isArray(fresh.fields[key]) && fresh.fields[key].length === 0
+      && Array.isArray(current.fields[key]) && current.fields[key].length > 0) {
+      fields[key] = current.fields[key];
+    }
+  }
+  for (const key of ['auditedOrigin', 'deploymentRole', 'qualifier', 'scopeLabel']) {
+    if ((fresh.fields[key] === undefined || fresh.fields[key] === 'Single-site scope unavailable')
+      && current.fields[key] !== undefined) fields[key] = current.fields[key];
+  }
+  return Object.freeze({
+    ...fresh,
+    scopeKey: fresh.scopeKey === 'unknown' ? current.scopeKey : fresh.scopeKey,
+    complete: false,
+    fields: Object.freeze(fields),
+  });
+}
+
+function rememberSingleSiteConsoleJob(jobId) {
+  if (!SAFE_SINGLE_SITE_JOB_ID.test(jobId) || consoleKnownSingleSiteJobSet.has(jobId)) return;
+  if (consoleKnownSingleSiteJobSet.size >= MAX_CONSOLE_KNOWN_SINGLE_SITE_JOBS) {
+    consoleSingleSiteBackfillLimited = true;
+    return;
+  }
+  consoleKnownSingleSiteJobSet.add(jobId);
+  const slot = consoleKnownSingleSiteFreeSlots.pop();
+  if (slot === undefined) {
+    consoleKnownSingleSiteJobSlots.set(jobId, consoleKnownSingleSiteJobIds.length);
+    consoleKnownSingleSiteJobIds.push(jobId);
+  } else {
+    consoleKnownSingleSiteJobSlots.set(jobId, slot);
+    consoleKnownSingleSiteJobIds[slot] = jobId;
+  }
+}
+
+function forgetSingleSiteConsoleJob(jobId) {
+  forgetConsoleReportProjection({ mode: 'single-site', runId: jobId });
+  const slot = consoleKnownSingleSiteJobSlots.get(jobId);
+  consoleKnownSingleSiteJobSet.delete(jobId);
+  consoleKnownSingleSiteJobSlots.delete(jobId);
+  consoleKnownSingleSiteRevisions.delete(jobId);
+  consoleKnownSingleSiteFinalizations.delete(jobId);
+  consoleKnownSingleSiteAiOptIn.delete(jobId);
+  consoleIndexedStateSignatures.delete(`single-site\u0000${jobId}`);
+  if (slot !== undefined) {
+    consoleKnownSingleSiteJobIds[slot] = null;
+    consoleKnownSingleSiteFreeSlots.push(slot);
+  }
+}
+
+async function refreshSingleSiteConsoleRun(jobId) {
+  const state = await readSingleSiteJob(singleSiteQueue, jobId);
+  const finalization = await readSingleSiteFinalizationStatus(SINGLE_SITE_FINALIZATION_ROOT, jobId)
+    .catch(() => null);
+  upsertSingleSiteConsoleState(state, { finalization });
+}
+
+async function refreshSingleSiteConsoleRunBestEffort(jobId, reason) {
+  try {
+    await refreshSingleSiteConsoleRun(jobId);
+  } catch (error) {
+    console.error(`[PORTAL_CONSOLE_INDEX_REJECTED] Single-site ${reason} ${jobId}: ${redactLogValue(error.message)}`);
+  }
+}
+
+function beginConsoleIndexBackfill() {
+  const now = new Date().toISOString();
+  consoleComparativeBackfillRevision = nextConsoleSourceRevision('comparative');
+  consoleSingleSiteBackfillRevision = nextConsoleSourceRevision('single-site');
+  consoleComparativeBackfillIterator = runs.values();
+  consoleSingleSiteBackfillIterator = null;
+  consoleSingleSitePendingEntry = null;
+  consoleComparativeBackfillDone = false;
+  consoleSingleSiteBackfillDone = false;
+  consoleComparativeBackfillLimited = false;
+  consoleSingleSiteBackfillLimited = false;
+  consoleComparativeBackfillRecords = 0;
+  consoleSingleSiteBackfillRecords = 0;
+  consoleIndex.beginBackfill(COMPARATIVE_CONSOLE_SOURCE_ID, {
+    revision: consoleComparativeBackfillRevision,
+    updatedAt: now,
+    cursor: null,
+    budget: DEFAULT_CONSOLE_INDEX_BUDGET,
+  });
+  consoleIndex.beginBackfill(SINGLE_SITE_CONSOLE_SOURCE_ID, {
+    revision: consoleSingleSiteBackfillRevision,
+    updatedAt: now,
+    cursor: null,
+    budget: DEFAULT_CONSOLE_INDEX_BUDGET,
+  });
+}
+
+function boundedConsoleBackfillWork(work, startedAt, budgetExhausted = false) {
+  const elapsedMs = Math.max(0, Math.ceil(performance.now() - startedAt));
+  return createConsoleReadWork({
+    ...work,
+    elapsedMs,
+    budgetExhausted: budgetExhausted || elapsedMs >= DEFAULT_CONSOLE_INDEX_BUDGET.maxElapsedMs,
+  });
+}
+
+async function backfillComparativeConsoleIndexSlice() {
+  const startedAt = performance.now();
+  let work = createConsoleReadWork();
+  let budgetExhausted = false;
+  while (!consoleComparativeBackfillDone) {
+    if (work.recordsRead >= DEFAULT_CONSOLE_INDEX_BUDGET.maxRecords
+      || performance.now() - startedAt >= DEFAULT_CONSOLE_INDEX_BUDGET.maxElapsedMs) {
+      budgetExhausted = true;
+      break;
+    }
+    const next = consoleComparativeBackfillIterator.next();
+    if (next.done) {
+      consoleComparativeBackfillDone = true;
+      consoleComparativeBackfillIterator = null;
+      break;
+    }
+    const consumed = consumeConsoleReadWork(work, DEFAULT_CONSOLE_INDEX_BUDGET, { recordsRead: 1 });
+    if (!consumed.accepted) {
+      budgetExhausted = true;
+      break;
+    }
+    work = consumed.work;
+    consoleComparativeBackfillRecords += 1;
+    try {
+      const record = comparativeConsoleIndexRecord(next.value);
+      next.value.consoleSourceRevision = record.sourceRevision;
+      const result = upsertConsoleRecordSet(record, comparativeConsoleTimelineRecords(next.value, record));
+      if (result.committed) queueComparativeConsoleReportProjection(next.value, record.scopeKey);
+    } catch (error) {
+      consoleComparativeBackfillLimited = true;
+      console.error(`[PORTAL_CONSOLE_BACKFILL_REJECTED] comparative record: ${redactLogValue(error.message)}`);
+    }
+  }
+  const complete = consoleComparativeBackfillDone && !consoleComparativeBackfillLimited;
+  consoleIndex.updateBackfill(COMPARATIVE_CONSOLE_SOURCE_ID, {
+    revision: consoleComparativeBackfillRevision,
+    updatedAt: new Date().toISOString(),
+    cursor: complete ? null : `runs-${consoleComparativeBackfillRecords}`,
+    complete,
+    limitation: complete ? null : consoleComparativeBackfillDone ? 'source-malformed' : 'budget-exhausted',
+    work: boundedConsoleBackfillWork(work, startedAt, budgetExhausted),
+  });
+}
+
+async function backfillSingleSiteConsoleIndexSlice() {
+  const startedAt = performance.now();
+  let work = createConsoleReadWork();
+  let budgetExhausted = false;
+  if (!consoleSingleSiteBackfillIterator) {
+    try {
+      consoleSingleSiteBackfillIterator = await fs.opendir(join(singleSiteQueue.root, 'jobs'));
+    } catch (error) {
+      consoleSingleSiteBackfillDone = true;
+      consoleSingleSiteBackfillLimited = true;
+      console.error(`[PORTAL_CONSOLE_BACKFILL_UNAVAILABLE] Single-site queue: ${redactLogValue(error.message)}`);
+    }
+  }
+  while (!consoleSingleSiteBackfillDone && consoleSingleSiteBackfillIterator) {
+    if (work.recordsRead >= DEFAULT_CONSOLE_INDEX_BUDGET.maxRecords
+      || work.sourceFilesRead >= DEFAULT_CONSOLE_INDEX_BUDGET.maxSourceFiles
+      || performance.now() - startedAt >= DEFAULT_CONSOLE_INDEX_BUDGET.maxElapsedMs) {
+      budgetExhausted = true;
+      break;
+    }
+    const entry = consoleSingleSitePendingEntry ?? await consoleSingleSiteBackfillIterator.read();
+    consoleSingleSitePendingEntry = null;
+    if (!entry) {
+      consoleSingleSiteBackfillDone = true;
+      await consoleSingleSiteBackfillIterator.close().catch(() => {});
+      consoleSingleSiteBackfillIterator = null;
+      break;
+    }
+    const candidateWork = consumeConsoleReadWork(work, DEFAULT_CONSOLE_INDEX_BUDGET, {
+      recordsRead: 1,
+      sourceFilesRead: 1,
+    });
+    if (!candidateWork.accepted) {
+      consoleSingleSitePendingEntry = entry;
+      budgetExhausted = true;
+      break;
+    }
+    work = candidateWork.work;
+    consoleSingleSiteBackfillRecords += 1;
+    if (!entry.isDirectory() || !SAFE_SINGLE_SITE_JOB_ID.test(entry.name)) continue;
+    rememberSingleSiteConsoleJob(entry.name);
+    const statePath = join(singleSiteQueue.root, 'jobs', entry.name, 'state.json');
+    try {
+      const stateStat = await fs.lstat(statePath);
+      if (!stateStat.isFile() || stateStat.isSymbolicLink()
+        || stateStat.size < 1 || stateStat.size > MAX_SINGLE_SITE_CONSOLE_STATE_BYTES) {
+        consoleSingleSiteBackfillLimited = true;
+        continue;
+      }
+      const byteWork = consumeConsoleReadWork(work, DEFAULT_CONSOLE_INDEX_BUDGET, {
+        sourceBytesRead: stateStat.size,
+      });
+      if (!byteWork.accepted) {
+        consoleSingleSitePendingEntry = entry;
+        budgetExhausted = true;
+        break;
+      }
+      work = byteWork.work;
+      const state = await readSingleSiteJob(singleSiteQueue, entry.name);
+      const record = singleSiteConsoleIndexRecord(state);
+      upsertConsoleRecordSet(record, singleSiteConsoleTimelineRecords(state, record));
+    } catch (error) {
+      consoleSingleSiteBackfillLimited = true;
+      console.error(`[PORTAL_CONSOLE_BACKFILL_REJECTED] Single-site ${entry.name}: ${redactLogValue(error.message)}`);
+    }
+  }
+  const complete = consoleSingleSiteBackfillDone && !consoleSingleSiteBackfillLimited;
+  consoleIndex.updateBackfill(SINGLE_SITE_CONSOLE_SOURCE_ID, {
+    revision: consoleSingleSiteBackfillRevision,
+    updatedAt: new Date().toISOString(),
+    cursor: complete ? null : `jobs-${consoleSingleSiteBackfillRecords}`,
+    complete,
+    limitation: complete ? null : consoleSingleSiteBackfillDone ? 'source-malformed' : 'budget-exhausted',
+    work: boundedConsoleBackfillWork(work, startedAt, budgetExhausted),
+  });
+}
+
+async function runConsoleIndexMaintenanceSlice() {
+  if (consoleMaintenanceRunning || consoleMaintenanceAbortController?.signal.aborted) return;
+  consoleMaintenanceRunning = true;
+  try {
+    if (!consoleComparativeBackfillDone) await backfillComparativeConsoleIndexSlice();
+    if (!consoleMaintenanceAbortController.signal.aborted && !consoleSingleSiteBackfillDone) {
+      await backfillSingleSiteConsoleIndexSlice();
+    }
+    if (!consoleMaintenanceAbortController.signal.aborted && consoleReportProjectionTasks.size > 0) {
+      await runConsoleReportProjectionSlice();
+    }
+  } finally {
+    consoleMaintenanceRunning = false;
+  }
+}
+
+async function refreshKnownSingleSiteConsoleIndexSlice() {
+  if (consoleKnownSingleSiteRefreshRunning || !consoleSingleSiteBackfillDone
+    || consoleMaintenanceAbortController?.signal.aborted || consoleKnownSingleSiteJobIds.length === 0) return;
+  consoleKnownSingleSiteRefreshRunning = true;
+  const startedAt = performance.now();
+  let work = createConsoleReadWork();
+  let visited = 0;
+  try {
+    while (visited < consoleKnownSingleSiteJobIds.length
+      && work.recordsRead < DEFAULT_CONSOLE_INDEX_BUDGET.maxRecords
+      && work.sourceFilesRead < DEFAULT_CONSOLE_INDEX_BUDGET.maxSourceFiles
+      && performance.now() - startedAt < DEFAULT_CONSOLE_INDEX_BUDGET.maxElapsedMs) {
+      const slot = consoleKnownSingleSiteCursor % consoleKnownSingleSiteJobIds.length;
+      const jobId = consoleKnownSingleSiteJobIds[slot];
+      consoleKnownSingleSiteCursor = (slot + 1) % consoleKnownSingleSiteJobIds.length;
+      visited += 1;
+      if (!consoleKnownSingleSiteJobSet.has(jobId)) continue;
+      const candidate = consumeConsoleReadWork(work, DEFAULT_CONSOLE_INDEX_BUDGET, {
+        recordsRead: 1,
+        sourceFilesRead: 1,
+      });
+      if (!candidate.accepted) break;
+      work = candidate.work;
+      const statePath = join(singleSiteQueue.root, 'jobs', jobId, 'state.json');
+      let stateStat;
+      try {
+        stateStat = await fs.lstat(statePath);
+      } catch (error) {
+        if (error?.code === 'ENOENT') {
+          forgetSingleSiteConsoleJob(jobId);
+          continue;
+        }
+        throw error;
+      }
+      if (!stateStat.isFile() || stateStat.isSymbolicLink()
+        || stateStat.size < 1 || stateStat.size > MAX_SINGLE_SITE_CONSOLE_STATE_BYTES) continue;
+      const stateBytes = consumeConsoleReadWork(work, DEFAULT_CONSOLE_INDEX_BUDGET, {
+        sourceBytesRead: stateStat.size,
+      });
+      if (!stateBytes.accepted) {
+        consoleKnownSingleSiteCursor = slot;
+        break;
+      }
+      work = stateBytes.work;
+      const state = await readSingleSiteJob(singleSiteQueue, jobId);
+      let finalization = null;
+      if (SINGLE_SITE_TERMINAL_STATES.has(state.executionState)) {
+        const finalFile = consumeConsoleReadWork(work, DEFAULT_CONSOLE_INDEX_BUDGET, { sourceFilesRead: 1 });
+        if (!finalFile.accepted) {
+          consoleKnownSingleSiteCursor = slot;
+          break;
+        }
+        work = finalFile.work;
+        const finalizationPath = join(SINGLE_SITE_FINALIZATION_ROOT, jobId, 'status.json');
+        const finalizationStat = await fs.lstat(finalizationPath).catch((error) => {
+          if (error?.code === 'ENOENT') return null;
+          throw error;
+        });
+        if (!finalizationStat) {
+          finalization = { status: 'pending' };
+        } else if (finalizationStat.isFile() && !finalizationStat.isSymbolicLink()
+          && finalizationStat.size >= 2 && finalizationStat.size <= MAX_SINGLE_SITE_CONSOLE_FINALIZATION_BYTES) {
+          const finalizationBytes = consumeConsoleReadWork(work, DEFAULT_CONSOLE_INDEX_BUDGET, {
+            sourceBytesRead: finalizationStat.size,
+          });
+          if (!finalizationBytes.accepted) {
+            consoleKnownSingleSiteCursor = slot;
+            break;
+          }
+          work = finalizationBytes.work;
+          finalization = await readSingleSiteFinalizationStatus(SINGLE_SITE_FINALIZATION_ROOT, jobId);
+        } else {
+          finalization = { status: 'invalid' };
+        }
+      }
+      const revision = JSON.stringify([
+        state.sequence ?? null,
+        state.updatedAt ?? null,
+        finalization?.status ?? null,
+        finalization?.reportRevision ?? null,
+        finalization?.galleryExportRevision ?? null,
+      ]);
+      if (consoleKnownSingleSiteRevisions.get(jobId) === revision) continue;
+      upsertSingleSiteConsoleState(state, { finalization });
+      consoleKnownSingleSiteRevisions.set(jobId, revision);
+    }
+  } finally {
+    consoleKnownSingleSiteRefreshRunning = false;
+  }
+}
+
+function scheduleConsoleIndexMaintenance() {
+  if (consoleMaintenanceAbortController?.signal.aborted || consoleMaintenanceImmediate
+    || (consoleComparativeBackfillDone && consoleSingleSiteBackfillDone
+      && consoleReportProjectionTasks.size === 0)) return;
+  consoleMaintenanceImmediate = setImmediate(() => {
+    consoleMaintenanceImmediate = null;
+    void runConsoleIndexMaintenanceSlice()
+      .then(scheduleConsoleIndexMaintenance)
+      .catch((error) => console.error(`[PORTAL_CONSOLE_BACKFILL_FAILED] ${redactLogValue(error.message)}`));
+  });
+  consoleMaintenanceImmediate.unref?.();
+}
+
+async function closeConsoleIndexMaintenance() {
+  const iterator = consoleSingleSiteBackfillIterator;
+  consoleSingleSiteBackfillIterator = null;
+  consoleComparativeBackfillIterator = null;
+  consoleSingleSitePendingEntry = null;
+  if (iterator) await iterator.close().catch(() => {});
+  consolePendingPurgeTokens.clear();
+  consoleKnownSingleSiteJobSet.clear();
+  consoleKnownSingleSiteJobSlots.clear();
+  consoleKnownSingleSiteFreeSlots.length = 0;
+  consoleKnownSingleSiteJobIds.length = 0;
+  consoleKnownSingleSiteRevisions.clear();
+  consoleKnownSingleSiteFinalizations.clear();
+  consoleKnownSingleSiteAiOptIn.clear();
+  for (const { task } of consoleReportProjectionTasks.values()) {
+    cancelConsoleReportProjectionTask(task);
+  }
+  consoleReportProjectionTasks.clear();
+  consoleReportProjectionLoads.clear();
+  consoleReportProjectionFailures.clear();
+  consoleReportProjectionCompleted.clear();
+  consoleIndex?.clear();
+}
+
+async function resolveConsoleCapabilities({ identities, signal, authorization }) {
+  if (signal?.aborted) throw signal.reason ?? new DOMException('Console request disconnected.', 'AbortError');
+  const authorized = authorization?.authorized === true;
+  const authorityRevision = consoleIndex.sourceVector().indexRevision;
+  const baselineLocked = identities.some(({ mode }) => mode === 'single-site')
+    ? await isVisualBaselineMutationLocked(visualBaselineStore)
+    : false;
+  return identities.map((identity) => {
+    if (identity.mode === 'comparative') {
+      const run = runs.get(identity.runId);
+      const terminal = Boolean(run && TERMINAL_STATUSES.has(run.manifest.status));
+      const active = Boolean(run && !run.externalManaged && !terminal && !run.purgeQuarantine);
+      const purgeEligible = Boolean(run && (run.purgeQuarantine || (
+        terminal && !purgingRunIds.has(identity.runId)
+          && !manualMutationRunIds.has(identity.runId) && !galleryMutationRunIds.has(identity.runId)
+      )));
+      const manualEligible = Boolean(run && !run.externalManaged && terminal && !run.child
+        && !['stopped', 'spawn-failed'].includes(run.manifest.status) && !run.purgeQuarantine
+        && !purgingRunIds.has(identity.runId) && !manualMutationRunIds.has(identity.runId));
+      const aiEligible = Boolean(run && !run.externalManaged && terminal && !run.purgeQuarantine
+        && run.manifest.stages?.aiReview?.enabled === true
+        && run.manifest.stages.aiReview.status === 'failed' && currentAnthropicApiKey());
+      return {
+        identity,
+        contextId: 'comparative-live',
+        authorityRevision,
+        actions: consoleActionsForContext('comparative-live', authorized, {
+          stop: [active, active ? null : run?.externalManaged ? 'External runs must be stopped by their launcher.' : 'The run is not active.'],
+          purge: [purgeEligible, purgeEligible ? null : 'The run cannot be purged while active or mutation-locked.'],
+          manualEvidence: [manualEligible, manualEligible ? null : 'Manual evidence requires a finished portal-managed run without a mutation lock.'],
+          aiReview: [aiEligible, aiEligible ? null : 'A failed opted-in advisory with current credentials is required.'],
+          settings: [true, null],
+        }),
+      };
+    }
+    const indexed = consoleIndex.read(identity).value;
+    const terminal = indexed?.fields?.terminal === true;
+    const executionState = indexed?.fields?.executionState;
+    const finalization = consoleKnownSingleSiteFinalizations.get(identity.runId);
+    const finalizationReady = Boolean(finalization && finalization.status !== 'pending');
+    const finalizedEvidence = Boolean(finalization && ['complete', 'incomplete'].includes(finalization.status));
+    const completed = executionState === 'completed';
+    const purgeActive = consolePendingPurgeTokens.has(`single-site:${identity.runId}`);
+    const visualEligible = Boolean(completed && finalizedEvidence
+      && finalization.galleryExportRevision && finalization.galleryIndexDigest);
+    const baselineEligible = Boolean(visualEligible && finalization.visualEligibilityManifestDigest && !baselineLocked);
+    const aiEligible = Boolean(completed && finalizedEvidence
+      && consoleKnownSingleSiteAiOptIn.get(identity.runId) === true && singleSiteAiRuntimeKey());
+    return {
+      identity,
+      contextId: 'single-site-live',
+      authorityRevision,
+      actions: consoleActionsForContext('single-site-live', authorized, {
+        cancel: [Boolean(indexed && !terminal && !purgeActive), terminal ? 'The run is terminal.' : 'The run is unavailable.'],
+        purge: [Boolean(indexed && terminal && finalizationReady && !purgeActive),
+          finalizationReady ? 'The run is unavailable or already being purged.' : 'Finalization must publish before purge.'],
+        visualDisposition: [visualEligible, visualEligible ? null : 'A completed gallery publication is required.'],
+        baseline: [baselineEligible, baselineLocked ? 'A baseline mutation is already active.' : 'Eligible finalized visual evidence is required.'],
+        aiReview: [aiEligible, aiEligible ? null : 'An opted-in finalized advisory with current credentials is required.'],
+        settings: [true, null],
+      }),
+    };
+  });
+}
+
+function consoleActionsForContext(contextId, authorized, eligibility) {
+  const context = getConsoleCapabilities(contextId);
+  return Object.keys(context.actions).map((actionId) => {
+    const supported = context.actions[actionId] === true;
+    const [eligible, reason] = eligibility[actionId] ?? [null, null];
+    const resolved = resolveConsoleActionAvailability(contextId, actionId, {
+      authorized: supported ? authorized : null,
+      eligible: supported ? eligible : null,
+      unavailableReason: supported && authorized && eligible === false ? reason : null,
+    });
+    return {
+      actionId,
+      supported: resolved.supported,
+      authorized: resolved.authorized,
+      eligible: resolved.eligible,
+      available: resolved.available,
+      unavailableReason: resolved.unavailableReason,
+    };
   });
 }
 
@@ -267,8 +1469,61 @@ async function routeRequest(request, response) {
   const requestUrl = new URL(request.url ?? '/', 'http://portal.local');
   const pathname = requestUrl.pathname;
 
+  if ((request.method === 'GET' || request.method === 'HEAD') && pathname === '/console-contracts.mjs') {
+    return sendFile(
+      request,
+      response,
+      join(PORTAL_DIR, 'console-contracts.mjs'),
+      "default-src 'self'; connect-src 'self'; script-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+      { contentType: 'text/javascript; charset=utf-8' },
+    );
+  }
+
+  if ((request.method === 'GET' || request.method === 'HEAD')
+    && (CONSOLE_SHELL_FIXTURE_FILES.has(pathname) || pathname === CONSOLE_CONTRACT_FIXTURE_PATH)) {
+    if (process.env.PORTAL_E2E_FAILURE_INJECTION !== '1') throw httpError(404, 'Not found.');
+    const file = pathname === CONSOLE_CONTRACT_FIXTURE_PATH
+      ? join(PORTAL_DIR, 'console-contracts.mjs')
+      : CONSOLE_SHELL_FIXTURE_FILES.get(pathname);
+    return sendFile(
+      request,
+      response,
+      file,
+      "default-src 'self'; connect-src 'self'; img-src 'self' data:; media-src 'self'; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+      pathname === CONSOLE_CONTRACT_FIXTURE_PATH ? { contentType: 'text/javascript; charset=utf-8' } : undefined,
+    );
+  }
+
+  if (request.method === 'GET' && pathname === RUN_WORKSPACE_DIAGNOSTICS_PATH) {
+    if (process.env.PORTAL_E2E_FAILURE_INJECTION !== '1') throw httpError(404, 'Not found.');
+    return sendJson(response, 200, publicSseDiagnostics());
+  }
+
   if (request.method === 'GET' && pathname === '/healthz') {
     return sendJson(response, 200, { ok: true });
+  }
+  if (pathname === '/api/console/v1' || pathname.startsWith('/api/console/v1/')) {
+    const result = await withConsoleRequest(request, response, (signal) => handleConsoleApiRequest(consoleApi, {
+      method: request.method,
+      url: request.url,
+      signal,
+      authorization: { authorized: operatorRequestAuthorized(request) },
+    }));
+    if (!result.handled) throw httpError(404, 'Not found.');
+    return sendConsoleApiResult(request, response, result);
+  }
+  if (request.method === 'GET' && pathname === '/operator/bootstrap') {
+    if (!constantTimeTokenMatch(requestUrl.searchParams.get('token'), operatorCapabilityToken)) {
+      throw httpError(403, 'The operator unlock link is invalid. Copy the current link from the portal service log.');
+    }
+    response.writeHead(303, {
+      Location: '/',
+      'Set-Cookie': `portal_operator=${operatorSessionToken}; HttpOnly; SameSite=Strict; Path=/`,
+      'Cache-Control': 'no-store',
+      'Referrer-Policy': 'no-referrer',
+      'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'",
+    });
+    return response.end();
   }
   if (request.method === 'GET' && pathname === '/api/settings/anthropic-key') {
     return sendJson(response, 200, anthropicCredentialState());
@@ -301,9 +1556,32 @@ async function routeRequest(request, response) {
         releaseShardTotal: DEFAULT_RELEASE_SHARD_TOTAL,
         releaseShardWorkers: DEFAULT_RELEASE_SHARD_WORKERS,
         releaseShardConcurrency: DEFAULT_RELEASE_SHARD_CONCURRENCY,
+        singleSiteUrl: process.env.SINGLE_SITE_URL
+          ?? process.env.CANDIDATE_URL
+          ?? 'https://beta.quitting7oh-org.pages.dev',
+        singleSiteDeploymentRole: 'preview',
+        singleSiteCertificatePolicy: 'strict',
+      },
+      modes: ['comparative', 'single-site'],
+      singleSite: {
+        runnerRevision: singleSiteRunnerRevision,
+        previewTlsBypassConfigured: previewTlsBypassOrigins.length > 0,
+        fullProfileTargetIds: targetRegistry.singleSiteFullProfileTargetIds,
+        queue: {
+          available: true,
+          filesystemType: singleSiteQueue.storage?.filesystemType ?? 'unverified',
+          heartbeatMs: singleSiteQueue.heartbeatMs,
+          leaseMs: singleSiteQueue.leaseMs,
+          maxInfrastructureRetries: singleSiteQueue.maxInfrastructureRetries,
+        },
+        visualBaselines: {
+          available: true,
+          mutationsAuthorized: operatorRequestAuthorized(request),
+        },
       },
       limits: { maxConcurrentRuns: MAX_CONCURRENT_RUNS },
       externalSync: externalRunSyncDiagnostics,
+      operator: { authorized: operatorRequestAuthorized(request) },
       aiReview: {
         available: Boolean(currentAnthropicApiKey()) || process.env.AI_REVIEW_DRY_RUN === '1',
         dryRun: process.env.AI_REVIEW_DRY_RUN === '1',
@@ -330,9 +1608,261 @@ async function routeRequest(request, response) {
     triggerExternalShardedRunSync();
     return sendJson(response, 200, { runs: sortedRunSummaries() });
   }
+  if (request.method === 'POST' && pathname === '/api/single-site/preflight') {
+    assertMutationRequest(request);
+    const preview = await singleSiteLaunch.preview(await readJsonBody(request));
+    return sendJson(response, preview.accepted ? 200 : 422, preview);
+  }
+  if (request.method === 'GET' && pathname === '/api/single-site/runs') {
+    const jobs = await listSingleSiteJobs(singleSiteQueue);
+    return sendJson(response, 200, {
+      schemaVersion: 1,
+      jobs: await Promise.all(jobs.map(publicSingleSiteJobSummary)),
+    });
+  }
+  if (request.method === 'POST' && pathname === '/api/single-site/runs') {
+    assertMutationRequest(request);
+    const result = await singleSiteLaunch.launch(await readJsonBody(request));
+    const status = result.launched ? (result.idempotent ? 200 : 201) : result.reason === 'preview-stale' ? 409 : 422;
+    return sendJson(response, status, result);
+  }
   if (request.method === 'POST' && pathname === '/api/runs') {
     assertMutationRequest(request);
     return createRun(request, response);
+  }
+
+  if (request.method === 'GET' && pathname === '/api/single-site/visual-baselines') {
+    return sendJson(response, 200, await publicVisualBaselineCollection(requestUrl, request));
+  }
+
+  if (request.method === 'GET' && pathname === '/api/single-site/visual-baselines/history') {
+    return sendJson(response, 200, await publicVisualBaselineEventHistory(requestUrl));
+  }
+
+  if (request.method === 'POST' && pathname === '/api/single-site/visual-baselines/approve') {
+    assertMutationRequest(request);
+    const result = await mutateVisualBaselineApproval('approve', null, await readJsonBody(request));
+    return sendJson(response, 201, result);
+  }
+
+  const visualBaselineMatch = pathname.match(/^\/api\/single-site\/visual-baselines\/([^/]+)$/);
+  if (request.method === 'GET' && visualBaselineMatch) {
+    return sendJson(response, 200, await publicVisualBaseline(decodeURIComponent(visualBaselineMatch[1]), request));
+  }
+  if (request.method === 'DELETE' && visualBaselineMatch) {
+    assertMutationRequest(request);
+    const baselineId = decodeURIComponent(visualBaselineMatch[1]);
+    return sendJson(response, 200, await mutateVisualBaselineLifecycle('delete', baselineId, await readJsonBody(request)));
+  }
+
+  const visualBaselineMediaMatch = pathname.match(/^\/api\/single-site\/visual-baselines\/([^/]+)\/media$/);
+  if ((request.method === 'GET' || request.method === 'HEAD') && visualBaselineMediaMatch) {
+    return serveVisualBaselineMedia(request, response, decodeURIComponent(visualBaselineMediaMatch[1]));
+  }
+
+  const visualBaselineReplaceMatch = pathname.match(/^\/api\/single-site\/visual-baselines\/([^/]+)\/replace$/);
+  if (request.method === 'POST' && visualBaselineReplaceMatch) {
+    assertMutationRequest(request);
+    const baselineId = decodeURIComponent(visualBaselineReplaceMatch[1]);
+    return sendJson(response, 200, await mutateVisualBaselineApproval('replace', baselineId, await readJsonBody(request)));
+  }
+
+  const visualBaselineRevokeMatch = pathname.match(/^\/api\/single-site\/visual-baselines\/([^/]+)\/revoke$/);
+  if (request.method === 'POST' && visualBaselineRevokeMatch) {
+    assertMutationRequest(request);
+    const baselineId = decodeURIComponent(visualBaselineRevokeMatch[1]);
+    return sendJson(response, 200, await mutateVisualBaselineLifecycle('revoke', baselineId, await readJsonBody(request)));
+  }
+
+  const singleSiteRunMatch = pathname.match(/^\/api\/single-site\/runs\/([^/]+)$/);
+  if (request.method === 'GET' && singleSiteRunMatch) {
+    const jobId = decodeURIComponent(singleSiteRunMatch[1]);
+    const state = await readSingleSiteJob(singleSiteQueue, jobId);
+    const input = await readSingleSiteJobInput(singleSiteQueue, jobId);
+    return sendJson(response, 200, await publicSingleSiteJobWithFinalization(state, input));
+  }
+
+  const singleSiteAiReviewMatch = pathname.match(/^\/api\/single-site\/runs\/([^/]+)\/ai-review$/);
+  if (request.method === 'GET' && singleSiteAiReviewMatch) {
+    const jobId = decodeURIComponent(singleSiteAiReviewMatch[1]);
+    const input = await readSingleSiteJobInput(singleSiteQueue, jobId);
+    const optedIn = input.advisory?.aiReview?.optedIn === true;
+    const status = await readSingleSiteAiReview(singleSiteAiReview, jobId);
+    const finalization = await readSingleSiteFinalizationStatus(SINGLE_SITE_FINALIZATION_ROOT, jobId)
+      .catch(() => null);
+    const displayState = singleSiteAiReviewDisplayState(optedIn, status, finalization);
+    return sendJson(response, 200, {
+      schemaVersion: 1,
+      mode: 'single-site',
+      advisory: true,
+      gating: false,
+      optedIn,
+      model: input.advisory?.aiReview?.model ?? null,
+      state: displayState.state,
+      unavailableReason: displayState.unavailableReason,
+      status: publicSingleSiteAiReviewStatus(status),
+      result: status?.state === 'completed'
+        ? `/api/single-site/runs/${encodeURIComponent(jobId)}/ai-review/result`
+        : null,
+    });
+  }
+  if (request.method === 'POST' && singleSiteAiReviewMatch) {
+    assertMutationRequest(request);
+    const jobId = decodeURIComponent(singleSiteAiReviewMatch[1]);
+    const body = assertVisualBaselineMutationBody(
+      await readJsonBody(request),
+      ['expectedStateRevision', 'confirmation'],
+      ['expectedStateRevision', 'confirmation'],
+    );
+    if (body.confirmation !== `RETRY AI ${jobId}`) {
+      throw httpError(400, `Type ${JSON.stringify(`RETRY AI ${jobId}`)} exactly to retry the AI advisory.`);
+    }
+    const current = await readSingleSiteAiReview(singleSiteAiReview, jobId);
+    if (!current || !['failed', 'unavailable'].includes(current.state)) {
+      throw httpError(409, 'Only a failed or unavailable Single-site AI advisory can be retried.');
+    }
+    if (!Number.isSafeInteger(body.expectedStateRevision) || body.expectedStateRevision < 1) {
+      throw httpError(400, 'AI advisory retry requires the current non-negative state revision.');
+    }
+    const result = await scheduleSingleSiteAiReview(jobId, {
+      force: true,
+      expectedStateRevision: body.expectedStateRevision,
+      requestId: `manual-${current.stateRevision}-${randomBytes(8).toString('hex')}`,
+    });
+    if (!result) throw httpError(409, 'AI advisory retry requires a finalized deterministic Single-site report.');
+    return sendJson(response, 202, result);
+  }
+
+  const singleSiteAiReviewResultMatch = pathname.match(/^\/api\/single-site\/runs\/([^/]+)\/ai-review\/result$/);
+  if (request.method === 'GET' && singleSiteAiReviewResultMatch) {
+    const jobId = decodeURIComponent(singleSiteAiReviewResultMatch[1]);
+    const input = await readSingleSiteJobInput(singleSiteQueue, jobId);
+    if (input.advisory?.aiReview?.optedIn !== true) {
+      throw httpError(404, 'This run did not opt in to an AI advisory result.');
+    }
+    try {
+      return sendJson(
+        response,
+        200,
+        publicSingleSiteAiReviewResult(await readSingleSiteAiReviewResult(singleSiteAiReview, jobId)),
+      );
+    } catch (error) {
+      if (error?.code === 'AI_REVIEW_NOT_READY') throw httpError(409, error.message);
+      throw error;
+    }
+  }
+
+  if (request.method === 'DELETE' && singleSiteRunMatch) {
+    assertMutationRequest(request);
+    const jobId = decodeURIComponent(singleSiteRunMatch[1]);
+    const body = assertVisualBaselineMutationBody(
+      await readJsonBody(request),
+      ['confirmation'],
+      ['confirmation'],
+    );
+    const expectedConfirmation = singleSitePurgeConfirmation(jobId);
+    if (body.confirmation !== expectedConfirmation) {
+      await purgeSingleSiteRun({
+        queue: singleSiteQueue,
+        finalizationRoot: SINGLE_SITE_FINALIZATION_ROOT,
+        aiReviewRoot: SINGLE_SITE_AI_REVIEW_ROOT,
+        baselineStore: visualBaselineStore,
+        jobId,
+        confirmation: body.confirmation,
+      });
+    }
+    const purgeKey = `single-site:${jobId}`;
+    let purgeToken = consolePendingPurgeTokens.get(purgeKey);
+    if (!purgeToken) {
+      const authoritativeState = await readSingleSiteJob(singleSiteQueue, jobId).catch((error) => {
+        if (error?.code === 'QUEUE_NOT_FOUND' || error?.code === 'ENOENT') return null;
+        throw error;
+      });
+      purgeToken = consoleIndex.beginPurge({ mode: 'single-site', runId: jobId }, {
+        sourceId: SINGLE_SITE_CONSOLE_SOURCE_ID,
+        sourceRevision: authoritativeState ? `state-${authoritativeState.sequence ?? 0}` : null,
+        updatedAt: consoleSourceUpdatedAt(authoritativeState?.updatedAt),
+      });
+    }
+    forgetConsoleReportProjection({ mode: 'single-site', runId: jobId });
+    let transferFenced = false;
+    let aiReviewFenced = false;
+    let purgeInvoked = false;
+    try {
+      await fenceAndDrainRunTransfers('single-site', jobId);
+      transferFenced = true;
+      await fenceSingleSiteAiReviewForPurge(singleSiteAiReview, jobId);
+      aiReviewFenced = true;
+      purgeInvoked = true;
+      const result = await purgeSingleSiteRun({
+        queue: singleSiteQueue,
+        finalizationRoot: SINGLE_SITE_FINALIZATION_ROOT,
+        aiReviewRoot: SINGLE_SITE_AI_REVIEW_ROOT,
+        baselineStore: visualBaselineStore,
+        jobId,
+        confirmation: body.confirmation,
+      });
+      evictSingleSiteIdentityCaches(jobId);
+      forgetSingleSiteConsoleJob(jobId);
+      consoleIndex.commitPurge(purgeToken, {
+        sourceRevision: nextConsoleSourceRevision('single-site'),
+        updatedAt: new Date().toISOString(),
+      });
+      consolePendingPurgeTokens.delete(purgeKey);
+      return sendJson(response, 200, {
+        ...result,
+        message: 'Run evidence was permanently purged. Independently copied visual baseline media and tombstoned baseline provenance were preserved.',
+      });
+    } catch (error) {
+      const preQuarantineFailure = !purgeInvoked || [
+        'SINGLE_SITE_PURGE_CONFIRMATION',
+        'SINGLE_SITE_PURGE_INVALID',
+        'SINGLE_SITE_PURGE_NOT_TERMINAL',
+        'SINGLE_SITE_PURGE_FINALIZATION_PENDING',
+        'SINGLE_SITE_PURGE_LIMIT',
+        'SINGLE_SITE_PURGE_BASELINE_BUSY',
+      ].includes(error?.code);
+      if (preQuarantineFailure) {
+        if (transferFenced) releaseRunTransferFence('single-site', jobId);
+        if (aiReviewFenced) releaseSingleSiteAiReviewPurgeFence(singleSiteAiReview, jobId);
+        try {
+          const reread = await readSingleSiteJob(singleSiteQueue, jobId);
+          const record = singleSiteConsoleIndexRecord(reread);
+          consoleIndex.abortPurge(
+            purgeToken,
+            [record, ...singleSiteConsoleTimelineRecords(reread, record)],
+            { sourceComplete: consoleIndex.backfillState(SINGLE_SITE_CONSOLE_SOURCE_ID)?.complete === true },
+          );
+          consolePendingPurgeTokens.delete(purgeKey);
+        } catch (rereadError) {
+          consolePendingPurgeTokens.set(purgeKey, purgeToken);
+          console.error(`[PORTAL_CONSOLE_PURGE_REVERIFY_FAILED] Single-site ${jobId} remains unavailable: ${redactLogValue(rereadError.message)}`);
+        }
+      } else {
+        consolePendingPurgeTokens.set(purgeKey, purgeToken);
+        console.error(`[PORTAL_CONSOLE_PURGE_FENCED] Single-site ${jobId} remains unavailable after ${error?.code ?? 'an unknown failure'}.`);
+      }
+      throw error;
+    }
+  }
+
+  const singleSiteCancelMatch = pathname.match(/^\/api\/single-site\/runs\/([^/]+)\/cancel$/);
+  if (request.method === 'POST' && singleSiteCancelMatch) {
+    assertMutationRequest(request);
+    const body = await readJsonBody(request);
+    if (!body || typeof body !== 'object' || Array.isArray(body)
+      || typeof body.reason !== 'string' || body.reason.trim().length < 3 || body.reason.length > 512) {
+      throw httpError(400, 'Cancellation requires a reason from 3 through 512 characters.');
+    }
+    const state = await cancelSingleSiteJob(
+      singleSiteQueue,
+      decodeURIComponent(singleSiteCancelMatch[1]),
+      body.reason.trim(),
+    );
+    const input = await readSingleSiteJobInput(singleSiteQueue, state.jobId);
+    const result = await publicSingleSiteJobWithFinalization(state, input);
+    upsertSingleSiteConsoleState(state, { input });
+    return sendJson(response, 202, result);
   }
 
   const runMatch = pathname.match(/^\/api\/runs\/([^/]+)$/);
@@ -420,6 +1950,48 @@ async function routeRequest(request, response) {
     });
   }
 
+  const singleSiteLogsMatch = pathname.match(/^\/api\/single-site\/runs\/([^/]+)\/logs$/);
+  if (request.method === 'GET' && singleSiteLogsMatch) {
+    const jobId = decodeURIComponent(singleSiteLogsMatch[1]);
+    const state = await readSingleSiteJob(singleSiteQueue, jobId);
+    const maximumBytes = queryInteger(
+      requestUrl.searchParams.get('maxBytes'),
+      'maxBytes',
+      DEFAULT_LOG_SNAPSHOT_BYTES,
+      MIN_LOG_SNAPSHOT_BYTES,
+      MAX_LOG_SNAPSHOT_BYTES,
+    );
+    const attemptId = state.attemptId ?? [...state.publications]
+      .sort((left, right) => right.attemptNumber - left.attemptNumber)[0]?.attemptId ?? null;
+    if (attemptId === null) {
+      return sendJson(response, 200, {
+        log: '',
+        sequence: state.sequence,
+        bytes: 0,
+        maxBytes: maximumBytes,
+        truncated: false,
+        sources: [],
+      });
+    }
+    const logPath = join(SINGLE_SITE_QUEUE_ROOT, 'jobs', state.jobId, 'attempts', attemptId, 'work', 'logs', 'worker.ndjson');
+    const tail = await readBoundedFileTail(logPath, maximumBytes);
+    const redactedLog = redactLogValue(tail.content);
+    const redactedBytes = Buffer.byteLength(redactedLog);
+    return sendJson(response, 200, {
+      log: redactedLog,
+      sequence: state.sequence,
+      bytes: redactedBytes,
+      maxBytes: maximumBytes,
+      truncated: tail.truncated,
+      sources: tail.size === 0 ? [] : [{
+        path: `attempts/${attemptId}/work/logs/worker.ndjson`,
+        size: tail.size,
+        returnedBytes: redactedBytes,
+        truncated: tail.truncated,
+      }],
+    });
+  }
+
   const manualEvidenceMatch = pathname.match(/^\/api\/runs\/([^/]+)\/manual-evidence$/);
   if (request.method === 'GET' && manualEvidenceMatch) {
     const run = requireRun(decodeURIComponent(manualEvidenceMatch[1]));
@@ -434,10 +2006,10 @@ async function routeRequest(request, response) {
 
   const manualUploadMatch = pathname.match(/^\/api\/runs\/([^/]+)\/manual-uploads$/);
   if (request.method === 'POST' && manualUploadMatch) {
-    assertSameOrigin(request);
+    requireOperatorAuthorization(request);
     const run = requireRun(decodeURIComponent(manualUploadMatch[1]));
     const upload = await withManualMutation(run, () => receiveManualUpload(run, request, requestUrl));
-    return sendJson(response, 201, upload);
+    return sendJson(response, upload.replayed === true ? 200 : 201, upload);
   }
 
   const artifactListMatch = pathname.match(/^\/api\/runs\/([^/]+)\/artifacts$/);
@@ -448,6 +2020,23 @@ async function routeRequest(request, response) {
     return sendJson(response, 200, await listArtifacts(run.directory, run.manifest.id, offset, limit, request));
   }
 
+  const singleSiteArtifactListMatch = pathname.match(/^\/api\/single-site\/runs\/([^/]+)\/artifacts$/);
+  if (request.method === 'GET' && singleSiteArtifactListMatch) {
+    const jobId = decodeURIComponent(singleSiteArtifactListMatch[1]);
+    const state = await readSingleSiteJob(singleSiteQueue, jobId);
+    const attemptRoot = singleSiteAttemptArtifactDirectory(state);
+    const offset = queryInteger(requestUrl.searchParams.get('offset'), 'offset', 0, 0, 1_000_000);
+    const limit = queryInteger(requestUrl.searchParams.get('limit'), 'limit', DEFAULT_ARTIFACT_PAGE_SIZE, 1, MAX_ARTIFACT_PAGE_SIZE);
+    return sendJson(response, 200, await listArtifacts(
+      attemptRoot,
+      state.jobId,
+      offset,
+      limit,
+      request,
+      '/single-site-artifacts',
+    ));
+  }
+
   const reportMatch = pathname.match(/^\/api\/runs\/([^/]+)\/report$/);
   if (request.method === 'GET' && reportMatch) {
     const id = decodeURIComponent(reportMatch[1]);
@@ -455,6 +2044,113 @@ async function routeRequest(request, response) {
     const run = requireRun(id);
     const value = await readBoundedReportJson(run, 'summary.json', MAX_REPORT_SUMMARY_BYTES);
     return sendJson(response, 200, value);
+  }
+
+  const singleSiteReportMatch = pathname.match(/^\/api\/single-site\/runs\/([^/]+)\/report$/);
+  if (request.method === 'GET' && singleSiteReportMatch) {
+    const reportRun = await singleSiteReportRun(decodeURIComponent(singleSiteReportMatch[1]));
+    const value = await readBoundedReportJson(
+      reportRun,
+      'summary.json',
+      MAX_REPORT_SUMMARY_BYTES,
+      singleSiteRequestedReportRevision(reportRun, requestUrl),
+    );
+    if (value.mode !== 'single-site') throw httpError(422, 'Single-site report publication has the wrong mode.');
+    return sendJson(response, 200, value);
+  }
+
+  const singleSiteReportAuditsMatch = pathname.match(/^\/api\/single-site\/runs\/([^/]+)\/report\/audits$/);
+  if (request.method === 'GET' && singleSiteReportAuditsMatch) {
+    const jobId = decodeURIComponent(singleSiteReportAuditsMatch[1]);
+    const reportRun = await singleSiteReportRun(jobId);
+    const input = await readSingleSiteJobInput(singleSiteQueue, jobId);
+    return sendJson(response, 200, await filterSingleSiteReportAudits(reportRun, input, requestUrl));
+  }
+
+  const singleSiteGalleryMatch = pathname.match(/^\/api\/single-site\/runs\/([^/]+)\/gallery$/);
+  if (request.method === 'GET' && singleSiteGalleryMatch) {
+    const jobId = decodeURIComponent(singleSiteGalleryMatch[1]);
+    return withGalleryRequest(request, response, async (signal) => {
+      const snapshot = await loadPortalSingleSiteGallery(jobId, request, signal);
+      return sendJson(response, 200, singleSiteGalleryHead(snapshot));
+    });
+  }
+
+  const singleSiteGalleryItemsMatch = pathname.match(/^\/api\/single-site\/runs\/([^/]+)\/gallery\/items$/);
+  if (request.method === 'GET' && singleSiteGalleryItemsMatch) {
+    const jobId = decodeURIComponent(singleSiteGalleryItemsMatch[1]);
+    return withGalleryRequest(request, response, async (signal) => {
+      const snapshot = await loadPortalSingleSiteGallery(jobId, request, signal);
+      return sendJson(response, 200, await pageSingleSiteGalleryItems(snapshot, {
+        offset: queryInteger(requestUrl.searchParams.get('offset'), 'offset', 0, 0, 10_000),
+        limit: queryInteger(requestUrl.searchParams.get('limit'), 'limit', 50, 1, 100),
+        revision: requestUrl.searchParams.get('revision') ?? undefined,
+        baselineStoreRevision: requestUrl.searchParams.has('baselineStoreRevision')
+          ? queryInteger(requestUrl.searchParams.get('baselineStoreRevision'), 'baselineStoreRevision', 0, 0, Number.MAX_SAFE_INTEGER)
+          : undefined,
+        reviewRevision: requestUrl.searchParams.has('reviewRevision')
+          ? queryInteger(requestUrl.searchParams.get('reviewRevision'), 'reviewRevision', 0, 0, Number.MAX_SAFE_INTEGER)
+          : undefined,
+        anchorItemId: galleryAnchor(requestUrl.searchParams.get('anchor')),
+        scope: requestUrl.searchParams.get('scope') ?? undefined,
+        kind: requestUrl.searchParams.get('kind') ?? undefined,
+        suite: requestUrl.searchParams.get('suite') ?? undefined,
+        finding: requestUrl.searchParams.get('finding') ?? undefined,
+        coverage: requestUrl.searchParams.get('coverage') ?? undefined,
+        visual: requestUrl.searchParams.get('visual') ?? undefined,
+        query: requestUrl.searchParams.get('q') ?? undefined,
+        signal,
+      }));
+    });
+  }
+
+  const singleSiteGalleryItemMatch = pathname.match(/^\/api\/single-site\/runs\/([^/]+)\/gallery\/items\/([^/]+)$/);
+  if (request.method === 'GET' && singleSiteGalleryItemMatch) {
+    const jobId = decodeURIComponent(singleSiteGalleryItemMatch[1]);
+    const itemId = decodeURIComponent(singleSiteGalleryItemMatch[2]);
+    return withGalleryRequest(request, response, async (signal) => {
+      const snapshot = await loadPortalSingleSiteGallery(jobId, request, signal);
+      return sendJson(response, 200, await readSingleSiteGalleryItem(snapshot, itemId, {
+        revision: requestUrl.searchParams.get('revision') ?? undefined,
+        baselineStoreRevision: requestUrl.searchParams.has('baselineStoreRevision')
+          ? queryInteger(requestUrl.searchParams.get('baselineStoreRevision'), 'baselineStoreRevision', 0, 0, Number.MAX_SAFE_INTEGER)
+          : undefined,
+        reviewRevision: requestUrl.searchParams.has('reviewRevision')
+          ? queryInteger(requestUrl.searchParams.get('reviewRevision'), 'reviewRevision', 0, 0, Number.MAX_SAFE_INTEGER)
+          : undefined,
+        signal,
+      }));
+    });
+  }
+
+  const singleSiteGalleryReviewMatch = pathname.match(/^\/api\/single-site\/runs\/([^/]+)\/gallery\/items\/([^/]+)\/review$/);
+  if (request.method === 'POST' && singleSiteGalleryReviewMatch) {
+    assertMutationRequest(request);
+    const jobId = decodeURIComponent(singleSiteGalleryReviewMatch[1]);
+    const itemId = decodeURIComponent(singleSiteGalleryReviewMatch[2]);
+    const snapshot = await loadPortalSingleSiteGallery(jobId, request);
+    const result = await reviewSingleSiteGalleryItem(snapshot, itemId, await readJsonBody(request));
+    await refreshSingleSiteConsoleRunBestEffort(jobId, 'visual review');
+    console.log(`Single-site visual review ${jobId}/${itemId}: ${result.disposition} at revision ${result.reviewRevision}.`);
+    return sendJson(response, result.idempotent ? 200 : 201, result);
+  }
+
+  const singleSiteGalleryMediaMatch = pathname.match(/^\/api\/single-site\/runs\/([^/]+)\/gallery\/items\/([^/]+)\/media\/(current|diff)$/);
+  if ((request.method === 'GET' || request.method === 'HEAD') && singleSiteGalleryMediaMatch) {
+    const jobId = decodeURIComponent(singleSiteGalleryMediaMatch[1]);
+    const itemId = decodeURIComponent(singleSiteGalleryMediaMatch[2]);
+    const view = singleSiteGalleryMediaMatch[3];
+    return withRunScopedTransfer('single-site', jobId, response, () =>
+      withGalleryRequest(request, response, async (signal) => {
+        const snapshot = await loadPortalSingleSiteGallery(jobId, request, signal);
+        const media = await resolveSingleSiteGalleryMedia(snapshot, itemId, view, { signal });
+        return sendFile(request, response, media.absolutePath, "default-src 'none'; frame-ancestors 'self'", {
+          opened: media.opened,
+          contentType: media.contentType,
+          etag: media.etag,
+        });
+      }),
+    );
   }
 
   const reportAuditsMatch = pathname.match(/^\/api\/runs\/([^/]+)\/report\/audits$/);
@@ -536,7 +2232,7 @@ async function routeRequest(request, response) {
     const result = await withGalleryMutationLock(run, async () => {
       const snapshot = await loadGallerySnapshot(run, undefined, { includeRows: false });
       const detail = await readGalleryItem(snapshot, run.manifest.id, body?.itemId);
-      return mutateGalleryFlag(run.directory, {
+      return mutateRunGalleryFlag(run, {
         action: 'open',
         itemId: detail.item.id,
         identity: galleryFlagIdentity(detail.item),
@@ -563,7 +2259,7 @@ async function routeRequest(request, response) {
     if (!/^gflag_[a-f0-9]{16,64}$/.test(flagId)) throw httpError(404, 'Reviewer flag was not found.');
     const body = await readJsonBody(request);
     consumeGalleryFlagRate(request, run.manifest.id);
-    const result = await withGalleryMutationLock(run, () => mutateGalleryFlag(run.directory, {
+    const result = await withGalleryMutationLock(run, () => mutateRunGalleryFlag(run, {
       action: body?.action,
       flagId,
       reviewer: body?.reviewer,
@@ -648,12 +2344,28 @@ async function routeRequest(request, response) {
 
   const artifactMatch = pathname.match(/^\/artifacts\/([^/]+)(?:\/(.*))?$/);
   if ((request.method === 'GET' || request.method === 'HEAD') && artifactMatch) {
-    return serveArtifact(
+    const runId = decodeURIComponent(artifactMatch[1]);
+    return withRunScopedTransfer('comparative', runId, response, () => serveArtifact(
       request,
       response,
-      decodeURIComponent(artifactMatch[1]),
+      runId,
       artifactMatch[2] ? decodeURIComponent(artifactMatch[2]) : '',
-    );
+    ));
+  }
+
+
+  const singleSiteArtifactMatch = pathname.match(/^\/single-site-artifacts\/([^/]+)(?:\/(.*))?$/);
+  if ((request.method === 'GET' || request.method === 'HEAD') && singleSiteArtifactMatch) {
+    const jobId = decodeURIComponent(singleSiteArtifactMatch[1]);
+    return withRunScopedTransfer('single-site', jobId, response, async () => {
+      const state = await readSingleSiteJob(singleSiteQueue, jobId);
+      return serveArtifactFromDirectory(
+        request,
+        response,
+        singleSiteAttemptArtifactDirectory(state),
+        singleSiteArtifactMatch[2] ? decodeURIComponent(singleSiteArtifactMatch[2]) : '',
+      );
+    });
   }
 
   if (request.method === 'GET' || request.method === 'HEAD') {
@@ -675,6 +2387,26 @@ async function withGalleryRequest(request, response, operation) {
     return await operation(controller.signal);
   } finally {
     request.removeListener('aborted', abort);
+  }
+}
+
+async function withConsoleRequest(request, response, operation) {
+  const controller = new AbortController();
+  const abort = () => {
+    if (!controller.signal.aborted) {
+      controller.abort(new DOMException('Console request disconnected.', 'AbortError'));
+    }
+  };
+  const close = () => {
+    if (!response.writableEnded) abort();
+  };
+  request.once('aborted', abort);
+  response.once('close', close);
+  try {
+    return await operation(controller.signal);
+  } finally {
+    request.removeListener('aborted', abort);
+    response.removeListener('close', close);
   }
 }
 
@@ -771,6 +2503,25 @@ function logGalleryFlagMutation(run, result, requestedStatus) {
   };
   console.log(`[GALLERY_FLAG] ${JSON.stringify(record)}`);
   appendEvent(run, 'gallery-flag', record);
+}
+
+async function mutateRunGalleryFlag(run, transition) {
+  const checklistRoot = join(run.directory, 'checklist');
+  const galleryRoot = join(checklistRoot, 'gallery');
+  const result = await withRunArtifactWriteWindow(
+    run,
+    () => mutateGalleryFlag(run.directory, transition),
+    {
+      writablePaths: [checklistRoot, galleryRoot, join(galleryRoot, 'revisions')],
+      sealPaths: [
+        galleryRoot,
+        join(checklistRoot, 'gallery.html'),
+        join(run.directory, 'visual-flags.json'),
+      ],
+    },
+  );
+  upsertComparativeConsoleRun(run);
+  return result;
 }
 
 function galleryRevisionKey(head) {
@@ -880,11 +2631,24 @@ async function refreshAllGalleryPublications(emit) {
   for (const run of runs.values()) {
     if (purgingRunIds.has(run.manifest.id)) continue;
     try {
+      const beforeStamp = await sealedGalleryHeadStamp(run);
+      if (beforeStamp && observedGalleryPublications.has(run.manifest.id)
+        && observedSealedGalleryHeads.get(run.manifest.id) === beforeStamp) {
+        // Sealed gallery reads authenticate a large integrity manifest. Once a
+        // terminal pointer has been validated, an unchanged inode/stat stamp
+        // cannot publish a new revision and does not need to consume the
+        // interactive event loop on every one-second discovery tick. Request
+        // paths still validate integrity independently and fail closed.
+        continue;
+      }
       const publication = await probeGalleryPublication(run);
       if (!publication) continue;
       const prior = observedGalleryPublications.get(run.manifest.id);
       const token = `${publication.phase}:${publication.contentRevision}:${publication.flagRevision}:${publication.orderRevision}`;
       observedGalleryPublications.set(run.manifest.id, token);
+      const afterStamp = publication.phase === 'sealed' ? await sealedGalleryHeadStamp(run) : null;
+      if (beforeStamp && beforeStamp === afterStamp) observedSealedGalleryHeads.set(run.manifest.id, afterStamp);
+      else observedSealedGalleryHeads.delete(run.manifest.id);
       if (emit && prior !== token) {
         appendEvent(run, 'gallery', {
           schemaVersion: 1,
@@ -899,11 +2663,22 @@ async function refreshAllGalleryPublications(emit) {
         });
       }
     } catch (error) {
+      observedSealedGalleryHeads.delete(run.manifest.id);
       if (error?.statusCode !== 404) {
         console.error(`Could not inspect gallery publication for ${run.manifest.id}: ${error.message}`);
       }
     }
   }
+}
+
+async function sealedGalleryHeadStamp(run) {
+  const sealedReviewable = run.manifest?.stages?.reportRebuild?.status === 'completed'
+    || run.manifest?.pipeline?.completed === true
+    || Boolean(run.manifest?.finishedAt);
+  if (!sealedReviewable) return null;
+  const stat = await safeStat(join(run.directory, 'checklist', 'gallery', 'current.json'));
+  if (!stat?.isFile()) return null;
+  return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
 }
 
 async function createRun(request, response) {
@@ -918,9 +2693,10 @@ async function createRun(request, response) {
   const id = makeRunId();
   const directory = join(ARTIFACT_ROOT, id);
   const logDirectory = join(directory, 'logs');
+  let artifactPermissionMode;
   try {
     await fs.mkdir(logDirectory, { recursive: true });
-    await prepareRunDirectoryForRunner(directory);
+    artifactPermissionMode = await prepareRunDirectoryForRunner(directory);
   } catch (error) {
     launchReservations.delete(reservation);
     throw error;
@@ -954,7 +2730,10 @@ async function createRun(request, response) {
     artifactPath: relative(REPOSITORY_ROOT, directory),
     progress: { total: null, completed: 0, passed: null, failed: null, flaky: null, skipped: null },
     reviewReasons: [],
-    executionProvenance: portalExecutionProvenance(),
+    executionProvenance: {
+      ...portalExecutionProvenance(),
+      artifactPermissionMode,
+    },
     pipeline: {
       status: 'running',
       completed: false,
@@ -994,6 +2773,7 @@ async function createRun(request, response) {
     childTimeoutError: null,
     infrastructureFailure: null,
     aiApiKey,
+    artifactPermissionsSealed: false,
   };
   let logStream = null;
   let lifecycleStream = null;
@@ -1091,6 +2871,14 @@ async function createRun(request, response) {
     stage: structuredClone(run.manifest.stages.playwright),
   });
   appendLog(run, 'stdout', `Command started: ${playwrightCommand.join(' ')}`, 'playwright');
+  appendLog(
+    run,
+    'stdout',
+    artifactPermissionMode === 'portable-bind'
+      ? 'Artifact permissions: portable bind-mount mode; worker identities remain isolated from the credential vault and completed artifacts are sealed before reporting.'
+      : 'Artifact permissions: owner/group isolation mode.',
+    'playwright',
+  );
   appendLog(run, 'stdout', `TLS policy: candidate certificate errors ${options.candidateIgnoreHTTPSErrors ? 'ignored for development' : 'enforced'}; production certificate errors enforced.`, 'playwright');
 
   consumeOutput(run, child.stdout, 'stdout', 'playwright');
@@ -1288,14 +3076,7 @@ function validateRunRequest(body) {
   const productionUrl = validateTargetUrl(body.productionUrl, 'Production URL');
   const candidateUrl = validateTargetUrl(body.candidateUrl, 'Candidate URL');
   if (candidateIgnoreHTTPSErrors) {
-    const production = new URL(productionUrl);
-    const candidate = new URL(candidateUrl);
-    const protectedProductionHosts = new Set(['quitting7oh.org', 'www.quitting7oh.org']);
-    if (candidate.origin === production.origin
-      || candidate.hostname === production.hostname
-      || protectedProductionHosts.has(candidate.hostname)) {
-      throw httpError(400, 'Candidate certificate bypass cannot be used for the production origin. Disable the bypass or choose a development candidate origin.');
-    }
+    throw httpError(400, 'Candidate certificate bypass is unavailable because browsers cannot restrict it to one exact origin. Install the development/Netskope CA and keep TLS verification enabled.');
   }
 
   return {
@@ -1312,6 +3093,810 @@ function validateRunRequest(body) {
     aiModel,
     candidateIgnoreHTTPSErrors,
   };
+}
+
+function validateSingleSitePortalContract(contract) {
+  const unknownTargets = contract.targetIds.filter((id) => !SINGLE_SITE_TARGET_IDS.has(id));
+  if (unknownTargets.length > 0) {
+    throw httpError(400, `Unknown Single-site browser targets: ${unknownTargets.join(', ')}.`);
+  }
+  const unavailableTargets = contract.targetIds.filter((id) => !RUNNABLE_SINGLE_SITE_TARGET_IDS.has(id));
+  if (unavailableTargets.length > 0) {
+    throw httpError(400, `These Single-site Docker targets are unavailable: ${unavailableTargets.join(', ')}.`);
+  }
+}
+
+function bareSha256Digest(value, label) {
+  if (typeof value !== 'string') {
+    throw new SingleSiteLaunchError(502, 'SINGLE_SITE_DIGEST_INVALID', `${label} is missing.`);
+  }
+  const normalized = value.startsWith('sha256:') ? value.slice('sha256:'.length) : value;
+  if (!/^[a-f0-9]{64}$/.test(normalized)) {
+    throw new SingleSiteLaunchError(502, 'SINGLE_SITE_DIGEST_INVALID', `${label} is not a SHA-256 digest.`);
+  }
+  return normalized;
+}
+
+function singleSiteEvidenceAuthority(preflight) {
+  const reasons = Array.isArray(preflight?.evidenceAuthority?.reasons)
+    ? [...preflight.evidenceAuthority.reasons]
+    : [];
+  return {
+    authoritative: preflight?.evidenceAuthority?.status === 'authoritative',
+    reasons,
+  };
+}
+
+async function createSingleSiteQueueJob({ idempotencyKey, runContract, preflight, coverage, routeInventoryPlan, advisory }) {
+  if (advisory.aiReview.optedIn && !currentAnthropicApiKey() && process.env.AI_REVIEW_DRY_RUN !== '1') {
+    throw new SingleSiteLaunchError(
+      400,
+      'SINGLE_SITE_AI_UNAVAILABLE',
+      'AI review was requested, but no Anthropic credential is available in the isolated portal vault.',
+      { focusTarget: 'aiReview' },
+    );
+  }
+  const runContractDigest = bareSha256Digest(coverage?.revisions?.runContract, 'Run contract digest');
+  if (queueSha256(runContract) !== runContractDigest) {
+    throw new SingleSiteLaunchError(
+      502,
+      'SINGLE_SITE_CONTRACT_BINDING_INVALID',
+      'Compiled coverage is not bound to the launch contract.',
+    );
+  }
+  const checkpoint = {
+    preflightDigest: bareSha256Digest(preflight.preflightDigest, 'Preflight digest'),
+    identityFingerprint: bareSha256Digest(preflight.identityFingerprint, 'Identity fingerprint'),
+    revisionFingerprint: preflight.deploymentRevision?.fingerprint
+      ? bareSha256Digest(preflight.deploymentRevision.fingerprint, 'Deployment revision fingerprint')
+      : null,
+    evidenceAuthority: singleSiteEvidenceAuthority(preflight),
+  };
+  const inputDocument = {
+    schemaVersion: 1,
+    kind: 'single-site-worker-input',
+    runContract,
+    coverageManifest: coverage,
+    routeInventoryPlan,
+    launchCheckpoint: checkpoint,
+    advisory,
+    runnerRevision: singleSiteRunnerRevision,
+  };
+  const now = Date.now();
+  const submission = {
+    idempotencyKey,
+    runMode: 'single-site',
+    inputDocumentDigest: queueSha256(inputDocument),
+    runContractDigest,
+    compiledManifestDigest: bareSha256Digest(coverage.manifestDigest, 'Coverage manifest digest'),
+    preflightDigest: checkpoint.preflightDigest,
+    identityFingerprint: checkpoint.identityFingerprint,
+    revisionFingerprint: checkpoint.revisionFingerprint,
+    evidenceAuthority: checkpoint.evidenceAuthority,
+    registryRevision: coverage.revisions.pluginRegistry,
+    targetSetRevision: coverage.revisions.targetRegistry,
+    runnerRevision: coverage.revisions.runner,
+    stageDeadlines: {
+      inventory: new Date(now + Math.min(PLAYWRIGHT_DEADLINE_MS, 15 * 60_000)).toISOString(),
+      browser: new Date(now + PLAYWRIGHT_DEADLINE_MS).toISOString(),
+      finalizer: new Date(
+        now + PLAYWRIGHT_DEADLINE_MS + VIDEO_STAGE_DEADLINE_MS + REPORT_STAGE_DEADLINE_MS,
+      ).toISOString(),
+    },
+  };
+  try {
+    const submitted = await submitSingleSiteJob(singleSiteQueue, submission, { inputDocument });
+    upsertSingleSiteConsoleState(submitted.state, { input: inputDocument });
+    return publicSingleSiteJobWithFinalization(submitted.state, inputDocument, { includeEvents: false });
+  } catch (error) {
+    if (!(error instanceof JobQueueError)) throw error;
+    const conflict = ['QUEUE_IDEMPOTENCY_CONFLICT', 'QUEUE_INPUT_MISMATCH'].includes(error.code);
+    throw new SingleSiteLaunchError(
+      conflict ? 409 : 503,
+      conflict ? 'SINGLE_SITE_QUEUE_CONFLICT' : 'SINGLE_SITE_QUEUE_UNAVAILABLE',
+      conflict ? error.message : 'The durable Single-site queue could not accept this launch.',
+    );
+  }
+}
+
+function publicSingleSiteJob(state, input, { includeEvents = true } = {}) {
+  const coverage = input.coverageManifest;
+  const contract = input.runContract;
+  return {
+    schemaVersion: 1,
+    id: state.jobId,
+    mode: 'single-site',
+    revision: state.sequence,
+    sourceRevision: `state-${state.sequence}`,
+    status: state.executionState,
+    activity: state.activityState,
+    createdAt: state.submittedAt,
+    updatedAt: state.updatedAt,
+    url: contract.url,
+    deploymentRole: contract.deploymentRole,
+    certificatePolicy: contract.certificatePolicy,
+    scope: {
+      qualifier: coverage.scope.qualifier,
+      requestedQualifier: coverage.scope.requestedQualifier,
+      filters: coverage.scope.filters,
+      selectedTargetIds: coverage.scope.selectedTargetIds,
+      omissions: coverage.omissions,
+    },
+    coverage: {
+      status: coverage.coverageStatus,
+      counts: coverage.counts,
+      gaps: coverage.coverageGaps,
+      outsideModeCount: coverage.outsideMode.length,
+    },
+    evidenceAuthority: state.evidenceAuthority,
+    advisory: structuredClone(input.advisory ?? { schemaVersion: 1, aiReview: { optedIn: false, model: null } }),
+    attempt: {
+      number: state.attemptNumber,
+      id: state.attemptId,
+      fencingToken: state.fencingToken,
+      infrastructureRetriesUsed: state.infrastructureRetriesUsed,
+      maxInfrastructureRetries: state.maxInfrastructureRetries,
+    },
+    lease: state.lease,
+    result: state.result,
+    cancellation: state.cancellation,
+    finalization: null,
+    stageDeadlines: state.stageDeadlines,
+    events: includeEvents ? state.events : undefined,
+    publications: includeEvents ? state.publications : undefined,
+    links: {
+      self: `/api/single-site/runs/${encodeURIComponent(state.jobId)}`,
+      cancel: `/api/single-site/runs/${encodeURIComponent(state.jobId)}/cancel`,
+      report: null,
+    },
+    purge: {
+      eligible: SINGLE_SITE_TERMINAL_STATES.has(state.executionState),
+      confirmation: singleSitePurgeConfirmation(state.jobId),
+      baselineBytesPreserved: true,
+    },
+  };
+}
+
+async function publicSingleSiteJobWithFinalization(state, input, options = {}) {
+  const job = publicSingleSiteJob(state, input, options);
+  let finalizationIntegrityValid = true;
+  try {
+    job.finalization = await readSingleSiteFinalizationStatus(SINGLE_SITE_FINALIZATION_ROOT, state.jobId);
+  } catch (error) {
+    finalizationIntegrityValid = false;
+    job.finalization = {
+      schemaVersion: 1,
+      jobId: state.jobId,
+      status: 'invalid',
+      deadlineExceeded: false,
+      executionState: state.executionState,
+      finalizationDigest: null,
+      failureDigest: null,
+      reportRevision: null,
+      reportPublicationDigest: null,
+      visualPublicationDigest: null,
+      visualEligibilityManifestDigest: null,
+      error: 'Finalization status is unavailable or failed integrity validation.',
+    };
+  }
+  if ((job.finalization.status === 'complete' || job.finalization.status === 'incomplete')
+    && job.finalization.reportRevision !== null) {
+    job.links.report = `/report.html?mode=single-site&run=${encodeURIComponent(state.jobId)}`;
+  }
+  job.purge.eligible = job.purge.eligible
+    && finalizationIntegrityValid
+    && ['complete', 'incomplete', 'deadline-exceeded', 'invalid'].includes(job.finalization.status);
+  const advisory = input.advisory?.aiReview ?? { optedIn: false, model: null };
+  const aiStatus = await readSingleSiteAiReview(singleSiteAiReview, state.jobId).catch(() => null);
+  const displayState = singleSiteAiReviewDisplayState(advisory.optedIn === true, aiStatus, job.finalization);
+  job.aiReview = {
+    schemaVersion: 1,
+    mode: 'single-site',
+    advisory: true,
+    gating: false,
+    optedIn: advisory.optedIn === true,
+    model: advisory.model ?? null,
+    state: displayState.state,
+    unavailableReason: displayState.unavailableReason,
+    status: publicSingleSiteAiReviewStatus(aiStatus),
+  };
+  job.links.aiReview = advisory.optedIn
+    ? `/api/single-site/runs/${encodeURIComponent(state.jobId)}/ai-review`
+    : null;
+  return job;
+}
+
+function publicSingleSiteAiReviewStatus(status) {
+  if (!status) return null;
+  const output = status.output ? {
+    publicationDigest: status.output.publicationDigest,
+    reviewSha256: status.output.reviewSha256,
+    reviewStatus: status.output.reviewStatus,
+    findingCount: status.output.findingCount,
+    advisory: true,
+    gating: false,
+  } : null;
+  return { ...structuredClone(status), output };
+}
+
+function publicSingleSiteAiReviewResult(result) {
+  const review = structuredClone(result.review);
+  if (review?.source && typeof review.source === 'object') {
+    review.source.runDirectory = null;
+  }
+  return {
+    schemaVersion: 1,
+    mode: 'single-site',
+    advisory: true,
+    gating: false,
+    status: publicSingleSiteAiReviewStatus(result.status),
+    publication: structuredClone(result.publication),
+    review,
+    inventory: structuredClone(result.inventory),
+  };
+}
+
+function singleSiteAiReviewDisplayState(optedIn, status, finalization) {
+  if (!optedIn) return { state: 'disabled', unavailableReason: null };
+  if (status) return { state: status.state, unavailableReason: status.error?.message ?? null };
+  if (finalization?.status === 'invalid' || finalization?.status === 'deadline-exceeded') {
+    return {
+      state: 'unavailable',
+      unavailableReason: 'AI advisory requires a valid finalized deterministic report and cannot repair failed finalization.',
+    };
+  }
+  return { state: 'waiting-for-finalization', unavailableReason: null };
+}
+
+async function publicSingleSiteJobSummary(state) {
+  const input = await readSingleSiteJobInput(singleSiteQueue, state.jobId);
+  return publicSingleSiteJobWithFinalization(state, input, { includeEvents: false });
+}
+
+function latestSingleSiteAttemptId(state) {
+  return state.attemptId ?? [...state.publications]
+    .sort((left, right) => right.attemptNumber - left.attemptNumber)[0]?.attemptId ?? null;
+}
+
+function singleSiteAiRuntimeKey() {
+  return currentAnthropicApiKey()
+    ?? (process.env.AI_REVIEW_DRY_RUN === '1' ? 'sk-ant-dry-run-no-provider-egress' : null);
+}
+
+async function scheduleSingleSiteAiReview(jobId, options = {}) {
+  const [state, input] = await Promise.all([
+    readSingleSiteJob(singleSiteQueue, jobId),
+    readSingleSiteJobInput(singleSiteQueue, jobId),
+  ]);
+  upsertSingleSiteConsoleState(state, { input });
+  const advisory = input.advisory?.aiReview;
+  if (advisory?.optedIn !== true || typeof advisory.model !== 'string') return null;
+  const finalization = await readSingleSiteFinalizationStatus(SINGLE_SITE_FINALIZATION_ROOT, jobId);
+  upsertSingleSiteConsoleState(state, { input, finalization });
+  if (!['complete', 'incomplete'].includes(finalization.status)) return null;
+  const current = await readSingleSiteAiReview(singleSiteAiReview, jobId);
+  if (!options.force) {
+    if (current && ['pending', 'running', 'completed', 'failed'].includes(current.state)) return current;
+    if (current?.state === 'unavailable') {
+      const automaticallyRetryable = ['credential-unavailable', 'interrupted-requires-runtime-secret']
+        .includes(current.error?.code);
+      if (!automaticallyRetryable || !singleSiteAiRuntimeKey()) return current;
+    }
+  }
+  const expectedStateRevision = options.expectedStateRevision ?? current?.stateRevision ?? 0;
+  if (current && expectedStateRevision !== current.stateRevision) {
+    throw httpError(409, `AI advisory state revision is ${current.stateRevision}, not ${expectedStateRevision}.`);
+  }
+  const requestId = options.requestId
+    ?? `${current ? 'retry' : 'auto'}-${expectedStateRevision}-${finalization.reportRevision}`;
+  return requestSingleSiteAiReview(singleSiteAiReview, {
+    jobId: state.jobId,
+    requestId,
+    expectedStateRevision,
+    optIn: true,
+    model: advisory.model,
+    apiKey: singleSiteAiRuntimeKey(),
+    reportDirectory: resolve(SINGLE_SITE_FINALIZATION_ROOT, state.jobId, 'report'),
+    reportRevision: finalization.reportRevision,
+    reportPublicationDigest: finalization.reportPublicationDigest,
+  });
+}
+
+async function syncSingleSiteAiReviews() {
+  const jobs = await listSingleSiteJobs(singleSiteQueue);
+  for (const state of jobs) {
+    if (!SINGLE_SITE_TERMINAL_STATES.has(state.executionState)) continue;
+    await scheduleSingleSiteAiReview(state.jobId).catch((error) => {
+      console.error(`Could not schedule Single-site AI advisory ${state.jobId}: ${redactLogValue(error.message)}`);
+    });
+  }
+}
+
+function triggerSingleSiteAiReviewSync() {
+  if (singleSiteAiReviewSyncPromise) return;
+  singleSiteAiReviewSyncPromise = syncSingleSiteAiReviews()
+    .catch((error) => console.error(`Could not refresh Single-site AI advisories: ${redactLogValue(error.message)}`))
+    .finally(() => { singleSiteAiReviewSyncPromise = null; });
+}
+
+function singleSiteAttemptArtifactDirectory(state) {
+  const attemptId = latestSingleSiteAttemptId(state);
+  if (attemptId === null) throw httpError(404, 'This Single-site run has not created an attempt artifact directory yet.');
+  const jobRoot = resolve(SINGLE_SITE_QUEUE_ROOT, 'jobs', state.jobId);
+  const artifactRoot = resolve(jobRoot, 'attempts', attemptId, 'work', 'artifacts');
+  if (artifactRoot !== jobRoot && !artifactRoot.startsWith(`${jobRoot}${sep}`)) {
+    throw httpError(404, 'Single-site artifact directory is invalid.');
+  }
+  return artifactRoot;
+}
+
+const VISUAL_BASELINE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/;
+const VISUAL_BASELINE_DIGEST = /^sha256:[a-f0-9]{64}$/;
+const VISUAL_BASELINE_SECRET_TEXT = /(?:\bauthorization\s*:|\bbearer\s+[A-Za-z0-9._~+/=-]{8,}|\bsk-[A-Za-z0-9_-]{16,}|\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|cookie)\s*[=:]\s*[^\s,;"}]{8,}|[?&](?:token|key|signature|auth)=[^&#\s"}]{8,})/i;
+
+function visualBaselineId(value) {
+  if (typeof value !== 'string' || !VISUAL_BASELINE_ID.test(value)) {
+    throw httpError(404, 'Visual baseline not found.');
+  }
+  return value;
+}
+
+function assertVisualBaselineMutationBody(value, allowed, required) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw httpError(400, 'Visual baseline mutation body must be a JSON object.');
+  }
+  const forbidden = findClientActorIdentity(value);
+  if (forbidden) {
+    throw httpError(400, `Client-supplied actor identity is not allowed (${forbidden}). The portal attributes mutations from the authenticated operator session.`);
+  }
+  if (VISUAL_BASELINE_SECRET_TEXT.test(JSON.stringify(value))) {
+    throw httpError(400, 'Visual baseline mutations cannot persist credential-bearing text or secret query values.');
+  }
+  const allowedFields = new Set(allowed);
+  const unknown = Object.keys(value).filter((key) => !allowedFields.has(key));
+  const missing = required.filter((key) => !(key in value));
+  if (unknown.length > 0 || missing.length > 0) {
+    throw httpError(400, `Visual baseline mutation has invalid fields${unknown.length ? `; unknown: ${unknown.sort().join(', ')}` : ''}${missing.length ? `; missing: ${missing.sort().join(', ')}` : ''}.`);
+  }
+  return value;
+}
+
+function findClientActorIdentity(value, path = 'body', depth = 0) {
+  if (depth > 16 || value === null || typeof value !== 'object') return null;
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index += 1) {
+      const found = findClientActorIdentity(value[index], `${path}[${index}]`, depth + 1);
+      if (found) return found;
+    }
+    return null;
+  }
+  for (const [key, child] of Object.entries(value)) {
+    if (/^(?:actor|actorId|approvedBy|reviewer|reviewerId)$/i.test(key)) return `${path}.${key}`;
+    const found = findClientActorIdentity(child, `${path}.${key}`, depth + 1);
+    if (found) return found;
+  }
+  return null;
+}
+
+function visualBaselineConfirmation(operation, baselineId, evidenceId = null) {
+  if (operation === 'approve') return `APPROVE ${evidenceId ?? ''}`;
+  if (operation === 'replace') return `REPLACE ${baselineId} ${evidenceId ?? ''}`;
+  if (operation === 'revoke') return `REVOKE ${baselineId}`;
+  return `DELETE ${baselineId}`;
+}
+
+function assertVisualBaselineConfirmation(value, expected) {
+  if (value !== expected) {
+    throw httpError(400, `Confirm this exact visual baseline action with ${JSON.stringify(expected)}.`);
+  }
+}
+
+function publicVisualBaselineRecord(record) {
+  return {
+    ...structuredClone(record),
+    media: {
+      sha256: record.media.sha256,
+      bytes: record.media.bytes,
+      available: record.media.available,
+      url: record.media.available
+        ? `/api/single-site/visual-baselines/${encodeURIComponent(record.baselineId)}/media`
+        : null,
+    },
+  };
+}
+
+function publicVisualBaselineMutation(result, snapshot) {
+  const record = snapshot.state.baselines[result.baselineId] ?? null;
+  return {
+    schemaVersion: 1,
+    mode: 'single-site',
+    result,
+    storeRevision: snapshot.state.storeRevision,
+    historyDigest: snapshot.state.historyDigest,
+    baseline: record ? publicVisualBaselineRecord(record) : null,
+  };
+}
+
+async function publicVisualBaselineCollection(requestUrl, request) {
+  const snapshot = await readVisualBaselineStore(visualBaselineStore);
+  const slotKey = requestUrl.searchParams.get('slotKey');
+  if (slotKey !== null && !VISUAL_BASELINE_DIGEST.test(slotKey)) throw httpError(400, 'slotKey must be a visual-baseline SHA-256 digest.');
+  const requestedState = requestUrl.searchParams.get('state');
+  if (requestedState !== null && !['active', 'replaced', 'revoked', 'deleted'].includes(requestedState)) {
+    throw httpError(400, 'state must be active, replaced, revoked, or deleted.');
+  }
+  const offset = queryInteger(requestUrl.searchParams.get('offset'), 'offset', 0, 0, 1_000_000);
+  const limit = queryInteger(
+    requestUrl.searchParams.get('limit'),
+    'limit',
+    DEFAULT_BASELINE_PAGE_SIZE,
+    1,
+    MAX_BASELINE_PAGE_SIZE,
+  );
+  const records = listVisualBaselineHistory(snapshot, slotKey)
+    .filter((record) => requestedState === null || record.state === requestedState)
+    .sort((left, right) => right.approvedAt.localeCompare(left.approvedAt) || left.baselineId.localeCompare(right.baselineId));
+  const items = records.slice(offset, offset + limit).map(publicVisualBaselineRecord);
+  return {
+    schemaVersion: 1,
+    mode: 'single-site',
+    storeRevision: snapshot.state.storeRevision,
+    historyDigest: snapshot.state.historyDigest,
+    items,
+    total: records.length,
+    offset,
+    limit,
+    hasMore: offset + items.length < records.length,
+    mutationCapability: { authorized: operatorRequestAuthorized(request), actorSource: 'server-session' },
+  };
+}
+
+async function publicVisualBaselineEventHistory(requestUrl) {
+  const snapshot = await readVisualBaselineStore(visualBaselineStore);
+  const slotKey = requestUrl.searchParams.get('slotKey');
+  if (slotKey !== null && !VISUAL_BASELINE_DIGEST.test(slotKey)) throw httpError(400, 'slotKey must be a visual-baseline SHA-256 digest.');
+  const baselineId = requestUrl.searchParams.get('baselineId');
+  if (baselineId !== null) visualBaselineId(baselineId);
+  const offset = queryInteger(requestUrl.searchParams.get('offset'), 'offset', 0, 0, 1_000_000);
+  const limit = queryInteger(
+    requestUrl.searchParams.get('limit'),
+    'limit',
+    DEFAULT_BASELINE_PAGE_SIZE,
+    1,
+    MAX_BASELINE_PAGE_SIZE,
+  );
+  const events = snapshot.history.filter((event) => {
+    const eventBaselineIds = [
+      event.result?.baselineId,
+      event.payload?.baselineId,
+      event.payload?.replacedBaselineId,
+      event.payload?.record?.baselineId,
+    ].filter(Boolean);
+    if (baselineId !== null && !eventBaselineIds.includes(baselineId)) return false;
+    const eventSlotKey = event.result?.slotKey ?? event.payload?.record?.slotKey ?? null;
+    return slotKey === null || eventSlotKey === slotKey;
+  });
+  const items = events.slice(offset, offset + limit).map((event) => ({
+    schemaVersion: event.schemaVersion,
+    sequence: event.sequence,
+    eventId: event.eventId,
+    type: event.type,
+    at: event.at,
+    actorId: event.actorId,
+    reason: event.reason,
+    previousDigest: event.previousDigest,
+    eventDigest: event.eventDigest,
+    result: structuredClone(event.result),
+    affectedBaselineIds: [...new Set([
+      event.result?.baselineId,
+      event.payload?.baselineId,
+      event.payload?.replacedBaselineId,
+      event.payload?.record?.baselineId,
+    ].filter(Boolean))],
+  }));
+  return {
+    schemaVersion: 1,
+    mode: 'single-site',
+    storeRevision: snapshot.state.storeRevision,
+    historyDigest: snapshot.state.historyDigest,
+    items,
+    total: events.length,
+    offset,
+    limit,
+    hasMore: offset + items.length < events.length,
+  };
+}
+
+async function publicVisualBaseline(baselineIdValue, request) {
+  const baselineId = visualBaselineId(baselineIdValue);
+  const snapshot = await readVisualBaselineStore(visualBaselineStore);
+  const record = snapshot.state.baselines[baselineId];
+  if (!record) throw httpError(404, 'Visual baseline not found.');
+  const history = snapshot.history
+    .filter((event) => [event.result?.baselineId, event.payload?.baselineId,
+      event.payload?.replacedBaselineId, event.payload?.record?.baselineId].includes(baselineId))
+    .map((event) => ({ eventId: event.eventId, sequence: event.sequence, type: event.type, at: event.at, actorId: event.actorId, reason: event.reason }));
+  return {
+    schemaVersion: 1,
+    mode: 'single-site',
+    storeRevision: snapshot.state.storeRevision,
+    historyDigest: snapshot.state.historyDigest,
+    baseline: publicVisualBaselineRecord(record),
+    history,
+    mutationCapability: { authorized: operatorRequestAuthorized(request), actorSource: 'server-session' },
+  };
+}
+
+async function serveVisualBaselineMedia(request, response, baselineIdValue) {
+  const baselineId = visualBaselineId(baselineIdValue);
+  const snapshot = await readVisualBaselineStore(visualBaselineStore);
+  const record = snapshot.state.baselines[baselineId];
+  if (!record) throw httpError(404, 'Visual baseline not found.');
+  if (!record.media.available) throw httpError(410, 'Visual baseline media was deleted; tombstoned provenance remains available.');
+  let opened;
+  try {
+    opened = await openContainedArtifactFile(fs, visualBaselineStore.root, record.media.relativePath, {
+      requireDescriptorContainment: false,
+    });
+    if (opened.relativePath !== record.media.relativePath || opened.stat.size !== record.media.bytes) {
+      throw new Error('Visual baseline media metadata does not match the immutable record.');
+    }
+    const bytes = Buffer.alloc(record.media.bytes);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const read = await opened.handle.read(bytes, offset, bytes.length - offset, offset);
+      if (read.bytesRead === 0) throw new Error('Visual baseline media ended before its declared byte length.');
+      offset += read.bytesRead;
+    }
+    const digest = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
+    if (digest !== record.media.sha256) throw new Error('Visual baseline media digest validation failed.');
+  } catch (error) {
+    await opened?.handle?.close().catch(() => undefined);
+    if (['ENOENT', 'ENOTDIR', 'ELOOP', 'EINVAL', 'UNSAFE_ARTIFACT_PATH'].includes(error?.code)) {
+      throw httpError(410, 'Visual baseline media is unavailable; tombstoned provenance remains available.');
+    }
+    if (Number.isInteger(error?.statusCode)) throw error;
+    throw httpError(422, 'Visual baseline media failed immutable integrity validation.');
+  }
+  return sendFile(request, response, opened.path, "default-src 'none'; frame-ancestors 'self'", { opened });
+}
+
+function baselineEligibilityError(statusCode, code, message) {
+  return Object.assign(httpError(statusCode, message), { code });
+}
+
+function exactEligibilityKeys(value, expected, label) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw baselineEligibilityError(422, 'SINGLE_SITE_BASELINE_ELIGIBILITY_INVALID', `${label} must be an object.`);
+  }
+  const fields = Object.keys(value);
+  const unknown = fields.filter((field) => !expected.includes(field));
+  const missing = expected.filter((field) => !(field in value));
+  if (unknown.length > 0 || missing.length > 0) {
+    throw baselineEligibilityError(422, 'SINGLE_SITE_BASELINE_ELIGIBILITY_INVALID', `${label} has unsupported or missing fields.`);
+  }
+}
+
+function canonicalEligibilityTimestamp(value) {
+  if (typeof value !== 'string') return false;
+  try { return new Date(value).toISOString() === value; } catch { return false; }
+}
+
+async function readVisualBaselineEligibility(runIdValue, evidenceIdValue) {
+  const runId = visualBaselineId(runIdValue);
+  if (typeof evidenceIdValue !== 'string' || !VISUAL_BASELINE_DIGEST.test(evidenceIdValue)) {
+    throw httpError(400, 'evidenceId must be a server-published visual evidence SHA-256 identity.');
+  }
+  const state = await readSingleSiteJob(singleSiteQueue, runId);
+  const finalization = await readSingleSiteFinalizationStatus(SINGLE_SITE_FINALIZATION_ROOT, runId)
+    .catch(() => null);
+  if (state.executionState !== 'completed' || !['passed', 'findings'].includes(state.result?.kind)
+    || finalization?.status !== 'complete') {
+    throw baselineEligibilityError(
+      409,
+      'SINGLE_SITE_BASELINE_ELIGIBILITY_UNAVAILABLE',
+      'Visual baseline approval requires a completed run with a valid complete finalization publication.',
+    );
+  }
+  if (state.evidenceAuthority?.authoritative !== true || state.evidenceAuthority.reasons?.length !== 0) {
+    throw baselineEligibilityError(422, 'SINGLE_SITE_BASELINE_INELIGIBLE', 'Non-authoritative run evidence cannot become a visual baseline.');
+  }
+  const attemptId = latestSingleSiteAttemptId(state);
+  if (!attemptId) {
+    throw baselineEligibilityError(422, 'SINGLE_SITE_BASELINE_ELIGIBILITY_INVALID', 'Completed run state has no current fenced attempt identity.');
+  }
+  const visualRoot = resolve(SINGLE_SITE_FINALIZATION_ROOT, runId, 'visual');
+  const eligibilityPath = resolve(visualRoot, 'eligibility.json');
+  if (eligibilityPath !== join(visualRoot, 'eligibility.json')) {
+    throw baselineEligibilityError(422, 'SINGLE_SITE_BASELINE_ELIGIBILITY_INVALID', 'Visual eligibility path is invalid.');
+  }
+  let stat;
+  try { stat = await fs.lstat(eligibilityPath); } catch (error) {
+    if (error?.code === 'ENOENT') {
+      throw baselineEligibilityError(
+        409,
+        'SINGLE_SITE_BASELINE_ELIGIBILITY_UNAVAILABLE',
+        'This run has not published its immutable visual baseline eligibility manifest yet.',
+      );
+    }
+    throw error;
+  }
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size < 2 || stat.size > MAX_BASELINE_ELIGIBILITY_BYTES) {
+    throw baselineEligibilityError(422, 'SINGLE_SITE_BASELINE_ELIGIBILITY_INVALID', 'Visual baseline eligibility manifest is unsafe or exceeds its byte bound.');
+  }
+  const [realRoot, realFile] = await Promise.all([fs.realpath(visualRoot), fs.realpath(eligibilityPath)]);
+  if (realFile !== join(realRoot, 'eligibility.json')) {
+    throw baselineEligibilityError(422, 'SINGLE_SITE_BASELINE_ELIGIBILITY_INVALID', 'Visual baseline eligibility manifest escaped its immutable publication directory.');
+  }
+  let manifest;
+  try { manifest = JSON.parse(await fs.readFile(realFile, 'utf8')); } catch {
+    throw baselineEligibilityError(422, 'SINGLE_SITE_BASELINE_ELIGIBILITY_INVALID', 'Visual baseline eligibility manifest is not valid JSON.');
+  }
+  exactEligibilityKeys(manifest, [
+    'schemaVersion', 'kind', 'mode', 'jobId', 'attemptId', 'finalizationDigest',
+    'reportRevision', 'generatedAt', 'comparatorCalibration', 'items', 'manifestDigest',
+  ], 'Visual baseline eligibility manifest');
+  if (manifest.schemaVersion !== 1 || manifest.kind !== 'single-site-visual-baseline-eligibility'
+    || manifest.mode !== 'single-site' || manifest.jobId !== runId || manifest.attemptId !== attemptId
+    || manifest.finalizationDigest !== finalization.finalizationDigest
+    || manifest.reportRevision !== finalization.reportRevision
+    || !canonicalEligibilityTimestamp(manifest.generatedAt)
+    || !Array.isArray(manifest.items) || manifest.items.length > MAX_BASELINE_ELIGIBILITY_ITEMS) {
+    throw baselineEligibilityError(422, 'SINGLE_SITE_BASELINE_ELIGIBILITY_INVALID', 'Visual baseline eligibility manifest is not bound to the current run, attempt, finalization, and report revision.');
+  }
+  try {
+    await verifyPublishedVisualComparatorCalibration(manifest.comparatorCalibration);
+  } catch {
+    throw baselineEligibilityError(
+      422,
+      'SINGLE_SITE_BASELINE_ELIGIBILITY_INVALID',
+      'Visual baseline eligibility manifest has an unsupported comparator calibration binding.',
+    );
+  }
+  const { manifestDigest, ...manifestBody } = manifest;
+  if (manifestDigest !== visualBaselineDigest(manifestBody)
+    || manifestDigest !== finalization.visualEligibilityManifestDigest) {
+    throw baselineEligibilityError(422, 'SINGLE_SITE_BASELINE_ELIGIBILITY_INVALID', 'Visual baseline eligibility manifest failed digest verification.');
+  }
+  const evidenceIds = new Set();
+  let selected = null;
+  for (const item of manifest.items) {
+    exactEligibilityKeys(item, [
+      'evidenceId', 'identity', 'identityKey', 'slotKey', 'evidence', 'requiresFindingWaiver',
+      'eligible', 'ineligibilityReasons',
+    ], 'Visual baseline eligibility item');
+    if (typeof item.evidenceId !== 'string' || !VISUAL_BASELINE_DIGEST.test(item.evidenceId)
+      || evidenceIds.has(item.evidenceId)) {
+      throw baselineEligibilityError(422, 'SINGLE_SITE_BASELINE_ELIGIBILITY_INVALID', 'Visual baseline eligibility manifest has an invalid or duplicate evidence ID.');
+    }
+    evidenceIds.add(item.evidenceId);
+    if (item.evidenceId === evidenceIdValue) selected = item;
+  }
+  if (!selected) throw httpError(404, 'Eligible visual evidence not found in this finalized run.');
+  if (selected.eligible !== true || !Array.isArray(selected.ineligibilityReasons)
+    || selected.ineligibilityReasons.length !== 0 || selected.evidence === null) {
+    const reason = Array.isArray(selected.ineligibilityReasons) && selected.ineligibilityReasons.length > 0
+      ? selected.ineligibilityReasons.join(' ')
+      : 'The server-published evidence record is not eligible.';
+    throw baselineEligibilityError(422, 'SINGLE_SITE_BASELINE_INELIGIBLE', `Visual evidence cannot become a baseline. ${reason}`);
+  }
+  let identity;
+  let evidence;
+  try {
+    identity = parseVisualBaselineIdentity(selected.identity);
+    const unresolved = selected.evidence?.findingStatus === 'unresolved';
+    evidence = parseVisualBaselineEvidence(unresolved ? {
+      ...selected.evidence,
+      findingWaiver: {
+        actorId: PORTAL_OPERATOR_ACTOR_ID,
+        reason: 'Eligibility validation placeholder; the approval action must supply the recorded waiver.',
+        at: selected.generatedAt ?? manifest.generatedAt,
+      },
+    } : selected.evidence);
+    if (unresolved) evidence = { ...evidence, findingWaiver: null };
+  } catch (error) {
+    throw baselineEligibilityError(422, 'SINGLE_SITE_BASELINE_ELIGIBILITY_INVALID', `Visual eligibility identity or evidence is invalid: ${error.message}`);
+  }
+  if (selected.identityKey !== visualBaselineIdentityKey(identity)
+    || selected.slotKey !== visualBaselineSlotKey(identity)
+    || evidence.runId !== runId || evidence.runStatus !== 'completed'
+    || evidence.evidenceComplete !== true || evidence.evidenceAuthority.status !== 'authoritative'
+    || !['clear', 'unresolved'].includes(evidence.findingStatus) || evidence.findingWaiver !== null
+    || selected.requiresFindingWaiver !== (evidence.findingStatus === 'unresolved')) {
+    throw baselineEligibilityError(422, 'SINGLE_SITE_BASELINE_ELIGIBILITY_INVALID', 'Eligible visual evidence contradicts its server-published identity, authority, completeness, or Finding state.');
+  }
+  const expectedEvidenceId = visualBaselineDigest({
+    jobId: runId,
+    attemptId,
+    identityKey: selected.identityKey,
+    artifactSha256: evidence.artifactSha256,
+  });
+  if (evidenceIdValue !== expectedEvidenceId) {
+    throw baselineEligibilityError(422, 'SINGLE_SITE_BASELINE_ELIGIBILITY_INVALID', 'Visual evidence ID is not bound to its run, attempt, identity, and artifact digest.');
+  }
+  return {
+    identity,
+    evidence,
+    runRoot: singleSiteAttemptArtifactDirectory(state),
+    manifestDigest,
+  };
+}
+
+async function mutateVisualBaselineApproval(operation, expectedActiveBaselineId, rawBody) {
+  const body = assertVisualBaselineMutationBody(rawBody, [
+    'expectedStoreRevision', 'runId', 'evidenceId', 'reason', 'findingWaiverReason',
+    'idempotencyKey', 'confirmation',
+  ], ['expectedStoreRevision', 'runId', 'evidenceId', 'reason', 'idempotencyKey', 'confirmation']);
+  if (operation === 'replace') visualBaselineId(expectedActiveBaselineId);
+  assertVisualBaselineConfirmation(
+    body.confirmation,
+    visualBaselineConfirmation(operation, expectedActiveBaselineId, body.evidenceId),
+  );
+  const source = await readVisualBaselineEligibility(body.runId, body.evidenceId);
+  const requiresFindingWaiver = source.evidence.findingStatus === 'unresolved';
+  if (requiresFindingWaiver) {
+    if (typeof body.findingWaiverReason !== 'string'
+      || body.findingWaiverReason.trim() !== body.findingWaiverReason
+      || body.findingWaiverReason.length < 1
+      || body.findingWaiverReason.length > 1_200) {
+      throw baselineEligibilityError(
+        422,
+        'SINGLE_SITE_BASELINE_FINDING_WAIVER_REQUIRED',
+        'This evidence has unresolved Findings. Record a Finding waiver rationale of 1 through 1200 characters.',
+      );
+    }
+  } else if (body.findingWaiverReason !== undefined) {
+    throw httpError(400, 'findingWaiverReason is allowed only when the selected evidence has unresolved Findings.');
+  }
+  const sourceImage = safeResolve(source.runRoot, source.evidence.artifactRelativePath);
+  if (!sourceImage) throw httpError(422, 'Visual baseline source path is outside the source run artifact root.');
+  await validateUploadedMedia(sourceImage, 'image/png');
+  const mutation = {
+    expectedStoreRevision: body.expectedStoreRevision,
+    identity: source.identity,
+    evidence: source.evidence,
+    runArtifactRoot: source.runRoot,
+    actorId: PORTAL_OPERATOR_ACTOR_ID,
+    reason: body.reason,
+    ...(requiresFindingWaiver
+      ? { findingWaiverReason: body.findingWaiverReason }
+      : {}),
+    idempotencyKey: body.idempotencyKey,
+    ...(operation === 'replace' ? { expectedActiveBaselineId } : {}),
+  };
+  const result = operation === 'approve'
+    ? await approveVisualBaseline(visualBaselineStore, mutation)
+    : await replaceVisualBaseline(visualBaselineStore, mutation);
+  const snapshot = await readVisualBaselineStore(visualBaselineStore);
+  await refreshSingleSiteConsoleRunBestEffort(body.runId, 'baseline mutation');
+  return {
+    ...publicVisualBaselineMutation(result, snapshot),
+    eligibilityManifestDigest: source.manifestDigest,
+  };
+}
+
+async function mutateVisualBaselineLifecycle(operation, baselineIdValue, rawBody) {
+  const baselineId = visualBaselineId(baselineIdValue);
+  const body = assertVisualBaselineMutationBody(rawBody,
+    ['expectedStoreRevision', 'reason', 'idempotencyKey', 'confirmation'],
+    ['expectedStoreRevision', 'reason', 'idempotencyKey', 'confirmation']);
+  assertVisualBaselineConfirmation(body.confirmation, visualBaselineConfirmation(operation, baselineId));
+  const mutation = {
+    expectedStoreRevision: body.expectedStoreRevision,
+    baselineId,
+    actorId: PORTAL_OPERATOR_ACTOR_ID,
+    reason: body.reason,
+    idempotencyKey: body.idempotencyKey,
+  };
+  const result = operation === 'revoke'
+    ? await revokeVisualBaseline(visualBaselineStore, mutation)
+    : await deleteVisualBaseline(visualBaselineStore, mutation);
+  const snapshot = await readVisualBaselineStore(visualBaselineStore);
+  const sourceRunId = snapshot.state.baselines[result.baselineId]?.evidence?.runId;
+  if (SAFE_SINGLE_SITE_JOB_ID.test(sourceRunId ?? '')) {
+    await refreshSingleSiteConsoleRunBestEffort(sourceRunId, 'baseline lifecycle');
+  }
+  return publicVisualBaselineMutation(result, snapshot);
 }
 
 function validateTargetUrl(value, label) {
@@ -1830,7 +4415,79 @@ function signalChild(child, signal) {
   }
 }
 
+function activeSseCount(run) {
+  return (run.clients?.size ?? 0) + (run.galleryClients?.size ?? 0);
+}
+
+function totalActiveSseCount() {
+  let total = 0;
+  for (const run of runs.values()) total += activeSseCount(run);
+  return total;
+}
+
+function publicSseDiagnostics() {
+  let runStreams = 0;
+  let galleryStreams = 0;
+  let heartbeats = 0;
+  for (const run of runs.values()) {
+    runStreams += run.clients?.size ?? 0;
+    galleryStreams += run.galleryClients?.size ?? 0;
+    for (const client of [...(run.clients ?? []), ...(run.galleryClients ?? [])]) {
+      if (client.auditHeartbeat) heartbeats += 1;
+    }
+  }
+  return {
+    schemaVersion: 1,
+    runStreams,
+    galleryStreams,
+    heartbeats,
+    totalStreams: runStreams + galleryStreams,
+    capacity: { perRun: MAX_SSE_CLIENTS_PER_RUN, server: MAX_SSE_CLIENTS_TOTAL },
+    refused: sseCapacityDiagnostics.refused,
+    peak: sseCapacityDiagnostics.peak,
+  };
+}
+
+function assertSseCapacity(run) {
+  if (activeSseCount(run) >= MAX_SSE_CLIENTS_PER_RUN || totalActiveSseCount() >= MAX_SSE_CLIENTS_TOTAL) {
+    sseCapacityDiagnostics.refused += 1;
+    throw httpError(429, 'Live stream capacity is currently full. Use the bounded snapshot and retry later.');
+  }
+}
+
+function observeSseCapacity() {
+  sseCapacityDiagnostics.peak = Math.max(sseCapacityDiagnostics.peak, totalActiveSseCount());
+}
+
+function attachSseClient(request, response, clients) {
+  let cleaned = false;
+  const cleanup = () => {
+    if (cleaned) return;
+    cleaned = true;
+    if (response.auditHeartbeat) clearInterval(response.auditHeartbeat);
+    response.auditHeartbeat = null;
+    clients.delete(response);
+  };
+  request.once('close', cleanup);
+  response.once('close', cleanup);
+  response.once('error', cleanup);
+  if (request.destroyed || response.destroyed || response.writableEnded) {
+    cleanup();
+    return false;
+  }
+  response.auditHeartbeat = setInterval(() => {
+    if (!response.writableNeedDrain && !response.writableEnded) response.write(': heartbeat\n\n');
+  }, 15_000);
+  clients.add(response);
+  if (request.destroyed || response.destroyed || response.writableEnded) {
+    cleanup();
+    return false;
+  }
+  return true;
+}
+
 function streamRunEvents(request, response, run) {
+  assertSseCapacity(run);
   response.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache, no-transform',
@@ -1875,19 +4532,11 @@ function streamRunEvents(request, response, run) {
     data: { manifest: publicManifest(run.manifest) },
   };
   writeSse(response, snapshot);
-  run.clients.add(response);
-  const heartbeat = setInterval(() => {
-    if (!response.writableNeedDrain && !response.writableEnded) response.write(': heartbeat\n\n');
-  }, 15_000);
-  response.auditHeartbeat = heartbeat;
-  request.once('close', () => {
-    clearInterval(heartbeat);
-    response.auditHeartbeat = null;
-    run.clients.delete(response);
-  });
+  if (attachSseClient(request, response, run.clients)) observeSseCapacity();
 }
 
 function streamGalleryEvents(request, response, run) {
+  assertSseCapacity(run);
   response.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache, no-transform',
@@ -1932,16 +4581,7 @@ function streamGalleryEvents(request, response, run) {
   };
   writeSse(response, snapshot);
   run.galleryClients ??= new Set();
-  run.galleryClients.add(response);
-  const heartbeat = setInterval(() => {
-    if (!response.writableNeedDrain && !response.writableEnded) response.write(': heartbeat\n\n');
-  }, 15_000);
-  response.auditHeartbeat = heartbeat;
-  request.once('close', () => {
-    clearInterval(heartbeat);
-    response.auditHeartbeat = null;
-    run.galleryClients.delete(response);
-  });
+  if (attachSseClient(request, response, run.galleryClients)) observeSseCapacity();
 }
 
 function galleryStreamManifest(manifest) {
@@ -2045,6 +4685,7 @@ function sseEventBytes(event) {
 
 async function servePortalAsset(request, response, pathname) {
   const relativePath = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
+  if (CONSOLE_SHELL_FIXTURE_RELATIVE_PATHS.has(relativePath)) throw httpError(404, 'Not found.');
   const file = safeResolve(STATIC_ROOT, relativePath);
   if (!file) throw httpError(404, 'Not found.');
   return sendFile(request, response, file, "default-src 'self'; connect-src 'self'; img-src 'self' data:; media-src 'self'; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'");
@@ -2052,103 +4693,148 @@ async function servePortalAsset(request, response, pathname) {
 
 async function serveArtifact(request, response, runId, requestedPath) {
   const run = requireRun(runId);
+  return serveArtifactFromDirectory(request, response, run.directory, requestedPath);
+}
+
+async function serveArtifactFromDirectory(request, response, artifactRoot, requestedPath) {
   // Persisted execution logs can contain arbitrary child-process output. They
   // are available only through the bounded, redacting logs API and must never
   // inherit the generic artifact download path.
   if (isRawLogArtifactPath(requestedPath)) throw httpError(404, 'Artifact not found.');
-  let file = safeResolve(run.directory, requestedPath || '.');
-  if (!file) throw httpError(404, 'Artifact not found.');
-  const stat = await safeStat(file);
-  if (!stat) throw httpError(404, 'Artifact not found.');
-  if (stat.isDirectory()) file = join(file, 'index.html');
-  const verifiedFile = await resolveContainedRealPath(run.directory, file);
-  if (!verifiedFile) throw httpError(404, 'Artifact not found.');
-  const relativeArtifactPath = relative(run.directory, verifiedFile).split(sep).join('/');
-  // Revision-pinned archive wrappers are inert data envelopes loaded into a
-  // second sandboxed opaque-origin iframe. They must accept that opaque parent;
-  // every other artifact document retains frame-ancestors 'self'.
-  const opaqueArchiveWrapper = /(?:^|\/)checklist\/gallery\/revisions\/export_[a-f0-9]{16}\/(?:flags\.html|(?:query|items|raw)\/.+\.html)$/.test(relativeArtifactPath);
-  const opaqueArchiveSurface = /(?:^|\/)checklist\/gallery\.html$/.test(relativeArtifactPath);
   const artifactOrigin = `http://${assertAllowedRequestHost(request)}`;
-  const sandboxSources = opaqueArchiveSurface
-    ? `default-src 'self' data: blob:; connect-src 'self'; img-src 'self' data: blob: ${artifactOrigin}; media-src 'self' data: blob: ${artifactOrigin}; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; worker-src 'self' blob:; frame-src 'self' blob: ${artifactOrigin}; font-src 'self' data:; base-uri 'none'`
-    : "default-src 'self' data: blob:; connect-src 'self'; img-src 'self' data: blob:; media-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; worker-src 'self' blob:; frame-src 'self' blob:; font-src 'self' data:; base-uri 'none'";
-  const activeContentIsolation = extname(verifiedFile).toLowerCase() === '.html'
-    ? `sandbox allow-scripts allow-forms allow-downloads allow-popups; ${sandboxSources}${opaqueArchiveWrapper ? '' : "; frame-ancestors 'self'"}`
-    : "default-src 'none'; frame-ancestors 'self'";
-  const opaqueArchiveModule = /(?:^|\/)checklist\/assets\/gallery-(?:archive|core)\.js$/.test(relativeArtifactPath);
-  return sendFile(request, response, verifiedFile, activeContentIsolation, { opaqueArchiveModule });
+  let opened;
+  try {
+    opened = await openContainedArtifactFile(fs, artifactRoot, requestedPath, {
+      requireDescriptorContainment: CREDENTIAL_ISOLATION_ACTIVE,
+    });
+  } catch (error) {
+    if (['ENOENT', 'ENOTDIR', 'ELOOP', 'EINVAL', 'UNSAFE_ARTIFACT_PATH'].includes(error?.code)) {
+      throw httpError(404, 'Artifact not found.');
+    }
+    throw error;
+  }
+  try {
+    const verifiedFile = opened.path;
+    const relativeArtifactPath = opened.relativePath;
+    // Revision-pinned archive wrappers are inert data envelopes loaded into a
+    // second sandboxed opaque-origin iframe. They must accept that opaque parent;
+    // every other artifact document retains frame-ancestors 'self'.
+    const opaqueArchiveWrapper = /(?:^|\/)checklist\/gallery\/revisions\/export_[a-f0-9]{16}\/(?:flags\.html|(?:query|items|raw)\/.+\.html)$/.test(relativeArtifactPath);
+    const opaqueArchiveSurface = /(?:^|\/)checklist\/gallery\.html$/.test(relativeArtifactPath);
+    const sandboxSources = opaqueArchiveSurface
+      ? `default-src 'self' data: blob:; connect-src 'self'; img-src 'self' data: blob: ${artifactOrigin}; media-src 'self' data: blob: ${artifactOrigin}; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; worker-src 'self' blob:; frame-src 'self' blob: ${artifactOrigin}; font-src 'self' data:; base-uri 'none'`
+      : "default-src 'self' data: blob:; connect-src 'self'; img-src 'self' data: blob:; media-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; worker-src 'self' blob:; frame-src 'self' blob:; font-src 'self' data:; base-uri 'none'";
+    const activeContentIsolation = extname(verifiedFile).toLowerCase() === '.html'
+      ? `sandbox allow-scripts allow-forms allow-downloads allow-popups; ${sandboxSources}${opaqueArchiveWrapper ? '' : "; frame-ancestors 'self'"}`
+      : "default-src 'none'; frame-ancestors 'self'";
+    const opaqueArchiveModule = /(?:^|\/)checklist\/assets\/gallery-(?:archive|core)\.js$/.test(relativeArtifactPath);
+    const transfer = sendFile(request, response, verifiedFile, activeContentIsolation, { opaqueArchiveModule, opened });
+    opened = null;
+    return await transfer;
+  } finally {
+    await opened?.handle?.close().catch(() => undefined);
+  }
 }
 
-async function sendFile(request, response, file, contentSecurityPolicy, { opaqueArchiveModule = false } = {}) {
-  let handle;
-  try {
-    handle = await fs.open(file, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
-  } catch (error) {
-    if (['ENOENT', 'ENOTDIR', 'ELOOP'].includes(error?.code)) throw httpError(404, 'File not found.');
-    throw error;
+async function sendFile(request, response, file, contentSecurityPolicy, {
+  opaqueArchiveModule = false,
+  opened = null,
+  contentType = null,
+  etag = null,
+} = {}) {
+  let handle = opened?.handle;
+  let stat = opened?.stat;
+  if (!handle) {
+    try {
+      handle = await fs.open(file, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    } catch (error) {
+      if (['ENOENT', 'ENOTDIR', 'ELOOP'].includes(error?.code)) throw httpError(404, 'File not found.');
+      throw error;
+    }
   }
-  let stat;
-  try {
-    stat = await handle.stat();
-  } catch (error) {
-    await handle.close().catch(() => undefined);
-    if (['ENOENT', 'ENOTDIR'].includes(error?.code)) throw httpError(404, 'File not found.');
-    throw error;
-  }
-  if (!stat.isFile()) {
-    await handle.close().catch(() => undefined);
-    throw httpError(404, 'File not found.');
-  }
-  let range;
-  try {
-    range = parseByteRange(request.headers.range, stat.size);
-  } catch (error) {
-    await handle.close().catch(() => undefined);
-    throw error;
-  }
-  const headers = {
-    'Content-Type': MIME_TYPES[extname(file).toLowerCase()] ?? 'application/octet-stream',
-    'Content-Length': range ? range.end - range.start + 1 : stat.size,
-    'Cache-Control': 'no-store',
-    'Content-Security-Policy': contentSecurityPolicy,
-    'Accept-Ranges': 'bytes',
-    'X-Content-Type-Options': 'nosniff',
-    'Referrer-Policy': 'no-referrer',
+  let stream = null;
+  let closeStarted = false;
+  let resolveClosed;
+  const closed = new Promise((resolveClose) => { resolveClosed = resolveClose; });
+  const closeOwnedHandle = () => {
+    if (closeStarted) return closed;
+    closeStarted = true;
+    stream?.destroy();
+    void handle.close().catch(() => undefined).finally(resolveClosed);
+    return closed;
   };
-  if (opaqueArchiveModule) {
-    // Archive HTML intentionally has an opaque origin so it cannot inherit
-    // portal authority. Only these inert, generated module assets opt into
-    // CORS; run data and mutation APIs remain unavailable to that origin.
-    headers['Access-Control-Allow-Origin'] = '*';
-    headers['Cross-Origin-Resource-Policy'] = 'cross-origin';
-  }
-  if (range) headers['Content-Range'] = `bytes ${range.start}-${range.end}/${stat.size}`;
-  response.writeHead(range ? 206 : 200, headers);
-  if (request.method === 'HEAD') {
-    await handle.close().catch(() => undefined);
-    return response.end();
-  }
-  const stream = handle.createReadStream({ ...(range ?? {}), autoClose: false });
-  return new Promise((resolveStream) => {
-    let settled = false;
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      stream.destroy();
-      void handle.close().catch(() => undefined).finally(resolveStream);
+  // Own the descriptor before any further await or response setup. Browser
+  // media preload requests commonly disconnect after reading metadata; a late
+  // `close` listener misses that event and leaves autoClose:false handles for GC.
+  response.once('finish', closeOwnedHandle);
+  response.once('close', closeOwnedHandle);
+  try {
+    if (response.destroyed || response.writableEnded) {
+      await closeOwnedHandle();
+      return;
+    }
+    stat ??= await handle.stat();
+    if (response.destroyed || response.writableEnded) {
+      await closeOwnedHandle();
+      return;
+    }
+    if (!stat.isFile()) throw httpError(404, 'File not found.');
+    const range = parseByteRange(request.headers.range, stat.size);
+    const headers = {
+      'Content-Type': contentType ?? MIME_TYPES[extname(file).toLowerCase()] ?? 'application/octet-stream',
+      'Content-Length': range ? range.end - range.start + 1 : stat.size,
+      'Cache-Control': 'no-store',
+      'Content-Security-Policy': contentSecurityPolicy,
+      'Accept-Ranges': 'bytes',
+      'X-Content-Type-Options': 'nosniff',
+      'Referrer-Policy': 'no-referrer',
     };
-    response.once('finish', finish);
-    response.once('close', finish);
+    if (etag) headers.ETag = etag;
+    if (opaqueArchiveModule) {
+      // Archive HTML intentionally has an opaque origin so it cannot inherit
+      // portal authority. Only these inert, generated module assets opt into
+      // CORS; run data and mutation APIs remain unavailable to that origin.
+      headers['Access-Control-Allow-Origin'] = '*';
+      headers['Cross-Origin-Resource-Policy'] = 'cross-origin';
+    }
+    if (range) headers['Content-Range'] = `bytes ${range.start}-${range.end}/${stat.size}`;
+    const injectedDelay = process.env.PORTAL_E2E_FAILURE_INJECTION === '1'
+      ? Number(request.headers['x-portal-e2e-send-file-delay-ms'] ?? 0)
+      : 0;
+    if (Number.isInteger(injectedDelay) && injectedDelay > 0 && injectedDelay <= 1_000) {
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, injectedDelay));
+    }
+    if (response.destroyed || response.writableEnded) {
+      await closeOwnedHandle();
+      return;
+    }
+    response.writeHead(range ? 206 : 200, headers);
+    if (request.method === 'HEAD') {
+      response.end();
+      await closeOwnedHandle();
+      return;
+    }
+    stream = handle.createReadStream({ ...(range ?? {}), autoClose: false });
     stream.once('error', () => {
       if (!response.destroyed) response.destroy();
-      finish();
+      void closeOwnedHandle();
     });
+    stream.once('end', closeOwnedHandle);
+    stream.once('close', closeOwnedHandle);
     stream.pipe(response);
-  });
+    await closed;
+  } catch (error) {
+    await closeOwnedHandle();
+    if (response.destroyed || response.writableEnded) return;
+    if (['ENOENT', 'ENOTDIR', 'ELOOP'].includes(error?.code)) throw httpError(404, 'File not found.');
+    throw error;
+  } finally {
+    response.off('finish', closeOwnedHandle);
+    response.off('close', closeOwnedHandle);
+  }
 }
 
-async function listArtifacts(runDirectory, runId, offset, limit, request) {
+async function listArtifacts(runDirectory, runId, offset, limit, request, artifactBase = '/artifacts') {
   const index = await artifactIndex(runDirectory, offset);
   await extendArtifactIndex(index, offset + limit + 1, request);
   const selectedPaths = index.paths.slice(offset, offset + limit);
@@ -2169,7 +4855,7 @@ async function listArtifacts(runDirectory, runId, offset, limit, request) {
       bytes: stat.size,
       modifiedAt: stat.mtime.toISOString(),
       kind: artifactKind(path),
-      url: `/artifacts/${encodeURIComponent(runId)}/${path.split('/').map(encodeURIComponent).join('/')}`,
+      url: `${artifactBase}/${encodeURIComponent(runId)}/${path.split('/').map(encodeURIComponent).join('/')}`,
       ...(mediaRecord ? { evidenceRole: mediaRecord.evidenceRole } : {}),
     });
   }
@@ -2418,6 +5104,142 @@ async function readLegacyBoundedReportJson(run, relativePath, maximumBytes) {
   return structuredClone(value);
 }
 
+async function singleSiteReportRun(jobId) {
+  const state = await readSingleSiteJob(singleSiteQueue, jobId);
+  const finalization = await readSingleSiteFinalizationStatus(SINGLE_SITE_FINALIZATION_ROOT, jobId)
+    .catch(() => null);
+  if (!finalization || !['complete', 'incomplete'].includes(finalization.status)) {
+    throw httpError(409, 'The deterministic Single-site report is still being finalized or failed integrity validation.');
+  }
+  const directory = resolve(SINGLE_SITE_FINALIZATION_ROOT, state.jobId, 'report');
+  if (directory !== SINGLE_SITE_FINALIZATION_ROOT && !directory.startsWith(`${SINGLE_SITE_FINALIZATION_ROOT}${sep}`)) {
+    throw httpError(404, 'Single-site report directory is invalid.');
+  }
+  let publication;
+  try {
+    publication = await loadSingleSiteReportPublication(directory, finalization.reportRevision);
+  } catch (error) {
+    throw httpError(422, `Single-site report publication is invalid: ${error.message}`);
+  }
+  if (publication.publicationRevision !== finalization.reportRevision
+    || publication.publicationDigest !== finalization.reportPublicationDigest) {
+    throw httpError(422, 'Single-site report publication does not match its digest-bound finalization status.');
+  }
+  return {
+    directory,
+    manifest: { id: state.jobId },
+    reportRevision: finalization.reportRevision,
+    reportPublicationDigest: finalization.reportPublicationDigest,
+  };
+}
+
+async function loadPortalSingleSiteGallery(jobId, request, signal) {
+  const state = await readSingleSiteJob(singleSiteQueue, jobId);
+  const finalization = await readSingleSiteFinalizationStatus(SINGLE_SITE_FINALIZATION_ROOT, jobId);
+  if (!['complete', 'incomplete'].includes(finalization.status)) {
+    throw httpError(409, 'The Single-site gallery is still being finalized or is unavailable.');
+  }
+  if (typeof state.attemptId !== 'string' || state.attemptId.length < 1) {
+    throw httpError(409, 'The finalized Single-site run has no authoritative attempt binding.');
+  }
+  return openSingleSiteGallery({
+    finalizationRoot: SINGLE_SITE_FINALIZATION_ROOT,
+    jobId,
+    attemptId: state.attemptId,
+    bindings: {
+      ...finalization,
+      attemptId: state.attemptId,
+    },
+    baselineStore: visualBaselineStore,
+    reviewStore: visualReviewStore,
+    auditCatalog: catalog,
+    mutationAuthorized: operatorRequestAuthorized(request),
+    signal,
+  });
+}
+
+function singleSiteRequestedReportRevision(run, requestUrl) {
+  const requested = reportRevision(requestUrl);
+  if (requested !== null && requested !== run.reportRevision) {
+    throw httpError(409, 'Requested Single-site report revision is not the revision bound to finalization status.');
+  }
+  return run.reportRevision;
+}
+
+async function filterSingleSiteReportAudits(run, input, requestUrl) {
+  const revision = singleSiteRequestedReportRevision(run, requestUrl);
+  const summary = await readBoundedReportJson(run, 'summary.json', MAX_REPORT_SUMMARY_BYTES, revision);
+  if (summary.mode !== 'single-site' || !summary.auditPages || !Number.isSafeInteger(summary.auditPages.pageCount)
+    || summary.auditPages.pageCount < 0 || summary.auditPages.pageCount > 1_000) {
+    throw httpError(422, 'Single-site report audit page metadata is invalid.');
+  }
+  const definitions = new Map((input.coverageManifest?.selectedDefinitions ?? [])
+    .map((definition) => [definition.auditId, definition]));
+  const rows = [];
+  for (let page = 1; page <= summary.auditPages.pageCount; page += 1) {
+    const document = await readBoundedReportJson(
+      run,
+      `audits/page-${String(page).padStart(6, '0')}.json`,
+      MAX_REPORT_AUDIT_INDEX_BYTES,
+      revision,
+    );
+    if (document.mode !== 'single-site' || !Array.isArray(document.items)) {
+      throw httpError(422, `Single-site audit report page ${page} is invalid.`);
+    }
+    for (const row of document.items) {
+      const definition = definitions.get(row.id);
+      rows.push({
+        ...row,
+        severity: definition?.severity ?? 'P3',
+        userPromise: definition?.standaloneOracle?.expected ?? row.detail,
+        reason: row.detail,
+        releaseBlocking: false,
+        evidenceCounts: {
+          video: 0,
+          screenshot: 0,
+          total: row.artifactCount,
+        },
+      });
+    }
+  }
+  if (rows.length !== summary.auditPages.total) {
+    throw httpError(422, 'Single-site audit report pages disagree with the summary count.');
+  }
+  const offset = queryInteger(requestUrl.searchParams.get('offset'), 'offset', 0, 0, 1_000_000);
+  const limit = queryInteger(requestUrl.searchParams.get('limit'), 'limit', 25, 1, 100);
+  const status = reportFilter(requestUrl, 'status', 40)?.toUpperCase() ?? null;
+  const severity = reportFilter(requestUrl, 'severity', 20)?.toUpperCase() ?? null;
+  const area = reportFilter(requestUrl, 'area', 80)?.toLowerCase() ?? null;
+  const query = reportFilter(requestUrl, 'q', 160)?.toLowerCase() ?? null;
+  const manualRaw = requestUrl.searchParams.get('manual');
+  if (manualRaw !== null && !['true', 'false'].includes(manualRaw)) throw httpError(400, 'manual must be true or false.');
+  const manual = manualRaw === null ? null : manualRaw === 'true';
+  const matches = rows.filter((row) => {
+    if (status && row.status !== status) return false;
+    if (severity && row.severity !== severity) return false;
+    if (area && String(row.area).toLowerCase() !== area) return false;
+    if (manual !== null && row.manual !== manual) return false;
+    if (query && ![row.id, row.title, row.detail, row.userPromise].join(' ').toLowerCase().includes(query)) return false;
+    return true;
+  });
+  const items = matches.slice(offset, offset + limit);
+  return {
+    schemaVersion: 1,
+    mode: 'single-site',
+    publicationRevision: summary.publicationRevision,
+    items,
+    total: matches.length,
+    offset,
+    limit,
+    hasMore: offset + items.length < matches.length,
+    filters: {
+      statuses: [...new Set(rows.map(({ status: value }) => value))].sort(),
+      severities: [...new Set(rows.map(({ severity: value }) => value))].sort(),
+      areas: [...new Set(rows.map(({ area: value }) => value))].sort(),
+    },
+  };
+}
+
 async function filterReportAudits(run, requestUrl) {
   const document = await readBoundedReportJson(
     run,
@@ -2540,7 +5362,10 @@ function triggerExternalShardedRunSync() {
 async function syncExternalShardedRunForRead(id) {
   const existing = runs.get(id);
   if (existing) {
-    if (existing.externalManaged) triggerExternalShardedRunSync();
+    if (existing.externalManaged
+      && Date.now() >= (existing.externalState.nextRefreshAt ?? 0)) {
+      triggerExternalShardedRunSync();
+    }
     return;
   }
   // Unknown IDs receive one authoritative discovery pass before returning a
@@ -2572,7 +5397,13 @@ async function refreshExternalShardedRuns() {
       if (purgingRunIds.has(entry.name)) continue;
       const directory = join(SHARDED_ARTIFACT_ROOT, entry.name);
       const existing = runs.get(entry.name);
+      if (existing?.purgeQuarantine) continue;
       if (existing && !existing.externalManaged) continue;
+      // A known external run already proved its discovery markers when it was
+      // admitted. Honor its refresh deadline before touching those files so
+      // high-frequency gallery reads do not turn an immutable terminal run
+      // into a background stat storm.
+      if (existing && Date.now() < (existing.externalState.nextRefreshAt ?? 0)) continue;
       const discoverable = await Promise.all([
         safeStat(join(directory, 'logs', 'coordinator.log')),
         safeStat(join(directory, 'sharded-run.json')),
@@ -2581,7 +5412,6 @@ async function refreshExternalShardedRuns() {
       ]).then((stats) => stats.some((stat) => stat?.isFile()));
       if (!discoverable) continue;
       const run = existing ?? await createExternalRun(entry.name, directory);
-      if (existing && Date.now() < (run.externalState.nextRefreshAt ?? 0)) continue;
       await refreshExternalRun(run, !existing, budget);
       run.externalState.nextRefreshAt = Date.now() + (
         TERMINAL_STATUSES.has(run.manifest.status) && !run.externalState.leaseFailed
@@ -2706,6 +5536,7 @@ async function refreshExternalRun(run, initial, budget) {
     pipeline: run.manifest.pipeline,
     release: run.manifest.release,
   });
+  upsertComparativeConsoleRun(run);
   if (!initial && before !== after) {
     appendEvent(run, 'snapshot', { manifest: publicManifest(run.manifest) });
     if (TERMINAL_STATUSES.has(run.manifest.status)) {
@@ -3063,13 +5894,16 @@ async function refreshExternalManifest(run) {
   }
 
   state.leaseFailed = false;
-  run.manifest.status = 'running';
+  const externalStopping = heartbeat?.status === 'stopping';
+  run.manifest.status = externalStopping ? 'stopping' : 'running';
   run.manifest.finishedAt = null;
   run.manifest.exitCode = null;
   run.manifest.pipeline = {
     status: 'running',
     completed: false,
-    reason: 'An externally launched sharded browser and evidence pipeline is running.',
+    reason: externalStopping
+      ? 'The externally launched sharded coordinator is stopping active work.'
+      : 'An externally launched sharded browser and evidence pipeline is running.',
     finishedAt: null,
   };
   run.manifest.release = pendingRelease();
@@ -3077,7 +5911,9 @@ async function refreshExternalManifest(run) {
   const performance = state.commands.get('PERFORMANCE');
   const completedShards = [...state.shardProgress.values()].filter(({ finished }) => finished).length;
   const activeMergeStage = [...state.mergeStages.entries()].find(([, stage]) => !stage.finishedAt)?.[0];
-  run.manifest.phase = activeMergeStage === 'process-media' ? 'Processing and indexing video evidence'
+  run.manifest.phase = externalStopping
+    ? `Stopping external sharded work · ${heartbeat.activeCommands} command(s) still active`
+    : activeMergeStage === 'process-media' ? 'Processing and indexing video evidence'
     : activeMergeStage === 'rebuild-checklist' ? 'Rebuilding checklist with final evidence links'
       : activeMergeStage === 'merge-reports' || (merge && !merge.finishedAt) ? 'Merging shard reports'
         : performance && !performance.finishedAt ? 'Executing isolated Lighthouse and performance checks · one worker'
@@ -3576,8 +6412,7 @@ async function loadPersistedRuns() {
       if (!manifest.release) {
         manifest.release = unavailableRelease('No authoritative release decision was recorded for this legacy run.');
       }
-      await atomicWriteJson(join(directory, 'run.json'), manifest);
-      runs.set(entry.name, {
+      const recoveredRun = {
         directory,
         manifest,
         child: null,
@@ -3589,9 +6424,108 @@ async function loadPersistedRuns() {
         lineBuffer: { stdout: '', stderr: '' },
         killTimer: null,
         aiApiKey: null,
-      });
-    } catch {
+        artifactPermissionsSealed: false,
+      };
+      if (REPORT_WORKER_IDENTITY.active) {
+        const reportStageReachedSealing = ['running', 'completed', 'failed']
+          .includes(manifest.stages?.reportRebuild?.status);
+        if (!interrupted && reportStageReachedSealing) {
+          const portable = manifest.executionProvenance?.artifactPermissionMode === 'portable-bind';
+          await fs.chmod(directory, portable ? 0o550 : 0o750);
+          recoveredRun.artifactPermissionsSealed = true;
+        } else {
+          await sealRunDirectoryForReporting(recoveredRun, 'recovery');
+        }
+      }
+      await persistManifest(recoveredRun);
+      runs.set(entry.name, recoveredRun);
+    } catch (error) {
       // A directory without a valid run manifest is not portal-managed evidence.
+      console.error(`[PORTAL_RUN_RECOVERY_REJECTED] ${entry.name}: ${redactLogValue(error instanceof Error ? error.message : String(error))}`);
+    }
+  }
+}
+
+async function loadPurgeQuarantines() {
+  await fs.mkdir(PURGE_JOURNAL_ROOT, { recursive: true, mode: 0o700 });
+  await fs.chmod(PURGE_JOURNAL_ROOT, 0o700);
+  const entries = await fs.readdir(PURGE_JOURNAL_ROOT, { withFileTypes: true });
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+    const journalPath = join(PURGE_JOURNAL_ROOT, entry.name);
+    let record;
+    try {
+      record = JSON.parse(await fs.readFile(journalPath, 'utf8'));
+      if (!record || record.schemaVersion !== 1 || !SAFE_RUN_ID.test(record.id)
+        || !['portal-managed', 'external-sharded'].includes(record.source)
+        || !new RegExp(`^${escapeRegex(record.id)}-[a-f0-9]{16}$`).test(record.quarantineName)
+        || !record.manifest || record.manifest.id !== record.id) {
+        throw new Error('journal fields are invalid');
+      }
+      const externalManaged = record.source === 'external-sharded';
+      const configuredRoot = externalManaged ? SHARDED_ARTIFACT_ROOT : ARTIFACT_ROOT;
+      if (journalPath !== purgeJournalPath(configuredRoot, record.id)) {
+        throw new Error('journal path does not match its configured artifact root');
+      }
+      const originalTarget = join(configuredRoot, record.id);
+      const directory = join(configuredRoot, PURGE_QUARANTINE_NAME, record.quarantineName);
+      const quarantineStat = await fs.lstat(directory).catch(() => null);
+      if (!quarantineStat) {
+        // A prepared rename never happened, or deletion finished before the
+        // supervisor could unlink its journal. Neither case is a partial tree.
+        await fs.unlink(journalPath);
+        continue;
+      }
+      if (await safeStat(originalTarget)) {
+        throw new Error('both original and quarantined evidence exist');
+      }
+      const quarantine = {
+        configuredRoot,
+        originalTarget,
+        directory,
+        journalPath,
+        quarantineName: record.quarantineName,
+        record,
+      };
+      await verifiedPurgeQuarantineTarget(configuredRoot, quarantine, record.id);
+      const finishedAt = record.failedAt ?? new Date().toISOString();
+      const manifest = structuredClone(record.manifest);
+      manifest.status = 'evidence-failed';
+      manifest.phase = 'Purge incomplete · remaining evidence quarantined';
+      manifest.finishedAt = finishedAt;
+      manifest.pipeline = {
+        status: 'failed',
+        completed: false,
+        reason: record.error ?? 'Portal restarted while quarantined evidence was being deleted.',
+        finishedAt,
+      };
+      manifest.release = unavailableRelease('No release decision is usable because the stored evidence may be partially purged.');
+      manifest.purgeFailure = {
+        occurredAt: finishedAt,
+        reason: manifest.pipeline.reason,
+        quarantined: true,
+        retrySafe: true,
+      };
+      runs.set(record.id, {
+        directory,
+        externalManaged,
+        manifest,
+        child: null,
+        clients: new Set(),
+        galleryClients: new Set(),
+        events: [],
+        sequence: 0,
+        logStream: null,
+        lifecycleStream: null,
+        lineBuffer: { stdout: '', stderr: '' },
+        killTimer: null,
+        aiApiKey: null,
+        artifactPermissionsSealed: true,
+        purgeQuarantine: quarantine,
+      });
+      console.error(`[PORTAL_PURGE_RECOVERED] ${record.id}: remaining evidence is quarantined and requires a purge retry.`);
+    } catch (error) {
+      throw new Error(`Purge quarantine journal ${entry.name} is invalid: ${error.message}`);
     }
   }
 }
@@ -3603,8 +6537,11 @@ function sortedRunSummaries() {
 }
 
 function publicManifest(manifest) {
+  const authorityRun = runs.get(manifest.id);
   return {
     ...structuredClone(manifest),
+    revision: Number.isSafeInteger(authorityRun?.sequence) ? authorityRun.sequence : null,
+    sourceRevision: typeof authorityRun?.consoleSourceRevision === 'string' ? authorityRun.consoleSourceRevision : null,
     purge: {
       eligible: PURGE_ELIGIBLE_STATUSES.has(manifest.status),
       confirmation: `PURGE ${manifest.id}`,
@@ -3647,23 +6584,71 @@ async function purgeRun(run, body, response) {
   if (galleryMutationRunIds.has(id)) throw httpError(409, 'A gallery review update is being saved for this run. Wait for it to finish before purging.');
 
   purgingRunIds.add(id);
+  const consolePurgeKey = `comparative:${id}`;
+  let consolePurgeToken = consolePendingPurgeTokens.get(consolePurgeKey) ?? null;
   try {
+    if (!consolePurgeToken) {
+      consolePurgeToken = consoleIndex.beginPurge({ mode: 'comparative', runId: id }, {
+        sourceId: COMPARATIVE_CONSOLE_SOURCE_ID,
+        sourceRevision: nextConsoleSourceRevision('comparative'),
+        updatedAt: new Date().toISOString(),
+      });
+    }
+    await fenceAndDrainRunTransfers('comparative', id);
+    forgetConsoleReportProjection({ mode: 'comparative', runId: id });
     const configuredRoot = run.externalManaged ? SHARDED_ARTIFACT_ROOT : ARTIFACT_ROOT;
-    const target = await verifiedPurgeTarget(configuredRoot, run.directory, id);
-    const reclaimed = await measureRunEvidence(target);
-    await fs.rm(target, { recursive: true, force: false, maxRetries: 2, retryDelay: 100 });
+    const originalTarget = run.purgeQuarantine?.originalTarget
+      ?? await verifiedPurgeTarget(configuredRoot, run.directory, id);
+    if (!run.purgeQuarantine) {
+      await assertPurgeHasNoNestedMounts(originalTarget);
+    }
+    const reclaimed = await measureRunEvidence(run.purgeQuarantine?.directory ?? originalTarget);
+    if (!run.purgeQuarantine) {
+      await moveRunToPurgeQuarantine(run, configuredRoot, originalTarget);
+    }
+    const target = await verifiedPurgeQuarantineTarget(configuredRoot, run.purgeQuarantine, id);
+    await assertPurgeHasNoNestedMounts(target);
+    try {
+      await removeValidatedArtifactTree(fs, target);
+    } catch (error) {
+      if (await safeStat(target)) {
+        await retainFailedPurge(run, error);
+        throw error;
+      }
+      console.warn(`Purge removal for ${id} reported ${error.message}, but its quarantined directory is gone; treating deletion as complete.`);
+    }
+    await fs.unlink(run.purgeQuarantine.journalPath).catch((error) => {
+      if (error?.code !== 'ENOENT') {
+        // Evidence deletion is already complete. Keep the API/run state
+        // truthful and let startup's missing-quarantine recovery remove this
+        // root-only stale journal rather than reporting retained evidence.
+        console.warn(`Purge journal cleanup for ${id} failed after evidence deletion completed: ${error.message}`);
+      }
+    });
 
+    artifactPathCache.delete(originalTarget);
     artifactPathCache.delete(target);
+    preferredMediaValidationCache.delete(originalTarget);
     preferredMediaValidationCache.delete(target);
     galleryRevisionCache.delete(id);
+    consoleIndexedStateSignatures.delete(`comparative\u0000${id}`);
     observedGalleryPublications.delete(id);
+    observedSealedGalleryHeads.delete(id);
+    for (const key of galleryFlagRateWindows.keys()) {
+      if (key.endsWith(`\u0000${id}`)) galleryFlagRateWindows.delete(key);
+    }
     purgedGalleryRunIds.add(id);
     while (purgedGalleryRunIds.size > 256) purgedGalleryRunIds.delete(purgedGalleryRunIds.values().next().value);
     for (const cachedPath of reportDataCache.keys()) {
-      if (isDirectlyContained(target, cachedPath)) reportDataCache.delete(cachedPath);
+      if (isDirectlyContained(target, cachedPath) || isDirectlyContained(originalTarget, cachedPath)) reportDataCache.delete(cachedPath);
     }
     runs.delete(id);
     closePurgedRunStreams(run, id);
+    consoleIndex.commitPurge(consolePurgeToken, {
+      sourceRevision: nextConsoleSourceRevision('comparative'),
+      updatedAt: new Date().toISOString(),
+    });
+    consolePendingPurgeTokens.delete(consolePurgeKey);
     console.log(`Purged ${run.externalManaged ? 'external sharded' : 'portal-managed'} run ${id}: ${reclaimed.files} file references and ${reclaimed.logicalBytes} logical bytes removed (hardlinks make physical reclaimed-byte claims unreliable).`);
     return sendJson(response, 200, {
       id,
@@ -3673,9 +6658,27 @@ async function purgeRun(run, body, response) {
       logicalBytesRemoved: reclaimed.logicalBytes,
     });
   } catch (error) {
+    if (consolePurgeToken && !run.purgeQuarantine && runs.get(id) === run) {
+      releaseRunTransferFence('comparative', id);
+      try {
+        const record = await authoritativeComparativeConsoleIndexRecord(run);
+        consoleIndex.abortPurge(
+          consolePurgeToken,
+          [record, ...comparativeConsoleTimelineRecords(run, record)],
+          { sourceComplete: consoleIndex.backfillState(COMPARATIVE_CONSOLE_SOURCE_ID)?.complete === true },
+        );
+        consolePendingPurgeTokens.delete(consolePurgeKey);
+      } catch (rereadError) {
+        console.error(`[PORTAL_CONSOLE_PURGE_REVERIFY_FAILED] comparative ${id} remains unavailable: ${redactLogValue(rereadError.message)}`);
+      }
+    } else if (consolePurgeToken && run.purgeQuarantine) {
+      consolePendingPurgeTokens.set(consolePurgeKey, consolePurgeToken);
+    }
     if (Number.isInteger(error?.statusCode)) throw error;
     console.error(`Run purge failed for ${id}:`, error);
-    throw httpError(500, 'The run could not be completely purged. Its portal record was retained; inspect the portal service log and evidence directory before retrying.');
+    throw httpError(500, run.purgeQuarantine
+      ? 'The run could not be completely purged. Its remaining evidence and durable portal record were quarantined for inspection or a safe retry.'
+      : 'The run could not be purged and its original evidence record remains unchanged.');
   } finally {
     purgingRunIds.delete(id);
   }
@@ -3683,6 +6686,7 @@ async function purgeRun(run, body, response) {
 
 async function withGalleryMutationLock(run, callback) {
   const id = run.manifest.id;
+  if (run.purgeQuarantine) throw httpError(409, 'Quarantined partial evidence cannot accept gallery review updates.');
   if (purgingRunIds.has(id)) throw httpError(409, 'This run is being purged and cannot accept gallery review updates.');
   if (galleryMutationRunIds.has(id)) throw httpError(409, 'Another gallery review update is already being saved for this run.');
   galleryMutationRunIds.add(id);
@@ -3743,6 +6747,102 @@ async function verifiedPurgeTarget(configuredRoot, runDirectory, id) {
   return target;
 }
 
+async function assertPurgeHasNoNestedMounts(target) {
+  try {
+    await assertNoNestedMountPoints(fs, target);
+  } catch (error) {
+    if (['NESTED_MOUNT_POINT', 'MOUNT_BOUNDARY_UNAVAILABLE'].includes(error?.code)) {
+      throw httpError(409, error.message);
+    }
+    throw error;
+  }
+}
+
+async function moveRunToPurgeQuarantine(run, configuredRoot, originalTarget) {
+  const id = run.manifest.id;
+  const source = run.externalManaged ? 'external-sharded' : 'portal-managed';
+  const quarantineRoot = join(configuredRoot, PURGE_QUARANTINE_NAME);
+  await fs.mkdir(quarantineRoot, { recursive: true, mode: 0o700 });
+  await fs.chmod(quarantineRoot, 0o700);
+  const quarantineRootStat = await fs.lstat(quarantineRoot);
+  if (!quarantineRootStat.isDirectory() || quarantineRootStat.isSymbolicLink()) {
+    throw httpError(409, 'Purge refused because its quarantine root is not a real directory.');
+  }
+  const quarantineName = `${id}-${randomBytes(8).toString('hex')}`;
+  const directory = join(quarantineRoot, quarantineName);
+  const journalPath = purgeJournalPath(configuredRoot, id);
+  const record = {
+    schemaVersion: 1,
+    id,
+    source,
+    quarantineName,
+    status: 'prepared',
+    preparedAt: new Date().toISOString(),
+    manifest: structuredClone(run.manifest),
+  };
+  await atomicWriteSecureJson(journalPath, record);
+  try {
+    await fs.rename(originalTarget, directory);
+  } catch (error) {
+    await fs.unlink(journalPath).catch(() => undefined);
+    throw error;
+  }
+  record.status = 'deleting';
+  record.quarantinedAt = new Date().toISOString();
+  await atomicWriteSecureJson(journalPath, record);
+  run.directory = directory;
+  run.purgeQuarantine = { configuredRoot, originalTarget, directory, journalPath, quarantineName, record };
+}
+
+async function verifiedPurgeQuarantineTarget(configuredRoot, quarantine, id) {
+  if (!quarantine || quarantine.configuredRoot !== configuredRoot) {
+    throw httpError(409, 'Purge refused because its durable quarantine record is inconsistent.');
+  }
+  const quarantineRoot = resolve(configuredRoot, PURGE_QUARANTINE_NAME);
+  const target = resolve(quarantine.directory);
+  const expected = resolve(quarantineRoot, quarantine.quarantineName);
+  if (target !== expected || dirname(target) !== quarantineRoot
+    || !new RegExp(`^${escapeRegex(id)}-[a-f0-9]{16}$`).test(basename(target))) {
+    throw httpError(409, 'Purge refused because its quarantine path failed containment checks.');
+  }
+  const [rootStat, targetStat] = await Promise.all([fs.lstat(quarantineRoot), fs.lstat(target)]);
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()
+    || !targetStat.isDirectory() || targetStat.isSymbolicLink()) {
+    throw httpError(409, 'Purge refused because quarantined evidence is not a real directory.');
+  }
+  const [realRoot, realTarget] = await Promise.all([fs.realpath(quarantineRoot), fs.realpath(target)]);
+  if (dirname(realTarget) !== realRoot || basename(realTarget) !== quarantine.quarantineName) {
+    throw httpError(409, 'Purge refused because quarantined evidence resolves outside its storage root.');
+  }
+  return target;
+}
+
+async function retainFailedPurge(run, error) {
+  const finishedAt = new Date().toISOString();
+  const reason = `Purge failed after evidence entered quarantine: ${redactLogValue(error instanceof Error ? error.message : String(error)).slice(0, 800)}`;
+  run.manifest.status = 'evidence-failed';
+  run.manifest.phase = 'Purge incomplete · remaining evidence quarantined';
+  run.manifest.finishedAt = finishedAt;
+  run.manifest.pipeline = { status: 'failed', completed: false, reason, finishedAt };
+  run.manifest.release = unavailableRelease('No release decision is usable because the stored evidence was only partially purged.');
+  run.manifest.purgeFailure = {
+    occurredAt: finishedAt,
+    reason,
+    quarantined: true,
+    retrySafe: true,
+  };
+  run.purgeQuarantine.record.status = 'failed';
+  run.purgeQuarantine.record.failedAt = finishedAt;
+  run.purgeQuarantine.record.error = reason;
+  run.purgeQuarantine.record.manifest = structuredClone(run.manifest);
+  await atomicWriteSecureJson(run.purgeQuarantine.journalPath, run.purgeQuarantine.record);
+}
+
+function purgeJournalPath(configuredRoot, id) {
+  const rootKey = createHash('sha256').update(resolve(configuredRoot)).digest('hex').slice(0, 16);
+  return join(PURGE_JOURNAL_ROOT, `${rootKey}-${id}.json`);
+}
+
 async function measureRunEvidence(root) {
   const pending = [root];
   let files = 0;
@@ -3783,11 +6883,31 @@ function isDirectlyContained(root, path) {
   return candidate !== '' && candidate !== '..' && !candidate.startsWith(`..${sep}`) && !isAbsolute(candidate);
 }
 
+function evictSingleSiteIdentityCaches(jobId) {
+  const roots = [
+    join(singleSiteQueue.root, 'jobs', jobId),
+    join(SINGLE_SITE_FINALIZATION_ROOT, jobId),
+  ];
+  for (const cache of [artifactPathCache, preferredMediaValidationCache, reportDataCache]) {
+    for (const cachedPath of cache.keys()) {
+      if (roots.some((root) => cachedPath === root || isDirectlyContained(root, cachedPath))) {
+        cache.delete(cachedPath);
+      }
+    }
+  }
+}
+
 async function persistManifest(run) {
   if (run.externalManaged) {
     throw new Error('Externally launched sharded evidence is read-only in the portal.');
   }
-  await atomicWriteJson(join(run.directory, 'run.json'), run.manifest);
+  const manifestPath = join(run.directory, 'run.json');
+  await withRunArtifactWriteWindow(
+    run,
+    () => atomicWriteJson(manifestPath, run.manifest),
+    { sealPaths: [manifestPath] },
+  );
+  upsertComparativeConsoleRun(run);
 }
 
 function openAppendStream(path, label) {
@@ -3836,6 +6956,21 @@ async function atomicWriteJson(path, value) {
   }
 }
 
+async function atomicWriteSecureJson(path, value) {
+  await fs.mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  await fs.chmod(dirname(path), 0o700);
+  const temporary = `${path}.${randomBytes(4).toString('hex')}.tmp`;
+  try {
+    await fs.writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+    await fs.rename(temporary, path);
+    await fs.chmod(path, 0o600);
+  } finally {
+    await fs.unlink(temporary).catch((error) => {
+      if (error?.code !== 'ENOENT') throw error;
+    });
+  }
+}
+
 function resolvePlaywrightExecutable() {
   const suffix = process.platform === 'win32' ? '.cmd' : '';
   const executable = join(REPOSITORY_ROOT, 'node_modules', '.bin', `playwright${suffix}`);
@@ -3849,16 +6984,32 @@ function resolveToolExecutable(name) {
 }
 
 async function prepareRunDirectoryForRunner(directory) {
-  if (!RUNNER_IDENTITY.active) return;
-  await fs.chown(directory, RUNNER_IDENTITY.uid, RUNNER_IDENTITY.gid);
-  await fs.chmod(directory, 0o770);
+  return prepareRunnerArtifactDirectory(fs, directory, RUNNER_IDENTITY);
 }
 
 async function sealRunDirectoryForReporting(run, stageName = 'reportRebuild') {
   if (!REPORT_WORKER_IDENTITY.active) return;
+  return serializeRunArtifactPermissionMutation(
+    run,
+    () => sealRunDirectoryForReportingExclusive(run, stageName),
+  );
+}
+
+async function sealRunDirectoryForReportingExclusive(run, stageName) {
+  let portable = run.manifest.executionProvenance?.artifactPermissionMode === 'portable-bind';
   let removedSymlinks = 0;
   let files = 0;
   let directories = 0;
+  async function transferOwnership(itemPath, uid) {
+    if (portable) return;
+    try {
+      await fs.chown(itemPath, uid, RUNNER_IDENTITY.gid);
+    } catch (error) {
+      if (!ownershipTransitionUnavailable(error)) throw error;
+      portable = true;
+      run.manifest.executionProvenance.artifactPermissionMode = 'portable-bind';
+    }
+  }
   async function visit(directory) {
     const entries = await fs.readdir(directory, { withFileTypes: true });
     for (const entry of entries) {
@@ -3871,8 +7022,8 @@ async function sealRunDirectoryForReporting(run, stageName = 'reportRebuild') {
       }
       if (details.isDirectory()) {
         await visit(itemPath);
-        await fs.chown(itemPath, 0, RUNNER_IDENTITY.gid);
-        await fs.chmod(itemPath, 0o750);
+        await transferOwnership(itemPath, 0);
+        await fs.chmod(itemPath, portable ? 0o550 : 0o750);
         directories += 1;
         continue;
       }
@@ -3882,48 +7033,103 @@ async function sealRunDirectoryForReporting(run, stageName = 'reportRebuild') {
       if (details.nlink > 1) {
         throw new Error(`Run sealing rejected a hard-linked artifact: ${relative(run.directory, itemPath)}`);
       }
-      await fs.chown(itemPath, 0, RUNNER_IDENTITY.gid);
-      await fs.chmod(itemPath, 0o640);
+      await transferOwnership(itemPath, 0);
+      await fs.chmod(itemPath, portable ? 0o440 : 0o640);
       files += 1;
     }
   }
   await visit(run.directory);
-  await fs.chown(run.directory, 0, RUNNER_IDENTITY.gid);
-  await fs.chmod(run.directory, 0o750);
+  await transferOwnership(run.directory, 0);
+  await fs.chmod(run.directory, portable ? 0o550 : 0o750);
+  run.artifactPermissionsSealed = true;
   appendLog(
     run,
     'stdout',
-    `Run evidence sealed for private report generation: ${files} regular files, ${directories} directories, ${removedSymlinks} symlinks removed.`,
+    `Run evidence sealed for private report generation: ${files} regular files, ${directories} directories, ${removedSymlinks} symlinks removed; permission mode ${portable ? 'portable bind-mount (run root and existing artifacts read-only outside supervisor write windows)' : 'owner/group isolation'}.`,
     stageName,
   );
 }
 
 async function createPrivateReportStaging(run) {
-  const staging = await fs.mkdtemp(join(run.directory, '.checklist-staging-'));
-  if (REPORT_WORKER_IDENTITY.active) {
-    await fs.chown(staging, REPORT_WORKER_IDENTITY.uid, REPORT_WORKER_IDENTITY.gid);
+  const staging = await withRunArtifactWriteWindow(
+    run,
+    () => fs.mkdtemp(join(run.directory, '.checklist-staging-')),
+  );
+  let portable = run.manifest.executionProvenance?.artifactPermissionMode === 'portable-bind';
+  if (REPORT_WORKER_IDENTITY.active && !portable) {
+    try {
+      await fs.chown(staging, REPORT_WORKER_IDENTITY.uid, REPORT_WORKER_IDENTITY.gid);
+    } catch (error) {
+      if (!ownershipTransitionUnavailable(error)) throw error;
+      portable = true;
+      run.manifest.executionProvenance.artifactPermissionMode = 'portable-bind';
+    }
   }
-  await fs.chmod(staging, 0o750);
+  if (portable) {
+    const details = await fs.lstat(staging);
+    if (details.uid !== REPORT_WORKER_IDENTITY.uid && details.gid !== REPORT_WORKER_IDENTITY.gid) {
+      await withRunArtifactWriteWindow(run, () => fs.rm(staging, { recursive: true, force: true }));
+      throw new Error(
+        'Private report staging cannot be delegated safely: the bind mount does not use the isolated report worker group.',
+      );
+    }
+    await fs.chmod(run.directory, 0o550);
+  }
+  await fs.chmod(staging, portable ? 0o770 : 0o750);
   return staging;
+}
+
+function portableArtifactPermissionsActive(run) {
+  return run.artifactPermissionsSealed === true
+    && run.manifest.executionProvenance?.artifactPermissionMode === 'portable-bind';
+}
+
+function withRunArtifactWriteWindow(run, operation, options = {}) {
+  if (!portableArtifactPermissionsActive(run)) return operation();
+  const execute = () => withPortableArtifactWriteWindow(
+    fs,
+    run.directory,
+    {
+      active: true,
+      writablePaths: options.writablePaths ?? [],
+      recursiveWritablePaths: options.recursiveWritablePaths ?? [],
+      sealPaths: options.sealPaths ?? [],
+      removeSealSymlinks: options.removeSealSymlinks ?? false,
+    },
+    operation,
+  );
+  return serializeRunArtifactPermissionMutation(run, execute);
+}
+
+function serializeRunArtifactPermissionMutation(run, operation) {
+  const scheduled = (run.artifactPermissionMutationPromise ?? Promise.resolve()).then(operation, operation);
+  run.artifactPermissionMutationPromise = scheduled.catch(() => undefined);
+  return scheduled;
 }
 
 async function publishPrivateChecklist(run, staging, stageName) {
   const destination = join(run.directory, 'checklist');
   const backup = join(run.directory, `.checklist-backup-${randomBytes(6).toString('hex')}`);
-  let backedUp = false;
-  try {
-    await fs.rename(destination, backup);
-    backedUp = true;
-  } catch (error) {
-    if (error?.code !== 'ENOENT') throw error;
-  }
-  try {
-    await fs.rename(staging, destination);
-  } catch (error) {
-    if (backedUp) await fs.rename(backup, destination).catch(() => undefined);
-    throw error;
-  }
-  if (backedUp) await fs.rm(backup, { recursive: true, force: true });
+  await withRunArtifactWriteWindow(run, async () => {
+    let backedUp = false;
+    try {
+      await fs.rename(destination, backup);
+      backedUp = true;
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+    try {
+      await fs.rename(staging, destination);
+    } catch (error) {
+      if (backedUp) await fs.rename(backup, destination).catch(() => undefined);
+      throw error;
+    }
+    if (backedUp) await fs.rm(backup, { recursive: true, force: true });
+  }, {
+    recursiveWritablePaths: [destination, staging],
+    sealPaths: [destination, backup],
+    removeSealSymlinks: true,
+  });
   await sealRunDirectoryForReporting(run, stageName);
 }
 
@@ -3954,7 +7160,11 @@ async function rebuildChecklistInPrivateStaging(run, stageName, label) {
       appendLog(run, 'stdout', 'Privately staged checklist published atomically.', stageName);
     }
   } finally {
-    await fs.rm(staging, { recursive: true, force: true }).catch(() => undefined);
+    await withRunArtifactWriteWindow(
+      run,
+      () => fs.rm(staging, { recursive: true, force: true }),
+      { recursiveWritablePaths: [staging] },
+    ).catch(() => undefined);
   }
 }
 
@@ -3975,6 +7185,18 @@ async function initializeSecretVault() {
     }
   }
   await fs.chmod(SECRET_MASTER_PATH, 0o600);
+
+  const testOperatorToken = process.env.PORTAL_E2E_FAILURE_INJECTION === '1'
+    ? process.env.PORTAL_E2E_OPERATOR_TOKEN
+    : null;
+  operatorCapabilityToken = testOperatorToken
+    ?? createHmac('sha256', secretMasterKey).update('ai-mobile-testing:portal-operator:v1').digest('base64url');
+  if (typeof operatorCapabilityToken !== 'string' || operatorCapabilityToken.length < 32) {
+    throw new Error('Portal operator capability initialization failed.');
+  }
+  operatorSessionToken = randomBytes(32).toString('base64url');
+  sensitiveLogValues.add(operatorCapabilityToken);
+  sensitiveLogValues.add(operatorSessionToken);
 
   const environmentKey = process.env.ANTHROPIC_API_KEY;
   if (environmentKey) sensitiveLogValues.add(environmentKey);
@@ -4037,6 +7259,7 @@ async function saveAnthropicCredential(input) {
   savedAnthropicCredential = { apiKey, updatedAt, fingerprint: credentialFingerprint(apiKey) };
   sensitiveLogValues.add(apiKey);
   console.log(`Anthropic credential saved in the portal vault (${savedAnthropicCredential.fingerprint}).`);
+  triggerSingleSiteAiReviewSync();
 }
 
 async function deleteAnthropicCredential() {
@@ -4133,6 +7356,9 @@ async function safeStat(path) {
 }
 
 function assertManualRunReady(run) {
+  if (run.purgeQuarantine) {
+    throw httpError(409, 'This run has partially purged evidence in quarantine and accepts only a purge retry.');
+  }
   if (run.externalManaged) {
     throw httpError(409, 'Manual evidence for an externally launched run must be managed from its original workflow.');
   }
@@ -4176,6 +7402,30 @@ async function readManualEvidence(run) {
 }
 
 async function receiveManualUpload(run, request, requestUrl) {
+  assertManualRunReady(run);
+  const auditId = requestUrl.searchParams.get('auditId') ?? '';
+  if (!MANUAL_AUDIT_IDS.has(auditId)) throw httpError(400, 'Choose a catalogued manual audit.');
+  const idempotencyKey = requestUrl.searchParams.get('idempotencyKey') ?? '';
+  if (!/^manual-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(idempotencyKey)) {
+    throw httpError(400, 'Manual evidence uploads require a valid immutable idempotency key.');
+  }
+  const existing = (await readManualEvidence(run)).uploads.find((upload) => upload.auditId === auditId
+    && upload.idempotencyKey === idempotencyKey);
+  if (existing) return { ...existing, replayed: true };
+  const manualRoot = join(run.directory, 'manual-evidence');
+  const auditDirectory = join(manualRoot, auditId);
+  const manualIndex = join(run.directory, 'manual-evidence.json');
+  return withRunArtifactWriteWindow(
+    run,
+    () => receiveManualUploadWritable(run, request, requestUrl),
+    {
+      writablePaths: [manualRoot, auditDirectory],
+      sealPaths: [manualRoot, manualIndex],
+    },
+  );
+}
+
+async function receiveManualUploadWritable(run, request, requestUrl) {
   assertManualRunReady(run);
   const auditId = requestUrl.searchParams.get('auditId') ?? '';
   if (!MANUAL_AUDIT_IDS.has(auditId)) throw httpError(400, 'Choose a catalogued manual audit.');
@@ -4229,6 +7479,7 @@ async function receiveManualUpload(run, request, requestUrl) {
     const document = await readManualEvidence(run);
     const upload = {
       id: uploadId,
+      idempotencyKey: requestUrl.searchParams.get('idempotencyKey'),
       auditId,
       name: normalizedName,
       contentType,
@@ -4393,7 +7644,12 @@ async function recordManualEvidence(run, body) {
   document.entries = document.entries.filter((entry) => entry.auditId !== auditId);
   document.entries.push(attestation);
   document.updatedAt = attestation.attestedAt;
-  await atomicWriteJson(join(run.directory, 'manual-evidence.json'), document);
+  const manualIndex = join(run.directory, 'manual-evidence.json');
+  await withRunArtifactWriteWindow(
+    run,
+    () => atomicWriteJson(manualIndex, document),
+    { sealPaths: [manualIndex] },
+  );
   await rebuildAfterManualEvidence(run, auditId);
   return attestation;
 }
@@ -4403,8 +7659,15 @@ async function rebuildAfterManualEvidence(run, auditId) {
   let logStream = null;
   let lifecycleStream = null;
   try {
-    logStream = await openAppendStream(join(logDirectory, 'runner.log'), `${run.manifest.id} manual rebuild runner log`);
-    lifecycleStream = await openAppendStream(join(logDirectory, 'lifecycle.jsonl'), `${run.manifest.id} manual rebuild lifecycle log`);
+    const runnerLogPath = join(logDirectory, 'runner.log');
+    const lifecycleLogPath = join(logDirectory, 'lifecycle.jsonl');
+    await withRunArtifactWriteWindow(run, async () => {
+      logStream = await openAppendStream(runnerLogPath, `${run.manifest.id} manual rebuild runner log`);
+      lifecycleStream = await openAppendStream(lifecycleLogPath, `${run.manifest.id} manual rebuild lifecycle log`);
+    }, {
+      writablePaths: [logDirectory, runnerLogPath, lifecycleLogPath],
+      sealPaths: [runnerLogPath, lifecycleLogPath],
+    });
   } catch (error) {
     await closeWritableStream(logStream);
     await closeWritableStream(lifecycleStream);
@@ -4513,6 +7776,19 @@ function sendJson(response, status, value) {
   response.end(body);
 }
 
+function sendConsoleApiResult(request, response, result) {
+  if (response.headersSent || response.destroyed || response.writableEnded) return;
+  const headers = {
+    'Cache-Control': 'no-store',
+    'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'",
+    'X-Content-Type-Options': 'nosniff',
+    ...result.headers,
+  };
+  response.writeHead(result.status, headers);
+  if (request.method === 'HEAD') return response.end();
+  return response.end(JSON.stringify(result.body));
+}
+
 function uniqueStrings(value) {
   if (value === undefined) return [];
   if (!Array.isArray(value) || value.some((item) => typeof item !== 'string')) {
@@ -4539,7 +7815,35 @@ function assertMutationRequest(request) {
   if (!contentType.toLowerCase().startsWith('application/json')) {
     throw httpError(415, 'Mutation requests must use application/json.');
   }
+  requireOperatorAuthorization(request);
+}
+
+function requireOperatorAuthorization(request) {
+  if (request.headers.origin === 'null') {
+    throw httpError(403, 'Sandboxed artifact documents cannot call portal mutation APIs.');
+  }
   assertSameOrigin(request);
+  if (!operatorRequestAuthorized(request)) {
+    throw httpError(401, 'Operator authorization is required. Open the current operator unlock link from the portal service log.');
+  }
+}
+
+function operatorRequestAuthorized(request) {
+  const authorization = String(request.headers['x-portal-operator-token'] ?? '');
+  if (constantTimeTokenMatch(authorization, operatorCapabilityToken)) return true;
+  const cookie = String(request.headers.cookie ?? '')
+    .split(';')
+    .map((value) => value.trim())
+    .find((value) => value.startsWith('portal_operator='))
+    ?.slice('portal_operator='.length);
+  return constantTimeTokenMatch(cookie, operatorSessionToken);
+}
+
+function constantTimeTokenMatch(value, expected) {
+  if (typeof value !== 'string' || typeof expected !== 'string') return false;
+  const provided = Buffer.from(value);
+  const target = Buffer.from(expected);
+  return provided.length === target.length && timingSafeEqual(provided, target);
 }
 
 function assertSameOrigin(request) {

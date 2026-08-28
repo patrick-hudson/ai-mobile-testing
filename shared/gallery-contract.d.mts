@@ -215,6 +215,16 @@ export interface GalleryArchiveDescriptor {
   orderRevision: string;
   exportRevision: string;
   exportedAt: string;
+  /** Missing only on retained bundle-v1 exports. New exports always publish this contract. */
+  archiveBundle?: {
+    schemaVersion: 1;
+    bundleVersion: 2;
+    runtimeVersion: 2;
+    minimumReaderVersion: 1;
+    dataSchemaVersion: 1;
+    assetBase: 'assets/archive-v2';
+    manifestHref: 'assets/archive-v2/bundle.json';
+  };
   primaryCounts: GalleryCatalog['primaryCounts'];
   facets: {
     kinds: string[];

@@ -3,24 +3,40 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="color-scheme" content="dark" />
+    <meta name="color-scheme" content="light" />
     <title>Quitting 7-OH · Run report</title>
     <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/console-shell.css" />
     <link rel="stylesheet" href="/report.css" />
     <script src="/report.js" type="module"></script>
   </head>
   <body class="report-page">
-    <a class="skip-link" href="#report-main">Skip to report</a>
-    <header class="report-nav">
-      <a class="report-back" href="/">← Release audit console</a>
-      <div class="report-nav-actions">
-        <a id="visual-gallery-link" class="secondary-button">Visual gallery</a>
-        <span id="report-connection" class="report-connection" role="status" aria-live="polite">Loading report…</span>
-        <button id="refresh-report" class="secondary-button" type="button">Refresh</button>
-      </div>
-    </header>
-
-    <main id="report-main" class="report-shell">
+    <div id="report-console" class="console-shell">
+      <a class="console-skip-link" href="#report-main">Skip to report</a>
+      <nav class="console-navigation" aria-label="Console">
+        <p class="console-product">AUDIT CONSOLE</p>
+        <ul class="console-navigation-list">
+          <li><a href="/">Overview</a></li>
+          <li><a href="/runs.html" aria-current="page">Runs</a></li>
+          <li><a href="/findings.html">Findings</a></li>
+          <li><a href="/evidence.html">Evidence</a></li>
+          <li><a href="/new-audit.html">New audit</a></li>
+          <li><a href="/settings.html">Settings</a></li>
+        </ul>
+      </nav>
+      <div class="console-workspace">
+        <header class="console-context-header">
+          <h1 id="console-page-title" tabindex="-1">Run report</h1>
+          <p>Verdict, coverage, findings, evidence authority, and source material remain separate and traceable.</p>
+          <div class="console-context-actions report-nav-actions">
+            <a class="report-back console-button console-button-secondary" href="/runs.html">Run workspace</a>
+            <a id="visual-gallery-link" class="console-button console-button-secondary">Visual gallery</a>
+            <span id="report-connection" class="report-connection" role="status" aria-live="polite">Loading report…</span>
+            <button id="refresh-report" class="console-button" type="button">Refresh</button>
+          </div>
+        </header>
+        <div class="console-workspace-body report-workspace-body">
+          <main id="report-main" class="console-main report-shell" aria-labelledby="console-page-title">
       <section id="report-loading" class="report-loading" aria-label="Loading run report" aria-busy="true">
         <div class="report-skeleton report-skeleton-hero"></div>
         <div class="report-skeleton-grid" aria-hidden="true">
@@ -35,7 +51,7 @@
         <p id="report-error-message" class="lede"></p>
         <div class="report-state-actions">
           <button id="retry-report" class="primary-button" type="button">Try again</button>
-          <a class="secondary-button" href="/">Return to runs</a>
+          <a class="secondary-button" href="/runs.html">Return to runs</a>
         </div>
       </section>
 
@@ -54,16 +70,14 @@
               <a id="manifest-download-link" class="secondary-button" download>Download raw checklist JSON (large)</a>
             </div>
           </div>
-          <dl class="run-context-card">
-            <div><dt>Run</dt><dd id="context-run-id"></dd></div>
-            <div><dt>Test depth</dt><dd id="context-profile"></dd></div>
-            <div><dt>Scope</dt><dd id="context-scope"></dd></div>
-            <div><dt>Started</dt><dd id="context-started"></dd></div>
-            <div><dt>Elapsed</dt><dd id="context-elapsed"></dd></div>
-            <div><dt>Evidence pipeline</dt><dd id="context-pipeline"></dd></div>
-            <div class="context-wide"><dt>Current site</dt><dd><a id="context-production" target="_blank" rel="noopener"></a></dd></div>
-            <div class="context-wide"><dt>Redesign candidate</dt><dd><a id="context-candidate" target="_blank" rel="noopener"></a></dd></div>
-          </dl>
+        </section>
+
+        <section aria-labelledby="report-trust-title" class="report-section report-trust-section">
+          <div class="report-section-heading">
+            <div><p class="step-label">TRUTH DIMENSIONS</p><h2 id="report-trust-title">Verdict and run trust</h2></div>
+            <span class="muted">Independent sourced conclusions</span>
+          </div>
+          <dl id="report-trust-facts" class="report-trust-facts"></dl>
         </section>
 
         <section aria-labelledby="summary-title" class="report-section">
@@ -122,13 +136,14 @@
             <p class="step-label">04 · HUMAN ACCEPTANCE</p>
             <h2 id="manual-title">Manual evidence</h2>
             <div id="manual-summary"></div>
-            <a class="secondary-button" href="/">Open the run console to add evidence</a>
+          <a id="manual-workspace-link" class="secondary-button" href="/runs.html">Open the run workspace to add evidence</a>
           </article>
           <article class="report-card" id="ai-card">
             <p class="step-label">05 · ADVISORY REVIEW</p>
             <h2>AI evidence review</h2>
             <div id="ai-summary"></div>
             <a id="ai-review-link" class="secondary-button" target="_blank" rel="noopener" hidden>Open complete AI review</a>
+            <button id="ai-review-retry" class="secondary-button" type="button" hidden>Retry advisory review</button>
           </article>
         </section>
 
@@ -152,7 +167,25 @@
           <div id="log-links" class="log-links"></div>
         </section>
       </div>
-    </main>
+          </main>
+          <div id="report-separator" class="console-separator" role="separator" tabindex="0" aria-label="Resize report context" aria-orientation="vertical" aria-controls="report-inspector" aria-valuemin="240" aria-valuemax="560" aria-valuenow="320"></div>
+          <aside id="report-inspector" class="console-inspector" aria-label="Run report context">
+            <h2>Run context</h2>
+            <p class="report-inspector-note">Identity and source scope for the report currently in view.</p>
+            <dl class="run-context-card">
+              <div><dt>Run</dt><dd id="context-run-id"></dd></div>
+              <div><dt>Test depth</dt><dd id="context-profile"></dd></div>
+              <div><dt>Scope</dt><dd id="context-scope"></dd></div>
+              <div><dt>Started</dt><dd id="context-started"></dd></div>
+              <div><dt>Elapsed</dt><dd id="context-elapsed"></dd></div>
+              <div><dt>Evidence pipeline</dt><dd id="context-pipeline"></dd></div>
+              <div class="context-wide"><dt>Current site</dt><dd><a id="context-production" target="_blank" rel="noopener noreferrer"></a></dd></div>
+              <div class="context-wide"><dt>Redesign candidate</dt><dd><a id="context-candidate" target="_blank" rel="noopener noreferrer"></a></dd></div>
+            </dl>
+          </aside>
+        </div>
+      </div>
+    </div>
 
     <div id="report-announcer" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
   </body>

@@ -227,6 +227,16 @@ export function recommendedLeadingBlankTrimSeconds(assessment: VideoQualityAsses
   return Math.round(trimStartSeconds * 1_000) / 1_000;
 }
 
+export function recommendedPosterSeekSeconds(assessment: VideoQualityAssessment | null): number {
+  const durationSeconds = assessment?.durationSeconds;
+  if (durationSeconds === null || durationSeconds === undefined || !Number.isFinite(durationSeconds)) return 0.5;
+  // The poster represents the asserted response, not Playwright's often-empty
+  // browser startup frame. Retained clips already prove sustained content in
+  // the final response window, so seek one second before the end while leaving
+  // a safe half-second fallback for the shortest qualifying recordings.
+  return Math.round(Math.max(0.5, durationSeconds - 1) * 1_000) / 1_000;
+}
+
 function isShortDynamicFailure(status: string | undefined, assessment: VideoQualityAssessment): boolean {
   return ['failed', 'timedOut'].includes(status ?? '')
     && assessment.durationSeconds !== null
@@ -248,6 +258,33 @@ function isShortDynamicFailure(status: string | undefined, assessment: VideoQual
     && !assessment.probeError
     && assessment.reasons.length === 1
     && assessment.reasons[0]?.startsWith('duration ') === true;
+}
+
+function isVisibleNonResponseFailure(
+  status: string | undefined,
+  assessment: VideoQualityAssessment,
+  hasFailedInteractionStep: boolean,
+): boolean {
+  return ['failed', 'timedOut'].includes(status ?? '')
+    && hasFailedInteractionStep
+    && assessment.durationSeconds !== null
+    && Number.isFinite(assessment.durationSeconds)
+    && assessment.durationSeconds >= MIN_ACTION_VIDEO_SECONDS
+    && assessment.sampledFrames >= 2
+    && assessment.maxFrameDifference !== null
+    && Number.isFinite(assessment.maxFrameDifference)
+    && assessment.maxFrameDifference >= MIN_ACTION_FRAME_DIFFERENCE
+    && assessment.changedFrames !== null
+    && assessment.changedFrames >= 1
+    && assessment.blankFrameRatio !== null
+    && assessment.blankFrameRatio <= MAX_BLANK_FRAME_RATIO
+    && assessment.initialNonBlankRatio !== null
+    && assessment.initialNonBlankRatio >= MIN_WINDOW_NONBLANK_RATIO
+    && assessment.finalNonBlankRatio !== null
+    && assessment.finalNonBlankRatio >= MIN_WINDOW_NONBLANK_RATIO
+    && !assessment.probeError
+    && assessment.reasons.length === 1
+    && assessment.reasons[0] === 'no visual response was measured after the page content settled';
 }
 
 function frameProbeArgs(file: string, maximumFrames: number, seekSeconds: number | null = null): string[] {
@@ -571,6 +608,8 @@ interface JsonAttachment {
   name?: string;
   contentType?: string;
   path?: string;
+  /** Playwright's JSON reporter encodes in-memory attachment bodies as base64. */
+  body?: string;
 }
 
 interface JsonResult {
@@ -601,6 +640,32 @@ function isVideo(attachment: JsonAttachment): boolean {
   return attachment.contentType?.startsWith('video/') === true
     || attachment.name?.toLowerCase() === 'video'
     || attachment.path?.toLowerCase().endsWith('.webm') === true;
+}
+
+function hasFailedInteractionStep(result: JsonResult): boolean {
+  const attachments = result.attachments ?? [];
+  const attachment = attachments.find(({ name, contentType, body }) => (
+    name === 'audit-result-summary'
+    && contentType?.includes('json') === true
+    && typeof body === 'string'
+  )) ?? attachments.find(({ name, contentType, body }) => (
+    name === 'audit-result'
+    && contentType?.includes('json') === true
+    && typeof body === 'string'
+  ));
+  if (!attachment?.body) return false;
+  try {
+    const record = JSON.parse(Buffer.from(attachment.body, 'base64').toString('utf8')) as {
+      steps?: Array<{ kind?: string; status?: string }>;
+    };
+    // The special nonresponse exception is valid only when the recorded action
+    // and its expected response are the step that failed. An unrelated earlier
+    // success must never satisfy evidence integrity for a later failure.
+    return record.steps?.some(({ kind, status }) => kind === 'interaction' && status === 'failed') === true;
+  } catch {
+    // Fail closed: corrupt or non-JSON audit evidence cannot prove an action.
+    return false;
+  }
 }
 
 function isInside(root: string, candidate: string): boolean {
@@ -840,6 +905,17 @@ export async function buildVideoRetentionPlan(
             usableVideoCount += 1;
             plan.eligiblePaths.add(source);
             plan.eligibleHashes.add(hash);
+          } else if (isVisibleNonResponseFailure(result.status, quality, hasFailedInteractionStep(result))) {
+            // A failed interaction can legitimately prove that the requested
+            // visual response never happened. Retain a sufficiently long,
+            // fully visible recording with a measured action as diagnostic
+            // evidence and satisfy evidence integrity for this already-failed
+            // attempt. The failed assertion—not the media pipeline—keeps the
+            // release non-green.
+            usableVideoCount += 1;
+            plan.diagnosticRetainedClips += 1;
+            plan.diagnosticPaths.add(source);
+            plan.diagnosticHashes.add(hash);
           } else if (isShortDynamicFailure(result.status, quality)) {
             // An immediate failed response can finish before the action-video
             // duration floor. Preserve that visibly changing, decodable clip as
@@ -1013,7 +1089,7 @@ export async function applyVideoRetentionPlan(
               ? 'shared content-addressed evidence required by an eligible interaction'
               : 'non-skipped interaction execution'
             : keepDiagnostic
-              ? 'short dynamic failed interaction retained as diagnostic evidence; release integrity remains non-green'
+              ? 'visible failed interaction retained as diagnostic evidence; the assertion outcome remains authoritative'
             : 'protected unknown or manual checklist evidence',
         });
         continue;

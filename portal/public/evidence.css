@@ -1,0 +1,5 @@
+.console-index-table td:first-child { min-width: 14rem; }
+.evidence-selected-media { margin: 0 0 0.9rem; border-top: 3px solid var(--console-accent); padding: 0.7rem; background: var(--console-surface); }
+.evidence-selected-media h3 { margin: 0 0 0.4rem; font-size: 0.9rem; }
+.evidence-selected-media p { margin: 0; color: var(--console-muted); font-size: 0.8rem; }
+.evidence-selected-media-element { display: block; width: 100%; max-height: min(52vh, 34rem); border: 1px solid var(--console-rule); background: #111; object-fit: contain; }

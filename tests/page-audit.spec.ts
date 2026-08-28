@@ -1,5 +1,7 @@
 import { pageAuditDefinition } from '../audit/catalog.js';
-import { projectMetadata } from '../audit/environments.js';
+import { ENVIRONMENTS, parseAuditProjectMetadata } from '../audit/environments.js';
+import { evaluateRouteContract, normalizedPathname } from '../audit/page-oracles.js';
+import { pageAuditApplicability } from '../audit/page-audit-family.js';
 import { CANDIDATE_HTML_ROUTES } from '../audit/routes.js';
 import { expect, staticEvidence, staticTest, test } from '../fixtures/test.js';
 
@@ -16,10 +18,11 @@ interface LinkEvidence {
 
 for (const route of CANDIDATE_HTML_ROUTES) {
   const definition = pageAuditDefinition(route.path);
+  const applicability = pageAuditApplicability(route.path);
 
-  staticTest(`[${definition.id}] ${route.kind} route renders a complete, usable document`, staticEvidence(`Capture ${route.path} at representative scroll positions with its structure, links, network, and accessibility evidence.`, 'full-sweep-projects'), async ({ page, audit }, testInfo) => {
+  staticTest(`[${definition.id}] ${route.kind} route renders a complete, usable document`, staticEvidence(`Capture ${route.path} at representative scroll positions with its structure, links, network, and accessibility evidence.`, applicability), async ({ page, audit }, testInfo) => {
     audit.setDefinition(definition);
-    const metadata = projectMetadata(testInfo.project.metadata);
+    const metadata = parseAuditProjectMetadata(testInfo.project.metadata);
     test.skip(!metadata.fullSweep, 'The complete route inventory runs only in full-sweep projects.');
 
     const resolvedPath = audit.environmentPath(route.path);
@@ -34,6 +37,18 @@ for (const route of CANDIDATE_HTML_ROUTES) {
         await page.evaluate(async () => {
           if ('fonts' in document) await document.fonts.ready;
         });
+        if (route.kind === 'search') {
+          await expect(
+            page.locator('main input[type="search"], main input[inputmode="search"], main input[role="searchbox"], main [role="search"] input').first(),
+            'The client-rendered search control must hydrate before route semantics are inspected',
+          ).toBeVisible();
+        }
+        if (route.kind === 'meeting') {
+          await expect.poll(
+            () => page.locator('main h2:visible, main h3:visible, main article:visible, main input:visible, main select:visible').count(),
+            { message: 'The meeting surface must finish rendering a schedule, section, article, or control' },
+          ).toBeGreaterThan(0);
+        }
         return navigation;
       },
     );
@@ -53,6 +68,110 @@ for (const route of CANDIDATE_HTML_ROUTES) {
       async () => audit.inspectPage(),
     );
 
+    await audit.attachJson('page-geometry-evidence', {
+      route,
+      resolvedPath,
+      inspection,
+    });
+
+    const routeIdentity = await page.evaluate(() => {
+      const visible = (element: Element): boolean => {
+        const style = window.getComputedStyle(element);
+        const box = element.getBoundingClientRect();
+        return style.display !== 'none' && style.visibility !== 'hidden' && box.width > 0 && box.height > 0;
+      };
+      const main = document.querySelector('main');
+      const mainHeadings = main ? [...main.querySelectorAll('h1')].filter(visible) : [];
+      const visibleArticles = main ? [...main.querySelectorAll('article')].filter(visible) : [];
+      const canonical = document.querySelector<HTMLLinkElement>('link[rel="canonical"]')?.href ?? null;
+      const canonicalUrl = canonical ? new URL(canonical, window.location.href) : null;
+      const textLength = (element: Element | null): number => (
+        (element instanceof HTMLElement ? element.innerText : element?.textContent ?? '')
+          .replace(/\s+/g, ' ')
+          .trim()
+          .length
+      );
+      return {
+        actualUrl: window.location.href,
+        actualPathname: window.location.pathname,
+        canonical,
+        canonicalPathname: canonicalUrl?.pathname ?? null,
+        canonicalOrigin: canonicalUrl?.origin ?? null,
+        title: document.title.trim(),
+        h1Text: (mainHeadings[0]?.textContent ?? '').replace(/\s+/g, ' ').trim(),
+        mainH1Count: mainHeadings.length,
+        mainCharacters: textLength(main),
+        visibleArticleCount: visibleArticles.length,
+        articleCharacters: Math.max(0, ...visibleArticles.map(textLength)),
+        proseBlockLengths: main
+          ? [...main.querySelectorAll('article p, article li, article blockquote')].filter(visible).map(textLength)
+          : [],
+        sectionHeadingCount: main ? [...main.querySelectorAll('h2, h3')].filter(visible).length : 0,
+        mainInternalPaths: main
+          ? [...main.querySelectorAll<HTMLAnchorElement>('a[href]')]
+              .filter(visible)
+              .map((anchor) => new URL(anchor.href, window.location.href))
+              .filter((url) => url.origin === window.location.origin)
+              .map((url) => url.pathname)
+          : [],
+        enabledFormControlCount: main
+          ? [...main.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>('input, select, textarea')]
+              .filter((control) => visible(control) && !control.disabled && control.getAttribute('aria-disabled') !== 'true')
+              .length
+          : 0,
+        searchInputs: main
+          ? [...main.querySelectorAll<HTMLInputElement>('input[type="search"], input[inputmode="search"], input[role="searchbox"], [role="search"] input')]
+              .filter(visible)
+              .map((input) => {
+                const labelledBy = (input.getAttribute('aria-labelledby') ?? '')
+                  .split(/\s+/)
+                  .filter(Boolean)
+                  .map((id) => document.getElementById(id)?.textContent ?? '')
+                  .join(' ');
+                return {
+                  accessibleName: input.getAttribute('aria-label')
+                    || labelledBy
+                    || input.labels?.[0]?.textContent
+                    || '',
+                  disabled: input.disabled || input.getAttribute('aria-disabled') === 'true',
+                };
+              })
+          : [],
+        urgentLinkCount: main
+          ? [...main.querySelectorAll<HTMLAnchorElement>('a[href]')]
+              .filter(visible)
+              .filter((anchor) => /^(?:tel:|sms:)/i.test(anchor.href)
+                || /(?:988lifeline\.org|thehotline\.org|poison\.org|\/crisis-hotlines)/i.test(anchor.href))
+              .length
+          : 0,
+      };
+    });
+    const expectedPathname = normalizedPathname(resolvedPath);
+    const declaredRoutePaths = CANDIDATE_HTML_ROUTES
+      .map(({ path }) => audit.environmentPath(path))
+      .filter((path): path is string => path !== null);
+    const expectedChildPaths = CANDIDATE_HTML_ROUTES
+      .filter(({ path }) => path.startsWith(`${route.path}/`) && !path.slice(route.path.length + 1).includes('/'))
+      .map(({ path }) => audit.environmentPath(path))
+      .filter((path): path is string => path !== null);
+    const routeContractIssues = evaluateRouteContract(route, routeIdentity, {
+      environment: metadata.mode === 'single-site' ? 'candidate' : metadata.environment,
+      expectedPathname,
+      approvedCanonicalOrigins: [new URL(ENVIRONMENTS.production.baseURL).origin],
+      expectedChildPaths,
+      declaredRoutePaths,
+    });
+    const routeIdentityEvidence = {
+      route,
+      resolvedPath,
+      expectedPathname,
+      expectedChildPaths,
+      approvedCanonicalOrigins: [new URL(ENVIRONMENTS.production.baseURL).origin],
+      routeContractIssues,
+      ...routeIdentity,
+    };
+    await audit.attachJson('route-identity-evidence', routeIdentityEvidence);
+
     await audit.step('Assert meaningful page semantics', 'The page is identified and contains substantive, visible content.', async () => {
       expect(inspection.title.trim().length, 'Document title should identify the page').toBeGreaterThan(8);
       expect(inspection.h1Count, 'Exactly one visible H1 should identify the page').toBe(1);
@@ -60,11 +179,10 @@ for (const route of CANDIDATE_HTML_ROUTES) {
       expect(inspection.brokenImages, 'Every rendered image must load').toEqual([]);
       expect(inspection.horizontalOverflowPx, 'The document must not require page-level sideways scrolling').toBeLessThanOrEqual(1);
 
-      const h1 = page.locator('h1:visible');
+      const h1 = page.locator('main h1:visible');
       await expect(h1).toHaveCount(1);
       await expect(h1).not.toHaveText(/^\s*$/);
-      const visibleTextLength = await page.locator('main').innerText().then((text) => text.replace(/\s+/g, ' ').trim().length);
-      expect(visibleTextLength, 'Main content should be more than an empty shell').toBeGreaterThan(120);
+      expect(routeContractIssues, 'Exact route identity and its kind-specific structure must match the reviewed contract').toEqual([]);
     });
 
     const linkEvidence = await audit.step(
@@ -105,7 +223,12 @@ for (const route of CANDIDATE_HTML_ROUTES) {
 
     audit.observe('Route kind', route.kind);
     audit.observe('Resolved environment path', resolvedPath);
-    audit.observe('Visible document characters', await page.locator('main').innerText().then((text) => text.trim().length), '> 120');
+    audit.observe('Visible document characters', routeIdentity.mainCharacters, '> 120');
+    audit.observe('Reviewed route H1', routeIdentity.h1Text, route.expectedH1);
+    audit.observe('Reviewed route title', routeIdentity.title, route.expectedTitle);
+    audit.observe('Route contract issues', routeContractIssues.length, '0');
+    audit.observe('Horizontal overflow culprit candidates', inspection.horizontalOverflowCandidateCount, '0 when document overflow is 0');
+    audit.observe('Horizontal overflow evidence truncated', inspection.horizontalOverflowTruncated, 'false');
     audit.observe('Links inspected', linkEvidence.length);
     audit.observe('Images missing alt attribute', missingImageAlt, '0');
     await audit.attachJson('page-content-evidence', {
@@ -156,7 +279,9 @@ for (const route of CANDIDATE_HTML_ROUTES) {
       documentHeight: document.documentElement.scrollHeight,
       viewportHeight: window.innerHeight,
     }));
-    const viewportSegments = metadata.environment === 'candidate' && viewportEvidence.documentHeight > viewportEvidence.viewportHeight * 1.5
+    const capturesReviewedViewport = metadata.mode === 'single-site' || metadata.environment === 'candidate';
+    const samplesLongDocument = capturesReviewedViewport && viewportEvidence.documentHeight > viewportEvidence.viewportHeight * 1.5;
+    const viewportSegments = samplesLongDocument
       ? [
           { label: 'top', fraction: 0 },
           { label: 'middle', fraction: 0.5 },
@@ -172,7 +297,7 @@ for (const route of CANDIDATE_HTML_ROUTES) {
       await audit.checkpoint(`${definition.id}-rendered-${segment.label}`, { fullPage: false });
     }
     await page.evaluate(() => window.scrollTo(0, 0));
-    audit.observe('Viewport evidence samples', viewportSegments.length, metadata.environment === 'candidate' && viewportEvidence.documentHeight > viewportEvidence.viewportHeight * 1.5 ? '3' : '1');
+    audit.observe('Viewport evidence samples', viewportSegments.length, samplesLongDocument ? '3' : '1');
     await audit.attachJson('viewport-sampling-evidence', { ...viewportEvidence, segments: viewportSegments });
     await audit.assertRuntimeHealthy();
   });

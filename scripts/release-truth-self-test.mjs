@@ -21,6 +21,20 @@ const ready = parseChecklistRelease({
 });
 assert.equal(releaseOutcome('completed', ready).status, 'ready');
 assert.equal(releaseOutcome('completed', ready).exitCode, 0);
+assert.throws(() => parseChecklistRelease({
+  schemaVersion: 1,
+  mode: 'single-site',
+  release: {
+    ready: true,
+    decision: 'READY',
+    reason: 'This field must not grant promotion authority.',
+    decisionBasis: 'Single-site health is advisory.',
+    blockingFailures: 0,
+    blockingIncomplete: 0,
+    baselineIssues: 0,
+    runIntegrityFailure: false,
+  },
+}), /cannot be parsed as comparative release truth/);
 
 const notReady = parseChecklistRelease({
   schemaVersion: 1,

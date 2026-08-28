@@ -1,5 +1,19 @@
 # Release process
 
+## Single-site Audit interpretation (advisory and non-gating)
+
+A Single-site Audit examines exactly one Preview or Production deployment against standalone Product Oracles. It does not compare two origins, make a release decision, or substitute for the comparative release process below. Read its final report as several independent truths rather than one green or red gate:
+
+- **Site Health** is advisory for the executed automated scope. `HEALTHY` means the required executions completed without deterministic Findings; `FINDINGS` means they completed with one or more Findings; `INCOMPLETE` means required execution, evidence, processing, or publication did not complete safely. Always retain the `FULL` or `TARGETED` scope qualifier—a targeted `HEALTHY` result is not whole-site approval.
+- **Coverage** reports what the compiled Single-site Product Oracle selected, omitted, classified as comparison-only, or could not execute. Coverage Gaps and known route limitations remain visible independently; they are not Findings and do not rewrite Site Health.
+- **Manual acceptance** remains a separate human record. Browser automation, AI interpretation, and a healthy automated result cannot complete physical-device, assistive-technology, or visual-design review.
+- **Visual Review** reports same-site baseline outcomes such as `UNCHANGED`, `CHANGED`, `REVIEWED`, absent, incompatible, or unavailable. A baseline decision or human review disposition routes visual drift; it does not erase a deterministic Finding or alter Site Health or Coverage.
+- **Pipeline Integrity** states whether collection, FFmpeg processing, immutable publication, and report generation completed safely. A pipeline failure makes the audit `INCOMPLETE`; a partial result must never be presented as healthy.
+
+Evidence Authority qualifies every result. Strict TLS using the baked public Netskope CA is the default. The `preview-bypass` exception is allowed only for an explicitly confirmed and exact-origin-allowlisted Preview deployment, and it makes the resulting evidence non-authoritative. Production-role Single-site runs remain strict. A non-authoritative result, including an otherwise `HEALTHY` one, is diagnostic evidence and must be described with that qualification.
+
+Use a Single-site result to investigate Findings, assign follow-up work, complete manual review, approve or disposition eligible visual evidence, and rerun the same deployment. It neither authorizes nor blocks deployment or promotion. The go-live rules below belong only to the established comparative production-versus-candidate process; a Single-site result cannot satisfy or veto that checklist.
+
 ## Before the audit
 
 - Confirm the production and candidate origins in the portal.

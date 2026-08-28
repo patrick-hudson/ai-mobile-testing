@@ -7,14 +7,17 @@ import type {
   TestError,
   TestResult,
 } from '@playwright/test/reporter';
+import { readFile } from 'node:fs/promises';
 import type { AuditProjectMetadata } from '../audit/types.js';
 import {
   resolveReportOutputDir,
   writeAuditReport,
+  writeSingleSiteAuditReport,
   type ReportAttachmentInput,
   type ReportErrorInput,
   type ReportTestInput,
 } from './report-model.js';
+import type { SingleSiteReportInput } from '../scripts/lib/site-health-report.mjs';
 
 interface ChecklistReporterOptions {
   outputDir?: string;
@@ -106,6 +109,34 @@ export default class ChecklistReporter implements Reporter {
       ? { ordinal: this.config.shard.current, total: this.config.shard.total }
       : undefined;
     const tests = this.suite?.allTests().map((test) => toReportTest(test, sourceShard)) ?? [];
+    const projectModes = new Set((this.config?.projects ?? [])
+      .map((project) => (project.metadata as Partial<AuditProjectMetadata> | undefined)?.mode)
+      .filter((mode): mode is NonNullable<typeof mode> => mode !== undefined));
+    if (projectModes.has('single-site')) {
+      if (projectModes.size !== 1) {
+        throw new Error('Checklist reporter refuses mixed comparative and Single-site project metadata.');
+      }
+      const inputPath = process.env.AUDIT_SINGLE_SITE_REPORT_INPUT_PATH;
+      if (!inputPath) {
+        throw new Error(
+          'Single-site report finalization requires AUDIT_SINGLE_SITE_REPORT_INPUT_PATH to name the frozen '
+          + 'Site Health, scope, coverage, lifecycle, and paged audit input. Comparative release inference is forbidden.',
+        );
+      }
+      let input: SingleSiteReportInput;
+      try {
+        input = JSON.parse(await readFile(inputPath, 'utf8')) as SingleSiteReportInput;
+      } catch (error) {
+        throw new Error(`Single-site report input could not be read: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      const summary = await writeSingleSiteAuditReport({ outputDir, input });
+      const relative = outputDir.replace(`${process.cwd()}/`, '');
+      console.log(
+        `\nSingle-site audit report: ${relative}/data/summary.json (${summary.siteHealth.displayLabel}; `
+        + `${summary.auditPages.total} paged audit rows)`,
+      );
+      return;
+    }
     const manifest = await writeAuditReport({
       outputDir,
       tests,

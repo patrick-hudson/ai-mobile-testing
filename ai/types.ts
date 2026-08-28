@@ -1,4 +1,5 @@
 export type AiReviewStatus = 'completed' | 'dry-run' | 'skipped' | 'error';
+export type AiReviewMode = 'comparative' | 'single-site';
 
 export interface AiInputArtifact {
   name: string;
@@ -24,7 +25,8 @@ export interface AiAdvisoryFinding {
 
 export interface AiReviewContent {
   executiveSummary: string;
-  releaseRecommendation: string;
+  /** Always null for Single-site runs; AI never owns promotion or release decisions. */
+  releaseRecommendation: string | null;
   findings: AiAdvisoryFinding[];
   coverageGaps: string[];
   questionsForHumanReviewer: string[];
@@ -38,6 +40,7 @@ export interface AiReviewDocument {
   generatedAt: string;
   model: string;
   source: {
+    mode: AiReviewMode;
     runDirectory: string;
     checklistManifest: string | null;
     runId: string | null;
@@ -45,6 +48,12 @@ export interface AiReviewDocument {
     structuredInputBytes: number;
     selectedAuditCount: number;
     artifacts: AiInputArtifact[];
+    payloadInventory: {
+      path: 'payload-inventory.json';
+      sha256: string;
+      fieldCount: number;
+      redactionCount: number;
+    };
   };
   api: {
     status: 'not-attempted' | 'success' | 'error';
@@ -80,6 +89,8 @@ export interface AiReviewOptions {
   /** Runtime-only secret supplied in memory; never serialized into review output. */
   apiKey?: string;
   dryRun: boolean;
+  /** Required before a Single-site packet may leave the process. */
+  optIn?: boolean;
   model: string;
   limits: AiReviewLimits;
   request?: {

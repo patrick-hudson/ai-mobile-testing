@@ -5,15 +5,20 @@ import {
   GALLERY_LIMITS,
   createGalleryWorkbench,
   createInitialGalleryState,
+  createSingleSiteGalleryWorkbench,
   decodeGalleryItemDetail,
   decodeGalleryQueryRow,
   galleryReducer,
+  filterSingleSiteGalleryItems,
+  isSingleSiteAttentionItem,
+  normalizeSingleSiteGalleryItem,
   selectAsyncState,
   selectLocalFilmstrip,
   selectNavigationTarget,
   selectSelectedMember,
   shouldSuppressGalleryShortcut,
 } from '../portal/public/gallery-core.js';
+import { singleSiteEndpoints as singleSiteGalleryEndpoints } from '../portal/public/gallery-data-source.js';
 
 function row(number, overrides = {}) {
   const id = number.toString(16).padStart(16, '0');
@@ -253,7 +258,21 @@ class FakeElement {
 
 class FakeDocument {
   constructor() {
-    this.defaultView = { innerWidth: 1_280 };
+    const listeners = new Map();
+    this.defaultView = {
+      innerWidth: 1_280,
+      addEventListener(name, listener) {
+        const current = listeners.get(name) ?? [];
+        current.push(listener);
+        listeners.set(name, current);
+      },
+      removeEventListener(name, listener) {
+        listeners.set(name, (listeners.get(name) ?? []).filter((candidate) => candidate !== listener));
+      },
+      dispatchEvent(event) {
+        for (const listener of listeners.get(event.type) ?? []) listener(event);
+      },
+    };
     this.activeElement = null;
   }
 
@@ -442,6 +461,157 @@ await Promise.all(calls);
 assert.equal(controllerWorkbench.getState().accepted.items[0].id, row(149).id);
 controllerWorkbench.destroy();
 
+// Single-site is a transport/presentation adapter over the same core reducer,
+// request generations, cancellation, selection, focus, and keyboard contract.
+const singleDocument = new FakeDocument();
+const singleRoot = singleDocument.createElement('div');
+const singleRevision = '8'.repeat(32);
+const singleRows = [
+  {
+    itemId: 'gitem_1000000000000001', title: 'Single core image', suite: 'Layout', auditId: 'LAYOUT-001',
+    caseId: 'LAYOUT-001.image', targetId: 'single-site-desktop-chromium', route: '/', capturePoint: 'ready',
+    theme: 'light', severity: 'P1', kind: 'image', findingCount: 1, coverageGap: false,
+    comparison: { status: 'CHANGED', reason: 'Changed.' }, identity: {}, eligible: true, ineligibilityReasons: [], baseline: null,
+    urls: {
+      current: '/api/single-site/runs/fixture/gallery/items/gitem_1000000000000001/media/current',
+      baseline: '/api/single-site/visual-baselines/baseline-1/media',
+      diff: '/api/single-site/runs/fixture/gallery/items/gitem_1000000000000001/media/diff',
+    },
+  },
+  {
+    itemId: 'gitem_1000000000000002', title: 'Single core video', suite: 'Navigation', auditId: 'NAV-001',
+    caseId: 'NAV-001.video', targetId: 'single-site-desktop-chromium', route: '/', capturePoint: 'clicked',
+    theme: 'light', severity: 'P2', kind: 'video', findingCount: 1, coverageGap: false,
+    comparison: { status: 'absent', reason: 'Interaction video.' }, identity: {}, eligible: false,
+    ineligibilityReasons: ['Video evidence is not baseline eligible.'], baseline: null,
+    urls: { current: '/api/single-site/runs/fixture/gallery/items/gitem_1000000000000002/media/current' },
+  },
+];
+let deferSinglePages = false;
+const pendingSinglePages = [];
+const singleActions = [];
+const baselineIntents = [];
+let singleFullscreenActive = false;
+const singleWorkbench = createSingleSiteGalleryWorkbench(singleRoot, {
+  scheduler: immediate,
+  initialState: { selectedId: singleRows[0].itemId },
+  onStateChange(_state, action) { singleActions.push(action.type); },
+  onBaselineIntent(intent) { baselineIntents.push(intent); },
+  resolveMediaUrl({ value }) { return value; },
+  fullscreen: {
+    async enter() { singleFullscreenActive = true; },
+    async exit() { singleFullscreenActive = false; },
+    isActive() { return singleFullscreenActive; },
+  },
+  dataSource: {
+    async loadHead() {
+      return {
+        mode: 'single-site', publicationRevision: singleRevision, baselineStoreRevision: 3, reviewRevision: 2,
+        mutationCapability: { authorized: true }, primaryCounts: { total: 2, images: 1, videos: 1 },
+        facets: { suites: ['Layout', 'Navigation'] },
+      };
+    },
+    loadItems({ filters, signal }) {
+      const response = {
+        mode: 'single-site', publicationRevision: singleRevision, baselineStoreRevision: 3, reviewRevision: 2,
+        items: filters.kind ? singleRows.filter(({ kind }) => kind === filters.kind) : singleRows,
+        total: 2, offset: 0, limit: 50, hasMore: false, nextOffset: 2, hasPrevious: false, previousOffset: 0,
+        queuePosition: null, scan: { offset: 0, nextOffset: 2, rows: 2, complete: true },
+      };
+      if (!deferSinglePages) return Promise.resolve(response);
+      return new Promise((resolve) => pendingSinglePages.push({ filters: { ...filters }, signal, resolve, response }));
+    },
+    async loadItem({ itemId }) {
+      return { item: { ...singleRows.find((item) => item.itemId === itemId), testContext: { testId: `test::${itemId}` } } };
+    },
+  },
+});
+assert.equal(await singleWorkbench.load(), true);
+assert.equal(singleRoot.children[0].dataset.galleryController, 'shared-core');
+assert.equal(singleWorkbench.getState().selectedId, singleRows[0].itemId);
+assert(singleActions.includes('HEAD_SUCCEEDED'));
+assert(singleActions.includes('QUERY_SUCCEEDED'));
+assert(singleActions.includes('DETAIL_SUCCEEDED'));
+assert(walk(singleRoot).some(({ className }) => className === 'single-site-review-queue'));
+assert(walk(singleRoot).some(({ className }) => className === 'single-site-review-workspace'));
+assert(walk(singleRoot).some(({ className }) => className === 'single-site-review-context'));
+assert.equal(walk(singleRoot).filter(({ className }) => className === 'single-site-queue-heading').length, 1);
+assert(walk(singleRoot).length <= GALLERY_LIMITS.galleryDomNodes);
+const baselineAction = walk(singleRoot).find(({ dataset }) => dataset.galleryAction === 'single-site-baseline-approve');
+assert(baselineAction);
+baselineAction.dispatchEvent({ type: 'click', preventDefault() {} });
+assert.equal(baselineIntents[0].item.itemId, singleRows[0].itemId);
+const singleShell = singleRoot.children[0];
+const pressSingleKey = async (key, target = singleShell) => {
+  let prevented = false;
+  singleShell.dispatchEvent({
+    type: 'keydown', key, target,
+    preventDefault() { prevented = true; }, stopPropagation() {},
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(prevented, true, `Single-site ${JSON.stringify(key)} shortcut must be owned by the shared core.`);
+};
+assert.equal(singleShell.getAttribute('aria-keyshortcuts'), Object.values(GALLERY_KEYS).join(' '));
+await pressSingleKey(GALLERY_KEYS.nextItem);
+assert.equal(singleWorkbench.getState().selectedId, singleRows[1].itemId);
+assert.equal(singleDocument.activeElement?.className, 'single-site-review-workspace');
+await pressSingleKey(GALLERY_KEYS.previousItem);
+assert.equal(singleWorkbench.getState().selectedId, singleRows[0].itemId);
+await pressSingleKey(GALLERY_KEYS.nextTest);
+assert.equal(singleWorkbench.getState().selectedId, singleRows[1].itemId);
+await pressSingleKey(GALLERY_KEYS.previousTest);
+assert.equal(singleWorkbench.getState().selectedId, singleRows[0].itemId);
+await pressSingleKey(GALLERY_KEYS.nextTest);
+assert.equal(singleWorkbench.getState().selectedId, singleRows[1].itemId);
+await pressSingleKey(GALLERY_KEYS.nextMember);
+assert.equal(singleWorkbench.getState().view, 'baseline');
+await pressSingleKey(GALLERY_KEYS.previousMember);
+assert.equal(singleWorkbench.getState().view, 'current');
+const singleWorkspace = walk(singleRoot).find(({ className }) => className === 'single-site-review-workspace');
+const singleVideo = walk(singleWorkspace).find(({ tagName }) => tagName === 'VIDEO');
+assert(singleVideo);
+await pressSingleKey(GALLERY_KEYS.playPause, singleWorkspace);
+assert.equal(singleVideo.paused, false);
+const singleContext = walk(singleRoot).find(({ className }) => className === 'single-site-review-context');
+assert.equal(singleContext.tabIndex, 0, 'The scrollable Single-site context must be reachable from the keyboard.');
+assert(walk(singleContext).some(({ dataset }) => dataset.focusKey === 'context-heading'),
+  'The Single-site context must expose the shared controller focus target.');
+assert.equal(walk(singleRoot).find(({ dataset }) => dataset.galleryAction === 'single-site-diff-tab').getAttribute('role'), null,
+  'Desktop comparison controls use grouped-button semantics.');
+singleDocument.defaultView.innerWidth = 390;
+singleDocument.defaultView.dispatchEvent({ type: 'resize' });
+assert.equal(walk(singleRoot).find(({ dataset }) => dataset.galleryAction === 'single-site-diff-tab').getAttribute('role'), 'tab',
+  'Breakpoint changes must update comparison semantics without rebuilding the loaded viewer.');
+await pressSingleKey(GALLERY_KEYS.context);
+assert.equal(singleContext.hidden, true);
+await pressSingleKey(GALLERY_KEYS.context);
+assert.equal(singleContext.hidden, false);
+await pressSingleKey(GALLERY_KEYS.escape);
+assert.equal(singleContext.hidden, true);
+await pressSingleKey(GALLERY_KEYS.help);
+assert(singleRoot.querySelector('[data-gallery-help]'));
+await pressSingleKey(GALLERY_KEYS.escape);
+assert.equal(singleRoot.querySelector('[data-gallery-help]'), null);
+await pressSingleKey(GALLERY_KEYS.fullscreen);
+assert.equal(singleFullscreenActive, true);
+await pressSingleKey(GALLERY_KEYS.escape);
+assert.equal(singleFullscreenActive, false);
+assert.equal(singleDocument.activeElement?.className, 'single-site-gallery');
+
+deferSinglePages = true;
+singleWorkbench.setFilters({ kind: 'image' });
+singleWorkbench.setFilters({ kind: 'video' });
+assert.equal(pendingSinglePages.length, 2);
+assert.equal(pendingSinglePages[0].signal.aborted, true);
+pendingSinglePages[0].resolve(pendingSinglePages[0].response);
+pendingSinglePages[1].resolve(pendingSinglePages[1].response);
+await new Promise((resolve) => setImmediate(resolve));
+assert.equal(singleWorkbench.getState().filters.kind, 'video');
+assert.deepEqual(singleWorkbench.getState().items.map(({ itemId }) => itemId), [singleRows[1].itemId]);
+assert.equal(singleWorkbench.getState().selectedId, singleRows[1].itemId);
+singleWorkbench.destroy();
+assert.equal(singleWorkbench.getState().destroyed, true);
+
 // Renderer bounds: a 1,000-row sequence still retains no more than 500 nodes,
 // a nine-item filmstrip, and never creates adjacent video elements.
 const renderDocument = new FakeDocument();
@@ -483,10 +653,27 @@ selectedVideo.dispatchEvent({ type: 'error', target: selectedVideo, preventDefau
 assert.equal(renderWorkbench.getState().media.status, 'error');
 assert.equal(renderWorkbench.getState().availability.state, 'tombstone');
 await renderWorkbench.loadSelected();
+const queueButtonsBeforeNavigation = walk(renderRoot).filter(({ dataset }) => dataset.galleryAction === 'select-item');
+const filmstripButtonsBeforeNavigation = walk(renderRoot).filter(({ dataset }) => dataset.galleryAction === 'filmstrip-select');
 await renderWorkbench.selectItem(largeRows[1].id);
+const queueButtonsAfterNavigation = walk(renderRoot).filter(({ dataset }) => dataset.galleryAction === 'select-item');
+const filmstripButtonsAfterNavigation = walk(renderRoot).filter(({ dataset }) => dataset.galleryAction === 'filmstrip-select');
+assert.equal(queueButtonsAfterNavigation[0], queueButtonsBeforeNavigation[0], 'Warm navigation keeps the bounded queue window mounted.');
+assert.equal(queueButtonsAfterNavigation.find(({ dataset }) => dataset.itemId === largeRows[1].id)?.getAttribute('aria-current'), 'true');
+assert.equal(filmstripButtonsAfterNavigation[0], filmstripButtonsBeforeNavigation[0], 'Warm navigation keeps the bounded filmstrip window mounted.');
+assert.equal(filmstripButtonsAfterNavigation.find(({ dataset }) => dataset.itemId === largeRows[1].id)?.getAttribute('aria-current'), 'true');
 assert(selectedVideo.pauseCalls >= 1);
 assert(selectedVideo.loadCalls >= 1);
 assert.equal(selectedVideo.src, '');
+const selectedImage = walk(renderRoot).find(({ tagName, className }) => tagName === 'IMG' && className === 'gallery-selected-image');
+assert(selectedImage);
+selectedImage.dispatchEvent({ type: 'load', target: selectedImage, preventDefault() {}, stopPropagation() {} });
+assert.equal(renderWorkbench.getState().media.status, 'ready');
+assert.equal(
+  walk(renderRoot).find(({ tagName, className }) => tagName === 'IMG' && className === 'gallery-selected-image'),
+  selectedImage,
+  'Settling selected media must not replace and decode the same element again.',
+);
 renderWorkbench.dispatch({ type: 'OPEN_LAYER', layer: 'help', focusKey: 'gallery-root' });
 const help = renderRoot.querySelector('[data-gallery-help]');
 assert(help);
@@ -510,6 +697,63 @@ assert(walk(renderRoot).length <= GALLERY_LIMITS.galleryDomNodes);
 assert(observedOverviewImages.length > 0, 'Overview photos are observed before a source is resolved.');
 assert(walk(renderRoot).filter(({ tagName }) => tagName === 'VIDEO').length === 0, 'Overview never preloads videos.');
 renderWorkbench.destroy();
+
+// Background filmstrip hydration must wait until the selected evidence has
+// settled. Rapid keyboard traversal crosses multiple nine-item window
+// boundaries; only the final window may be hydrated after the reviewer pauses.
+const priorityDocument = new FakeDocument();
+const priorityRoot = priorityDocument.createElement('div');
+const priorityRows = Array.from({ length: 18 }, (_, index) => row(index + 12_000));
+const thumbnailCalls = [];
+const thumbnailTasks = [];
+const priorityWorkbench = createGalleryWorkbench(priorityRoot, {
+  scheduler: immediate,
+  thumbnailScheduler(task) {
+    const scheduled = { cancelled: false, task };
+    thumbnailTasks.push(scheduled);
+    return () => { scheduled.cancelled = true; };
+  },
+  adapter: {
+    async loadItem({ itemId }) { return detail(priorityRows.find(({ id }) => id === itemId)); },
+    async resolveMedia({ item }) {
+      return { validatedByAdapter: true, url: `/artifacts/run/${item.id}.png` };
+    },
+    async resolveThumbnail({ row: thumbnailRow }) {
+      thumbnailCalls.push(thumbnailRow.id);
+      return { validatedByAdapter: true, url: `/artifacts/run/thumb-${thumbnailRow.id}.png` };
+    },
+  },
+});
+priorityWorkbench.dispatch({ type: 'REQUEST_STARTED', slot: 'query', generation: 1, semanticKey: 'priority' });
+priorityWorkbench.dispatch({
+  type: 'QUERY_SUCCEEDED', slot: 'query', generation: 1, semanticKey: 'priority', rows: priorityRows,
+  total: priorityRows.length, contentRevision: 'content_priority', orderRevision: 'order_priority', phase: 'sealed',
+});
+await priorityWorkbench.loadSelected();
+assert.equal(thumbnailCalls.length, 0, 'Filmstrip details must not compete with the initial selected media.');
+walk(priorityRoot).find(({ className }) => className === 'gallery-selected-image')
+  .dispatchEvent({ type: 'load', preventDefault() {}, stopPropagation() {} });
+assert.equal(thumbnailCalls.length, 0, 'Settled media schedules thumbnail work without running it before the quiet period.');
+await priorityWorkbench.selectItem(priorityRows[5].id);
+await priorityWorkbench.selectItem(priorityRows[10].id);
+assert.equal(thumbnailCalls.length, 0, 'Rapid traversal must keep thumbnail work paused across filmstrip boundaries.');
+walk(priorityRoot).find(({ className }) => className === 'gallery-selected-image')
+  .dispatchEvent({ type: 'load', preventDefault() {}, stopPropagation() {} });
+for (const scheduled of thumbnailTasks.splice(0)) {
+  if (!scheduled.cancelled) scheduled.task();
+}
+await new Promise((resolve) => setImmediate(resolve));
+const finalFilmstripIds = selectLocalFilmstrip(priorityWorkbench.getState()).map(({ id }) => id);
+const finalSelectedIndex = finalFilmstripIds.indexOf(priorityRows[10].id);
+const prioritizedFinalFilmstripIds = [];
+for (let distance = 1; distance < finalFilmstripIds.length; distance += 1) {
+  if (finalFilmstripIds[finalSelectedIndex + distance]) prioritizedFinalFilmstripIds.push(finalFilmstripIds[finalSelectedIndex + distance]);
+  if (finalFilmstripIds[finalSelectedIndex - distance]) prioritizedFinalFilmstripIds.push(finalFilmstripIds[finalSelectedIndex - distance]);
+}
+prioritizedFinalFilmstripIds.push(finalFilmstripIds[finalSelectedIndex]);
+assert.deepEqual(thumbnailCalls, prioritizedFinalFilmstripIds,
+  'After the reviewer pauses, only the final bounded filmstrip window is hydrated with the next item first.');
+priorityWorkbench.destroy();
 
 // Unsafe resolved URLs cannot reach a URL-bearing DOM property, even when a
 // faulty adapter claims they were validated.
@@ -555,9 +799,39 @@ const duplicateSettled = galleryReducer(firstSettled, {
 assert.equal(firstSettled.media.status, 'ready');
 assert.equal(duplicateSettled, firstSettled, 'Duplicate media load completion must be a reducer no-op.');
 
+const singleSiteRoutes = singleSiteGalleryEndpoints('single-site-fixture');
+assert.equal(singleSiteRoutes.head(), '/api/single-site/runs/single-site-fixture/gallery');
+assert.equal(singleSiteRoutes.items('offset=100&limit=100'), '/api/single-site/runs/single-site-fixture/gallery/items?offset=100&limit=100');
+assert.equal(singleSiteRoutes.currentMedia('visual:item'), '/api/single-site/runs/single-site-fixture/gallery/items/visual%3Aitem/media/current');
+assert.equal(singleSiteRoutes.approve(), '/api/single-site/visual-baselines/approve');
+assert.equal(singleSiteRoutes.replace('baseline:one'), '/api/single-site/visual-baselines/baseline%3Aone/replace');
+assert.throws(() => singleSiteGalleryEndpoints('../unsafe'));
+
+const singleSiteItems = [{
+  itemId: 'visual-changed', title: 'Changed', suite: 'Navigation', auditId: 'NAV-001', caseId: 'case-b',
+  severity: 'P1', comparison: { status: 'CHANGED' }, findingCount: 0, coverageGap: false,
+}, {
+  itemId: 'finding-first', title: 'Finding', suite: 'Content', auditId: 'CONTENT-001', caseId: 'case-a',
+  severity: 'P0', comparison: { status: 'UNCHANGED' }, findingCount: 1, coverageGap: false,
+}, {
+  itemId: 'stable', title: 'Stable', suite: 'Content', auditId: 'CONTENT-002', caseId: 'case-c',
+  severity: 'P3', comparison: { status: 'UNCHANGED' }, findingCount: 0, coverageGap: false,
+}];
+const normalizedChanged = normalizeSingleSiteGalleryItem(singleSiteItems[0]);
+assert.equal(normalizedChanged.visualStatus, 'CHANGED');
+assert.equal(isSingleSiteAttentionItem(normalizedChanged), true);
+assert.deepEqual(filterSingleSiteGalleryItems(singleSiteItems, { scope: 'attention' }).map(({ itemId }) => itemId), [
+  'finding-first', 'visual-changed',
+]);
+assert.deepEqual(filterSingleSiteGalleryItems(singleSiteItems, { scope: 'all', suite: 'Content', finding: 'clear' }).map(({ itemId }) => itemId), ['stable']);
+
 const coreSource = await readFile(new URL('../portal/public/gallery-core.js', import.meta.url), 'utf8');
+const liveGallerySource = await readFile(new URL('../portal/public/gallery.js', import.meta.url), 'utf8');
 const cssSource = await readFile(new URL('../portal/public/gallery.css', import.meta.url), 'utf8');
 assert.doesNotMatch(coreSource, /\.innerHTML\s*=|insertAdjacentHTML|\bfetch\s*\(|createElement\(['"]iframe['"]\)|localStorage|sessionStorage/);
+assert.match(coreSource, /export function createSingleSiteGalleryWorkbench\(/);
+assert.match(liveGallerySource, /createSingleSiteGalleryWorkbench\(elements\.gallery_workbench/);
+assert.doesNotMatch(liveGallerySource, /function createSingleSiteGalleryController|function loadPage\(|function renderQueue\(|function renderSelection\(/);
 assert.match(cssSource, /@media \(min-width: 768px\) and \(max-width: 1023px\)/);
 assert.match(cssSource, /@media \(max-width: 767px\)/);
 assert.match(cssSource, /min-height: 44px/);

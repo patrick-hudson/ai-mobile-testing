@@ -5,6 +5,52 @@ import {
   createArchiveIframeTransport,
   validateArchiveMediaUrl,
 } from '../reporters/assets/gallery-archive.js';
+import { createGalleryWorkbench as archiveCreateGalleryWorkbench } from '../reporters/assets/gallery-core.js';
+import { createGalleryWorkbench as portalCreateGalleryWorkbench } from '../portal/public/gallery-core.js';
+await import('../reporters/assets/archive-runtime.js');
+
+const archiveRuntime = globalThis.Quitting7ohArchiveRuntime;
+assert.equal(archiveRuntime.CURRENT_RUNTIME_VERSION, 2);
+assert.equal(archiveRuntime.validateBundleContract(null, null, 1).bundleVersion, 1,
+  'Runtime N must retain legacy bundle N-1 support when metadata is absent.');
+const currentBundle = {
+  schemaVersion: 1,
+  bundleVersion: 2,
+  runtimeVersion: 2,
+  minimumReaderVersion: 1,
+  dataSchemaVersion: 1,
+  assetBase: 'assets/archive-v2',
+  manifestHref: 'assets/archive-v2/bundle.json',
+};
+assert.equal(
+  archiveRuntime.validateBundleContract(currentBundle, currentBundle, 1).bundleVersion,
+  2,
+  'Runtime N must accept the current generated bundle.',
+);
+assert.throws(
+  () => archiveRuntime.validateBundleContract(
+    currentBundle,
+    { ...currentBundle, runtimeVersion: 1 },
+    1,
+  ),
+  /does not match/i,
+  'Embedded and descriptor bundle mismatch must fail closed.',
+);
+assert.throws(
+  () => archiveRuntime.validateBundleContract(
+    { ...currentBundle, bundleVersion: 3, runtimeVersion: 3, assetBase: 'assets/archive-v3', manifestHref: 'assets/archive-v3/bundle.json' },
+    { ...currentBundle, bundleVersion: 3, runtimeVersion: 3, assetBase: 'assets/archive-v3', manifestHref: 'assets/archive-v3/bundle.json' },
+    1,
+  ),
+  /not compatible/i,
+  'A future bundle must not be interpreted by an older runtime.',
+);
+
+assert.strictEqual(
+  archiveCreateGalleryWorkbench,
+  portalCreateGalleryWorkbench,
+  'The reporter bridge must re-export the canonical portal gallery controller.',
+);
 
 function descriptor(overrides = {}) {
   return {

@@ -35,6 +35,10 @@ export function parseChecklistRelease(document, source = 'checklist/manifest.jso
   if (document.schemaVersion !== CHECKLIST_SCHEMA_VERSION) {
     throw new Error(`Checklist manifest schemaVersion must be ${CHECKLIST_SCHEMA_VERSION}.`);
   }
+  if (document.mode === 'single-site' || document.run?.mode === 'single-site'
+    || document.kind === 'single-site-health') {
+    throw new Error('Single-site Site Health evidence cannot be parsed as comparative release truth.');
+  }
   const release = document.release;
   if (!release || typeof release !== 'object' || Array.isArray(release)) {
     throw new Error('Checklist manifest is missing release truth.');

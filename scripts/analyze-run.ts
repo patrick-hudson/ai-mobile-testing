@@ -7,6 +7,7 @@ interface ParsedArguments {
   runDir: string | null;
   outputDir: string | undefined;
   dryRun: boolean;
+  optIn: boolean;
   selfTest: boolean;
   help: boolean;
   limits: AiReviewLimits;
@@ -27,6 +28,7 @@ function parseArguments(argv: string[]): ParsedArguments {
     runDir: process.env.AUDIT_ARTIFACT_DIR ?? null,
     outputDir: undefined,
     dryRun: process.env.AI_REVIEW_DRY_RUN === '1',
+    optIn: process.env.AI_REVIEW_OPT_IN === '1',
     selfTest: false,
     help: false,
     limits: {
@@ -44,6 +46,7 @@ function parseArguments(argv: string[]): ParsedArguments {
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
     if (argument === '--dry-run') args.dryRun = true;
+    else if (argument === '--opt-in') args.optIn = true;
     else if (argument === '--self-test') args.selfTest = true;
     else if (argument === '--help' || argument === '-h') args.help = true;
     else if (argument === '--run-dir') args.runDir = argv[++index] ?? null;
@@ -60,6 +63,7 @@ function usage(): string {
 
 Options:
   --dry-run                 Select and validate evidence without calling Anthropic
+  --opt-in                  Explicitly allow this run's sanitized AI packet to be sent
   --output-dir <directory>  Override the default <run-dir>/ai-review output
   --max-audits <count>      Bound structured problem audits (default: 25)
   --max-screenshots <count> Bound uploaded screenshots and video posters (default: 4)
@@ -71,11 +75,12 @@ Runtime environment:
   ANTHROPIC_KEY_STDIN=1      Read the key once from stdin instead of exposing it in the child environment
   ANTHROPIC_MODEL            Defaults to claude-sonnet-5
   AI_REVIEW_DRY_RUN=1        Equivalent to --dry-run
+  AI_REVIEW_OPT_IN=1         Equivalent to --opt-in; required for Single-site egress
   AI_REVIEW_REQUEST_DEADLINE_MS  Overall API attempt/retry budget (default: 120000)
   AI_REVIEW_MAX_ATTEMPTS      Bounded total API attempts (default: 3)
   AI_REVIEW_MAX_RETRY_DELAY_MS  Maximum Retry-After/backoff delay (default: 10000)
 
-Exit codes: 0 completed/skipped/dry-run; 2 invalid input; 3 API or response failure.`;
+Exit codes: 0 completed/skipped/dry-run or non-blocking Single-site advisory failure; 2 invalid input; 3 comparative API or response failure.`;
 }
 
 async function readSecretFromStdin(): Promise<string> {
@@ -122,6 +127,7 @@ if (parsed.help) {
       ...(parsed.outputDir ? { outputDir: path.resolve(parsed.outputDir) } : {}),
       ...(apiKey ? { apiKey } : {}),
       dryRun: parsed.dryRun,
+      optIn: parsed.optIn,
       model: process.env.ANTHROPIC_MODEL ?? 'claude-sonnet-5',
       limits: parsed.limits,
       request: parsed.request,

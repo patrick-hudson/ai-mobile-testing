@@ -1,6 +1,5 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { ALL_AUDIT_CATALOG, INSTALLED_PLUGIN_REGISTRY, ROUTE_AUDIT_CATALOG } from '../audit/definitions.js';
-import { LOCAL_AUDIT_TARGETS } from '../audit/targets.js';
 
 const outputUrl = new URL('../docs/ASSERTION_LEDGER.md', import.meta.url);
 const check = process.argv.includes('--check');
@@ -19,6 +18,8 @@ const cases = new Map<string, Array<{
   entrySpec: string;
   applicability: string;
   supportedProjects: string[];
+  supportedModes: string[];
+  oracleVariants: { comparative?: string; singleSite?: string };
 }>>();
 for (const plugin of INSTALLED_PLUGIN_REGISTRY.plugins) {
   for (const definition of plugin.auditDefinitions) {
@@ -33,6 +34,8 @@ for (const plugin of INSTALLED_PLUGIN_REGISTRY.plugins) {
       entrySpec: auditCase.entrySpec,
       applicability: auditCase.applicability,
       supportedProjects: [...auditCase.supportedProjects],
+      supportedModes: [...auditCase.supportedModes],
+      oracleVariants: { ...auditCase.oracleVariants },
     });
     cases.set(auditCase.auditId, current);
   }
@@ -41,10 +44,6 @@ for (const plugin of INSTALLED_PLUGIN_REGISTRY.plugins) {
 const automated = ALL_AUDIT_CATALOG.filter(({ manual }) => !manual);
 const manual = ALL_AUDIT_CATALOG.filter(({ manual }) => manual);
 const releaseBlocking = ALL_AUDIT_CATALOG.filter(({ releaseBlocking }) => releaseBlocking);
-const fullSweepProjects = LOCAL_AUDIT_TARGETS.filter((target) => (
-  target.fullSweep && !('requiredCapability' in target)
-))
-  .map(({ id }) => id);
 const modes = new Map<string, number>();
 for (const definition of ALL_AUDIT_CATALOG) {
   modes.set(definition.evidencePolicy.mode, (modes.get(definition.evidencePolicy.mode) ?? 0) + 1);
@@ -73,12 +72,10 @@ const lines = [
 
 for (const definition of ALL_AUDIT_CATALOG) {
   const routeAudit = definition.id.startsWith('PAGE-');
-  const auditCases = cases.get(definition.id) ?? (routeAudit ? [{
-    plugin: 'platform-routes-content',
-    entrySpec: 'tests/page-audit.spec.ts',
-    applicability: 'full-sweep-projects',
-    supportedProjects: fullSweepProjects,
-  }] : []);
+  const auditCases = cases.get(definition.id) ?? [];
+  const standaloneOracleLabel = definition.standaloneOracle
+    ? ` — default oracle ${codeList([definition.standaloneOracle.id])}`
+    : '';
   lines.push(
     `### ${definition.id} — ${definition.title}`,
     '',
@@ -88,19 +85,25 @@ for (const definition of ALL_AUDIT_CATALOG) {
     `- User promise: ${definition.userPromise}`,
     `- Exact expected behavior: ${definition.expected}`,
     `- Primary evidence: ${definition.evidencePolicy.mode} — ${definition.evidencePolicy.rationale}`,
+    `- Single-site classification: ${definition.singleSiteClassification}${standaloneOracleLabel}`,
     `- Evidence attachments: ${codeList(definition.evidence)}`,
-    `- Owning plugins: ${routeAudit ? '`platform-routes-content` (generated from the reviewed route inventory)' : codeList([...(owners.get(definition.id) ?? [])].sort())}`,
+    `- Owning plugins: ${codeList([...(owners.get(definition.id) ?? [])].sort())}${routeAudit ? ' (generated from the reviewed route inventory)' : ''}`,
     '',
   );
   if (auditCases.length === 0) {
     lines.push('Manual coverage has no automated source case; the long checklist remains incomplete until a reviewer attaches and attests valid evidence.', '');
     continue;
   }
-  lines.push('| Source test | Applicability | Executable browser/device targets |', '| --- | --- | --- |');
+  lines.push(
+    '| Source test | Applicability | Run modes | Product Oracle variants | Executable browser/device targets |',
+    '| --- | --- | --- | --- | --- |',
+  );
   for (const auditCase of auditCases.sort((left, right) => (
     left.entrySpec.localeCompare(right.entrySpec) || left.applicability.localeCompare(right.applicability)
   ))) {
-    lines.push(`| \`${cell(auditCase.entrySpec)}\` | \`${cell(auditCase.applicability)}\` | ${codeList(auditCase.supportedProjects)} |`);
+    const oracleVariants = Object.entries(auditCase.oracleVariants)
+      .map(([mode, oracle]) => `${mode}: ${oracle}`);
+    lines.push(`| \`${cell(auditCase.entrySpec)}\` | \`${cell(auditCase.applicability)}\` | ${codeList(auditCase.supportedModes)} | ${codeList(oracleVariants)} | ${codeList(auditCase.supportedProjects)} |`);
   }
   lines.push('');
 }

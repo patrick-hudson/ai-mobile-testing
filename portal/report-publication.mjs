@@ -1,9 +1,14 @@
 import { constants as fsConstants, promises as fs } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join, relative, resolve, sep } from 'node:path';
+import {
+  expectedSingleSiteReportPaths,
+  parseSingleSiteReportPage,
+  parseSingleSiteReportSummary,
+} from '../scripts/lib/site-health-report.mjs';
 
 const REVISION_PATTERN = /^[a-f0-9]{32}$/;
-const REPORT_PATH_PATTERN = /^(?:summary\.json|audits\.json|audits\/[A-Z0-9-]{3,160}\.json)$/;
+const REPORT_PATH_PATTERN = /^(?:summary\.json|audits\.json|audits\/[A-Z0-9-]{3,160}\.json|(?:audits|coverage|scope\/(?:selected|omitted|outside-mode))\/page-\d{6}\.json)$/;
 
 export async function loadReportPublication(runDirectoryValue, requestedRevision = null, options = {}) {
   const runDirectory = resolve(runDirectoryValue);
@@ -41,8 +46,27 @@ export async function loadReportPublication(runDirectoryValue, requestedRevision
     revisionDirectory,
     publicationRevision: document.publicationRevision,
     generatedAt: document.generatedAt,
+    mode: document.mode === 'single-site' ? 'single-site' : 'comparative-legacy',
+    kind: document.kind ?? 'comparative-report-publication',
     files: document.files,
+    publicationDigest: createHash('sha256').update(pointer.buffer).digest('hex'),
   };
+}
+
+export async function loadComparativeReportPublication(runDirectoryValue, requestedRevision = null, options = {}) {
+  const publication = await loadReportPublication(runDirectoryValue, requestedRevision, options);
+  if (publication.mode === 'single-site') {
+    throw new Error('Single-site Site Health publication cannot be read as a comparative release report.');
+  }
+  return publication;
+}
+
+export async function loadSingleSiteReportPublication(runDirectoryValue, requestedRevision = null, options = {}) {
+  const publication = await loadReportPublication(runDirectoryValue, requestedRevision, options);
+  if (publication.mode !== 'single-site') {
+    throw new Error('Comparative release publication cannot be read as a Single-site Site Health report.');
+  }
+  return publication;
 }
 
 export async function readPublishedReportFile(publication, relativePath, maximumBytes) {
@@ -81,6 +105,12 @@ export async function readPublishedReportJson(publication, relativePath, maximum
   if (document.generatedAt !== publication.generatedAt) {
     throw new Error(`Compact report file ${relativePath} names a different generation time.`);
   }
+  if (publication.mode === 'single-site' && document.mode !== 'single-site') {
+    throw new Error(`Compact report file ${relativePath} is missing its Single-site mode discriminator.`);
+  }
+  if (publication.mode !== 'single-site' && document.mode === 'single-site') {
+    throw new Error(`Single-site compact report file ${relativePath} cannot be read through a comparative publication.`);
+  }
   return { document, ...file };
 }
 
@@ -98,10 +128,13 @@ export async function validateCompleteReportPublication(runDirectory, options = 
     summary = (await readPublishedReportJson(
       publication,
       'summary.json',
-      options.maximumSummaryBytes ?? 2 * 1024 * 1024,
+      options.maximumSummaryBytes ?? (publication.mode === 'single-site' ? 512 * 1024 : 2 * 1024 * 1024),
     )).document;
   } catch (error) {
     problems.push(error.message);
+  }
+  if (publication.mode === 'single-site') {
+    return validateSingleSitePublication(publication, summary, problems, options);
   }
   try {
     audits = (await readPublishedReportJson(
@@ -151,11 +184,124 @@ export async function validateCompleteReportPublication(runDirectory, options = 
   return { problems: [...new Set(problems)], publication, summary, audits };
 }
 
+async function validateSingleSitePublication(publication, summaryDocument, initialProblems, options) {
+  const problems = [...initialProblems];
+  let summary = null;
+  if (summaryDocument) {
+    try {
+      summary = parseSingleSiteReportSummary(summaryDocument);
+    } catch (error) {
+      problems.push(error.message);
+    }
+  }
+  if (!summary) return { problems: [...new Set(problems)], publication, summary: null, audits: null };
+  const expectedPaths = new Set(expectedSingleSiteReportPaths(summary));
+  for (const path of Object.keys(publication.files)) {
+    if (!expectedPaths.has(path)) problems.push(`Single-site compact report publication declares unexpected file ${path}.`);
+  }
+  for (const path of expectedPaths) {
+    if (!publication.files[path]) problems.push(`Single-site compact report publication is missing ${path}.`);
+  }
+  const identifiers = {
+    audits: new Set(),
+    selected: new Set(),
+    omitted: new Set(),
+    outsideMode: new Set(),
+  };
+  let publishedFindingCount = 0;
+  let publishedGapCount = 0;
+  let publishedLimitationCount = 0;
+  const publishedCoverage = [];
+  const publishedOutsideMode = [];
+  for (const path of [...expectedPaths].filter((value) => value !== 'summary.json').sort()) {
+    if (!publication.files[path]) continue;
+    try {
+      const document = (await readPublishedReportJson(
+        publication,
+        path,
+        options.maximumPageBytes ?? 512 * 1024,
+      )).document;
+      const page = parseSingleSiteReportPage(document, path, summary);
+      if (path.startsWith('audits/')) {
+        for (const item of page.items) {
+          if (identifiers.audits.has(item.id)) problems.push(`Single-site audit row ${item.id} is duplicated across pages.`);
+          identifiers.audits.add(item.id);
+          publishedFindingCount += item.findingCount;
+        }
+      } else if (path.startsWith('scope/selected/')) {
+        for (const item of page.items) {
+          if (identifiers.selected.has(item)) problems.push(`Selected scope item ${item} is duplicated across pages.`);
+          identifiers.selected.add(item);
+        }
+      } else if (path.startsWith('scope/omitted/')) {
+        for (const item of page.items) {
+          if (identifiers.omitted.has(item)) problems.push(`Omitted scope item ${item} is duplicated across pages.`);
+          identifiers.omitted.add(item);
+        }
+      } else if (path.startsWith('scope/outside-mode/')) {
+        for (const item of page.items) {
+          publishedOutsideMode.push(item);
+          if (identifiers.outsideMode.has(item.auditId)) problems.push(`Outside-mode item ${item.auditId} is duplicated across pages.`);
+          identifiers.outsideMode.add(item.auditId);
+        }
+      } else if (path.startsWith('coverage/')) {
+        for (const item of page.items) {
+          publishedCoverage.push(item);
+          if (item.kind === 'gap') publishedGapCount += 1;
+          if (item.kind === 'limitation') publishedLimitationCount += 1;
+        }
+      }
+    } catch (error) {
+      problems.push(error.message);
+    }
+  }
+  for (const item of identifiers.selected) {
+    if (identifiers.omitted.has(item)) problems.push(`Coverage item ${item} is both selected and omitted.`);
+  }
+  if (JSON.stringify([...identifiers.selected].slice(0, 12)) !== JSON.stringify(summary.scope.selected.preview)) {
+    problems.push('Single-site selected-scope preview disagrees with its paged source.');
+  }
+  if (JSON.stringify([...identifiers.omitted].slice(0, 12)) !== JSON.stringify(summary.scope.omitted.preview)) {
+    problems.push('Single-site omitted-scope preview disagrees with its paged source.');
+  }
+  if (JSON.stringify(publishedOutsideMode.slice(0, 12)) !== JSON.stringify(summary.scope.outsideMode.preview)) {
+    problems.push('Single-site outside-mode preview disagrees with its paged source.');
+  }
+  if (JSON.stringify(publishedCoverage.slice(0, 12)) !== JSON.stringify(summary.coverage.preview)) {
+    problems.push('Single-site Coverage preview disagrees with its paged source.');
+  }
+  if (publishedFindingCount !== summary.findings.count) {
+    problems.push('Single-site paged audit finding counts disagree with the compact summary.');
+  }
+  if (publishedGapCount !== summary.coverage.gapCount
+    || publishedLimitationCount !== summary.coverage.limitationCount) {
+    problems.push('Single-site paged Coverage details disagree with the compact summary.');
+  }
+  return { problems: [...new Set(problems)], publication, summary, audits: null };
+}
+
 function validatePublicationDocument(document) {
   if (!document || typeof document !== 'object' || Array.isArray(document)) {
     throw new Error('Compact report publication pointer must contain a JSON object.');
   }
   if (document.schemaVersion !== 1) throw new Error('Compact report publication schemaVersion must be 1.');
+  if (document.mode !== undefined && document.mode !== 'single-site') {
+    throw new Error('Compact report publication mode is invalid.');
+  }
+  if (document.mode === 'single-site' && document.kind !== 'single-site-report-publication') {
+    throw new Error('Single-site compact report publication kind is invalid.');
+  }
+  if (document.mode === undefined && document.kind === 'single-site-report-publication') {
+    throw new Error('Single-site compact report publication is missing its mode discriminator.');
+  }
+  if (document.mode === 'single-site') {
+    const unexpected = Object.keys(document).filter((key) => ![
+      'schemaVersion', 'kind', 'mode', 'publicationRevision', 'generatedAt', 'files',
+    ].includes(key));
+    if (unexpected.length > 0) {
+      throw new Error(`Single-site compact report publication contains unknown fields: ${unexpected.sort().join(', ')}.`);
+    }
+  }
   if (!REVISION_PATTERN.test(document.publicationRevision ?? '')) {
     throw new Error('Compact report publication revision is invalid.');
   }

@@ -11,6 +11,7 @@ export default defineConfig({
   timeout: 240_000,
   expect: { timeout: 20_000 },
   outputDir: `${artifactRoot}/raw`,
+  snapshotPathTemplate: '{testDir}/__screenshots__/{arg}{ext}',
   reporter: [
     ['list'],
     ['html', { outputFolder: `${artifactRoot}/playwright-html`, open: 'never' }],
@@ -19,6 +20,7 @@ export default defineConfig({
   use: {
     ...devices['Desktop Chrome'],
     baseURL: process.env.PORTAL_E2E_BASE_URL ?? 'http://127.0.0.1:4183',
+    storageState: process.env.PORTAL_E2E_STORAGE_STATE,
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
     video: 'retain-on-failure',

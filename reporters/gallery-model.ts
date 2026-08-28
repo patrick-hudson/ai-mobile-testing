@@ -66,6 +66,10 @@ import type {
   ReportResultInput,
   ReportTestInput,
 } from './report-model.js';
+import {
+  archiveBundleContract,
+  ensureArchiveRuntimeBundle,
+} from './archive-bundle.js';
 
 export interface NormalizedGalleryAttachment {
   attachmentKey: string;
@@ -1155,6 +1159,9 @@ function itemBase(
   definitionCatalog: readonly AuditDefinition[],
 ): Omit<GalleryItem, 'id' | 'kind' | 'members' | 'comparison' | 'capture'> {
   const firstRecord = attempt.evidenceRecords[0] ?? test.evidenceRecords[0] ?? null;
+  const projectEnvironment = test.source.projectMetadata && 'environment' in test.source.projectMetadata
+    ? test.source.projectMetadata.environment
+    : undefined;
   return {
     test: {
       id: test.source.id,
@@ -1175,7 +1182,7 @@ function itemBase(
     },
     project: {
       name: test.source.projectName,
-      environment: firstRecord?.environment ?? test.source.projectMetadata?.environment ?? 'unknown',
+      environment: firstRecord?.environment ?? projectEnvironment ?? 'unknown',
       browser: firstRecord?.browser ?? test.source.projectMetadata?.browserLabel ?? test.source.projectName,
       deviceClass: test.source.projectMetadata?.deviceClass ?? 'unknown',
     },
@@ -1669,7 +1676,14 @@ export async function prepareGalleryArchive(options: WriteGalleryArchiveOptions)
   const exportedAt = options.exportedAt && !Number.isNaN(Date.parse(options.exportedAt))
     ? new Date(options.exportedAt).toISOString()
     : new Date().toISOString();
-  const exportRevision = `export_${stableGalleryKey({ contentRevision, flagRevision, orderRevision, exportedAt })}`;
+  const archiveBundle = archiveBundleContract();
+  const exportRevision = `export_${stableGalleryKey({
+    contentRevision,
+    flagRevision,
+    orderRevision,
+    exportedAt,
+    archiveBundle,
+  })}`;
   const revisionHref = `gallery/revisions/${exportRevision}`;
   const finalDir = path.join(galleryRoot, 'revisions', exportRevision);
   const stagingDir = await mkdtemp(path.join(galleryRoot, `.staging-${exportRevision}-`));
@@ -1742,6 +1756,7 @@ export async function prepareGalleryArchive(options: WriteGalleryArchiveOptions)
     orderRevision,
     exportRevision,
     exportedAt,
+    archiveBundle,
     primaryCounts: options.catalog.primaryCounts,
     facets: {
       kinds: facet(queryRows.map(({ kind }) => kind)),
@@ -1848,6 +1863,7 @@ function inlineArchiveJson(value: unknown): string {
 }
 
 function galleryArchiveHtml(descriptor: GalleryArchiveDescriptor, inlineModule: string): string {
+  const bundle = descriptor.archiveBundle ?? archiveBundleContract();
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -1855,8 +1871,8 @@ function galleryArchiveHtml(descriptor: GalleryArchiveDescriptor, inlineModule: 
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark light">
   <title>Visual Evidence Gallery · Long Build Checklist</title>
-  <link rel="stylesheet" href="assets/gallery.css">
-  <link rel="stylesheet" href="assets/gallery-archive.css">
+  <link rel="stylesheet" href="${bundle.assetBase}/gallery.css">
+  <link rel="stylesheet" href="${bundle.assetBase}/gallery-archive.css">
 </head>
 <body>
   <a class="gallery-archive-skip" href="#gallery-workbench">Skip to visual evidence</a>
@@ -1901,8 +1917,10 @@ function galleryArchiveHtml(descriptor: GalleryArchiveDescriptor, inlineModule: 
     </section>
   </main>
   <p id="gallery-announcer" class="gallery-archive-visually-hidden" role="status" aria-live="polite" aria-atomic="true"></p>
+  <script id="archive-bundle" type="application/json">${inlineArchiveJson(bundle)}</script>
   <script id="gallery-archive-head" type="application/json">${inlineArchiveJson(descriptor)}</script>
-  <script src="assets/gallery-loader.js"></script>
+  <script src="${bundle.assetBase}/archive-runtime.js"></script>
+  <script src="${bundle.assetBase}/gallery-loader.js"></script>
   <script type="module">${inlineModule}</script>
 </body>
 </html>`;
@@ -1914,10 +1932,10 @@ function archiveInlineModule(coreSource: string, adapterSource: string): string 
     '',
   ).replace(
     "if ((typeof location === 'undefined' || location.protocol !== 'file:') && typeof document !== 'undefined' && document.querySelector('#gallery-archive-head')) {",
-    "if (location.protocol === 'file:' && typeof document !== 'undefined' && document.querySelector('#gallery-archive-head')) {",
+    "if (typeof document !== 'undefined' && document.querySelector('#gallery-archive-head')) {",
   );
-  if (bundledAdapter === adapterSource || !bundledAdapter.includes("location.protocol === 'file:'")) {
-    throw new Error('Could not build the self-contained direct-file gallery module.');
+  if (bundledAdapter === adapterSource || !bundledAdapter.includes("typeof document !== 'undefined'")) {
+    throw new Error('Could not build the self-contained archive gallery module.');
   }
   const source = `${coreSource}\n${bundledAdapter}`;
   return source.replace(/<\/script/gi, '<\\/script');
@@ -1928,20 +1946,14 @@ async function stageGalleryArchiveSurface(
   galleryRoot: string,
   descriptor: GalleryArchiveDescriptor,
 ): Promise<string> {
-  const assetsDir = path.join(outputDir, 'assets');
-  const reporterAssets = path.join(path.dirname(fileURLToPath(import.meta.url)), 'assets');
-  const portalAssets = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'portal', 'public');
-  await mkdir(assetsDir, { recursive: true });
+  const bundle = await ensureArchiveRuntimeBundle(outputDir);
+  if (JSON.stringify(descriptor.archiveBundle) !== JSON.stringify(bundle)) {
+    throw new Error('Gallery descriptor and staged archive runtime bundle do not match.');
+  }
+  const bundleAssets = path.join(outputDir, ...bundle.assetBase.split('/'));
   const [coreSource, adapterSource] = await Promise.all([
-    readFile(path.join(portalAssets, 'gallery-core.js'), 'utf8'),
-    readFile(path.join(reporterAssets, 'gallery-archive.js'), 'utf8'),
-  ]);
-  await Promise.all([
-    copyFile(path.join(portalAssets, 'gallery-core.js'), path.join(assetsDir, 'gallery-core.js')),
-    copyFile(path.join(portalAssets, 'gallery.css'), path.join(assetsDir, 'gallery.css')),
-    copyFile(path.join(reporterAssets, 'gallery-archive.js'), path.join(assetsDir, 'gallery-archive.js')),
-    copyFile(path.join(reporterAssets, 'gallery-archive.css'), path.join(assetsDir, 'gallery-archive.css')),
-    copyFile(path.join(reporterAssets, 'gallery-loader.js'), path.join(assetsDir, 'gallery-loader.js')),
+    readFile(path.join(bundleAssets, 'gallery-core.js'), 'utf8'),
+    readFile(path.join(bundleAssets, 'gallery-archive.js'), 'utf8'),
   ]);
   const surfacePagePath = path.join(galleryRoot, `.surface-${descriptor.exportRevision}-${randomUUID()}.html`);
   await writeFile(

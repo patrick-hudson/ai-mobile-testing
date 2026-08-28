@@ -1,30 +1,57 @@
 import { expect, interactionEvidence, interactionTest, staticEvidence, staticTest } from '../fixtures/test.js';
+import { parseAuditProjectMetadata } from '../audit/environments.js';
+import { REPRESENTATIVE_RUNTIME_ROUTES, REVIEWED_HOME_PRIMARY_ACTIONS } from '../audit/routes.js';
 import { CRISIS_ACTIONS, CRISIS_MEETING_FALLBACK } from './crisis-contract.js';
 import { loggedGet } from './helpers.js';
 
-interactionTest('[HOME-001] homepage exposes clear starting paths instead of a decorative shell', interactionEvidence('Activate a primary homepage starting path and show its intended guide destination loading successfully.', 'all-projects'), async ({ page, audit }) => {
+interactionTest('[HOME-001] homepage exposes clear starting paths instead of a decorative shell', interactionEvidence('Activate a primary homepage starting path and show its intended guide destination loading successfully.', 'all-projects'), async ({ page, audit }, testInfo) => {
   await audit.goto('/');
-  await expect(page.locator('h1')).toContainText(/7-OH/i);
-  await expect(page.locator('main')).toContainText(/withdrawal|quit|recovery/i);
+  const project = parseAuditProjectMetadata(testInfo.project.metadata);
+  const siteContract = project.mode === 'comparative'
+    ? project.environment
+    : project.deploymentRole === 'preview' ? 'candidate' : 'production';
+  const contract = REVIEWED_HOME_PRIMARY_ACTIONS[siteContract];
+  await expect(page.locator('main h1')).toHaveText(siteContract === 'candidate'
+    ? 'Help quitting 7-OH'
+    : 'A calm reference for getting off 7-OH and kratom synthetics.');
 
-  const startingPaths = await page.locator('main a[href^="/"]').evaluateAll((anchors) => anchors.map((node) => ({
-    href: (node as HTMLAnchorElement).getAttribute('href') ?? '',
-    label: (node.textContent ?? '').replace(/\s+/g, ' ').trim(),
-  })).filter(({ label }) => /withdrawal|quit|medication|meeting|support|guide|calculator/i.test(label)));
-
-  expect(startingPaths.length, 'The homepage should offer multiple concrete recovery paths').toBeGreaterThanOrEqual(2);
-  expect(startingPaths.some(({ href }) => /start-here|resources|medications|other-tools/.test(href))).toBe(true);
-  const chosen = startingPaths.find(({ href }) => href.startsWith('/') && /start-here|resources|medications|other-tools/.test(href));
-  expect(chosen, 'At least one visible starting path must be an internal guide destination').toBeTruthy();
-  if (chosen) {
-    await audit.step('Activate a primary starting path', 'The chosen homepage action loads its intended guide page.', async () => {
-      await page.locator(`main a[href="${chosen.href}"]`).first().click();
-      await expect(page).toHaveURL(new RegExp(`${chosen.href.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/?$`));
-      await expect(page.locator('main h1')).toBeVisible();
+  const renderedActions = [];
+  for (const action of contract) {
+    const link = page.getByRole('link', { name: action.label, exact: true });
+    await expect(link, `${siteContract} must expose the reviewed primary action ${action.label}`).toBeVisible();
+    await expect(link).toHaveAttribute('href', action.path);
+    renderedActions.push({
+      path: await link.getAttribute('href'),
+      label: (await link.innerText()).replace(/\s+/g, ' ').trim(),
     });
   }
-  audit.observe('Actionable starting paths', startingPaths.length, 'At least 2');
-  await audit.attachJson('homepage-starting-paths', startingPaths);
+  await audit.attachJson('homepage-primary-action-contract', {
+    mode: project.mode,
+    ...(project.mode === 'comparative'
+      ? { environment: project.environment }
+      : { deploymentRole: project.deploymentRole }),
+    contract: siteContract,
+    reviewedActions: contract,
+    renderedActions,
+  });
+
+  for (const action of contract) {
+    await audit.step(`Activate ${action.label}`, `The reviewed ${siteContract} action loads ${action.path} with its exact destination identity.`, async () => {
+      const link = page.getByRole('link', { name: action.label, exact: true });
+      await link.click();
+      await expect(page).toHaveURL(new RegExp(`${action.path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/?$`));
+      await expect(page.locator('main h1:visible')).toHaveText(action.expectedH1);
+      // Let destination islands finish importing before replacing the
+      // document; otherwise mobile Chromium can leave aborted module requests
+      // in the runtime ledger and obscure the actual navigation assertion.
+      await page.waitForTimeout(1_000);
+      await page.goBack({ waitUntil: 'load' });
+      await expect(page).toHaveURL(/\/$/);
+      await expect(page.getByRole('link', { name: action.label, exact: true })).toBeVisible();
+      await page.waitForTimeout(500);
+    });
+  }
+  audit.observe('Reviewed primary actions', renderedActions.length, String(contract.length));
   await audit.assertRuntimeHealthy();
 });
 
@@ -64,11 +91,23 @@ staticTest('[CRISIS-002] withdrawal fast path exposes exact urgent-help destinat
   await audit.assertRuntimeHealthy();
 });
 
-staticTest('[REL-001] primary page has no browser or first-party loading failures', staticEvidence('Capture the loaded primary page with its browser, request, response, and rendered-health evidence.', 'all-projects'), async ({ audit }) => {
-  await audit.goto('/');
-  const inspection = await audit.inspectPage();
-  audit.observe('Document height', inspection.documentHeight);
-  audit.observe('Broken images', inspection.brokenImages.length, '0');
-  await audit.checkpoint('runtime-healthy-primary-page');
-  await audit.assertRuntimeHealthy();
+staticTest('[REL-001] representative reader journeys have no browser or first-party loading failures', staticEvidence('Capture the final reviewed route after every representative shell, guide, calculator, and meeting route produces clean browser and network evidence.', 'all-projects'), async ({ page, audit }) => {
+  const runtimeLedger = [];
+
+  for (const candidatePath of REPRESENTATIVE_RUNTIME_ROUTES) {
+    const mappedPath = audit.environmentPath(candidatePath);
+    expect(mappedPath, `${candidatePath} must retain an environment mapping for the runtime matrix`).not.toBeNull();
+    await audit.goto(candidatePath);
+    await expect(page.locator('main'), `${candidatePath} must retain rendered primary content`).toBeVisible();
+    await expect(page.locator('main h1:visible'), `${candidatePath} must retain one visible page identity`).toHaveCount(1);
+    const inspection = await audit.inspectPage();
+    expect(inspection.brokenImages, `${candidatePath} must not contain a failed image request`).toEqual([]);
+    await audit.assertRuntimeHealthy();
+    runtimeLedger.push({ candidatePath, mappedPath, inspection });
+  }
+
+  expect(runtimeLedger.map(({ candidatePath }) => candidatePath), 'Every reviewed runtime surface must execute').toEqual([...REPRESENTATIVE_RUNTIME_ROUTES]);
+  audit.observe('Reviewed runtime routes', runtimeLedger.length, String(REPRESENTATIVE_RUNTIME_ROUTES.length));
+  await audit.attachJson('representative-runtime-health-ledger', runtimeLedger);
+  await audit.checkpoint('runtime-healthy-representative-matrix');
 });

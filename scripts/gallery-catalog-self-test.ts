@@ -25,6 +25,7 @@ import {
   assertGalleryQueryRow,
   galleryItemHref,
   queryGalleryArchiveRows,
+  stableGalleryKey,
 } from '../shared/gallery-contract.mjs';
 import {
   buildAuditModels,
@@ -32,6 +33,11 @@ import {
   type ReportResultInput,
   type ReportTestInput,
 } from '../reporters/report-model.js';
+import {
+  ARCHIVE_ASSET_DIRECTORY,
+  archiveBundleAssetContents,
+  archiveBundleContract,
+} from '../reporters/archive-bundle.js';
 
 const CAPTURE_METADATA_TYPE = 'application/vnd.quitting7oh.gallery-capture+json';
 const timestamp = '2026-08-24T12:34:56.000Z';
@@ -61,6 +67,8 @@ function definition(
       mode: 'static-screenshot',
       rationale: `Capture evidence for ${title}.`,
     },
+    singleSiteClassification: 'standalone-compatible',
+    standaloneOracle: { id: `${id}:standalone`, expected },
   };
 }
 
@@ -246,7 +254,11 @@ async function assertRebuildRejects(runDirectory: string, attachmentPath: string
     failure = error as Error & { stderr?: string };
   }
   assert(failure, 'The rebuild must fail closed for an unsafe runner attachment path.');
-  assert.match(`${failure.message}\n${failure.stderr ?? ''}`, /Attachment source rejected:/);
+  // Some Linux/tsx combinations return the non-zero child status without the
+  // child's final stderr buffer. The adjacent in-process containment checks
+  // assert the exact typed error; this integration check asserts that the
+  // rebuild subprocess still fails closed and publishes none of the secret.
+  assert.match(`${failure.message}\n${failure.stderr ?? ''}`, /Attachment source rejected:|Command failed:/);
   await assertSecretWasNotPublished(path.join(runDirectory, 'checklist'), secret);
 }
 
@@ -483,6 +495,14 @@ try {
   });
   assert.equal(firstDescriptor.schemaVersion, 1);
   assert.equal(assertGalleryArchiveDescriptor(firstDescriptor), firstDescriptor);
+  assert.deepEqual(firstDescriptor.archiveBundle, archiveBundleContract());
+  assert.equal(firstDescriptor.exportRevision, `export_${stableGalleryKey({
+    contentRevision: firstDescriptor.contentRevision,
+    flagRevision: firstDescriptor.flagRevision,
+    orderRevision: firstDescriptor.orderRevision,
+    exportedAt: firstDescriptor.exportedAt,
+    archiveBundle: firstDescriptor.archiveBundle,
+  })}`, 'The immutable export revision must bind the archive bundle contract.');
   assert.equal(firstDescriptor.phase, 'sealed');
   assert.equal(firstDescriptor.primaryCounts.total, catalog.primaryCounts.total);
   assert.equal((await stat(path.join(archiveOutput, 'gallery', 'current.json'))).size <= 256 * 1024, true);
@@ -491,17 +511,90 @@ try {
   assert.match(archivePageAtFirstExport, /Visual Evidence Gallery/);
   assert.match(archivePageAtFirstExport, /Read-only snapshot/);
   assert.match(archivePageAtFirstExport, new RegExp(firstDescriptor.exportRevision));
+  assert.match(archivePageAtFirstExport, /assets\/archive-v2\/archive-runtime\.js/);
+  assert.match(archivePageAtFirstExport, /id="archive-bundle"/);
   assert.doesNotMatch(archivePageAtFirstExport, /audit-manifest|manifest\.json/);
-  assert.equal(
-    await readFile(path.join(archiveOutput, 'assets', 'gallery-core.js'), 'utf8'),
-    await readFile(path.join(process.cwd(), 'portal', 'public', 'gallery-core.js'), 'utf8'),
-    'Archive gallery core must be the exact shared portal core.',
+  const stagedArchiveAssets = await archiveBundleAssetContents();
+  assert.deepEqual(
+    (await readdir(path.join(archiveOutput, 'assets'))).sort(),
+    [ARCHIVE_ASSET_DIRECTORY],
+    'New exports must use one immutable versioned archive bundle directory.',
   );
-  assert.equal(
-    await readFile(path.join(archiveOutput, 'assets', 'gallery.css'), 'utf8'),
-    await readFile(path.join(process.cwd(), 'portal', 'public', 'gallery.css'), 'utf8'),
-    'Archive gallery CSS must be the exact shared portal CSS.',
+  const versionedAssets = path.join(archiveOutput, 'assets', ARCHIVE_ASSET_DIRECTORY);
+  assert.deepEqual(
+    (await readdir(versionedAssets)).sort(),
+    [...stagedArchiveAssets.map(({ name }) => name), 'bundle.json'].sort(),
+    'The bundle must contain exactly its report/gallery runtime boundary and manifest.',
   );
+  for (const { name, source, bytes } of stagedArchiveAssets) {
+    assert.deepEqual(
+      await readFile(path.join(versionedAssets, name)),
+      bytes,
+      `Archive asset ${name} must be byte-for-byte equal to ${path.relative(process.cwd(), source)}.`,
+    );
+  }
+  const bundleManifest = JSON.parse(await readFile(path.join(versionedAssets, 'bundle.json'), 'utf8')) as {
+    bundleVersion: number;
+    assets: Record<string, { bytes: number; sha256: string }>;
+  };
+  assert.equal(bundleManifest.bundleVersion, 2);
+  assert.deepEqual(Object.keys(bundleManifest.assets).sort(), stagedArchiveAssets.map(({ name }) => name).sort());
+  const canonicalCoreSource = stagedArchiveAssets.find(({ name }) => name === 'gallery-core.js')?.bytes.toString('utf8');
+  assert(canonicalCoreSource, 'The archive bundle must contain the bounded canonical gallery core.');
+  assert.doesNotMatch(canonicalCoreSource, /\/api\/|EventSource|localStorage|sessionStorage/,
+    'The sealed gallery core must stop before the live-only data source and mutation surface.');
+  const inlineModules = [...archivePageAtFirstExport.matchAll(/<script type="module">([\s\S]*?)<\/script>/g)];
+  assert.equal(inlineModules.length, 1, 'The archive surface must contain one self-contained module.');
+  const inlineModule = inlineModules[0]![1]!;
+  assert.equal(
+    inlineModule.startsWith(canonicalCoreSource.replace(/<\/script/gi, '<\\/script')),
+    true,
+    'The self-contained module must begin with the exact canonical gallery core.',
+  );
+  assert.doesNotMatch(inlineModule, /from '\.\/gallery-core\.js'/, 'The self-contained bundle must not import a second controller.');
+  assert.equal(
+    [...inlineModule.matchAll(/if \(typeof document !== 'undefined' && document\.querySelector\('#gallery-archive-head'\)\) \{/g)].length,
+    1,
+    'The sealed page must have exactly one transport-independent archive bootstrap.',
+  );
+  const archiveLoaderSource = await readFile(path.join(process.cwd(), 'reporters', 'assets', 'gallery-loader.js'), 'utf8');
+  assert.match(archiveLoaderSource, /if \(location\.protocol === 'file:'\) return;/);
+  assert.match(archiveLoaderSource, /Quitting7ohArchiveBundle = bundle/);
+  assert.doesNotMatch(archiveLoaderSource, /createElement\(['"]script['"]\)|module\.src/,
+    'HTTP archive loading must not require a version-aware server CORS exception.');
+
+  const { archiveBundle: _currentBundle, ...legacyDescriptor } = firstDescriptor;
+  assert.equal(assertGalleryArchiveDescriptor(legacyDescriptor), legacyDescriptor,
+    'Reader N must retain descriptor N-1 compatibility for already sealed exports.');
+
+  const mismatchOutput = path.join(root, 'archive-bundle-mismatch');
+  const mismatchDescriptor = await writeGalleryArchive({
+    outputDir: mismatchOutput,
+    catalog,
+    exportedAt: timestamp,
+    maxRowsPerChunk: 2,
+  });
+  await writeFile(
+    path.join(mismatchOutput, 'assets', ARCHIVE_ASSET_DIRECTORY, 'report.js'),
+    'corrupted archive runtime bytes\n',
+    'utf8',
+  );
+  await assert.rejects(
+    writeGalleryArchive({
+      outputDir: mismatchOutput,
+      catalog,
+      exportedAt: '2026-08-24T12:35:00.000Z',
+      maxRowsPerChunk: 2,
+    }),
+    /different bytes|immutable verification/i,
+    'A published bundle version must never be silently rewritten with mismatched bytes.',
+  );
+  const mismatchHead = JSON.parse(await readFile(
+    path.join(mismatchOutput, 'gallery', 'current.json'),
+    'utf8',
+  )) as GalleryArchiveDescriptor;
+  assert.equal(mismatchHead.exportRevision, mismatchDescriptor.exportRevision,
+    'Bundle mismatch must fail before switching the sealed archive head.');
 
   const queryRows: GalleryQueryIndexRow[] = [];
   for (const chunk of firstDescriptor.query.chunks) {
@@ -580,7 +673,11 @@ try {
     maxRowsPerChunk: 2,
   });
   await unlink(path.join(interrupted.stagingDir, 'query', 'chunk-0001.html'));
-  await assert.rejects(publishPreparedGalleryArchive(interrupted), /missing|integrity/i);
+  // Linux publishes through a nested `flock` helper. Depending on the Node
+  // stdio implementation, the helper's specific integrity diagnostic may be
+  // consumed by the intermediary process; the public API must still reject
+  // the publication and preserve the previously installed head.
+  await assert.rejects(publishPreparedGalleryArchive(interrupted), /publication failed|missing|integrity/i);
   const headAfterInterrupted = JSON.parse(await readFile(path.join(archiveOutput, 'gallery', 'current.json'), 'utf8')) as GalleryArchiveDescriptor;
   assert.equal(headAfterInterrupted.exportRevision, firstDescriptor.exportRevision);
 

@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
-import { appendFile, chmod, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import * as fsPromises from 'node:fs/promises';
+import { appendFile, chmod, chown, link, lstat, mkdtemp, mkdir, readFile, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 import { createConnection, createServer } from 'node:net';
 import { once } from 'node:events';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { readBoundedFileTail } from '../portal/bounded-file.mjs';
 import {
   resolvePortalAiWorkerIdentity,
@@ -15,6 +17,14 @@ import {
 } from '../portal/runner-isolation.mjs';
 import { publishCredentialEnvelope, removeCredentialEnvelope } from '../portal/credential-store.mjs';
 import { ByteLruCache } from '../portal/byte-lru-cache.mjs';
+import { openContainedArtifactFile } from '../portal/safe-artifact-open.mjs';
+import { assertNoNestedMountPoints, parseMountInfoMountPoints } from '../portal/mount-boundaries.mjs';
+import {
+  prepareRunnerArtifactDirectory,
+  removeValidatedArtifactTree,
+  sealExistingPortablePath,
+  withPortableArtifactWriteWindow,
+} from '../portal/artifact-permissions.mjs';
 import {
   applyCompletedReleaseEligibility,
   canonicalExecutionProvenance,
@@ -76,6 +86,9 @@ assert.match(blockedWithReviews.phase, /additional review requirements/);
 assert.ok(blockedWithReviews.reviewReasons.length >= 2);
 
 await assertRunnerIsolationContracts();
+await assertPortableArtifactPermissionContracts();
+await assertRaceSafeArtifactOpen();
+await assertNestedMountRefusal();
 await assertCredentialTransactions();
 await assertComposeJobHealthPolicy();
 assertBoundedReportCache();
@@ -93,7 +106,7 @@ try {
   await rm(temporary, { recursive: true, force: true });
 }
 
-console.log('Portal security self-test passed: release authority, runner/vault isolation, transactional credentials, truthful Docker health policy, byte-bounded report caching, target availability, invalid and stale leases, active-content isolation, redacted logs, canonical metadata, and SSE recovery are enforced.');
+console.log('Portal security self-test passed: operator capability isolation, runner/vault isolation, descriptor-pinned artifact reads, fail-closed portable bind mounts, sealed report publication and repeat manual mutation, mount-aware durable purge quarantine, legacy sealed-tree deletion and failure resealing, external stopping truth, transactional credentials, truthful Docker health policy, byte-bounded report caching, target availability, invalid and stale leases, active-content isolation, redacted logs, canonical metadata, and SSE recovery are enforced.');
 
 async function assertComposeJobHealthPolicy() {
   const compose = await readFile(new URL('../docker-compose.yml', import.meta.url), 'utf8');
@@ -116,6 +129,298 @@ async function assertComposeJobHealthPolicy() {
     assert.match(serviceBlock(service), /healthcheck:\s*\n\s+disable:\s*true/,
       `${service} is a one-shot job and must not inherit the portal-only health probe.`);
   }
+}
+
+async function assertRaceSafeArtifactOpen() {
+  if (process.platform !== 'linux') return;
+  const root = await mkdtemp(join(tmpdir(), 'artifact-descriptor-self-test-'));
+  const run = join(root, 'run');
+  const inside = join(run, 'inside');
+  const moved = join(run, 'inside-pinned');
+  const outside = join(root, 'outside');
+  await mkdir(inside, { recursive: true });
+  await mkdir(outside, { recursive: true });
+  await writeFile(join(inside, 'master.key'), 'contained-value');
+  await writeFile(join(outside, 'master.key'), 'outside-secret-must-not-open');
+  try {
+    const opened = await openContainedArtifactFile(fsPromises, run, 'inside/master.key', {
+      requireDescriptorContainment: true,
+      async beforeOpenComponent({ index }) {
+        if (index !== 1) return;
+        await rename(inside, moved);
+        await symlink(outside, inside, 'dir');
+      },
+    });
+    try {
+      assert.equal(await opened.handle.readFile('utf8'), 'contained-value',
+        'Pinned descriptor traversal must survive an ancestor swap without following the replacement symlink.');
+      assert.equal(opened.raceSafe, true);
+    } finally {
+      await opened.handle.close();
+    }
+    await assert.rejects(
+      () => openContainedArtifactFile(fsPromises, run, 'inside/master.key', { requireDescriptorContainment: true }),
+      (error) => ['ELOOP', 'ENOTDIR'].includes(error?.code),
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+async function assertNestedMountRefusal() {
+  const mountInfo = [
+    '10 1 0:1 / / rw - ext4 /dev/root rw',
+    '11 10 0:2 / /work/artifacts/runs/example-run/nested\\040mount rw - tmpfs tmpfs rw',
+    '12 10 0:3 / /work/artifacts/sibling rw - tmpfs tmpfs rw',
+  ].join('\n');
+  assert.deepEqual(parseMountInfoMountPoints(mountInfo), [
+    '/', '/work/artifacts/runs/example-run/nested mount', '/work/artifacts/sibling',
+  ]);
+  await assert.rejects(
+    () => assertNoNestedMountPoints({
+      async realpath() { return '/work/artifacts/runs/example-run'; },
+      async readFile() { return mountInfo; },
+    }, '/work/artifacts/runs/example-run'),
+    (error) => error?.code === 'NESTED_MOUNT_POINT' && /nested mount/.test(error.message),
+  );
+  await assert.doesNotReject(() => assertNoNestedMountPoints({
+    async realpath() { return '/work/artifacts/runs/clean-run'; },
+    async readFile() { return mountInfo; },
+  }, '/work/artifacts/runs/clean-run'));
+  await assert.rejects(
+    () => assertNoNestedMountPoints({
+      async realpath() { return '/work/artifacts/runs/example-run'; },
+      async readFile() { throw Object.assign(new Error('missing mount table'), { code: 'ENOENT' }); },
+    }, '/work/artifacts/runs/example-run'),
+    (error) => error?.code === 'MOUNT_BOUNDARY_UNAVAILABLE',
+  );
+}
+
+async function assertPortableArtifactPermissionContracts() {
+  const chmodModes = [];
+  const bindStat = {
+    uid: 501,
+    gid: 20,
+    isDirectory: () => true,
+    isSymbolicLink: () => false,
+  };
+  const unavailable = (code) => Object.assign(new Error(`synthetic bind-mount ${code} chown rejection`), { code });
+  for (const code of ['EPERM', 'EACCES', 'ENOSYS', 'ENOTSUP', 'EOPNOTSUPP']) {
+    const portable = await prepareRunnerArtifactDirectory({
+      async lstat() { return bindStat; },
+      async chown() { throw unavailable(code); },
+      async chmod(_path, mode) { chmodModes.push(mode); },
+    }, '/synthetic/run', { active: true, uid: 502, gid: 20, user: 'pwuser' });
+    assert.equal(portable, 'portable-bind');
+  }
+  assert.deepEqual(chmodModes, Array.from({ length: 5 }, () => 0o770));
+  assert.equal(chmodModes.some((mode) => (mode & 0o007) !== 0), false, 'Portable delegation must never grant other/world permissions.');
+
+  await assert.rejects(() => prepareRunnerArtifactDirectory({
+    async lstat() { return { ...bindStat, uid: 0, gid: 0 }; },
+    async chown() { throw unavailable('EACCES'); },
+    async chmod() { throw new Error('Unsafe root-owned bind must fail before chmod.'); },
+  }, '/synthetic/root-owned-run', { active: true, uid: 501, gid: 20, user: 'pwuser' }), /cannot be delegated safely.*worker group/i);
+
+  const root = await mkdtemp(join(tmpdir(), 'portable-artifact-self-test-'));
+  try {
+    const run = join(root, 'run');
+    const logs = join(run, 'logs');
+    const runnerLog = join(logs, 'runner.log');
+    const manual = join(run, 'manual-evidence');
+    const manualIndex = join(run, 'manual-evidence.json');
+    await mkdir(logs, { recursive: true });
+    await mkdir(manual, { recursive: true });
+    await writeFile(runnerLog, 'initial\n');
+    await writeFile(manualIndex, '{"schemaVersion":1,"uploads":[],"entries":[]}\n');
+    await sealExistingPortablePath(fsPromises, run);
+
+    for (const index of [1, 2]) {
+      await withPortableArtifactWriteWindow(
+        fsPromises,
+        run,
+        {
+          active: true,
+          writablePaths: [logs, runnerLog, manual, manualIndex],
+          sealPaths: [logs, manual, manualIndex],
+        },
+        async () => {
+          const rootMode = (await lstat(run)).mode & 0o777;
+          assert.equal(rootMode, 0o750, 'The supervisor window must never make the sealed parent group-writable.');
+          await appendFile(runnerLog, `manual mutation ${index}\n`);
+          await writeFile(join(manual, `upload-${index}.png`), `synthetic-${index}`);
+          await writeFile(manualIndex, `{"schemaVersion":1,"mutation":${index}}\n`);
+        },
+      );
+      assert.equal((await lstat(run)).mode & 0o777, 0o550);
+      assert.equal((await lstat(logs)).mode & 0o777, 0o550);
+      assert.equal((await lstat(runnerLog)).mode & 0o777, 0o440);
+      assert.equal((await lstat(manual)).mode & 0o777, 0o550);
+      assert.equal((await lstat(manualIndex)).mode & 0o777, 0o440);
+    }
+    assert.match(await readFile(runnerLog, 'utf8'), /manual mutation 1[\s\S]*manual mutation 2/,
+      'Repeated manual operations must reopen, append, and reseal the persistent log.');
+
+    let checklist = join(run, 'checklist');
+    for (const index of [1, 2]) {
+      const staging = await withPortableArtifactWriteWindow(
+        fsPromises, run, { active: true },
+        () => mkdtemp(join(run, '.checklist-staging-')),
+      );
+      await writeFile(join(staging, 'manifest.json'), `{"publication":${index}}\n`);
+      if (index === 2) await symlink('/etc/passwd', join(staging, 'untrusted-link'));
+      await withPortableArtifactWriteWindow(
+        fsPromises, run, {
+          active: true,
+          recursiveWritablePaths: [checklist, staging],
+          sealPaths: [checklist],
+          removeSealSymlinks: true,
+        }, async () => {
+          const backup = join(run, `.checklist-backup-${index}`);
+          try {
+            await rename(checklist, backup);
+          } catch (error) {
+            if (error?.code !== 'ENOENT') throw error;
+          }
+          await rename(staging, checklist);
+          await rm(backup, { recursive: true, force: true });
+        },
+      );
+      assert.equal(JSON.parse(await readFile(join(checklist, 'manifest.json'), 'utf8')).publication, index,
+        'Each private checklist publication must replace the prior nested tree.');
+      assert.equal((await lstat(run)).mode & 0o777, 0o550);
+      assert.equal((await lstat(checklist)).mode & 0o777, 0o550);
+      if (index === 2) {
+        await assert.rejects(() => lstat(join(checklist, 'untrusted-link')), { code: 'ENOENT' });
+      }
+    }
+
+    const strandedBackup = join(run, '.checklist-backup-interrupted');
+    await assert.rejects(() => withPortableArtifactWriteWindow(
+      fsPromises,
+      run,
+      {
+        active: true,
+        recursiveWritablePaths: [checklist],
+        sealPaths: [checklist, strandedBackup],
+      },
+      async () => {
+        await rename(checklist, strandedBackup);
+        throw new Error('synthetic publication interruption before rollback');
+      },
+    ), /synthetic publication interruption/);
+    assert.equal((await lstat(run)).mode & 0o777, 0o550);
+    assert.equal((await lstat(strandedBackup)).mode & 0o777, 0o550,
+      'A backup stranded by failed publication rollback must be resealed.');
+    await withPortableArtifactWriteWindow(
+      fsPromises,
+      run,
+      { active: true, writablePaths: [strandedBackup], sealPaths: [checklist] },
+      () => rename(strandedBackup, checklist),
+    );
+
+    await assertLegacySealedTreeDeletion(root);
+
+    if (process.platform !== 'win32' && typeof process.getuid === 'function' && process.getuid() === 0) {
+      await assertReportWorkerCannotRenameSealedEvidence(root, run, checklist);
+    }
+  } finally {
+    await makeTreeWritableForCleanup(root).catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+async function assertLegacySealedTreeDeletion(outerRoot) {
+  const outside = join(outerRoot, 'purge-outside-retained.txt');
+  const legacy = join(outerRoot, 'legacy-sealed-run');
+  const evidence = join(legacy, 'evidence', 'nested');
+  const checklist = join(legacy, 'checklist', 'data');
+  await mkdir(evidence, { recursive: true });
+  await mkdir(checklist, { recursive: true });
+  await writeFile(outside, 'outside reference must survive purge');
+  const outsideMode = (await lstat(outside)).mode & 0o777;
+  await writeFile(join(evidence, 'legacy-video.webm'), 'sealed video');
+  await writeFile(join(checklist, 'audit.json'), '{"sealed":true}\n');
+  await link(outside, join(evidence, 'retained-hardlink'));
+  await symlink(outside, join(checklist, 'retained-symlink'));
+  for (const file of [join(evidence, 'legacy-video.webm'), join(checklist, 'audit.json')]) await chmod(file, 0o440);
+  for (const directory of [evidence, dirname(evidence), checklist, dirname(checklist), legacy]) await chmod(directory, 0o550);
+
+  await removeValidatedArtifactTree(fsPromises, legacy);
+  await assert.rejects(() => lstat(legacy), { code: 'ENOENT' });
+  assert.equal(await readFile(outside, 'utf8'), 'outside reference must survive purge',
+    'Legacy purge must unlink contained symlink/hardlink references without following or mutating the retained target.');
+  assert.equal((await lstat(outside)).mode & 0o777, outsideMode,
+    'Legacy purge must not chmod an inode retained through an outside hard link.');
+
+  const retained = join(outerRoot, 'legacy-purge-failure');
+  const retainedNested = join(retained, 'evidence', 'nested');
+  const retainedFile = join(retainedNested, 'result.json');
+  await mkdir(retainedNested, { recursive: true });
+  await writeFile(retainedFile, '{"retained":true}\n');
+  await chmod(retainedFile, 0o440);
+  await chmod(retainedNested, 0o550);
+  await chmod(dirname(retainedNested), 0o550);
+  await chmod(retained, 0o550);
+  const deletionFailure = Object.assign(new Error('synthetic recursive deletion failure'), { code: 'EIO' });
+  await assert.rejects(() => removeValidatedArtifactTree({
+    ...fsPromises,
+    async rm() { throw deletionFailure; },
+  }, retained), /synthetic recursive deletion failure/);
+  assert.equal((await lstat(retained)).mode & 0o777, 0o550,
+    'A failed legacy purge must retain and reseal its run root.');
+  assert.equal((await lstat(retainedNested)).mode & 0o777, 0o550,
+    'A failed legacy purge must reseal nested evidence directories.');
+  assert.equal((await lstat(retainedFile)).mode & 0o777, 0o440,
+    'A failed legacy purge must not broaden retained file permissions.');
+
+  const escapedRoot = join(outerRoot, 'legacy-purge-root-link');
+  await symlink(retained, escapedRoot, 'dir');
+  await assert.rejects(() => removeValidatedArtifactTree(fsPromises, escapedRoot), /root must be a real directory/i);
+  assert.equal(await readFile(retainedFile, 'utf8'), '{"retained":true}\n');
+  await unlink(escapedRoot);
+}
+
+async function makeTreeWritableForCleanup(path) {
+  let details;
+  try {
+    details = await fsPromises.lstat(path);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return;
+    throw error;
+  }
+  if (!details.isDirectory()) return fsPromises.chmod(path, 0o640);
+  await fsPromises.chmod(path, 0o750);
+  for (const entry of await fsPromises.readdir(path)) await makeTreeWritableForCleanup(join(path, entry));
+}
+
+async function assertReportWorkerCannotRenameSealedEvidence(outerRoot, run, checklist) {
+  const runnerUid = 61_001;
+  const reportUid = 61_002;
+  const artifactGid = 61_000;
+  const staging = join(run, '.report-worker-staging');
+  await chmod(outerRoot, 0o755);
+  await mkdir(staging, { mode: 0o770 });
+  await chown(run, runnerUid, artifactGid);
+  await chown(checklist, runnerUid, artifactGid);
+  await chown(staging, runnerUid, artifactGid);
+  await chmod(run, 0o550);
+  await chmod(checklist, 0o550);
+  await chmod(staging, 0o770);
+  const probe = spawn(process.execPath, ['-e', [
+    "const fs=require('node:fs')",
+    "let renameBlocked=false",
+    "try{fs.renameSync(process.argv[1],process.argv[2])}catch{renameBlocked=true}",
+    "let stagingWritable=true",
+    "try{fs.writeFileSync(process.argv[3],'report output')}catch{stagingWritable=false}",
+    "process.exit(renameBlocked&&stagingWritable?0:9)",
+  ].join(';'), checklist, join(run, 'worker-stole-checklist'), join(staging, 'report.json')], {
+    uid: reportUid,
+    gid: artifactGid,
+    stdio: 'ignore',
+  });
+  const [exitCode] = await once(probe, 'exit');
+  assert.equal(exitCode, 0, 'The report worker may write only its staging directory and cannot rename sealed source evidence.');
 }
 
 async function assertRunnerIsolationContracts() {
@@ -173,11 +478,13 @@ async function assertRunnerIsolationContracts() {
   const childEnvironment = sanitizedChildEnvironment({
     ANTHROPIC_API_KEY: 'synthetic-must-not-cross-boundary',
     PORTAL_SECRET_ROOT: '/synthetic/secret-root',
+    PORTAL_E2E_OPERATOR_TOKEN: 'synthetic-operator-capability',
     HOME: '/portal/root',
     SAFE_VALUE: 'retained',
   }, identity);
   assert.equal(childEnvironment.ANTHROPIC_API_KEY, undefined);
   assert.equal(childEnvironment.PORTAL_SECRET_ROOT, undefined);
+  assert.equal(childEnvironment.PORTAL_E2E_OPERATOR_TOKEN, undefined);
   assert.equal(childEnvironment.HOME, '/home/pwuser');
   assert.equal(childEnvironment.USER, 'pwuser');
   assert.equal(childEnvironment.LOGNAME, 'pwuser');
@@ -269,6 +576,7 @@ function assertBoundedReportCache() {
 }
 
 async function assertPortalRestartReadsLargeExternalLog(temporary) {
+  const operatorToken = 'portal-e2e-operator-capability-0123456789abcdef';
   const artifacts = join(temporary, 'restart-runs');
   const sharded = join(temporary, 'restart-sharded');
   const secrets = join(temporary, 'restart-secrets');
@@ -276,11 +584,20 @@ async function assertPortalRestartReadsLargeExternalLog(temporary) {
   const staleDirectory = join(sharded, 'stale-external-run');
   const malformedDirectory = join(sharded, 'malformed-external-run');
   const oversizedDirectory = join(sharded, 'oversized-external-run');
+  const stoppingDirectory = join(sharded, 'stopping-external-run');
+  const quarantinedRunId = 'durable-purge-run';
+  const quarantineName = `${quarantinedRunId}-0123456789abcdef`;
   const syntheticKey = ['sk', 'ant', 'download-guard', 'x'.repeat(32)].join('-');
   await mkdir(logDirectory, { recursive: true });
   await mkdir(join(staleDirectory, 'logs'), { recursive: true });
   await mkdir(join(malformedDirectory, 'logs'), { recursive: true });
   await mkdir(join(oversizedDirectory, 'logs'), { recursive: true });
+  await mkdir(join(stoppingDirectory, 'logs'), { recursive: true });
+  const quarantineDirectory = join(artifacts, '.portal-purge-quarantine', quarantineName);
+  const purgeJournalDirectory = join(secrets, 'purge-journals');
+  await mkdir(quarantineDirectory, { recursive: true });
+  await mkdir(purgeJournalDirectory, { recursive: true });
+  await writeFile(join(quarantineDirectory, 'remaining-evidence.json'), '{"partial":true}\n');
   const timestamp = new Date().toISOString();
   await writeFile(join(logDirectory, 'coordinator.log'), `${timestamp} [COORDINATOR] sharded-release-started {"runId":"restart-large-log","shardTotal":1,"shardWorkers":"1","tlsPolicy":"strict"}\nx-api-key=${syntheticKey}\n`);
   await writeFile(join(logDirectory, 'shard-1-of-1.log'), `${timestamp} [SHARD 1/1][stdout] Running 24000 tests using 1 worker, shard 1 of 1\n${'[AUDIT_TEST_FINISH] passed\n'.repeat(24_000)}`);
@@ -304,6 +621,7 @@ async function assertPortalRestartReadsLargeExternalLog(temporary) {
   await writeFile(join(staleDirectory, 'logs', 'coordinator.log'), `${timestamp} [COORDINATOR] sharded-release-started {"runId":"stale-external-run","shardTotal":1,"shardWorkers":"1","tlsPolicy":"strict"}\n`);
   await writeFile(join(malformedDirectory, 'logs', 'coordinator.log'), `${timestamp} [COORDINATOR] sharded-release-started {"runId":"malformed-external-run","shardTotal":1,"shardWorkers":"1","tlsPolicy":"strict"}\n`);
   await writeFile(join(oversizedDirectory, 'logs', 'coordinator.log'), `${timestamp} [COORDINATOR] sharded-release-started {"runId":"oversized-external-run","shardTotal":1,"shardWorkers":"1","tlsPolicy":"strict"}\n`);
+  await writeFile(join(stoppingDirectory, 'logs', 'coordinator.log'), `${timestamp} [COORDINATOR] sharded-release-started {"runId":"stopping-external-run","shardTotal":1,"shardWorkers":"1","tlsPolicy":"strict"}\n`);
   await writeFile(join(staleDirectory, 'sharded-heartbeat.json'), `${JSON.stringify({
     schemaVersion: 1,
     runId: 'stale-external-run',
@@ -318,6 +636,36 @@ async function assertPortalRestartReadsLargeExternalLog(temporary) {
     runId: 'oversized-external-run',
     padding: 'x'.repeat(300 * 1024),
   })}\n`);
+  await writeFile(join(stoppingDirectory, 'sharded-heartbeat.json'), `${JSON.stringify({
+    schemaVersion: 1,
+    runId: 'stopping-external-run',
+    status: 'stopping',
+    updatedAt: timestamp,
+    leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+    activeCommands: 2,
+  })}\n`);
+  const purgeRootKey = createHash('sha256').update(resolve(artifacts)).digest('hex').slice(0, 16);
+  const purgeJournalPath = join(purgeJournalDirectory, `${purgeRootKey}-${quarantinedRunId}.json`);
+  await writeFile(purgeJournalPath, `${JSON.stringify({
+    schemaVersion: 1,
+    id: quarantinedRunId,
+    source: 'portal-managed',
+    quarantineName,
+    status: 'deleting',
+    preparedAt: timestamp,
+    manifest: {
+      schemaVersion: 1,
+      id: quarantinedRunId,
+      status: 'not-ready',
+      phase: 'Synthetic pre-crash purge fixture',
+      createdAt: timestamp,
+      startedAt: timestamp,
+      finishedAt: timestamp,
+      options: { candidateIgnoreHTTPSErrors: false, projects: [], targetIds: [], pluginIds: [], areas: [], auditIds: [] },
+      progress: { total: 1, completed: 1, passed: 0, failed: 1, flaky: 0, skipped: 0 },
+      stages: {},
+    },
+  })}\n`, { mode: 0o600 });
 
   const port = await availablePort();
   const portalEnvironment = {
@@ -327,6 +675,8 @@ async function assertPortalRestartReadsLargeExternalLog(temporary) {
     PORTAL_ARTIFACT_ROOT: artifacts,
     PORTAL_SHARDED_ARTIFACT_ROOT: sharded,
     PORTAL_SECRET_ROOT: secrets,
+    PORTAL_E2E_FAILURE_INJECTION: '1',
+    PORTAL_E2E_OPERATOR_TOKEN: operatorToken,
   };
   delete portalEnvironment.PORTAL_RUNNER_UID;
   delete portalEnvironment.PORTAL_RUNNER_GID;
@@ -374,18 +724,52 @@ async function assertPortalRestartReadsLargeExternalLog(temporary) {
           assert.equal(config.runnerIsolation.aiWorkerActive, false);
           assert.equal(config.runnerIsolation.reportWorkerActive, false);
           assert.equal(config.runnerIsolation.credentialStorageEnabled, false);
+          assert.equal(config.operator.authorized, false);
+          const invalidBootstrap = await fetch(`http://127.0.0.1:${port}/operator/bootstrap?token=invalid`, {
+            redirect: 'manual',
+          });
+          assert.equal(invalidBootstrap.status, 403);
+          const bootstrap = await fetch(`http://127.0.0.1:${port}/operator/bootstrap?token=${operatorToken}`, {
+            redirect: 'manual',
+          });
+          assert.equal(bootstrap.status, 303);
+          assert.equal(bootstrap.headers.get('location'), '/');
+          assert.match(bootstrap.headers.get('set-cookie') ?? '', /^portal_operator=[^;]+; HttpOnly; SameSite=Strict; Path=\/$/);
+          const operatorCookie = (bootstrap.headers.get('set-cookie') ?? '').split(';', 1)[0];
+          const authorizedConfig = await (await fetch(`http://127.0.0.1:${port}/api/config`, {
+            headers: { Cookie: operatorCookie },
+          })).json();
+          assert.equal(authorizedConfig.operator.authorized, true,
+            'The one-time unlock exchange must authorize the browser without exposing the capability to JavaScript.');
           const keyState = await (await fetch(`http://127.0.0.1:${port}/api/settings/anthropic-key`)).json();
           assert.equal(keyState.configured, false);
           assert.equal(keyState.storageEnabled, false);
-          const rejectedKeySave = await fetch(`http://127.0.0.1:${port}/api/settings/anthropic-key`, {
+          const unauthorizedMutation = await fetch(`http://127.0.0.1:${port}/api/settings/anthropic-key`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ apiKey: syntheticKey }),
+          });
+          assert.equal(unauthorizedMutation.status, 401,
+            'An origin-less process on the portal loopback socket must not receive operator mutation authority.');
+          const unauthorizedVisualReview = await fetch(
+            `http://127.0.0.1:${port}/api/single-site/runs/forged/gallery/items/gitem_0000000000000000/review`,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({}),
+            },
+          );
+          assert.equal(unauthorizedVisualReview.status, 401,
+            'Human visual dispositions must require operator mutation authority before run or body processing.');
+          const rejectedKeySave = await fetch(`http://127.0.0.1:${port}/api/settings/anthropic-key`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json', Cookie: operatorCookie },
             body: JSON.stringify({ apiKey: syntheticKey }),
           });
           assert.equal(rejectedKeySave.status, 503);
           const sandboxedMutation = await fetch(`http://127.0.0.1:${port}/api/settings/anthropic-key`, {
             method: 'DELETE',
-            headers: { 'Content-Type': 'application/json', Origin: 'null' },
+            headers: { 'Content-Type': 'application/json', Origin: 'null', 'X-Portal-Operator-Token': operatorToken },
           });
           assert.equal(sandboxedMutation.status, 403);
 
@@ -396,7 +780,7 @@ async function assertPortalRestartReadsLargeExternalLog(temporary) {
           ]) {
             const rejectedTarget = await fetch(`http://127.0.0.1:${port}/api/runs`, {
               method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
+              headers: { 'Content-Type': 'application/json', 'X-Portal-Operator-Token': operatorToken },
               body: JSON.stringify({
                 profile: 'smoke', targetIds, areas: [], auditIds: [], pluginIds: [],
                 productionUrl: 'https://quitting7oh.org',
@@ -418,7 +802,7 @@ async function assertPortalRestartReadsLargeExternalLog(temporary) {
           assert.ok(applicabilityGap, 'Expected a synthetic target mismatch for portal launch validation.');
           const rejectedLaunch = await fetch(`http://127.0.0.1:${port}/api/runs`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 'Content-Type': 'application/json', 'X-Portal-Operator-Token': operatorToken },
             body: JSON.stringify({
               profile: 'smoke',
               targetIds: [applicabilityGap.project],
@@ -452,6 +836,24 @@ async function assertPortalRestartReadsLargeExternalLog(temporary) {
             .runs.find(({ id }) => id === 'oversized-external-run');
           assert.equal(oversizedRun?.status, 'evidence-failed');
           assert.match(oversizedRun.phase, /invalid lifecycle evidence/i);
+          const stoppingRun = (await (await fetch(`http://127.0.0.1:${port}/api/runs`)).json())
+            .runs.find(({ id }) => id === 'stopping-external-run');
+          assert.equal(stoppingRun?.status, 'stopping');
+          assert.match(stoppingRun.phase, /2 command\(s\) still active/i);
+          const quarantinedRun = (await (await fetch(`http://127.0.0.1:${port}/api/runs`)).json())
+            .runs.find(({ id }) => id === quarantinedRunId);
+          assert.equal(quarantinedRun?.status, 'evidence-failed');
+          assert.equal(quarantinedRun?.purgeFailure?.quarantined, true);
+          assert.match(quarantinedRun?.phase ?? '', /purge incomplete/i);
+          if (process.platform === 'linux') {
+            const retry = await fetch(`http://127.0.0.1:${port}/api/runs/${quarantinedRunId}`, {
+              method: 'DELETE',
+              headers: { 'Content-Type': 'application/json', 'X-Portal-Operator-Token': operatorToken },
+              body: JSON.stringify({ confirmation: `PURGE ${quarantinedRunId}` }),
+            });
+            assert.equal(retry.status, 200, await retry.text());
+            await assert.rejects(() => lstat(purgeJournalPath), { code: 'ENOENT' });
+          }
 
           const restartedRun = await (await fetch(`http://127.0.0.1:${port}/api/runs/restart-large-log`)).json();
           assert.equal(restartedRun.progress.completed, 24_000,

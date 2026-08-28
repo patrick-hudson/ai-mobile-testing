@@ -19,8 +19,20 @@ x-audit-base: &audit-base
     CANDIDATE_IGNORE_HTTPS_ERRORS: ${CANDIDATE_IGNORE_HTTPS_ERRORS:-0}
 
 services:
+  single-site-volume-init:
+    <<: *audit-base
+    command: ["bash", "docker/init-single-site-volumes.sh"]
+    healthcheck:
+      disable: true
+    restart: "no"
+    volumes:
+      - single-site-jobs:/var/lib/ai-mobile-testing/jobs
+
   portal:
     <<: *audit-base
+    depends_on:
+      single-site-volume-init:
+        condition: service_completed_successfully
     ports:
       - "127.0.0.1:${PORTAL_PORT:-4173}:4173"
     environment:
@@ -35,6 +47,10 @@ services:
       - PORTAL_EXTERNAL_RUN_SYNC_MS=${PORTAL_EXTERNAL_RUN_SYNC_MS:-1000}
       - PORTAL_LOOPBACK_PUBLISHED=1
       - PORTAL_SECRET_ROOT=/var/lib/ai-mobile-testing/secrets
+      - PORTAL_SINGLE_SITE_QUEUE_ROOT=/var/lib/ai-mobile-testing/jobs
+      - PORTAL_SINGLE_SITE_FINALIZATION_ROOT=/var/lib/ai-mobile-testing/finalizations
+      - PORTAL_VISUAL_BASELINE_ROOT=/var/lib/ai-mobile-testing/baselines
+      - AUDIT_PREVIEW_TLS_BYPASS_ALLOWLIST=${AUDIT_PREVIEW_TLS_BYPASS_ALLOWLIST:-}
       - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-claude-sonnet-5}
       - AI_REVIEW_DRY_RUN
     stop_grace_period: 15s
@@ -42,6 +58,74 @@ services:
       - ./artifacts:/work/artifacts
       - ./certs:/work/certs:ro
       - portal-secrets:/var/lib/ai-mobile-testing/secrets
+      - single-site-jobs:/var/lib/ai-mobile-testing/jobs
+      - single-site-finalizations:/var/lib/ai-mobile-testing/finalizations
+      - single-site-baselines:/var/lib/ai-mobile-testing/baselines
+
+  single-site-worker:
+    <<: *audit-base
+    user: pwuser
+    healthcheck:
+      disable: true
+    command: ["npm", "run", "single-site:worker-pool:container"]
+    restart: unless-stopped
+    stop_grace_period: 30s
+    depends_on:
+      single-site-volume-init:
+        condition: service_completed_successfully
+    environment:
+      AUDIT_JOB_QUEUE_ROOT: /var/lib/ai-mobile-testing/jobs
+      AUDIT_QUEUE_POLL_MS: ${AUDIT_QUEUE_POLL_MS:-1000}
+      AUDIT_WORKERS: ${AUDIT_WORKERS:-3}
+      AUDIT_VERBOSE: ${AUDIT_VERBOSE:-1}
+      AUDIT_PREVIEW_TLS_BYPASS_ALLOWLIST: ${AUDIT_PREVIEW_TLS_BYPASS_ALLOWLIST:-}
+      AUDIT_MSEDGE_AVAILABLE: ${INSTALL_MSEDGE:-0}
+    volumes:
+      - ./certs:/work/certs:ro
+      - single-site-jobs:/var/lib/ai-mobile-testing/jobs
+
+  single-site-finalizer:
+    <<: *audit-base
+    healthcheck:
+      disable: true
+    command: ["npm", "run", "single-site:finalizer-pool:container"]
+    restart: unless-stopped
+    stop_grace_period: 30s
+    depends_on:
+      single-site-volume-init:
+        condition: service_completed_successfully
+    environment:
+      AUDIT_JOB_QUEUE_ROOT: /var/lib/ai-mobile-testing/jobs
+      AUDIT_FINALIZATION_OUTPUT_ROOT: /var/lib/ai-mobile-testing/finalizations
+      AUDIT_VISUAL_BASELINE_ROOT: /var/lib/ai-mobile-testing/baselines
+      AUDIT_QUEUE_POLL_MS: ${AUDIT_QUEUE_POLL_MS:-1000}
+      AUDIT_VERBOSE: ${AUDIT_VERBOSE:-1}
+    volumes:
+      - single-site-jobs:/var/lib/ai-mobile-testing/jobs
+      - single-site-finalizations:/var/lib/ai-mobile-testing/finalizations
+      - single-site-baselines:/var/lib/ai-mobile-testing/baselines
+
+  single-site-lease-load-proof:
+    <<: *audit-base
+    build:
+      context: .
+      target: lease-load-proof
+      args:
+        PLAYWRIGHT_VERSION: ${PLAYWRIGHT_VERSION:-1.62.1}
+        INSTALL_MSEDGE: ${INSTALL_MSEDGE:-0}
+    image: quitting7oh-release-audit-lease-load-proof:${AUDIT_IMAGE_TAG:-local}
+    profiles: [lease-proof]
+    user: pwuser
+    healthcheck:
+      disable: true
+    command: ["npm", "run", "single-site-lease-load:container"]
+    restart: "no"
+    cpus: "2.0"
+    mem_limit: 4g
+    environment:
+      AUDIT_JOB_QUEUE_ROOT: /work/artifacts/self-tests/lease-load-queue
+    volumes:
+      - ./artifacts:/work/artifacts
 
   portal-e2e:
     <<: *audit-base
@@ -60,6 +144,10 @@ services:
       CANDIDATE_IGNORE_HTTPS_ERRORS: "0"
       PORTAL_E2E_OUTPUT_DIR: /work/artifacts/portal-e2e
       PORTAL_E2E_CANONICAL_PROFILE: "1"
+      PORTAL_E2E_GREP: ${PORTAL_E2E_GREP:-}
+      PORTAL_E2E_UPDATE_SNAPSHOTS: ${PORTAL_E2E_UPDATE_SNAPSHOTS:-0}
+      PORTAL_E2E_CANONICAL_SCALE: ${PORTAL_E2E_CANONICAL_SCALE:-0}
+      PORTAL_E2E_RESTORE_ARTIFACT_OWNER: "1"
 
   audit-smoke:
     <<: *audit-base
@@ -169,3 +257,6 @@ services:
 
 volumes:
   portal-secrets:
+  single-site-jobs:
+  single-site-finalizations:
+  single-site-baselines:

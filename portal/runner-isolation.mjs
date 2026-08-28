@@ -140,6 +140,7 @@ export function sanitizedChildEnvironment(environment = process.env, runnerIdent
   const sanitized = { ...environment };
   delete sanitized.ANTHROPIC_API_KEY;
   delete sanitized.PORTAL_SECRET_ROOT;
+  delete sanitized.PORTAL_E2E_OPERATOR_TOKEN;
   if (runnerIdentity?.active) {
     sanitized.HOME = runnerIdentity.home;
     sanitized.USER = runnerIdentity.user;

@@ -7,6 +7,11 @@ export type AuditTargetFidelity = 'desktop-browser' | 'device-emulation';
 export type AuditTargetCapability = 'msedge';
 export const AUDIT_TARGET_REGISTRY_SCHEMA_VERSION = 1 as const;
 export const GENERATED_AUDIT_TARGET_REGISTRY_PATH = 'audit/targets.generated.json';
+export const AUDIT_SNAPSHOT_PATH_TEMPLATE = '{testFileDir}/__screenshots__/{arg}-{projectName}{ext}' as const;
+
+export function auditSnapshotFileName(argument: string, projectName: string, extension = '.png'): string {
+  return `${argument}-${projectName}${extension}`;
+}
 
 export interface AuditTargetDefinition {
   id: string;
@@ -24,6 +29,10 @@ export interface AuditTargetDefinition {
   requiredCapability?: AuditTargetCapability;
   userAgentSource?: 'browser-native';
   qualification: string;
+}
+
+export interface SingleSiteAuditTargetDefinition extends Omit<AuditTargetDefinition, 'environment'> {
+  sourceComparativeTargetId: string;
 }
 
 export interface ProviderTargetDefinition {
@@ -56,6 +65,8 @@ export interface AuditTargetRegistryDocument {
   schemaVersion: typeof AUDIT_TARGET_REGISTRY_SCHEMA_VERSION;
   defaultTargetIds: readonly string[];
   localTargets: readonly AuditTargetDefinition[];
+  singleSiteFullProfileTargetIds: readonly string[];
+  singleSiteTargets: readonly SingleSiteAuditTargetDefinition[];
   providerTargets: readonly ProviderTargetDefinition[];
 }
 
@@ -290,6 +301,40 @@ export const LOCAL_AUDIT_TARGETS = [
   },
 ] as const satisfies readonly AuditTargetDefinition[];
 
+const SINGLE_SITE_SOURCE_TARGET_IDS = [
+  'candidate-mobile-chromium',
+  'candidate-desktop-chromium',
+  'candidate-mobile-webkit',
+  'candidate-tablet-webkit',
+  'candidate-desktop-firefox',
+  'candidate-mobile-webkit-iphone-17-ios18',
+  'candidate-mobile-webkit-iphone-15-ios17',
+  'candidate-mobile-chromium-pixel-10-android16',
+  'candidate-mobile-chromium-pixel-8-android14',
+  'candidate-mobile-chromium-galaxy-s24-android14',
+  'candidate-desktop-chromium-edge-compat',
+  'candidate-desktop-chromium-msedge',
+] as const;
+
+function singleSiteTargetFrom(sourceId: (typeof SINGLE_SITE_SOURCE_TARGET_IDS)[number]): SingleSiteAuditTargetDefinition {
+  const source = LOCAL_AUDIT_TARGETS.find(({ id }) => id === sourceId);
+  if (!source) throw new Error(`Single-site target source ${sourceId} is missing.`);
+  const { environment: _environment, ...portable } = source;
+  return {
+    ...portable,
+    id: `single-site-${source.id.slice('candidate-'.length)}`,
+    label: portable.label.replace(/^Candidate · /, 'Single site · '),
+    sourceComparativeTargetId: source.id,
+  };
+}
+
+export const SINGLE_SITE_LOCAL_AUDIT_TARGETS = SINGLE_SITE_SOURCE_TARGET_IDS
+  .map(singleSiteTargetFrom) as readonly SingleSiteAuditTargetDefinition[];
+
+export const SINGLE_SITE_FULL_PROFILE_TARGET_IDS = SINGLE_SITE_LOCAL_AUDIT_TARGETS
+  .filter(({ defaultEnabled }) => defaultEnabled)
+  .map(({ id }) => id);
+
 /**
  * Provider-ready capability metadata only. These rows are deliberately not
  * accepted by AUDIT_TARGET_IDS until a provider adapter supplies sessions,
@@ -396,9 +441,14 @@ export function detectAuditTargetCapabilities(
 export function validateAuditTargetCatalog(
   localTargets: readonly AuditTargetDefinition[] = LOCAL_AUDIT_TARGETS,
   providerTargets: readonly ProviderTargetDefinition[] = PROVIDER_TARGET_CATALOG,
+  singleSiteTargets: readonly SingleSiteAuditTargetDefinition[] = SINGLE_SITE_LOCAL_AUDIT_TARGETS,
 ): void {
   const issues: string[] = [];
-  const allIds = [...localTargets.map(({ id }) => id), ...providerTargets.map(({ id }) => id)];
+  const allIds = [
+    ...localTargets.map(({ id }) => id),
+    ...singleSiteTargets.map(({ id }) => id),
+    ...providerTargets.map(({ id }) => id),
+  ];
   for (const duplicate of duplicateValues(allIds)) issues.push(`Duplicate target ID: ${duplicate}.`);
 
   for (const target of localTargets) {
@@ -427,6 +477,51 @@ export function validateAuditTargetCatalog(
   const configuredDefaults = localTargets.filter(({ defaultEnabled }) => defaultEnabled).map(({ id }) => id);
   if (!sameOrderedValues(configuredDefaults, DEFAULT_AUDIT_TARGET_IDS)) {
     issues.push(`Default target order must remain exactly: ${DEFAULT_AUDIT_TARGET_IDS.join(', ')}.`);
+  }
+
+  const comparativeById = new Map(localTargets.map((target) => [target.id, target]));
+  for (const target of singleSiteTargets) {
+    if (!target.id.startsWith('single-site-')) issues.push(`${target.id} must use the neutral single-site prefix.`);
+    const source = comparativeById.get(target.sourceComparativeTargetId);
+    if (!source || source.environment !== 'candidate') {
+      issues.push(`${target.id} must reference an existing candidate target template.`);
+      continue;
+    }
+    const comparable = {
+      browserLabel: target.browserLabel,
+      deviceClass: target.deviceClass,
+      engine: target.engine,
+      browserProduct: target.browserProduct,
+      deviceDescriptor: target.deviceDescriptor,
+      fidelity: target.fidelity,
+      defaultEnabled: target.defaultEnabled,
+      fullSweep: target.fullSweep,
+      visual: target.visual,
+      requiredCapability: target.requiredCapability,
+      userAgentSource: target.userAgentSource,
+      qualification: target.qualification,
+    };
+    const sourceComparable = {
+      browserLabel: source.browserLabel,
+      deviceClass: source.deviceClass,
+      engine: source.engine,
+      browserProduct: source.browserProduct,
+      deviceDescriptor: source.deviceDescriptor,
+      fidelity: source.fidelity,
+      defaultEnabled: source.defaultEnabled,
+      fullSweep: source.fullSweep,
+      visual: source.visual,
+      requiredCapability: source.requiredCapability,
+      userAgentSource: source.userAgentSource,
+      qualification: source.qualification,
+    };
+    if (JSON.stringify(comparable) !== JSON.stringify(sourceComparable)) {
+      issues.push(`${target.id} drifted from its comparative browser/device template.`);
+    }
+  }
+  const configuredSingleSiteDefaults = singleSiteTargets.filter(({ defaultEnabled }) => defaultEnabled).map(({ id }) => id);
+  if (!sameOrderedValues(configuredSingleSiteDefaults, SINGLE_SITE_FULL_PROFILE_TARGET_IDS)) {
+    issues.push(`Single-site full profile order must remain exactly: ${SINGLE_SITE_FULL_PROFILE_TARGET_IDS.join(', ')}.`);
   }
 
   for (const target of providerTargets) {
@@ -482,11 +577,35 @@ export function resolveAuditTargetSelection(
   return selected;
 }
 
+export function resolveSingleSiteTargetSelection(
+  rawTargetIds: string | undefined,
+  capabilities: AuditTargetCapabilities = detectAuditTargetCapabilities(),
+): SingleSiteAuditTargetDefinition[] {
+  validateAuditTargetCatalog();
+  const requestedIds = rawTargetIds === undefined || rawTargetIds.trim() === ''
+    ? [...SINGLE_SITE_FULL_PROFILE_TARGET_IDS]
+    : rawTargetIds.split(',').map((value) => value.trim()).filter(Boolean);
+  if (requestedIds.length === 0) throw new Error('Single-site target selection must contain at least one target.');
+  const duplicates = duplicateValues(requestedIds);
+  if (duplicates.length > 0) throw new Error(`Single-site target selection contains duplicates: ${duplicates.join(', ')}.`);
+  const byId = new Map(SINGLE_SITE_LOCAL_AUDIT_TARGETS.map((target) => [target.id, target]));
+  return requestedIds.map((id) => {
+    const target = byId.get(id);
+    if (!target) throw new Error(`Unknown Single-site target "${id}".`);
+    if (target.requiredCapability && !capabilities[target.requiredCapability].available) {
+      throw new Error(`${id} is unavailable: ${capabilities[target.requiredCapability].reason}`);
+    }
+    return target;
+  });
+}
+
 export function auditTargetRegistryDocument(): AuditTargetRegistryDocument {
   return {
     schemaVersion: AUDIT_TARGET_REGISTRY_SCHEMA_VERSION,
     defaultTargetIds: DEFAULT_AUDIT_TARGET_IDS,
     localTargets: LOCAL_AUDIT_TARGETS,
+    singleSiteFullProfileTargetIds: SINGLE_SITE_FULL_PROFILE_TARGET_IDS,
+    singleSiteTargets: SINGLE_SITE_LOCAL_AUDIT_TARGETS,
     providerTargets: PROVIDER_TARGET_CATALOG,
   };
 }

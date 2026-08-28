@@ -1,0 +1,2 @@
+.console-index-table td:first-child { min-width: 12rem; }
+.console-index-table td:last-child { white-space: nowrap; }

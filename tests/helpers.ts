@@ -1,9 +1,39 @@
 import type { APIRequestContext, APIResponse, Page, TestInfo } from '@playwright/test';
-import { projectMetadata } from '../audit/environments.js';
+import { parseAuditProjectMetadata, projectMetadata } from '../audit/environments.js';
+import type { AuditProjectMetadata, DeploymentRole } from '../audit/types.js';
 import type { AuditRun } from '../fixtures/test.js';
 
 export function meta(testInfo: TestInfo) {
   return projectMetadata(testInfo.project.metadata);
+}
+
+export function auditMeta(testInfo: TestInfo): AuditProjectMetadata {
+  return parseAuditProjectMetadata(testInfo.project.metadata);
+}
+
+/** True when the case should validate the reviewed current-site contract. */
+export function usesReviewedSiteContract(testInfo: TestInfo): boolean {
+  const metadata = auditMeta(testInfo);
+  return metadata.mode === 'single-site' || metadata.environment === 'candidate';
+}
+
+export function auditDeploymentRole(testInfo: TestInfo): DeploymentRole {
+  const metadata = auditMeta(testInfo);
+  if (metadata.mode === 'single-site') return metadata.deploymentRole;
+  return metadata.environment === 'candidate' ? 'preview' : 'production';
+}
+
+export function auditTargetTemplateId(testInfo: TestInfo): string {
+  const metadata = auditMeta(testInfo);
+  return metadata.mode === 'single-site' ? metadata.sourceComparativeTargetId : testInfo.project.name;
+}
+
+export function matchesAuditTargetTemplate(testInfo: TestInfo, sourceComparativeTargetId: string): boolean {
+  return auditTargetTemplateId(testInfo) === sourceComparativeTargetId;
+}
+
+export function isChromiumAuditProject(testInfo: TestInfo): boolean {
+  return auditTargetTemplateId(testInfo).includes('chromium');
 }
 
 export function isCandidate(testInfo: TestInfo): boolean {
@@ -28,6 +58,108 @@ export async function waitForSettledUI(page: Page): Promise<void> {
 
 export async function pageHasHorizontalOverflow(page: Page): Promise<number> {
   return page.evaluate(() => Math.max(0, document.documentElement.scrollWidth - document.documentElement.clientWidth));
+}
+
+export interface SkipLinkEntryEvidence {
+  beforeScrollY: number;
+  afterScrollY: number;
+  hash: string;
+  targetMatchesFragment: boolean;
+  targetInViewport: boolean;
+  targetRect: { top: number; right: number; bottom: number; left: number; width: number; height: number };
+  focusWithinMain: boolean;
+  focusedInViewport: boolean;
+  focusedUnoccluded: boolean;
+  focusedUsesFocusVisible: boolean;
+  focusedRect: { top: number; right: number; bottom: number; left: number; width: number; height: number } | null;
+  focusedElement: { tag: string; id: string; label: string; href: string | null };
+}
+
+/**
+ * Activate an already-focused skip link and prove the browser's sequential-focus entry point.
+ * A fragment target is allowed to be non-focusable: HTML uses it as the starting point for
+ * the next Tab stop, which must land inside main rather than replaying repeated header controls.
+ */
+export async function activateSkipLinkAndEnterMain(
+  page: Page,
+  targetSelector = '#main-content',
+): Promise<SkipLinkEntryEvidence> {
+  const beforeScrollY = await page.evaluate(() => window.scrollY);
+  await page.keyboard.press('Enter');
+  await page.waitForFunction((selector) => {
+    const target = document.querySelector(selector);
+    return window.location.hash === selector && target?.matches(':target');
+  }, targetSelector);
+  await page.waitForFunction((selector) => {
+    const target = document.querySelector(selector);
+    if (!target) return false;
+    const rect = target.getBoundingClientRect();
+    return rect.bottom > 0 && rect.top < window.innerHeight && rect.right > 0 && rect.left < window.innerWidth;
+  }, targetSelector);
+
+  const targetState = await page.locator(targetSelector).evaluate((target) => {
+    const rect = target.getBoundingClientRect();
+    return {
+      hash: window.location.hash,
+      targetMatchesFragment: target.matches(':target'),
+      targetInViewport: rect.bottom > 0 && rect.top < window.innerHeight && rect.right > 0 && rect.left < window.innerWidth,
+      targetRect: {
+        top: rect.top,
+        right: rect.right,
+        bottom: rect.bottom,
+        left: rect.left,
+        width: rect.width,
+        height: rect.height,
+      },
+    };
+  });
+
+  await page.keyboard.press('Tab');
+  await page.waitForFunction((selector) => {
+    const target = document.querySelector(selector);
+    return Boolean(target && document.activeElement && target.contains(document.activeElement));
+  }, targetSelector);
+  const focusState = await page.locator(targetSelector).evaluate((target) => {
+    const focused = document.activeElement as HTMLElement | null;
+    const rect = focused?.getBoundingClientRect() ?? null;
+    const focusedInViewport = Boolean(rect
+      && rect.bottom > 0
+      && rect.top < window.innerHeight
+      && rect.right > 0
+      && rect.left < window.innerWidth);
+    const hitX = rect ? Math.min(window.innerWidth - 1, Math.max(0, rect.left + rect.width / 2)) : 0;
+    const hitY = rect ? Math.min(window.innerHeight - 1, Math.max(0, rect.top + rect.height / 2)) : 0;
+    const hit = rect && focusedInViewport ? document.elementFromPoint(hitX, hitY) : null;
+    return {
+      focusWithinMain: Boolean(focused && target.contains(focused)),
+      focusedInViewport,
+      focusedUnoccluded: Boolean(focused && hit && (focused.contains(hit) || hit.contains(focused))),
+      focusedUsesFocusVisible: Boolean(focused?.matches(':focus-visible')),
+      focusedRect: rect ? {
+        top: rect.top,
+        right: rect.right,
+        bottom: rect.bottom,
+        left: rect.left,
+        width: rect.width,
+        height: rect.height,
+      } : null,
+      focusedElement: {
+        tag: focused?.tagName.toLowerCase() ?? 'none',
+        id: focused?.id ?? '',
+        label: focused?.getAttribute('aria-label')
+          ?? focused?.textContent?.replace(/\s+/g, ' ').trim().slice(0, 160)
+          ?? '',
+        href: focused instanceof HTMLAnchorElement ? focused.href : null,
+      },
+    };
+  });
+
+  return {
+    beforeScrollY,
+    afterScrollY: await page.evaluate(() => window.scrollY),
+    ...targetState,
+    ...focusState,
+  };
 }
 
 export async function mapWithConcurrency<T, R>(

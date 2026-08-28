@@ -1,0 +1,58 @@
+#overview-console .console-workspace-body { grid-template-columns: minmax(0, 1fr); }
+#overview-console .console-separator,
+#overview-console .console-inspector { display: none; }
+#overview-console .console-main { padding-top: 0.75rem; }
+#overview-console .console-index-toolbar { margin-bottom: 0.65rem; padding-block: 0.55rem; }
+#overview-console .console-region-heading { padding-block: 0.6rem; }
+#overview-console .console-region-status { min-height: 1.1rem; padding-top: 0.4rem; }
+#overview-console .console-region-content { padding: 0.55rem 0.75rem 0.75rem; }
+
+.overview-layout {
+  display: grid;
+  grid-template-areas:
+    "risk trust"
+    "active latest"
+    "metrics metrics";
+  grid-template-columns: minmax(0, 1.75fr) minmax(20rem, 1fr);
+  gap: 0.7rem;
+}
+.overview-panel { min-width: 0; border-top: 3px solid var(--console-rule-strong); padding: 0.65rem 0.75rem; background: var(--console-surface-muted); overflow: hidden; }
+.overview-panel:first-child { border-top-color: var(--console-danger); }
+.overview-panel h2 { margin: 0 0 0.5rem; font-size: 0.9rem; }
+.overview-panel p { margin: 0.45rem 0; color: var(--console-muted); font-size: 0.84rem; }
+.overview-risk-list, .overview-run-list { display: grid; gap: 0; margin: 0; padding: 0; list-style: none; }
+.overview-risk-list { max-height: 10.75rem; overflow: auto; }
+.overview-risk-list li, .overview-run-list li { display: grid; gap: 0.1rem; padding: 0.4rem 0; border-bottom: 1px solid var(--console-rule); }
+.overview-risk-list a, .overview-run-list a, .overview-panel > a { color: var(--console-accent); font-weight: 750; }
+.overview-risk-list span, .overview-run-list span { color: var(--console-muted); font-size: 0.78rem; }
+.overview-trust-facts { max-height: 10.75rem; margin: 0; overflow: auto; }
+#overview-risk { grid-area: risk; min-height: 13.25rem; }
+#overview-trust { grid-area: trust; min-height: 13.25rem; }
+#overview-active-runs { grid-area: active; min-height: 11rem; }
+#overview-latest { grid-area: latest; min-height: 11rem; }
+#overview-metrics { grid-area: metrics; }
+.overview-active-table { width: 100%; min-width: 0; table-layout: fixed; font-size: 0.7rem; }
+.overview-active-table th, .overview-active-table td { padding: 0.32rem 0.28rem; vertical-align: top; overflow-wrap: anywhere; }
+.overview-active-table th:nth-child(1) { width: 13%; }
+.overview-active-table th:nth-child(2) { width: 7%; }
+.overview-active-table th:nth-child(3) { width: 9%; }
+.overview-active-table th:nth-child(4) { width: 13%; }
+.overview-active-table th:nth-child(5) { width: 9%; }
+.overview-active-table th:nth-child(6) { width: 8%; }
+.overview-active-table th:nth-child(7) { width: 9%; }
+.overview-active-table th:nth-child(8) { width: 10%; }
+.overview-active-table th:nth-child(9) { width: 8%; }
+.overview-active-table th:nth-child(10) { width: 14%; }
+.overview-run-actions > div { display: flex; flex-wrap: wrap; gap: 0.25rem; align-items: center; }
+.overview-run-actions a { font-weight: 750; }
+.overview-run-actions button { min-height: 2rem; border: 1px solid var(--console-rule); border-radius: 2px; padding: 0.25rem 0.4rem; background: var(--console-surface); color: var(--console-muted); }
+.overview-latest-facts { margin-bottom: 0.4rem; }
+.overview-wide { grid-column: 1 / -1; }
+.overview-panel details p { max-width: 45rem; }
+
+@media (max-width: 1050px) {
+  .overview-layout { grid-template-areas: "risk" "trust" "active" "latest" "metrics"; grid-template-columns: 1fr; }
+  .overview-wide { grid-column: auto; }
+  .overview-risk-list, .overview-trust-facts { max-height: none; }
+  .overview-active-table { min-width: 62rem; table-layout: auto; font-size: 0.76rem; }
+}

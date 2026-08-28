@@ -2,6 +2,7 @@ import { AxeBuilder } from '@axe-core/playwright';
 import type { Locator, Page } from '@playwright/test';
 import { REPRESENTATIVE_A11Y_ROUTES } from '../audit/routes.js';
 import { expect, interactionEvidence, interactionTest, staticEvidence, staticTest, test, type AuditRun } from '../fixtures/test.js';
+import { activateSkipLinkAndEnterMain } from './helpers.js';
 
 const WCAG_AA_TAGS = ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22a', 'wcag22aa'] as const;
 
@@ -55,7 +56,7 @@ function surfaceIncompleteResults(
 }
 
 for (const candidatePath of REPRESENTATIVE_A11Y_ROUTES) {
-  staticTest(`[A11Y-001] automated WCAG scan of ${candidatePath}`, staticEvidence(`Capture the rendered ${candidatePath} state with its automated WCAG violation and incomplete-result evidence.`, 'full-sweep-projects'), async ({ page, audit }) => {
+  staticTest(`[A11Y-001] automated WCAG scan of ${candidatePath}`, staticEvidence(`Capture the rendered ${candidatePath} state with its automated WCAG violation and incomplete-result evidence.`, 'full-sweep-projects', candidatePath), async ({ page, audit }) => {
     test.skip(audit.environmentPath(candidatePath) === null, 'No production-baseline equivalent exists.');
 
     await audit.goto(candidatePath);
@@ -146,27 +147,53 @@ interactionTest('[A11Y-002] keyboard-only critical journeys expose logical and v
 
   const skipLink = page.getByRole('link', { name: 'Skip to content' });
   const dialog = page.getByRole('dialog', { name: 'Search quitting7oh.org' });
-  await audit.step('Complete the keyboard-only skip and search journey', 'Focus enters main content, operates search, and returns to the search trigger after Escape.', async () => {
+  await audit.step('Complete the keyboard-only skip and search journey', 'Focus enters main content, selects the reviewed result, and Enter opens its exact destination.', async () => {
     await page.keyboard.press('Tab');
     await recordFocus('Tab from document start');
     await expect(skipLink).toBeVisible();
     await expect(skipLink).toBeFocused();
-    await page.keyboard.press('Enter');
-    await expect(page.locator('#main-content')).toBeFocused();
-    await recordFocus('Activate skip link');
+    const skipEntry = await activateSkipLinkAndEnterMain(page);
+    await audit.attachJson('skip-link-entry-evidence', skipEntry);
+    expect(skipEntry.hash).toBe('#main-content');
+    expect(skipEntry.targetMatchesFragment).toBe(true);
+    expect(skipEntry.targetInViewport).toBe(true);
+    expect(skipEntry.focusWithinMain).toBe(true);
+    expect(skipEntry.focusedInViewport).toBe(true);
+    expect(skipEntry.focusedUnoccluded).toBe(true);
+    expect(skipEntry.focusedUsesFocusVisible).toBe(true);
+    await recordFocus('Tab into main content after activating skip link');
 
     await page.keyboard.press('Control+K');
     await expect(dialog).toBeVisible();
     const input = dialog.getByRole('combobox', { name: 'Search all pages' });
     await expect(input).toBeFocused();
-    await page.keyboard.type('withdrawal sleep');
+    await page.keyboard.type('clonidine');
     await expect(dialog.getByRole('listbox', { name: 'Search results' })).toBeVisible();
-    await expect(dialog.getByRole('option').first()).toBeVisible();
-    await recordFocus('Open search and enter a useful query');
-    await page.keyboard.press('Escape');
-    await expect(dialog).toBeHidden();
-    await expect(page.getByLabel('Search the guide')).toBeFocused();
-    await recordFocus('Close search with Escape');
+    const helperResult = dialog.getByRole('option', { name: /helper medications.*clonidine/i }).first();
+    await expect(helperResult).toHaveAttribute('href', '/medications-supplements/helper-meds#clonidine');
+    const optionCount = await dialog.getByRole('option').count();
+    let activeId: string | null = null;
+    let activeHref: string | null = null;
+    for (let index = 0; index < optionCount; index += 1) {
+      await page.keyboard.press('ArrowDown');
+      activeId = await input.getAttribute('aria-activedescendant');
+      activeHref = activeId ? await page.locator(`[id="${activeId}"]`).getAttribute('href') : null;
+      if (activeHref === '/medications-supplements/helper-meds#clonidine') break;
+    }
+    expect(activeId, 'ArrowDown must identify an active search option').toBeTruthy();
+    expect(activeHref, 'Keyboard selection must reach the exact reviewed helper-medications result').toBe('/medications-supplements/helper-meds#clonidine');
+    const activeResult = page.locator(`[id="${activeId}"]`);
+    await expect(activeResult).toHaveAttribute('href', '/medications-supplements/helper-meds#clonidine');
+    await expect(activeResult).toHaveAttribute('aria-selected', 'true');
+    await recordFocus('Select the reviewed search result');
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: 'load' }),
+      page.keyboard.press('Enter'),
+    ]);
+    await expect(page).toHaveURL(/\/medications-supplements\/helper-meds\/?#clonidine$/);
+    await expect(page.locator('main h1:visible')).toHaveText('Helper Medications');
+    await expect(page.locator('#clonidine')).toBeVisible();
+    await recordFocus('Open the reviewed search destination');
   });
 
   await audit.step('Operate guide navigation by keyboard', 'The device-appropriate guide control opens or changes navigation state and Escape/Enter restores it.', async () => {
@@ -181,9 +208,13 @@ interactionTest('[A11Y-002] keyboard-only critical journeys expose logical and v
       const guide = page.getByRole('dialog', { name: 'Guide navigation' });
       await expect(guide).toBeVisible();
       expect(await guide.evaluate((element) => element.contains(document.activeElement))).toBe(true);
-      await page.keyboard.press('Escape');
-      await expect(guide).toBeHidden();
-      await expect(mobileOpener).toBeFocused();
+      const welcome = guide.locator('a[href="/start-here/welcome"]');
+      const linkBefore = await focusAppearance(welcome);
+      await tabUntilFocused(page, welcome);
+      await assertKeyboardFocusVisible(welcome, linkBefore);
+      await page.keyboard.press('Enter');
+      await expect(page).toHaveURL(/\/start-here\/welcome\/?$/);
+      await expect(page.locator('main h1:visible')).toHaveText('Welcome');
     } else {
       const collapse = page.getByRole('button', { name: 'Collapse guide navigation' });
       const before = await focusAppearance(collapse);
@@ -197,6 +228,14 @@ interactionTest('[A11Y-002] keyboard-only critical journeys expose logical and v
       await page.keyboard.press('Enter');
       await expect(collapse).toBeVisible();
       await expect(collapse).toBeFocused();
+      const navigation = page.getByRole('complementary', { name: 'Guide navigation' });
+      const welcome = navigation.locator('a[href="/start-here/welcome"]');
+      const linkBefore = await focusAppearance(welcome);
+      await tabUntilFocused(page, welcome);
+      await assertKeyboardFocusVisible(welcome, linkBefore);
+      await page.keyboard.press('Enter');
+      await expect(page).toHaveURL(/\/start-here\/welcome\/?$/);
+      await expect(page.locator('main h1:visible')).toHaveText('Welcome');
     }
     await recordFocus('Complete guide navigation response');
   });
@@ -248,24 +287,66 @@ interactionTest('[A11Y-002] keyboard-only critical journeys expose logical and v
   await audit.assertRuntimeHealthy();
 });
 
-staticTest('[A11Y-005] reduced-motion preference disables decorative animation without removing status text', staticEvidence('Capture the reduced-motion rendered state with computed animation values and equivalent status text.', 'candidate-chromium-projects'), async ({ page, audit }) => {
+staticTest('[A11Y-005] reduced-motion preference disables decorative animation without removing status text', staticEvidence('Capture the reduced-motion rendered state with a complete computed motion ledger and exact non-color meeting status semantics.', 'candidate-chromium-projects'), async ({ page, audit }) => {
   await page.emulateMedia({ reducedMotion: 'reduce' });
+  await page.clock.setFixedTime(new Date('2026-08-24T14:10:00Z'));
   await audit.goto('/');
-  const animatedElements = await page.locator('[class*="animate-"]').evaluateAll((nodes) => nodes.map((node) => {
-    const style = getComputedStyle(node);
-    return {
-      className: node.getAttribute('class'),
-      animationName: style.animationName,
-      animationDuration: style.animationDuration,
-      text: node.textContent?.trim() ?? '',
-    };
-  }));
-  const activeAnimations = animatedElements.filter(({ animationName }) => animationName !== 'none');
-  const meetingAction = page.getByRole('link', { name: /meeting/i }).first();
+  const supportPanel = page.locator('section[aria-labelledby="right-now-title"]');
+  const liveStatus = supportPanel.locator('[aria-live="polite"]').filter({ hasText: 'Live now · 7-OH / kratom' });
+  await expect(supportPanel.locator('xpath=ancestor::astro-island[1]'), 'The support panel must hydrate before computed motion is inspected').not.toHaveAttribute('ssr', '');
+  await expect(liveStatus, 'Meeting state must expose one exact polite live-status announcement').toHaveCount(1);
+  await expect(liveStatus, 'Meeting state must remain expressed in exact text rather than success color alone').toHaveText('Live now · 7-OH / kratom');
+  await expect(supportPanel.getByRole('link', { name: 'Join live', exact: true })).toBeVisible();
+  const motionLedger = await page.locator('body *').evaluateAll((nodes) => {
+    const ACTIVE_MOTION_THRESHOLD_SECONDS = 0.001;
+    const seconds = (value: string) => value.split(',').map((part) => {
+      const token = part.trim();
+      const amount = Number.parseFloat(token);
+      return Number.isFinite(amount) ? (token.endsWith('ms') ? amount / 1_000 : amount) : 0;
+    });
+    const repeated = <T>(values: T[], index: number, fallback: T) => values.length > 0 ? values[index % values.length]! : fallback;
+    return nodes.flatMap((node) => {
+      const element = node as HTMLElement;
+      const style = getComputedStyle(element);
+      const box = element.getBoundingClientRect();
+      if (style.display === 'none' || style.visibility === 'hidden' || box.width <= 0 || box.height <= 0) return [];
+      const animationNames = style.animationName.split(',').map((name) => name.trim());
+      const animationDurations = seconds(style.animationDuration);
+      const animationIterations = style.animationIterationCount.split(',').map((value) => value.trim());
+      const animationPlayStates = style.animationPlayState.split(',').map((value) => value.trim());
+      const animationActive = animationNames.some((name, index) => name !== 'none'
+        && repeated(animationDurations, index, 0) > ACTIVE_MOTION_THRESHOLD_SECONDS
+        && repeated(animationIterations, index, '1') !== '0'
+        && repeated(animationPlayStates, index, 'running') !== 'paused');
+      const motionProperties = style.transitionProperty.split(',').map((property) => property.trim());
+      const transitionDurations = seconds(style.transitionDuration);
+      const transitionActive = motionProperties.some((property, index) =>
+        /^(?:all|transform|translate|scale|rotate|opacity|top|right|bottom|left|width|height|max-width|max-height)$/i.test(property)
+        && repeated(transitionDurations, index, 0) > ACTIVE_MOTION_THRESHOLD_SECONDS);
+      if (!animationActive && !transitionActive) return [];
+      return [{
+        tag: element.tagName.toLowerCase(),
+        id: element.id || null,
+        className: element.getAttribute('class'),
+        text: element.textContent?.replace(/\s+/g, ' ').trim().slice(0, 120) ?? '',
+        animationName: style.animationName,
+        animationDuration: style.animationDuration,
+        animationIterationCount: style.animationIterationCount,
+        animationPlayState: style.animationPlayState,
+        transitionProperty: style.transitionProperty,
+        transitionDuration: style.transitionDuration,
+        animationActive,
+        transitionActive,
+      }];
+    });
+  });
+  const activeAnimations = motionLedger.filter(({ animationActive }) => animationActive);
+  const activeMotionTransitions = motionLedger.filter(({ transitionActive }) => transitionActive);
 
-  expect(activeAnimations, 'Decorative animation classes must honor prefers-reduced-motion').toEqual([]);
-  await expect(meetingAction).toContainText(/meeting/i);
-  audit.observe('Decorative animations still active', activeAnimations.length, '0');
-  await audit.attachJson('reduced-motion-evidence', { animatedElements, activeAnimations });
+  expect(activeAnimations, 'Every computed decorative animation must honor prefers-reduced-motion, regardless of class name').toEqual([]);
+  expect(activeMotionTransitions, 'Transform, opacity, position, and size transitions must be removed under prefers-reduced-motion').toEqual([]);
+  audit.observe('Computed animations still active', activeAnimations.length, '0');
+  audit.observe('Computed motion transitions still active', activeMotionTransitions.length, '0');
+  await audit.attachJson('reduced-motion-evidence', { motionLedger, activeAnimations, activeMotionTransitions, statusText: await liveStatus.innerText() });
   await audit.checkpoint('reduced-motion-homepage');
 });

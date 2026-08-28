@@ -1,0 +1,2 @@
+.console-index-table td:first-child { min-width: 15rem; }
+.console-index-table td:nth-child(2), .console-index-table td:nth-child(3) { font-weight: 750; }

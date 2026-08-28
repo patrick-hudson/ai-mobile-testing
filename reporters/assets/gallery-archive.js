@@ -453,6 +453,12 @@ function appendTextRow(list, copy) {
 export async function bootstrapArchiveGallery(documentObject = document, windowObject = window) {
   const headNode = documentObject.querySelector('#gallery-archive-head');
   const descriptor = requireDescriptor(JSON.parse(headNode?.textContent ?? 'null'));
+  const archiveRuntime = globalThis.Quitting7ohArchiveRuntime;
+  if (!archiveRuntime?.readEmbeddedContract) {
+    if (descriptor.archiveBundle) throw new TypeError('The pinned archive runtime bundle is unavailable.');
+  } else {
+    archiveRuntime.readEmbeddedContract(documentObject, descriptor.archiveBundle ?? null, descriptor.schemaVersion);
+  }
   const parsed = parseArchiveUrl(new URL(windowObject.location.href));
   const transport = createArchiveIframeTransport({
     descriptor,

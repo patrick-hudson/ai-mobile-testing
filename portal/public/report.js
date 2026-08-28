@@ -1,3 +1,5 @@
+import { createConsoleSplitter } from './console-shell.js';
+
 const PAGE_SIZE = 25;
 const LOG_PREVIEW_BYTES = 64 * 1024;
 const REPORT_RETRY_MS = 5_000;
@@ -5,6 +7,7 @@ const TERMINAL_STATUSES = new Set(['passed', 'not-ready', 'review-required', 'fa
 const STATUS_ORDER = ['FAIL', 'BLOCKED', 'FLAKY', 'REVIEW', 'MANUAL_REQUIRED', 'NOT_RUN', 'INTENDED_CHANGE', 'PASS'];
 
 const state = {
+  mode: 'comparative',
   runId: null,
   run: null,
   report: null,
@@ -13,11 +16,15 @@ const state = {
   auditsController: null,
   detailController: null,
   logController: null,
+  aiController: null,
+  aiRetryTimer: null,
+  aiAdvisory: null,
   retryTimer: null,
   auditOffset: 0,
   auditRequest: 0,
   activeAuditId: null,
   queryTimer: null,
+  splitter: null,
 };
 
 const elements = Object.fromEntries([
@@ -28,22 +35,64 @@ const elements = Object.fromEntries([
   'status-total', 'status-bars', 'severity-bars', 'finding-total', 'top-findings', 'audit-result-count', 'audit-filters',
   'filter-query', 'filter-status', 'filter-severity', 'filter-area', 'filter-environment', 'filter-blocking', 'filter-manual',
   'clear-filters', 'audit-loading', 'audit-error', 'audit-list', 'audit-previous', 'audit-next', 'audit-page-label',
-  'manual-summary', 'ai-summary', 'ai-review-link', 'artifact-count', 'report-links', 'load-log', 'log-state',
-  'report-log', 'log-links', 'report-announcer',
+  'manual-summary', 'ai-card', 'ai-summary', 'ai-review-link', 'ai-review-retry', 'artifact-count', 'report-links', 'load-log', 'log-state',
+  'report-log', 'log-links', 'report-announcer', 'manual-workspace-link', 'report-trust-facts',
 ].map((id) => [id.replaceAll('-', '_'), document.querySelector(`#${id}`)]));
+
+const reportConsole = document.querySelector('#report-console');
+const reportSeparator = document.querySelector('#report-separator');
+const reportInspector = document.querySelector('#report-inspector');
+if (reportConsole && reportSeparator && reportInspector) {
+  state.splitter = createConsoleSplitter({
+    shell: reportConsole,
+    separator: reportSeparator,
+    inspector: reportInspector,
+  });
+}
 
 init().catch((error) => showFatal('This report could not be loaded', friendlyError(error)));
 
 async function init() {
-  const requestedId = new URLSearchParams(window.location.search).get('run')?.trim() ?? '';
+  const query = new URLSearchParams(window.location.search);
+  const requestedId = query.get('run')?.trim() ?? '';
+  state.mode = query.get('mode') === 'single-site' ? 'single-site' : 'comparative';
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{2,159}$/.test(requestedId)) {
     return showFatal('Choose a valid run', 'This report link is missing a valid run ID. Return to the audit console and open a completed run.');
   }
   state.runId = requestedId;
-  elements.visual_gallery_link.href = `/gallery.html?run=${encodeURIComponent(requestedId)}&from=report`;
-  document.title = `Run ${requestedId} · Quitting 7-OH release report`;
+  const workspaceUrl = `/run.html?mode=${encodeURIComponent(state.mode)}&run=${encodeURIComponent(requestedId)}&view=report`;
+  document.querySelector('.report-back').href = workspaceUrl;
+  elements.manual_workspace_link.href = workspaceUrl;
+  if (state.mode === 'single-site') {
+    elements.visual_gallery_link.hidden = false;
+    elements.visual_gallery_link.href = `/gallery.html?mode=single-site&run=${encodeURIComponent(requestedId)}&from=report`;
+    elements.visual_gallery_link.textContent = 'Visual evidence review';
+    document.title = `Run ${requestedId} · Single-site health report`;
+    document.querySelector('.report-back').textContent = 'Run workspace';
+    document.querySelector('#report-loading p').textContent = 'Loading Site Health and the compact evidence index…';
+    document.querySelector('.decision-copy .eyebrow').textContent = 'SINGLE-SITE HEALTH REPORT';
+  } else {
+    elements.visual_gallery_link.href = `/gallery.html?run=${encodeURIComponent(requestedId)}&from=report`;
+    document.title = `Run ${requestedId} · Quitting 7-OH release report`;
+  }
   bindEvents();
   await loadReport();
+}
+
+function apiPath(suffix = '') {
+  const encodedId = encodeURIComponent(state.runId);
+  return state.mode === 'single-site'
+    ? `/api/single-site/runs/${encodedId}${suffix}`
+    : `/api/runs/${encodedId}${suffix}`;
+}
+
+function runIsActive(run) {
+  if (state.mode === 'single-site') {
+    const executionTerminal = ['completed', 'failed', 'incomplete', 'cancelled'].includes(run.status);
+    const finalizationTerminal = ['complete', 'incomplete', 'deadline-exceeded', 'invalid'].includes(run.finalization?.status);
+    return !executionTerminal || !finalizationTerminal;
+  }
+  return !TERMINAL_STATUSES.has(run.status);
 }
 
 function bindEvents() {
@@ -75,6 +124,7 @@ function bindEvents() {
     void loadAudits();
   });
   elements.load_log.addEventListener('click', () => void loadLog());
+  elements.ai_review_retry.addEventListener('click', () => void retrySingleSiteAiReview());
   window.addEventListener('pagehide', abortRequests);
 }
 
@@ -83,52 +133,88 @@ function abortRequests() {
   state.auditsController?.abort();
   state.detailController?.abort();
   state.logController?.abort();
+  state.aiController?.abort();
+  window.clearTimeout(state.aiRetryTimer);
   window.clearTimeout(state.retryTimer);
   window.clearTimeout(state.queryTimer);
 }
 
+window.addEventListener('pagehide', () => state.splitter?.destroy(), { once: true });
+
 async function loadReport() {
+  const hasKnownContent = state.run !== null && state.report !== null;
   window.clearTimeout(state.retryTimer);
   state.reportController?.abort();
   state.auditsController?.abort();
   state.detailController?.abort();
+  state.aiController?.abort();
   const controller = new AbortController();
   state.reportController = controller;
-  setMainState('loading');
-  elements.report_connection.textContent = 'Loading report…';
+  if (hasKnownContent) {
+    elements.report_content.hidden = false;
+    elements.report_content.setAttribute('aria-busy', 'true');
+    elements.report_loading.hidden = true;
+    elements.report_error.hidden = true;
+    elements.report_connection.textContent = 'Refreshing while current report remains visible…';
+  } else {
+    setMainState('loading');
+    elements.report_connection.textContent = 'Loading report…';
+  }
   elements.refresh_report.disabled = true;
-  announce('Loading the run report.');
-  const encodedId = encodeURIComponent(state.runId);
+  announce(hasKnownContent ? 'Refreshing the run report while current data remains available.' : 'Loading the run report.');
   try {
     const [runResult, reportResult] = await Promise.allSettled([
-      fetchJson(`/api/runs/${encodedId}`, { signal: controller.signal }),
-      fetchJson(`/api/runs/${encodedId}/report`, { signal: controller.signal }),
+      fetchJson(apiPath(), { signal: controller.signal }),
+      fetchJson(apiPath('/report'), { signal: controller.signal }),
     ]);
     if (controller.signal.aborted) return;
     if (runResult.status === 'rejected') throw runResult.reason;
-    state.run = runResult.value;
     if (reportResult.status === 'rejected') {
-      const active = !TERMINAL_STATUSES.has(state.run.status);
+      const active = runIsActive(runResult.value);
+      if (hasKnownContent) {
+        showRefreshFailure(reportResult.reason, { retry: active });
+        return;
+      }
+      state.run = runResult.value;
       showReportUnavailable(active, friendlyError(reportResult.reason));
       if (active) state.retryTimer = window.setTimeout(() => void loadReport(), REPORT_RETRY_MS);
       return;
     }
+    state.run = runResult.value;
     state.report = reportResult.value;
     setMainState('content');
     renderReport();
     elements.report_connection.textContent = `Loaded ${formatDate(state.report.generatedAt)}`;
-    announce(`Release report loaded. ${state.run.status === 'review-required' ? 'Release signoff is withheld for review.' : `Decision: ${state.run.release?.decision ?? state.report.release?.decision ?? 'not available'}.`}`);
-    await Promise.allSettled([loadAudits(), loadArtifacts()]);
-    if (!TERMINAL_STATUSES.has(state.run.status)) {
+    announce(state.mode === 'single-site'
+      ? `Site Health report loaded. ${state.report.siteHealth?.displayLabel ?? 'Health verdict unavailable'}.`
+      : `Release report loaded. ${state.run.status === 'review-required' ? 'Release signoff is withheld for review.' : `Decision: ${state.run.release?.decision ?? state.report.release?.decision ?? 'not available'}.`}`);
+    await Promise.allSettled([
+      loadAudits(),
+      loadArtifacts(),
+      ...(state.mode === 'single-site' ? [loadSingleSiteAiReview()] : []),
+    ]);
+    if (runIsActive(state.run)) {
       state.retryTimer = window.setTimeout(() => void loadReport(), REPORT_RETRY_MS);
     }
   } catch (error) {
     if (controller.signal.aborted) return;
-    showFatal('This report could not be loaded', friendlyError(error));
+    if (hasKnownContent) showRefreshFailure(error);
+    else showFatal('This report could not be loaded', friendlyError(error));
   } finally {
     if (state.reportController === controller) state.reportController = null;
+    elements.report_content.setAttribute('aria-busy', 'false');
     elements.refresh_report.disabled = false;
   }
+}
+
+function showRefreshFailure(error, { retry = false } = {}) {
+  const detail = friendlyError(error);
+  elements.report_loading.hidden = true;
+  elements.report_error.hidden = true;
+  elements.report_content.hidden = false;
+  elements.report_connection.textContent = 'Refresh failed · showing last known report';
+  announce(`Report refresh failed. The last known sourced report remains visible. ${detail}`);
+  if (retry) state.retryTimer = window.setTimeout(() => void loadReport(), REPORT_RETRY_MS);
 }
 
 function showReportUnavailable(active, detail) {
@@ -158,6 +244,10 @@ function setMainState(value) {
 }
 
 function renderReport() {
+  if (state.mode === 'single-site') {
+    renderSingleSiteReport();
+    return;
+  }
   renderDecision();
   renderMetrics();
   renderBars();
@@ -167,12 +257,231 @@ function renderReport() {
   renderAiSummary();
 }
 
+function renderSingleSiteReport() {
+  const { run, report } = state;
+  const verdict = report.siteHealth?.verdict ?? 'INCOMPLETE';
+  const active = runIsActive(run);
+  const tone = active ? 'running' : verdict === 'HEALTHY' ? 'ready' : verdict === 'FINDINGS' ? 'review' : 'not-ready';
+  elements.decision_hero.dataset.tone = tone;
+  elements.decision_badge.dataset.tone = tone;
+  elements.decision_badge.textContent = active ? 'Finalizing' : report.siteHealth?.displayLabel ?? verdict;
+  elements.decision_title.textContent = active
+    ? 'This site audit is still being finalized'
+    : verdict === 'HEALTHY'
+      ? 'No deterministic findings in the completed scope'
+      : verdict === 'FINDINGS'
+        ? 'Deterministic findings need review'
+        : 'This audit is incomplete';
+  elements.decision_summary.textContent = report.siteHealth?.reason ?? 'Site Health is unavailable.';
+  elements.decision_basis.textContent = `${report.promotion?.statement ?? 'Site Health is advisory and has no promotion authority.'} Coverage ${humanize(report.coverage?.status)}; evidence ${humanize(report.evidenceCompletion?.status)}; authority ${humanize(report.evidenceAuthority?.status)}.`;
+  elements.context_run_id.textContent = run.id;
+  elements.context_profile.textContent = 'Single-site audit';
+  elements.context_scope.textContent = `${report.scope?.qualifier ?? run.scope?.qualifier ?? 'TARGETED'} · ${reportedCount(report.scope?.selected?.total)} selected · ${reportedCount(report.scope?.omitted?.total)} omitted`;
+  elements.context_started.textContent = formatDate(run.createdAt);
+  elements.context_elapsed.textContent = elapsedLabel(run.createdAt, run.updatedAt);
+  elements.context_pipeline.textContent = `${humanize(run.status)} · finalization ${humanize(run.finalization?.status ?? 'pending')} · ${humanize(report.pipelineIntegrity?.status ?? 'unknown')}`;
+  setExternalLink(elements.context_production, report.auditedUrl ?? run.url);
+  elements.context_production.closest('.context-wide').querySelector('dt').textContent = 'Audited site';
+  elements.context_candidate.closest('.context-wide').hidden = true;
+  elements.full_checklist_link.removeAttribute('target');
+  elements.full_checklist_link.removeAttribute('rel');
+  elements.full_checklist_link.href = '#audits-title';
+  elements.full_checklist_link.textContent = 'Review every audited feature';
+  elements.manifest_download_link.href = `${apiPath('/report')}?revision=${encodeURIComponent(report.publicationRevision)}`;
+  elements.manifest_download_link.setAttribute('download', `${run.id}-site-health-summary.json`);
+  elements.manifest_download_link.textContent = 'Download compact Site Health summary';
+  elements.summary_generated.textContent = `Immutable evidence index generated ${formatDate(report.generatedAt)}`;
+  renderTrustFacts([
+    ['Site Health verdict', report.siteHealth?.displayLabel ?? verdict, report.siteHealth?.reason ?? 'No verdict explanation is available.'],
+    ['Coverage', report.coverage?.status ?? 'Unavailable', `${reportedCount(report.coverage?.gapCount)} gaps · ${reportedCount(report.coverage?.limitationCount)} limitations`],
+    ['Evidence Authority', report.evidenceAuthority?.status ?? 'Unavailable', 'Determines whether captured evidence can support a conclusion.'],
+    ['Evidence completion', report.evidenceCompletion?.status ?? 'Unavailable', 'Evidence availability is independent of the product verdict.'],
+    ['Pipeline Integrity', report.pipelineIntegrity?.status ?? 'Unavailable', 'Reporter and finalization integrity remain independent of findings.'],
+    ['Manual acceptance', report.manual?.status ?? 'Unavailable', `${reportedCount(report.manual?.outstanding)} outstanding · ${reportedCount(report.manual?.failedOrBlocked)} failed or blocked`],
+    ['Publication', report.publicationRevision ? 'Finalized' : 'Unavailable', report.publicationRevision ? `Revision ${report.publicationRevision}` : 'No immutable publication revision is available.'],
+  ]);
+
+  const metrics = [
+    ['Site Health', report.siteHealth?.displayLabel ?? verdict, report.siteHealth?.reason ?? 'No health explanation'],
+    ['Audited definitions', reportedCount(report.auditPages?.total), `${reportedCount(report.scope?.outsideMode?.total)} comparison-only definitions kept outside this mode`],
+    ['Deterministic findings', reportedCount(report.findings?.count), 'Assertion outcomes, never AI-generated verdicts'],
+    ['Coverage', report.coverage?.status ?? 'Unavailable', `${reportedCount(report.coverage?.gapCount)} gaps · ${reportedCount(report.coverage?.limitationCount)} limitations`],
+    ['Manual acceptance', humanize(report.manual?.status ?? 'Unavailable'), `${reportedCount(report.manual?.outstanding)} outstanding · ${reportedCount(report.manual?.failedOrBlocked)} failed or blocked`],
+    ['Visual review', reportedCount(report.visualReview?.attentionRequired), `${reportedCount(report.visualReview?.total)} comparable visual states · changed items need human review`],
+  ];
+  elements.metric_grid.replaceChildren(...metrics.map(([label, value, note]) => {
+    const card = document.createElement('article');
+    card.className = 'metric-card';
+    const name = document.createElement('span');
+    name.textContent = label;
+    const result = document.createElement('strong');
+    result.textContent = String(value);
+    const detail = document.createElement('small');
+    detail.textContent = note;
+    card.append(name, result, detail);
+    return card;
+  }));
+  elements.status_total.textContent = `${number(report.auditPages?.total)} audited definitions`;
+  elements.status_bars.replaceChildren(statusMessage('Outcome totals stay paged with the audit rows below so this page never loads one giant evidence file.', 'review'));
+  elements.severity_bars.replaceChildren(statusMessage(`${number(report.coverage?.gapCount)} coverage gaps · ${number(report.scope?.omitted?.total)} operator omissions · ${number(report.scope?.outsideMode?.total)} comparison-only exclusions`, report.coverage?.status === 'COMPLETE' ? 'success' : 'review'));
+  elements.finding_total.textContent = `${number(report.findings?.count)} deterministic finding${number(report.findings?.count) === 1 ? '' : 's'}`;
+  elements.top_findings.replaceChildren();
+  appendEmpty(
+    elements.top_findings,
+    number(report.findings?.count)
+      ? 'Filter the paged checklist to FAIL, FLAKY, BLOCKED, or REVIEW to inspect each finding with its exact audit context.'
+      : 'No deterministic findings were recorded in the completed scope. Coverage, manual work, visual review, and evidence authority remain separate dimensions.',
+  );
+  const visualActions = document.createElement('div');
+  visualActions.className = 'report-state-actions';
+  const attention = document.createElement('a');
+  attention.className = 'primary-button';
+  attention.href = `/gallery.html?mode=single-site&run=${encodeURIComponent(run.id)}&from=report`;
+  attention.textContent = `Review ${number(report.visualReview?.attentionRequired)} visual attention item${number(report.visualReview?.attentionRequired) === 1 ? '' : 's'}`;
+  const browse = document.createElement('a');
+  browse.className = 'secondary-button';
+  browse.href = `/gallery.html?mode=single-site&run=${encodeURIComponent(run.id)}&from=report&review=all`;
+  browse.textContent = 'Browse all visual evidence';
+  visualActions.append(attention, browse);
+  elements.top_findings.append(visualActions);
+  elements.filter_environment.closest('label').hidden = true;
+  elements.filter_blocking.closest('label').hidden = true;
+  fillSelect(elements.filter_status, STATUS_ORDER, humanize);
+  fillSelect(elements.filter_severity, ['P0', 'P1', 'P2', 'P3'], (value) => value);
+  elements.manual_summary.replaceChildren();
+  const manualHeadline = document.createElement('p');
+  manualHeadline.className = 'large-summary';
+  manualHeadline.textContent = `${number(report.manual?.complete)} of ${number(report.manual?.required)} required manual checks are complete.`;
+  const manualDetail = document.createElement('p');
+  manualDetail.className = 'muted';
+  manualDetail.textContent = `${number(report.manual?.outstanding)} outstanding · ${number(report.manual?.failedOrBlocked)} failed or blocked. Manual status does not rewrite deterministic browser findings.`;
+  elements.manual_summary.append(manualHeadline, manualDetail);
+  elements.ai_summary.replaceChildren();
+  renderSingleSiteAiStatus(run.aiReview);
+}
+
+function renderSingleSiteAiStatus(aiReview, result = null) {
+  const previousState = state.aiAdvisory?.state ?? null;
+  state.aiAdvisory = aiReview;
+  elements.ai_card.setAttribute('aria-busy', String(['pending', 'running', 'waiting-for-finalization'].includes(aiReview?.state)));
+  elements.ai_summary.replaceChildren();
+  elements.ai_review_link.hidden = true;
+  elements.ai_review_retry.hidden = true;
+  const stateLabel = aiReview?.state ?? 'disabled';
+  const headline = document.createElement('p');
+  headline.className = 'large-summary';
+  headline.textContent = stateLabel === 'completed' ? 'Advisory review complete'
+    : stateLabel === 'running' ? 'AI is reviewing the finalized evidence'
+      : stateLabel === 'pending' ? 'AI review is queued'
+        : stateLabel === 'waiting-for-finalization' ? 'Waiting for deterministic finalization'
+          : stateLabel === 'disabled' ? 'Not requested for this run'
+            : `AI review ${humanize(stateLabel)}`;
+  const detail = document.createElement('p');
+  detail.className = 'muted';
+  detail.textContent = result?.review?.review?.executiveSummary
+    ?? aiReview?.status?.error?.message
+    ?? aiReview?.unavailableReason
+    ?? 'Optional AI interpretation is advisory only and cannot change deterministic Findings, Site Health, Coverage, promotion, baselines, or human decisions.';
+  const guardrail = document.createElement('p');
+  guardrail.className = 'advisory-notice';
+  guardrail.textContent = 'Advisory only: AI cannot change deterministic Findings, Site Health, Coverage, promotion, baselines, or human decisions.';
+  elements.ai_summary.append(headline, detail, guardrail);
+  if (result) {
+    const findings = Array.isArray(result.review?.review?.findings) ? result.review.review.findings : [];
+    const meta = document.createElement('p');
+    meta.className = 'advisory-notice';
+    meta.textContent = `${findings.length} advisory observation${findings.length === 1 ? '' : 's'} · model ${result.status?.model ?? aiReview?.model ?? 'unknown'} · gating disabled`;
+    elements.ai_summary.append(meta);
+  }
+  if (aiReview?.status?.state === 'completed') {
+    elements.ai_review_link.href = apiPath('/ai-review/result');
+    elements.ai_review_link.textContent = 'Open complete advisory JSON';
+    elements.ai_review_link.hidden = false;
+  }
+  if (aiReview?.optedIn === true && aiReview?.status?.retryable === true
+    && ['failed', 'unavailable'].includes(aiReview?.status?.state)) {
+    elements.ai_review_retry.hidden = false;
+  }
+  if (previousState && previousState !== aiReview?.state) {
+    announce(`AI advisory state changed from ${humanize(previousState)} to ${humanize(aiReview?.state)}.`);
+  }
+}
+
+async function loadSingleSiteAiReview() {
+  state.aiController?.abort();
+  const controller = new AbortController();
+  state.aiController = controller;
+  try {
+    const advisory = await fetchJson(apiPath('/ai-review'), { signal: controller.signal });
+    if (controller.signal.aborted) return;
+    if (advisory.state !== 'completed' || !advisory.result) {
+      renderSingleSiteAiStatus({ ...state.run.aiReview, ...advisory });
+      if (['pending', 'running', 'waiting-for-finalization'].includes(advisory.state)) {
+        window.clearTimeout(state.aiRetryTimer);
+        state.aiRetryTimer = window.setTimeout(() => void loadSingleSiteAiReview(), 2_000);
+      }
+      return;
+    }
+    const result = await fetchJson(advisory.result, { signal: controller.signal });
+    if (controller.signal.aborted) return;
+    renderSingleSiteAiStatus({ ...state.run.aiReview, ...advisory }, result);
+  } catch (error) {
+    if (controller.signal.aborted) return;
+    renderSingleSiteAiStatus({
+      ...state.run.aiReview,
+      state: 'unavailable',
+      status: { error: { message: friendlyError(error) } },
+    });
+  } finally {
+    if (state.aiController === controller) state.aiController = null;
+  }
+}
+
+async function retrySingleSiteAiReview() {
+  const status = state.aiAdvisory?.status;
+  if (!status || !Number.isSafeInteger(status.stateRevision)
+    || !['failed', 'unavailable'].includes(status.state)) return;
+  if (!window.confirm('Retry this optional AI advisory? Deterministic Site Health and Findings will remain unchanged.')) return;
+  elements.ai_review_retry.disabled = true;
+  elements.ai_review_retry.classList.add('is-loading');
+  elements.ai_review_retry.setAttribute('aria-busy', 'true');
+  elements.ai_review_retry.textContent = 'Retrying advisory…';
+  announce('Retrying the optional AI advisory review.');
+  try {
+    const next = await fetchJson(apiPath('/ai-review'), {
+      method: 'POST',
+      body: JSON.stringify({
+        expectedStateRevision: status.stateRevision,
+        confirmation: `RETRY AI ${state.runId}`,
+      }),
+    });
+    renderSingleSiteAiStatus({ ...state.aiAdvisory, state: next.state, status: next });
+    announce(next.state === 'pending'
+      ? 'AI advisory retry is queued.'
+      : `AI advisory retry is ${humanize(next.state)}.`);
+    window.clearTimeout(state.aiRetryTimer);
+    state.aiRetryTimer = window.setTimeout(() => void loadSingleSiteAiReview(), 1_000);
+  } catch (error) {
+    renderSingleSiteAiStatus({
+      ...state.aiAdvisory,
+      state: 'unavailable',
+      unavailableReason: friendlyError(error),
+    });
+    announce(`AI advisory retry failed. ${friendlyError(error)}`);
+  } finally {
+    elements.ai_review_retry.disabled = false;
+    elements.ai_review_retry.classList.remove('is-loading');
+    elements.ai_review_retry.removeAttribute('aria-busy');
+    elements.ai_review_retry.textContent = 'Retry advisory review';
+  }
+}
+
 function renderDecision() {
   const { run, report } = state;
   const active = !TERMINAL_STATUSES.has(run.status);
   // The run lifecycle is the current authority. A compact report can be a
   // successful but provisional snapshot produced before a later stage failed.
-  const release = run.release ?? report.release;
+  const release = { ...(report.release ?? {}), ...(run.release ?? {}) };
   const decision = release?.decision ?? 'UNAVAILABLE';
   const reviewRequired = run.status === 'review-required' || (decision === 'READY' && (run.reviewReasons?.length ?? 0) > 0);
   const tone = active ? 'running' : decision === 'NOT_READY' ? 'not-ready' : reviewRequired ? 'review' : decision === 'READY' ? 'ready' : 'review';
@@ -215,18 +524,52 @@ function renderDecision() {
   elements.manifest_download_link.setAttribute('download', `${run.id}-complete-checklist.json`);
   elements.manifest_download_link.textContent = 'Download raw checklist JSON (large)';
   elements.summary_generated.textContent = `Evidence index generated ${formatDate(report.generatedAt)}`;
+  const evidenceAuthority = release?.diagnosticCountsAuthoritative === true
+    ? 'Authoritative'
+    : release?.diagnosticCountsAuthoritative === false
+      ? 'Withheld'
+      : 'Unavailable';
+  const executed = reportedNumber(report.summary?.executed);
+  const documented = reportedNumber(report.summary?.total);
+  const manualOutstanding = reportedNumber(report.manualEvidence?.outstanding);
+  const manualFailed = reportedNumber(report.manualEvidence?.failedOrBlocked);
+  renderTrustFacts([
+    ['Release decision', reviewRequired ? 'Review required' : release?.decision ?? 'Unavailable', release?.reason ?? 'No release explanation is available.'],
+    ['Coverage', executed === null || documented === null ? 'Unavailable' : `${executed} / ${documented} executed`, executed === null || documented === null ? 'Coverage counts were not published.' : `${Math.max(0, documented - executed)} documented checks were not executed.`],
+    ['Evidence Authority', evidenceAuthority, evidenceAuthority === 'Withheld' ? 'Diagnostic counts remain visible but cannot support release authority.' : 'Derived from the published report integrity contract.'],
+    ['Pipeline Integrity', run.pipeline?.status ?? (release?.runIntegrityFailure === true ? 'Failed' : 'Unavailable'), run.pipeline?.reason ?? 'No pipeline explanation is available.'],
+    ['Manual acceptance', manualOutstanding === null ? 'Unavailable' : manualOutstanding > 0 ? 'Outstanding' : 'Complete', `${manualOutstanding ?? 'Unavailable'} outstanding · ${manualFailed ?? 'Unavailable'} failed or blocked`],
+    ['Publication', report.publicationRevision ? 'Finalized' : 'Unavailable', report.publicationRevision ? `Revision ${report.publicationRevision}` : 'No immutable publication revision is available.'],
+  ]);
+}
+
+function renderTrustFacts(entries) {
+  elements.report_trust_facts.replaceChildren();
+  for (const [label, value, detail] of entries) {
+    const group = document.createElement('div');
+    const term = document.createElement('dt');
+    term.textContent = label;
+    const description = document.createElement('dd');
+    const status = document.createElement('strong');
+    status.textContent = humanize(value);
+    const explanation = document.createElement('span');
+    explanation.textContent = detail;
+    description.append(status, explanation);
+    group.append(term, description);
+    elements.report_trust_facts.append(group);
+  }
 }
 
 function renderMetrics() {
   const summary = state.report.summary ?? {};
-  const release = state.run.release ?? state.report.release ?? {};
+  const release = { ...(state.report.release ?? {}), ...(state.run.release ?? {}) };
   const metrics = [
-    ['Documented checks', number(summary.total), 'Every expected behavior stays visible'],
-    ['Executed checks', `${number(summary.executed)} / ${number(summary.total)}`, percentCopy(summary.executed, summary.total)],
-    ['Release blockers', number(release.blockingFailures) + number(release.blockingIncomplete), `${number(release.blockingFailures)} failed or need review · ${number(release.blockingIncomplete)} incomplete`],
-    ['Evidence files', number(summary.artifacts), `${number(summary.usableInteractionVideos ?? summary.videos)} usable interaction videos · ${number(summary.diagnosticVideos)} diagnostic videos · ${number(summary.posters)} poster previews`],
-    ['Structured executions', number(summary.structuredExecutions), 'Observed steps and findings, not just pass/fail'],
-    ['Baseline issues', number(summary.baselineIssues), 'Existing production defects kept as context'],
+    ['Documented checks', reportedCount(summary.total), 'Every expected behavior stays visible'],
+    ['Executed checks', reportedRatio(summary.executed, summary.total), reportedNumber(summary.total) === null ? 'Coverage counts were not published' : percentCopy(summary.executed, summary.total)],
+    ['Release blockers', reportedSum(release.blockingFailures, release.blockingIncomplete), `${reportedCount(release.blockingFailures)} failed or need review · ${reportedCount(release.blockingIncomplete)} incomplete`],
+    ['Evidence files', reportedCount(summary.artifacts), `${reportedCount(summary.usableInteractionVideos ?? summary.videos)} usable interaction videos · ${reportedCount(summary.diagnosticVideos)} diagnostic videos · ${reportedCount(summary.posters)} poster previews`],
+    ['Structured executions', reportedCount(summary.structuredExecutions), 'Observed steps and findings, not just pass/fail'],
+    ['Baseline issues', reportedCount(summary.baselineIssues), 'Existing production defects kept as context'],
   ];
   elements.metric_grid.replaceChildren(...metrics.map(([label, value, note]) => {
     const card = document.createElement('article');
@@ -278,11 +621,24 @@ function renderBarList(container, entries, total, humanizeLabels = false) {
 function renderTopFindings() {
   const findings = state.report.topFindings ?? [];
   const total = number(state.report.topFindingCount);
-  elements.finding_total.textContent = total ? `${total} finding${total === 1 ? '' : 's'} recorded` : 'No findings recorded';
+  const attention = state.report.topAttention ?? [];
+  const attentionTotal = number(state.report.topAttentionCount);
+  elements.finding_total.textContent = total && attentionTotal
+    ? `${total} structured finding${total === 1 ? '' : 's'} · ${attentionTotal} other attention outcome${attentionTotal === 1 ? '' : 's'}`
+    : total
+      ? `${total} finding${total === 1 ? '' : 's'} recorded`
+      : attentionTotal
+        ? `${attentionTotal} attention outcome${attentionTotal === 1 ? '' : 's'}`
+        : 'No findings or attention outcomes recorded';
   elements.top_findings.replaceChildren();
-  if (findings.length === 0) {
+  if (findings.length === 0 && attention.length === 0) {
     return appendEmpty(elements.top_findings, 'No structured findings were recorded. Confirm that all required audits ran before treating this as release-ready.');
   }
+  const focusAudit = (auditId) => {
+    elements.filter_query.value = auditId;
+    state.auditOffset = 0;
+    void loadAudits().then(() => document.querySelector('#audits-title')?.scrollIntoView({ behavior: 'smooth' }));
+  };
   for (const finding of findings.slice(0, 8)) {
     const card = document.createElement('article');
     card.className = 'finding-card';
@@ -294,16 +650,94 @@ function renderTopFindings() {
     title.textContent = finding.title;
     const detail = document.createElement('p');
     detail.textContent = finding.detail;
+    const executionContext = document.createElement('p');
+    executionContext.className = 'muted';
+    const target = finding.sourceProject || finding.environment;
+    const gate = finding.baselineNonGating
+      ? 'non-gating production baseline'
+      : finding.scope === 'cross-environment'
+        ? 'cross-environment release gate'
+        : finding.releaseBlocking
+          ? 'release-blocking execution'
+          : 'advisory execution';
+    executionContext.textContent = target
+      ? `Observed on ${humanize(target)} · ${gate}`
+      : `Observed in a ${gate}`;
     const link = document.createElement('button');
     link.type = 'button';
     link.className = 'text-button';
     link.textContent = `${finding.auditId} · ${finding.auditTitle}`;
-    link.addEventListener('click', () => {
-      elements.filter_query.value = finding.auditId;
-      state.auditOffset = 0;
-      void loadAudits().then(() => document.querySelector('#audits-title')?.scrollIntoView({ behavior: 'smooth' }));
-    });
-    card.append(meta, title, detail, link);
+    link.addEventListener('click', () => focusAudit(finding.auditId));
+    card.append(meta, title, detail, executionContext, link);
+    elements.top_findings.append(card);
+  }
+  if (attention.length > 0) {
+    const explanation = document.createElement('p');
+    explanation.className = 'muted';
+    explanation.textContent = 'These additional audits need action even though their test code did not attach a structured finding. Assertion failures, evidence-integrity review states, missing executions, and outstanding manual acceptance are shown separately from production-only baseline context.';
+    elements.top_findings.append(explanation);
+  }
+  for (const item of attention.slice(0, 20)) {
+    const card = document.createElement('article');
+    card.className = 'finding-card';
+    card.dataset.blocking = item.releaseBlocking ? 'true' : 'false';
+    const meta = document.createElement('div');
+    meta.className = 'finding-meta';
+    const scope = item.scope === 'cross-environment'
+      ? 'Cross-environment gate'
+      : item.scope === 'candidate'
+        ? 'Candidate gate'
+        : 'Unclassified gate';
+    meta.append(
+      badge(item.severity, `severity-${String(item.severity).toLowerCase()}`),
+      badge(item.auditStatus, `status-${statusTone(item.auditStatus)}`),
+      badge(scope, 'status-review'),
+    );
+    const title = document.createElement('h3');
+    title.textContent = item.auditTitle;
+    const detail = document.createElement('p');
+    detail.textContent = item.detail;
+    card.append(meta, title, detail);
+    if (item.errorContext) {
+      const assertion = document.createElement('p');
+      const label = document.createElement('strong');
+      label.textContent = 'Assertion: ';
+      assertion.append(label, item.errorContext);
+      card.append(assertion);
+    }
+    if (item.reasonCodes?.length) {
+      const integrity = document.createElement('p');
+      integrity.className = 'muted';
+      integrity.textContent = `Evidence context: ${item.reasonCodes.map(humanize).join(', ')}`;
+      card.append(integrity);
+    }
+    if (item.baselineNonGating) {
+      const baseline = document.createElement('p');
+      baseline.className = 'muted';
+      baseline.textContent = `Production baseline (comparison only; not part of this candidate gate): ${item.baselineNote}`;
+      card.append(baseline);
+    }
+    if (item.evidence?.length) {
+      const links = document.createElement('div');
+      links.className = 'evidence-link-list';
+      for (const artifact of item.evidence) {
+        const evidenceContext = artifact.context === 'final-primary'
+          ? `Final attempt ${artifact.attempt} · primary`
+          : `Final attempt ${artifact.attempt} · diagnostic`;
+        links.append(evidenceLink(
+          checklistArtifactUrl(artifact.href),
+          `${evidenceContext} · ${humanize(artifact.kind)} · ${artifact.name}`,
+          formatBytes(artifact.sizeBytes),
+        ));
+      }
+      card.append(links);
+    }
+    const link = document.createElement('button');
+    link.type = 'button';
+    link.className = 'text-button';
+    link.textContent = `${item.auditId} · Open full audit context`;
+    link.addEventListener('click', () => focusAudit(item.auditId));
+    card.append(link);
     elements.top_findings.append(card);
   }
 }
@@ -343,14 +777,15 @@ async function loadAudits() {
   const query = new URLSearchParams({ offset: String(state.auditOffset), limit: String(PAGE_SIZE) });
   for (const [name, input] of [
     ['q', elements.filter_query], ['status', elements.filter_status], ['severity', elements.filter_severity],
-    ['area', elements.filter_area], ['environment', elements.filter_environment], ['releaseBlocking', elements.filter_blocking],
+    ['area', elements.filter_area],
+    ...(state.mode === 'single-site' ? [] : [['environment', elements.filter_environment], ['releaseBlocking', elements.filter_blocking]]),
   ]) {
     if (input.value) query.set(name, input.value);
   }
   if (elements.filter_manual.checked) query.set('manual', 'true');
   if (state.report.publicationRevision) query.set('revision', state.report.publicationRevision);
   try {
-    const page = await fetchJson(`/api/runs/${encodeURIComponent(state.runId)}/report/audits?${query}`, { signal: controller.signal });
+    const page = await fetchJson(`${apiPath('/report/audits')}?${query}`, { signal: controller.signal });
     if (controller.signal.aborted || requestId !== state.auditRequest) return;
     renderAuditPage(page);
   } catch (error) {
@@ -384,10 +819,16 @@ function renderAuditPage(page) {
   elements.audit_previous.disabled = page.offset <= 0;
   elements.audit_next.disabled = !page.hasMore;
   state.auditOffset = page.offset;
+  if (state.mode === 'single-site' && page.filters) {
+    fillSelect(elements.filter_status, page.filters.statuses ?? [], humanize);
+    fillSelect(elements.filter_severity, page.filters.severities ?? [], (value) => value);
+    fillSelect(elements.filter_area, page.filters.areas ?? [], humanize);
+  }
   announce(`${items.length} audit results loaded, ${page.total} total matches.`);
 }
 
 function auditCard(audit) {
+  if (state.mode === 'single-site') return singleSiteAuditCard(audit);
   const card = document.createElement('article');
   card.className = 'report-audit-card';
   card.dataset.status = statusTone(audit.status);
@@ -421,6 +862,60 @@ function auditCard(audit) {
   detail.className = 'audit-detail';
   detail.hidden = true;
   button.addEventListener('click', () => void toggleAuditDetail(audit.id, button, detail));
+  card.append(button, detail);
+  return card;
+}
+
+function singleSiteAuditCard(audit) {
+  const card = document.createElement('article');
+  card.className = 'report-audit-card';
+  card.dataset.status = statusTone(audit.status);
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'audit-summary-button';
+  button.setAttribute('aria-expanded', 'false');
+  const heading = document.createElement('span');
+  heading.className = 'audit-heading';
+  const badges = document.createElement('span');
+  badges.className = 'audit-badges';
+  badges.append(
+    badge(audit.status, `status-${statusTone(audit.status)}`),
+    badge(audit.severity, `severity-${String(audit.severity).toLowerCase()}`),
+    badge(humanize(audit.area), 'manual'),
+  );
+  if (audit.manual) badges.append(badge('Manual', 'manual'));
+  if (audit.visualStatus && audit.visualStatus !== 'not-applicable') badges.append(badge(`Visual ${humanize(audit.visualStatus)}`, 'evidence-screenshot'));
+  const title = document.createElement('strong');
+  title.textContent = `${audit.id} · ${audit.title}`;
+  const promise = document.createElement('small');
+  promise.textContent = audit.userPromise;
+  heading.append(badges, title, promise);
+  const outcome = document.createElement('span');
+  outcome.className = 'audit-outcome-copy';
+  const evidence = document.createElement('span');
+  evidence.textContent = `${audit.findingCount} finding${audit.findingCount === 1 ? '' : 's'} · ${audit.artifactCount} artifact${audit.artifactCount === 1 ? '' : 's'} · evidence ${humanize(audit.evidenceStatus)}`;
+  const reason = document.createElement('small');
+  reason.textContent = audit.detail;
+  outcome.append(evidence, reason);
+  const detail = document.createElement('div');
+  detail.className = 'audit-detail';
+  detail.hidden = true;
+  button.addEventListener('click', () => {
+    const opening = detail.hidden;
+    detail.hidden = !opening;
+    button.setAttribute('aria-expanded', String(opening));
+    if (opening && detail.childElementCount === 0) {
+      const intro = document.createElement('div');
+      intro.className = 'audit-detail-intro';
+      intro.append(
+        detailBlock('Reviewed Product Oracle', audit.userPromise),
+        detailBlock('Observed outcome', audit.detail),
+        detailBlock('Evidence state', `${humanize(audit.evidenceStatus)} · visual ${humanize(audit.visualStatus)} · ${audit.artifactCount} linked artifact${audit.artifactCount === 1 ? '' : 's'}`),
+      );
+      detail.append(intro);
+    }
+  });
+  button.append(heading, outcome);
   card.append(button, detail);
   return card;
 }
@@ -709,7 +1204,7 @@ function renderAiSummary() {
 
 async function loadArtifacts() {
   try {
-    const page = await fetchJson(`/api/runs/${encodeURIComponent(state.runId)}/artifacts?offset=0&limit=80`, { signal: state.reportController?.signal });
+    const page = await fetchJson(`${apiPath('/artifacts')}?offset=0&limit=80`, { signal: state.reportController?.signal });
     state.artifacts = page;
     renderArtifactLinks(page);
   } catch (error) {
@@ -750,7 +1245,7 @@ async function loadLog() {
   elements.load_log.textContent = 'Loading excerpt…';
   elements.log_state.textContent = 'Loading the most recent 64 KB from the persisted run logs…';
   try {
-    const snapshot = await fetchJson(`/api/runs/${encodeURIComponent(state.runId)}/logs?maxBytes=${LOG_PREVIEW_BYTES}`, { signal: controller.signal });
+    const snapshot = await fetchJson(`${apiPath('/logs')}?maxBytes=${LOG_PREVIEW_BYTES}`, { signal: controller.signal });
     if (controller.signal.aborted) return;
     const log = String(snapshot.log ?? '').slice(-LOG_PREVIEW_BYTES);
     elements.report_log.textContent = log || 'No log output has been recorded.';
@@ -847,14 +1342,22 @@ function artifactRationale(artifact, evidencePolicy, annotations, fallback) {
   return matching?.description ?? fallback;
 }
 
-async function fetchJson(url, { signal, timeoutMs = 30_000 } = {}) {
+async function fetchJson(url, { signal, timeoutMs = 30_000, ...requestOptions } = {}) {
   const controller = new AbortController();
   const abort = () => controller.abort(signal?.reason);
   if (signal?.aborted) abort();
   else signal?.addEventListener('abort', abort, { once: true });
   const timeout = window.setTimeout(() => controller.abort(new DOMException('Request timed out', 'TimeoutError')), timeoutMs);
   try {
-    const response = await fetch(url, { signal: controller.signal, headers: { Accept: 'application/json' } });
+    const response = await fetch(url, {
+      ...requestOptions,
+      signal: controller.signal,
+      headers: {
+        Accept: 'application/json',
+        ...(requestOptions.body ? { 'Content-Type': 'application/json' } : {}),
+        ...(requestOptions.headers ?? {}),
+      },
+    });
     const value = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(value.error ?? `Request failed with HTTP ${response.status}.`);
     return value;
@@ -873,6 +1376,28 @@ function friendlyError(error) {
 
 function number(value) {
   return Number.isFinite(Number(value)) ? Number(value) : 0;
+}
+
+function reportedNumber(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function reportedCount(value) {
+  return reportedNumber(value) ?? 'Unavailable';
+}
+
+function reportedRatio(part, total) {
+  const numerator = reportedNumber(part);
+  const denominator = reportedNumber(total);
+  return numerator === null || denominator === null ? 'Unavailable' : `${numerator} / ${denominator}`;
+}
+
+function reportedSum(left, right) {
+  const a = reportedNumber(left);
+  const b = reportedNumber(right);
+  return a === null || b === null ? 'Unavailable' : a + b;
 }
 
 function humanize(value) {

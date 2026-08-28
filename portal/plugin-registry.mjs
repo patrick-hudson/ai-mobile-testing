@@ -6,6 +6,8 @@ const AREA_PATTERN = /^[a-z][a-z-]{1,39}$/;
 const SEVERITIES = new Set(['P0', 'P1', 'P2', 'P3']);
 const EVIDENCE_TYPES = new Set(['video', 'screenshot', 'trace', 'json', 'axe', 'network', 'lighthouse']);
 const EVIDENCE_POLICY_MODES = new Set(['interaction-video', 'static-screenshot', 'structured-data']);
+const SINGLE_SITE_CLASSIFICATIONS = new Set(['standalone-compatible', 'comparison-only', 'standalone-required']);
+const RUN_MODES = new Set(['comparative', 'single-site']);
 function nonEmptyString(value, maximum = 2_000) {
   return typeof value === 'string' && value.trim().length > 0 && value.length <= maximum;
 }
@@ -26,8 +28,19 @@ function validatedAuditDefinition(value, pluginId) {
     || !value.evidencePolicy || typeof value.evidencePolicy !== 'object' || Array.isArray(value.evidencePolicy)
     || !EVIDENCE_POLICY_MODES.has(value.evidencePolicy.mode)
     || !nonEmptyString(value.evidencePolicy.rationale, 500)
+    || !SINGLE_SITE_CLASSIFICATIONS.has(value.singleSiteClassification)
     || (value.manual !== undefined && typeof value.manual !== 'boolean')) {
     throw new Error(`Installed test plugin ${pluginId} has an incomplete or invalid full audit definition.`);
+  }
+  const hasStandaloneOracle = value.standaloneOracle !== undefined;
+  if (hasStandaloneOracle && (!value.standaloneOracle || typeof value.standaloneOracle !== 'object'
+    || Array.isArray(value.standaloneOracle)
+    || !nonEmptyString(value.standaloneOracle.id)
+    || !nonEmptyString(value.standaloneOracle.expected))) {
+    throw new Error(`Installed test plugin ${pluginId} has an invalid standalone Product Oracle.`);
+  }
+  if ((value.singleSiteClassification === 'standalone-compatible') !== hasStandaloneOracle) {
+    throw new Error(`Installed test plugin ${pluginId} has inconsistent Single-site classification and Product Oracle metadata.`);
   }
   return {
     id: value.id,
@@ -39,6 +52,13 @@ function validatedAuditDefinition(value, pluginId) {
     expected: value.expected,
     evidence: [...value.evidence],
     evidencePolicy: { mode: value.evidencePolicy.mode, rationale: value.evidencePolicy.rationale },
+    singleSiteClassification: value.singleSiteClassification,
+    ...(hasStandaloneOracle ? {
+      standaloneOracle: {
+        id: value.standaloneOracle.id,
+        expected: value.standaloneOracle.expected,
+      },
+    } : {}),
     ...(typeof value.manual === 'boolean' ? { manual: value.manual } : {}),
   };
 }
@@ -54,6 +74,8 @@ function auditDefinitionSignature(value) {
     expected: value.expected,
     evidence: value.evidence,
     evidencePolicy: value.evidencePolicy,
+    singleSiteClassification: value.singleSiteClassification,
+    standaloneOracle: value.standaloneOracle ?? null,
     manual: value.manual ?? false,
   });
 }
@@ -111,26 +133,46 @@ export function validatePortalPluginRegistryDocument(document, options) {
       throw new Error(`Installed test plugin ${value.id} has an invalid project allowlist.`);
     }
     const definitionIds = new Set(auditDefinitions.map(({ id }) => id));
-    const caseSignatures = new Set();
+    const caseIds = new Set();
     const auditCases = value.auditCases.map((rawCase) => {
       const expectedProjects = applicableTargetIds(rawCase?.applicability, localTargets);
+      const supportedModes = Array.isArray(rawCase?.supportedModes) ? rawCase.supportedModes : [];
+      const definition = auditDefinitions.find(({ id }) => id === rawCase?.auditId);
+      const supportsComparative = supportedModes.includes('comparative');
+      const supportsSingleSite = supportedModes.includes('single-site');
       if (!rawCase || typeof rawCase !== 'object' || Array.isArray(rawCase)
+        || !nonEmptyString(rawCase.caseId)
         || !definitionIds.has(rawCase.auditId)
         || !entrySpecs.includes(rawCase.entrySpec)
         || expectedProjects.length === 0
         || !Array.isArray(rawCase.supportedProjects)
         || JSON.stringify(rawCase.supportedProjects) !== JSON.stringify(expectedProjects)
-        || expectedProjects.some((project) => !projectIds.has(project) || !supportedProjects.includes(project))) {
+        || expectedProjects.some((project) => !projectIds.has(project) || !supportedProjects.includes(project))
+        || supportedModes.length === 0
+        || supportedModes.some((mode) => !RUN_MODES.has(mode))
+        || new Set(supportedModes).size !== supportedModes.length
+        || !rawCase.oracleVariants || typeof rawCase.oracleVariants !== 'object' || Array.isArray(rawCase.oracleVariants)
+        || supportsComparative !== nonEmptyString(rawCase.oracleVariants.comparative)
+        || supportsSingleSite !== nonEmptyString(rawCase.oracleVariants.singleSite)
+        || (supportsSingleSite && definition?.singleSiteClassification === 'comparison-only')
+        || (supportsSingleSite
+          && definition?.singleSiteClassification === 'standalone-compatible'
+          && rawCase.oracleVariants.singleSite !== definition?.standaloneOracle?.id)) {
         throw new Error(`Installed test plugin ${value.id} has an invalid audit applicability case.`);
       }
-      const signature = JSON.stringify([rawCase.auditId, rawCase.entrySpec, rawCase.applicability]);
-      if (caseSignatures.has(signature)) throw new Error(`Installed test plugin ${value.id} has a duplicate audit applicability case.`);
-      caseSignatures.add(signature);
+      if (caseIds.has(rawCase.caseId)) throw new Error(`Installed test plugin ${value.id} has a duplicate executable case ID.`);
+      caseIds.add(rawCase.caseId);
       return {
+        caseId: rawCase.caseId,
         auditId: rawCase.auditId,
         entrySpec: rawCase.entrySpec,
         applicability: rawCase.applicability,
         supportedProjects: [...expectedProjects],
+        supportedModes: [...supportedModes],
+        oracleVariants: {
+          ...(supportsComparative ? { comparative: rawCase.oracleVariants.comparative } : {}),
+          ...(supportsSingleSite ? { singleSite: rawCase.oracleVariants.singleSite } : {}),
+        },
       };
     });
     const coveredAuditIds = new Set(auditCases.map(({ auditId }) => auditId));
@@ -139,6 +181,17 @@ export function validatePortalPluginRegistryDocument(document, options) {
       .map(({ id }) => id);
     if (uncoveredAutomatedAudits.length > 0) {
       throw new Error(`Installed test plugin ${value.id} has automated audits without executable applicability: ${uncoveredAutomatedAudits.join(', ')}.`);
+    }
+    const singleSiteAuditIds = new Set(auditCases
+      .filter(({ supportedModes: modes }) => modes.includes('single-site'))
+      .map(({ auditId }) => auditId));
+    const uncoveredSingleSiteAudits = auditDefinitions
+      .filter(({ id, manual, singleSiteClassification }) => !manual
+        && singleSiteClassification === 'standalone-compatible'
+        && !singleSiteAuditIds.has(id))
+      .map(({ id }) => id);
+    if (uncoveredSingleSiteAudits.length > 0) {
+      throw new Error(`Installed test plugin ${value.id} has standalone-compatible audits without Single-site cases: ${uncoveredSingleSiteAudits.join(', ')}.`);
     }
     return {
       id: value.id,
@@ -155,7 +208,12 @@ export function validatePortalPluginRegistryDocument(document, options) {
 }
 
 export function mergePortalCatalog(coreDefinitions, installedPlugins) {
-  const definitions = new Map(coreDefinitions.map((definition) => [definition.id, { ...definition }]));
+  const definitions = new Map(coreDefinitions.map((definition) => [definition.id, {
+    ...definition,
+    evidence: [...definition.evidence],
+    evidencePolicy: { ...definition.evidencePolicy },
+    ...(definition.standaloneOracle ? { standaloneOracle: { ...definition.standaloneOracle } } : {}),
+  }]));
   for (const plugin of installedPlugins) {
     for (const definition of plugin.auditDefinitions) {
       const current = definitions.get(definition.id);
@@ -166,6 +224,7 @@ export function mergePortalCatalog(coreDefinitions, installedPlugins) {
         ...definition,
         evidence: [...definition.evidence],
         evidencePolicy: { ...definition.evidencePolicy },
+        ...(definition.standaloneOracle ? { standaloneOracle: { ...definition.standaloneOracle } } : {}),
       });
     }
   }

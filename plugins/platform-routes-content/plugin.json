@@ -33,11 +33,13 @@
     { "id": "SEO-001", "source": "core" },
     { "id": "SEO-002", "source": "core" }
   ],
+  "auditFamilies": ["candidate-html-routes"],
   "entrySpecs": [
     "tests/contracts.spec.ts",
     "tests/content-system.spec.ts",
     "plugins/platform-routes-content/tests/runtime.spec.ts",
     "tests/page-audit.spec.ts",
+    "tests/single-site-generic-route.spec.ts",
     "tests/shell-content.spec.ts",
     "tests/smoke.spec.ts",
     "tests/visual-regression.spec.ts"

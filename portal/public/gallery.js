@@ -1,7 +1,15 @@
-import { createGalleryWorkbench } from './gallery-core.js';
+import {
+  createGalleryWorkbench,
+  createSingleSiteGalleryWorkbench,
+} from './gallery-core.js';
+import { createLiveGalleryDataSource } from './gallery-data-source.js';
+import { parseConsoleUrlState, serializeConsoleUrlState } from '/console-contracts.mjs';
+import { createRunInvalidationBus, publishRunInvalidation } from './console-invalidation.js';
+import { createConsoleUrlState } from './console-url-state.js';
 
 const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{2,159}$/;
 const ITEM_ID = /^gitem_[a-f0-9]{16}$/;
+const SINGLE_SITE_ITEM_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/;
 const MEMBER_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/;
 const REVISION = /^(?:content|order|flags)_[a-f0-9]{16}$/;
 const FILTERS = Object.freeze({
@@ -33,9 +41,24 @@ const elements = Object.fromEntries([
   'previous-raw', 'load-more-raw', 'raw-files', 'gallery-flag-dialog', 'gallery-flag-form', 'gallery-flag-close',
   'gallery-flag-cancel', 'gallery-reviewer', 'gallery-flag-action', 'gallery-flag-id-field', 'gallery-flag-id',
   'gallery-flag-copy', 'gallery-flag-note', 'gallery-flag-state', 'gallery-flag-submit', 'gallery-announcer',
+  'baseline-dialog', 'baseline-form', 'baseline-dialog-title', 'baseline-close', 'baseline-cancel',
+  'baseline-dialog-summary', 'baseline-identity', 'baseline-policy', 'baseline-reason', 'baseline-waiver-field',
+  'baseline-waiver', 'baseline-confirmation-copy', 'baseline-confirmation', 'baseline-dialog-state', 'baseline-submit',
+  'visual-review-dialog', 'visual-review-form', 'visual-review-dialog-title', 'visual-review-close',
+  'visual-review-cancel', 'visual-review-identity', 'visual-review-disposition', 'visual-review-rationale',
+  'visual-review-confirmation-copy', 'visual-review-confirmation', 'visual-review-dialog-state', 'visual-review-submit',
 ].map((id) => [id.replaceAll('-', '_'), document.querySelector(`#${id}`)]));
 
-const parsed = parseReviewUrl(new URL(window.location.href));
+const galleryUrlState = createConsoleUrlState({
+  window,
+  routeId: 'gallery',
+  parse: parseConsoleUrlState,
+  serialize: serializeConsoleUrlState,
+  onChange(next, { source }) {
+    if (source === 'history' && state?.urlSearch !== next.search) window.location.reload();
+  },
+});
+const parsed = parseReviewUrl(galleryUrlState.current);
 const state = {
   runId: parsed.runId,
   from: parsed.from,
@@ -51,6 +74,7 @@ const state = {
   rawLoading: false,
   logStream: null,
   detailCache: new Map(),
+  detailRequests: new Map(),
   acceptedRevisionKey: null,
   flags: null,
   flagAttempt: null,
@@ -66,21 +90,45 @@ const state = {
   destroyed: false,
   firstSequence: true,
   initialMemberRestored: false,
+  singleSite: null,
+  singleSiteEndpoints: null,
+  singleSiteMutation: null,
+  singleSiteMutationController: null,
+  singleSiteReviewMutation: null,
+  singleSiteReviewController: null,
+  invalidation: null,
+  purged: false,
+  terminalGeneration: 0,
+  urlSearch: galleryUrlState.current.search,
 };
+
+state.invalidation = createRunInvalidationBus({
+  window,
+  onInvalidate(detail) {
+    if (detail.mode === parsed.runMode && detail.runId === state.runId) {
+      terminatePurged('Another console tab permanently purged this run.', { publish: false });
+    }
+  },
+});
 
 init().catch((error) => showFatal(error));
 
 async function init() {
   if (!state.runId) throw new PortalGalleryError(400, 'INVALID_GALLERY_URL', 'Choose a valid run from the release audit console.');
+  if (parsed.runMode === 'single-site') return initSingleSiteGallery();
   const encodedRun = encodeURIComponent(state.runId);
   elements.gallery_run_id.textContent = state.runId;
   document.title = `Run ${state.runId} · Visual evidence gallery`;
-  elements.gallery_back.href = state.from === 'report' ? `/report.html?run=${encodedRun}` : '/';
-  elements.gallery_back.textContent = state.from === 'report' ? '← Run report' : '← Release audit console';
+  elements.gallery_back.href = state.from === 'report'
+    ? `/report.html?mode=comparative&run=${encodedRun}`
+    : `/run.html?mode=comparative&run=${encodedRun}&view=evidence`;
+  elements.gallery_back.textContent = state.from === 'report' ? '← Run report' : '← Run workspace';
   elements.gallery_reviewer.value = loadReviewerLabel();
   bindPageEvents();
 
-  const adapter = createPortalAdapter();
+  const adapter = createPortalAdapter(createLiveGalleryDataSource({
+    mode: 'comparative', runId: state.runId, requestJson: loggedJson,
+  }));
   state.workbench = createGalleryWorkbench(elements.gallery_workbench, {
     adapter,
     initialState: { mode: parsed.mode, query: parsed.query },
@@ -158,7 +206,8 @@ async function refreshHead({ initial = false } = {}) {
     if (!initial && !state.stream) connectGalleryEvents();
     return true;
   } catch (error) {
-    if (initial) showFatal(error); else announce(`Gallery refresh failed. ${friendlyError(error)}`);
+    if (error?.status === 410 || error?.code === 'GALLERY_RUN_PURGED') terminatePurged(friendlyError(error));
+    else if (initial) showFatal(error); else announce(`Gallery refresh failed. ${friendlyError(error)}`);
     return false;
   } finally {
     elements.gallery_refresh.disabled = false;
@@ -181,7 +230,10 @@ function renderHead(head) {
 function onGalleryState(gallery, action) {
   const accepted = gallery.accepted;
   const revisionKey = `${accepted.contentRevision ?? ''}\u0000${accepted.orderRevision ?? ''}\u0000${accepted.flagRevision ?? ''}`;
-  if (state.acceptedRevisionKey && revisionKey !== state.acceptedRevisionKey) state.detailCache.clear();
+  if (state.acceptedRevisionKey && revisionKey !== state.acceptedRevisionKey) {
+    state.detailCache.clear();
+    clearDetailRequests();
+  }
   state.acceptedRevisionKey = revisionKey;
   if (accepted.contentRevision) elements.gallery_revision.textContent = shortRevision(accepted.contentRevision);
   if (action.type === 'QUERY_SUCCEEDED' && state.firstSequence) {
@@ -196,23 +248,21 @@ function onGalleryState(gallery, action) {
 
 function updateUrl(gallery = state.workbench?.getState()) {
   if (!state.runId || !gallery) return;
-  const params = new URLSearchParams();
-  params.set('run', state.runId);
-  if (state.from !== 'runs') params.set('from', state.from);
-  if (gallery.mode !== 'workbench') params.set('mode', gallery.mode);
-  if (gallery.selection.itemId) params.set('item', gallery.selection.itemId);
-  if (gallery.selection.memberId) params.set('member', gallery.selection.memberId);
+  const next = { mode: 'comparative', run: state.runId, from: state.from, view: gallery.mode };
+  if (gallery.selection.itemId) next.item = gallery.selection.itemId;
+  if (gallery.selection.memberId) next.member = gallery.selection.memberId;
   for (const [key, name] of Object.entries(QUERY_NAMES)) {
-    for (const value of gallery.query[key] ?? []) params.append(name, value);
+    if ((gallery.query[key] ?? []).length > 0) next[name] = gallery.query[key];
   }
-  if (gallery.query.group !== 'feature') params.set('group', gallery.query.group);
-  if (gallery.query.sort !== 'attention') params.set('sort', gallery.query.sort);
-  if (gallery.query.search) params.set('q', gallery.query.search);
-  if (elements.raw_drawer.open) params.set('raw', '1');
-  history.replaceState(null, '', `/gallery.html?${params}`);
+  next.group = gallery.query.group;
+  next.sort = gallery.query.sort;
+  if (gallery.query.search) next.q = gallery.query.search;
+  next.raw = elements.raw_drawer.open ? '1' : '0';
+  const updated = galleryUrlState.replaceState(next);
+  state.urlSearch = updated.search;
 }
 
-function createPortalAdapter() {
+function createPortalAdapter(dataSource) {
   const encodedRun = encodeURIComponent(state.runId);
   const revisions = (params, source = state.workbench?.getState().accepted) => {
     if (REVISION.test(source?.contentRevision ?? '') && REVISION.test(source?.orderRevision ?? '') && REVISION.test(source?.flagRevision ?? '')) {
@@ -223,29 +273,40 @@ function createPortalAdapter() {
   };
   return {
     async loadHead({ signal }) {
-      return loggedJson(`/api/runs/${encodedRun}/gallery`, { signal, activityPath: '/api/runs/:run/gallery' });
+      return dataSource.loadHead({ signal });
     },
     async loadItems({ query, contentRevision, orderRevision, flagRevision, cursor, limit, anchorItemId, signal }) {
-      const params = new URLSearchParams({ limit: String(limit), group: query.group, sort: query.sort });
-      if (cursor) params.set('cursor', cursor);
-      else if (anchorItemId && ITEM_ID.test(anchorItemId)) params.set('anchor', anchorItemId);
-      revisions(params, { contentRevision, orderRevision, flagRevision });
-      for (const [key, name] of Object.entries(QUERY_NAMES)) for (const value of query[key] ?? []) params.append(name, value);
-      if (query.search) params.set('q', query.search);
-      const page = await loggedJson(`/api/runs/${encodedRun}/gallery/items?${params}`, {
-        signal, activityPath: '/api/runs/:run/gallery/items', rowCount: (value) => value.items?.length,
+      return dataSource.loadItems({
+        query, contentRevision, orderRevision, flagRevision, cursor, limit, anchorItemId, signal,
       });
-      return page;
     },
     async loadItem({ itemId, contentRevision, signal }) {
-      const params = new URLSearchParams();
       const accepted = state.workbench.getState().accepted;
-      revisions(params, { ...accepted, contentRevision });
-      const detail = await loggedJson(`/api/runs/${encodedRun}/gallery/items/${encodeURIComponent(itemId)}?${params}`, {
-        signal, activityPath: '/api/runs/:run/gallery/items/:item',
-      });
-      rememberDetail(itemId, detail, accepted);
-      return detail;
+      if (signal.aborted) throw abortError();
+      const revision = { ...accepted, contentRevision };
+      const key = detailCacheKey(itemId, revision);
+      const cached = state.detailCache.get(key);
+      if (cached) return cached;
+      let pending = state.detailRequests.get(key);
+      if (!pending) {
+        const controller = new AbortController();
+        pending = { controller, consumers: 0, promise: null };
+        pending.promise = dataSource.loadItem({
+          itemId,
+          contentRevision,
+          orderRevision: accepted.orderRevision,
+          flagRevision: accepted.flagRevision,
+          signal: controller.signal,
+        }).then((detail) => {
+          if (controller.signal.aborted) throw abortError();
+          rememberDetail(itemId, detail, revision);
+          return detail;
+        }).finally(() => {
+          if (state.detailRequests.get(key) === pending) state.detailRequests.delete(key);
+        });
+        state.detailRequests.set(key, pending);
+      }
+      return consumeDetailRequest(key, pending, signal);
     },
     async loadAvailability({ itemId, signal }) {
       const params = new URLSearchParams();
@@ -415,22 +476,63 @@ function rememberDetail(itemId, detail, revision) {
   while (state.detailCache.size > 72) state.detailCache.delete(state.detailCache.keys().next().value);
 }
 
+function consumeDetailRequest(key, pending, signal) {
+  if (signal.aborted) return Promise.reject(abortError());
+  pending.consumers += 1;
+  return new Promise((resolve, reject) => {
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      signal.removeEventListener('abort', onAbort);
+      pending.consumers -= 1;
+      if (pending.consumers === 0 && state.detailRequests.get(key) === pending) {
+        state.detailRequests.delete(key);
+        pending.controller.abort();
+      }
+    };
+    const onAbort = () => {
+      release();
+      reject(abortError());
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    pending.promise.then((detail) => {
+      release();
+      resolve(detail);
+    }, (error) => {
+      release();
+      reject(error);
+    });
+  });
+}
+
+function clearDetailRequests() {
+  for (const pending of state.detailRequests.values()) pending.controller.abort();
+  state.detailRequests.clear();
+}
+
 function connectGalleryEvents() {
+  if (state.purged) return;
   state.stream?.close();
   const suffix = state.eventSequence ? `?after=${state.eventSequence}` : '';
   const stream = new EventSource(`/api/runs/${encodeURIComponent(state.runId)}/gallery/events${suffix}`);
   state.stream = stream;
   stream.onopen = () => activity('SSE', 'gallery stream connected');
   stream.onerror = () => activity('SSE', 'gallery stream reconnecting');
-  for (const type of ['gallery', 'gallery-flag', 'snapshot', 'stage', 'status', 'overflow']) {
+  for (const type of ['gallery', 'gallery-flag', 'snapshot', 'stage', 'status', 'overflow', 'purged']) {
     stream.addEventListener(type, (event) => void onGalleryEvent(type, event));
   }
 }
 
 async function onGalleryEvent(type, event) {
+  if (state.purged) return;
   state.eventSequence = Math.max(state.eventSequence, Number(event.lastEventId) || 0);
   let data = {};
   try { data = JSON.parse(event.data); } catch { /* keep invalid stream payload out of the UI */ }
+  if (type === 'purged') {
+    terminatePurged(data?.message ?? 'The run and its evidence were permanently purged.');
+    return;
+  }
   if (type === 'snapshot') {
     const manifest = data.manifest ?? {};
     activity('SSE', `snapshot · ${humanize(manifest.status ?? 'unknown')} · ${manifest.progress?.completed ?? 0}/${manifest.progress?.total ?? 0}`);
@@ -495,7 +597,7 @@ async function discoverRevision() {
     });
     announce(`${attentionCount} new or changed attention item${attentionCount === 1 ? '' : 's'} available. Apply the updated order when ready.`);
   } catch (error) {
-    if (error?.name !== 'AbortError' && error.status === 410) state.workbench.dispatch({ type: 'PURGED' });
+    if (error?.name !== 'AbortError' && (error.status === 410 || error.code === 'GALLERY_RUN_PURGED')) terminatePurged(friendlyError(error));
   } finally {
     if (state.deltaController === controller) state.deltaController = null;
   }
@@ -512,19 +614,23 @@ async function restoreInitialMember() {
 }
 
 async function loadExecutionLog() {
+  const terminalGeneration = state.terminalGeneration;
   elements.reload_execution.disabled = true;
   elements.execution_state.textContent = 'Loading latest 64 KiB…';
   try {
     const value = await loggedJson(`/api/runs/${encodeURIComponent(state.runId)}/logs?maxBytes=65536`, { activityPath: '/api/runs/:run/logs' });
+    if (state.purged || terminalGeneration !== state.terminalGeneration) return;
     elements.execution_log.textContent = String(value.log ?? 'No execution output yet.').slice(-65_536);
     elements.execution_state.textContent = `${formatBytes(elements.execution_log.textContent.length)} shown · sequence ${value.sequence ?? 0}`;
   } catch (error) {
+    if (state.purged || terminalGeneration !== state.terminalGeneration) return;
     elements.execution_state.textContent = `Log unavailable: ${friendlyError(error)}`;
-  } finally { elements.reload_execution.disabled = false; }
+  } finally { elements.reload_execution.disabled = state.purged; }
 }
 
 async function loadRawFiles({ offset = state.rawOffset } = {}) {
   if (state.rawLoading || (offset === state.rawOffset && !state.rawHasMore)) return;
+  const terminalGeneration = state.terminalGeneration;
   state.rawLoading = true;
   elements.load_more_raw.disabled = true;
   elements.raw_state.textContent = 'Loading a bounded raw-file page…';
@@ -532,6 +638,7 @@ async function loadRawFiles({ offset = state.rawOffset } = {}) {
     const page = await loggedJson(`/api/runs/${encodeURIComponent(state.runId)}/artifacts?offset=${offset}&limit=100`, {
       activityPath: '/api/runs/:run/artifacts', rowCount: (value) => value.files?.length,
     });
+    if (state.purged || terminalGeneration !== state.terminalGeneration) return;
     elements.raw_files.replaceChildren();
     for (const file of page.files ?? []) {
       const url = validateRawArtifactUrl(file.url);
@@ -552,10 +659,11 @@ async function loadRawFiles({ offset = state.rawOffset } = {}) {
     elements.previous_raw.disabled = state.rawCurrentOffset === 0;
     elements.load_more_raw.textContent = state.rawHasMore ? 'Next page' : 'All known files loaded';
   } catch (error) {
+    if (state.purged || terminalGeneration !== state.terminalGeneration) return;
     elements.raw_state.textContent = `Raw files unavailable: ${friendlyError(error)}`;
   } finally {
     state.rawLoading = false;
-    elements.load_more_raw.disabled = !state.rawHasMore;
+    elements.load_more_raw.disabled = state.purged || !state.rawHasMore;
   }
 }
 
@@ -770,6 +878,389 @@ function cancelFlagMutation() {
   state.flagCloseTimer = null;
 }
 
+async function initSingleSiteGallery() {
+  const dataSource = createLiveGalleryDataSource({
+    mode: 'single-site', runId: state.runId, requestJson: loggedJson,
+  });
+  const endpoints = dataSource.endpoints;
+  const encodedRun = encodeURIComponent(state.runId);
+  document.body.dataset.galleryMode = 'single-site';
+  document.title = `Run ${state.runId} · Single-site evidence review`;
+  elements.gallery_run_id.textContent = state.runId;
+  elements.gallery_back.href = parsed.from === 'report'
+    ? `/report.html?mode=single-site&run=${encodedRun}`
+    : `/run.html?mode=single-site&run=${encodedRun}&view=evidence`;
+  elements.gallery_back.textContent = parsed.from === 'report' ? '← Site Health report' : '← Run workspace';
+  elements.gallery_phase.textContent = 'Loading';
+  elements.gallery_counts.textContent = 'Loading a bounded evidence index';
+  elements.gallery_revision.textContent = 'Not loaded';
+  elements.gallery_lifecycle.textContent = 'Loading visual evidence without downloading media bytes…';
+  elements.execution_drawer.hidden = true;
+  elements.raw_drawer.hidden = true;
+  elements.gallery_flag_dialog.hidden = true;
+
+  state.singleSiteEndpoints = endpoints;
+  bindSingleSiteMutationDialogs();
+  const controller = createSingleSiteGalleryWorkbench(elements.gallery_workbench, {
+    dataSource,
+    initialState: {
+      selectedId: parsed.itemId,
+      filters: parsed.singleSiteFilters,
+    },
+    announce,
+    onHead: renderSingleSiteHead,
+    onStateChange: updateSingleSiteUrl,
+    onStatus({ status, message }) {
+      const loading = status === 'loading';
+      elements.gallery_refresh.disabled = loading;
+      elements.gallery_loading.hidden = !loading;
+      elements.gallery_loading.setAttribute('aria-busy', loading ? 'true' : 'false');
+      elements.gallery_connection.textContent = message;
+      if (status !== 'error') elements.gallery_fatal.hidden = true;
+    },
+    onFatal(error) {
+      if (error?.status === 410 || error?.code === 'GALLERY_RUN_PURGED') terminatePurged(friendlyError(error));
+      else showFatal(error);
+    },
+    resolveMediaUrl: ({ value, item, view }) => safeSingleSiteMediaUrl(value, item, view, endpoints),
+    isInteractionBlocked: () => Boolean(elements.baseline_dialog.open || elements.visual_review_dialog.open),
+    fullscreen: {
+      enter: (node) => node.requestFullscreen(),
+      exit: () => document.exitFullscreen(),
+      isActive: () => Boolean(document.fullscreenElement),
+    },
+    onBaselineIntent: ({ operation, item, opener }) => openSingleSiteBaselineDialog(operation, item, opener),
+    onVisualReviewIntent: ({ item, opener }) => openSingleSiteVisualReviewDialog(item, opener),
+  });
+  state.singleSite = controller;
+  elements.gallery_refresh.addEventListener('click', () => void controller.load());
+  elements.gallery_retry.addEventListener('click', () => void controller.load());
+  window.addEventListener('pagehide', destroy);
+  await controller.load();
+}
+
+function renderSingleSiteHead(head) {
+  const counts = head.primaryCounts ?? head.summary ?? {};
+  elements.gallery_phase.textContent = humanize(head.phase ?? 'finalized');
+  elements.gallery_counts.textContent = `${numberOr(0, counts.total)} logical items · ${numberOr(0, counts.images)} photos · ${numberOr(0, counts.videos)} videos`;
+  elements.gallery_revision.textContent = shortRevision(head.publicationRevision ?? head.contentRevision ?? head.publicationDigest);
+  elements.gallery_lifecycle.textContent = `${humanize(head.lifecycle?.status ?? head.status ?? 'finalized')} · Visual review is separate from deterministic Findings, Site Health, and promotion authority.`;
+}
+
+function updateSingleSiteUrl(gallery = state.singleSite?.getState?.()) {
+  if (!gallery) return;
+  const next = {
+    mode: 'single-site', run: state.runId, from: parsed.from, view: 'workbench',
+    review: gallery.filters.scope, finding: gallery.filters.finding,
+    coverage: gallery.filters.coverage, visual: gallery.filters.visual,
+  };
+  if (gallery.selectedId) next.item = gallery.selectedId;
+  for (const [key, value] of Object.entries(gallery.filters)) {
+    if (['scope', 'query'].includes(key) || !value || value === 'all') continue;
+    next[key] = key === 'kind' || key === 'suite' ? [value] : value;
+  }
+  if (gallery.filters.query) next.q = gallery.filters.query;
+  const updated = galleryUrlState.replaceState(next);
+  state.urlSearch = updated.search;
+}
+
+function bindSingleSiteMutationDialogs() {
+  elements.baseline_close.addEventListener('click', closeSingleSiteBaselineDialog);
+  elements.baseline_cancel.addEventListener('click', closeSingleSiteBaselineDialog);
+  elements.baseline_dialog.addEventListener('cancel', (event) => {
+    event.preventDefault();
+    closeSingleSiteBaselineDialog();
+  });
+  elements.baseline_form.addEventListener('input', () => {
+    if (state.singleSiteMutation) state.singleSiteMutation.idempotencyKey = null;
+  });
+  elements.baseline_form.addEventListener('submit', submitSingleSiteBaselineMutation);
+  elements.visual_review_close.addEventListener('click', closeSingleSiteVisualReviewDialog);
+  elements.visual_review_cancel.addEventListener('click', closeSingleSiteVisualReviewDialog);
+  elements.visual_review_dialog.addEventListener('cancel', (event) => {
+    event.preventDefault();
+    closeSingleSiteVisualReviewDialog();
+  });
+  elements.visual_review_form.addEventListener('input', () => {
+    if (state.singleSiteReviewMutation) state.singleSiteReviewMutation.idempotencyKey = null;
+  });
+  elements.visual_review_form.addEventListener('submit', submitSingleSiteVisualReview);
+}
+
+function openSingleSiteVisualReviewDialog(item, opener) {
+  if (item.visualStatus !== 'CHANGED') return;
+  state.singleSiteReviewController?.abort();
+  state.singleSiteReviewMutation = { item, opener, idempotencyKey: null };
+  elements.visual_review_identity.replaceChildren();
+  for (const [label, value] of [
+    ['Source run', state.runId], ['Evidence item', item.itemId], ['Audit', item.auditId], ['Case', item.caseId],
+    ['Route', item.route], ['Target', item.targetId], ['Capture point', item.capturePoint],
+    ['Active baseline', item.baseline?.baselineId ?? 'Not recorded'],
+  ]) appendDefinition(elements.visual_review_identity, label, value);
+  elements.visual_review_disposition.value = 'accepted-change';
+  elements.visual_review_rationale.value = '';
+  elements.visual_review_confirmation.value = '';
+  elements.visual_review_confirmation_copy.textContent = `REVIEW ${item.itemId}`;
+  elements.visual_review_dialog_state.textContent = 'Choose a disposition, explain the review, then type the exact confirmation.';
+  elements.visual_review_submit.disabled = false;
+  elements.visual_review_dialog.removeAttribute('aria-busy');
+  if (!elements.visual_review_dialog.open) elements.visual_review_dialog.showModal();
+  elements.visual_review_disposition.focus();
+}
+
+async function submitSingleSiteVisualReview(event) {
+  event.preventDefault();
+  const mutation = state.singleSiteReviewMutation;
+  if (!mutation || !elements.visual_review_form.reportValidity()) return;
+  const confirmation = `REVIEW ${mutation.item.itemId}`;
+  if (elements.visual_review_confirmation.value !== confirmation) {
+    elements.visual_review_confirmation.setCustomValidity(`Type ${confirmation} exactly.`);
+    elements.visual_review_confirmation.reportValidity();
+    elements.visual_review_confirmation.setCustomValidity('');
+    return;
+  }
+  const gallery = state.singleSite?.getState();
+  if (!Number.isInteger(gallery?.reviewRevision) || !Number.isInteger(gallery?.storeRevision)) {
+    elements.visual_review_dialog_state.textContent = 'Current review or baseline revision is unavailable. Refresh the gallery and try again.';
+    announce('Visual disposition could not start because current revisions are unavailable.');
+    return;
+  }
+  if (!mutation.idempotencyKey) mutation.idempotencyKey = crypto.randomUUID();
+  const body = {
+    expectedReviewRevision: gallery.reviewRevision,
+    expectedBaselineStoreRevision: gallery.storeRevision,
+    disposition: elements.visual_review_disposition.value,
+    rationale: elements.visual_review_rationale.value.trim(),
+    idempotencyKey: mutation.idempotencyKey,
+    confirmation,
+  };
+  state.singleSiteReviewController?.abort();
+  const controller = new AbortController();
+  state.singleSiteReviewController = controller;
+  elements.visual_review_dialog.setAttribute('aria-busy', 'true');
+  elements.visual_review_submit.disabled = true;
+  elements.visual_review_dialog_state.textContent = 'Saving one guarded, idempotent visual review event…';
+  announce('Saving visual disposition.');
+  try {
+    await loggedJson(state.singleSiteEndpoints.review(mutation.item.itemId), {
+      method: 'POST', body, signal: controller.signal,
+      activityPath: '/api/single-site/runs/:run/gallery/items/:item/review',
+    });
+    if (controller.signal.aborted || state.singleSiteReviewMutation !== mutation) return;
+    elements.visual_review_dialog_state.textContent = 'Disposition recorded. Reloading visual review state…';
+    announce('Visual disposition recorded. Findings and Site Health are unchanged.');
+    closeSingleSiteVisualReviewDialog({ restoreFocus: false });
+    await state.singleSite.load({ preferredItemId: mutation.item.itemId, focus: true });
+  } catch (error) {
+    if (controller.signal.aborted) return;
+    if (error.status === 409) {
+      mutation.idempotencyKey = null;
+      elements.visual_review_dialog_state.textContent = 'Review or baseline history changed. Reloading current evidence before retry…';
+      announce('Visual review history changed. Reloading current evidence.');
+      const loaded = await state.singleSite.load({ preferredItemId: mutation.item.itemId });
+      elements.visual_review_dialog_state.textContent = loaded
+        ? 'Current revisions reloaded. Recheck the exact identity and submit again.'
+        : 'Current revisions could not be reloaded. Use Refresh and retry.';
+    } else {
+      elements.visual_review_dialog_state.textContent = `${friendlyError(error)} Your disposition, rationale, and confirmation remain available for retry.`;
+      announce(`Visual disposition failed. ${friendlyError(error)}`);
+    }
+  } finally {
+    if (state.singleSiteReviewController === controller) state.singleSiteReviewController = null;
+    elements.visual_review_dialog.removeAttribute('aria-busy');
+    if (state.singleSiteReviewMutation === mutation) elements.visual_review_submit.disabled = false;
+  }
+}
+
+function closeSingleSiteVisualReviewDialog({ restoreFocus = true } = {}) {
+  state.singleSiteReviewController?.abort();
+  state.singleSiteReviewController = null;
+  const opener = state.singleSiteReviewMutation?.opener;
+  state.singleSiteReviewMutation = null;
+  elements.visual_review_dialog.removeAttribute('aria-busy');
+  elements.visual_review_dialog_state.textContent = '';
+  elements.visual_review_form.reset();
+  if (elements.visual_review_dialog.open) elements.visual_review_dialog.close();
+  if (restoreFocus) opener?.focus?.();
+}
+
+function openSingleSiteBaselineDialog(operation, item, opener) {
+  state.singleSiteMutationController?.abort();
+  const baselineId = item.baseline?.baselineId ?? null;
+  if (['replace', 'revoke', 'delete'].includes(operation) && !baselineId) return;
+  state.singleSiteMutation = { operation, item, baselineId, opener, idempotencyKey: null, storeRevision: null };
+  elements.baseline_dialog_title.textContent = `${humanize(operation)} visual baseline`;
+  elements.baseline_dialog_summary.textContent = baselineMutationSummary(operation);
+  elements.baseline_identity.replaceChildren();
+  for (const [label, value] of exactIdentityPairs(item)) appendDefinition(elements.baseline_identity, label, value);
+  elements.baseline_policy.textContent = operation === 'delete'
+    ? 'This deletes retained baseline media but preserves tombstoned provenance, digests, and history. It does not delete the source run.'
+    : operation === 'revoke'
+      ? 'The baseline stops matching future runs. Its immutable history remains reviewable.'
+      : 'The portal records the server-authenticated actor, action time, source run, rationale, and supersession history.';
+  const confirmation = baselineConfirmation(operation, item);
+  elements.baseline_confirmation_copy.textContent = confirmation;
+  elements.baseline_confirmation.value = '';
+  elements.baseline_reason.value = '';
+  elements.baseline_waiver.value = '';
+  const findingWaiver = ['approve', 'replace'].includes(operation) && item.findingCount > 0;
+  elements.baseline_waiver_field.hidden = !findingWaiver;
+  elements.baseline_waiver.required = findingWaiver;
+  elements.baseline_dialog_state.textContent = item.eligible || !['approve', 'replace'].includes(operation)
+    ? 'Review the exact identity, provide rationale, then type the confirmation.'
+    : `This evidence is not eligible: ${item.ineligibilityReasons.join('; ') || 'eligibility was not established.'}`;
+  elements.baseline_submit.disabled = ['approve', 'replace'].includes(operation) && !item.eligible;
+  elements.baseline_submit.textContent = `${humanize(operation)} baseline`;
+  if (!elements.baseline_dialog.open) elements.baseline_dialog.showModal();
+  elements.baseline_reason.focus();
+}
+
+async function submitSingleSiteBaselineMutation(event) {
+  event.preventDefault();
+  const mutation = state.singleSiteMutation;
+  if (!mutation || !elements.baseline_form.reportValidity()) return;
+  const expected = baselineConfirmation(mutation.operation, mutation.item);
+  if (elements.baseline_confirmation.value !== expected) {
+    elements.baseline_confirmation.setCustomValidity(`Type ${expected} exactly.`);
+    elements.baseline_confirmation.reportValidity();
+    elements.baseline_confirmation.setCustomValidity('');
+    return;
+  }
+  let storeRevision = mutation.storeRevision ?? state.singleSite?.getState()?.storeRevision;
+  if (!Number.isInteger(storeRevision)) {
+    try {
+      const result = await refreshSingleSiteBaselineStore(mutation.item);
+      storeRevision = integerOrNull(result.storeRevision);
+      mutation.storeRevision = storeRevision;
+    } catch (error) {
+      elements.baseline_dialog_state.textContent = `Could not load the current baseline revision. ${friendlyError(error)}`;
+      return;
+    }
+  }
+  if (!mutation.idempotencyKey) mutation.idempotencyKey = crypto.randomUUID();
+  const body = {
+    expectedStoreRevision: storeRevision,
+    reason: elements.baseline_reason.value.trim(),
+    idempotencyKey: mutation.idempotencyKey,
+    confirmation: expected,
+    ...(['approve', 'replace'].includes(mutation.operation) ? {
+      runId: state.runId,
+      evidenceId: mutation.item.evidenceId,
+      ...(mutation.item.findingCount > 0 ? { findingWaiverReason: elements.baseline_waiver.value.trim() } : {}),
+    } : {}),
+  };
+  const endpoints = state.singleSiteEndpoints;
+  const url = mutation.operation === 'approve' ? endpoints.approve()
+    : mutation.operation === 'replace' ? endpoints.replace(mutation.baselineId)
+      : mutation.operation === 'revoke' ? endpoints.revoke(mutation.baselineId)
+        : endpoints.delete(mutation.baselineId);
+  const method = mutation.operation === 'delete' ? 'DELETE' : 'POST';
+  state.singleSiteMutationController?.abort();
+  const controller = new AbortController();
+  state.singleSiteMutationController = controller;
+  elements.baseline_submit.disabled = true;
+  elements.baseline_dialog_state.textContent = 'Saving one guarded, idempotent baseline event…';
+  try {
+    await loggedJson(url, { method, body, signal: controller.signal, activityPath: `/api/single-site/visual-baselines/${mutation.operation}` });
+    if (controller.signal.aborted || state.singleSiteMutation !== mutation) return;
+    elements.baseline_dialog_state.textContent = `${humanize(mutation.operation)} recorded. Refreshing the exact item state…`;
+    announce(`${humanize(mutation.operation)} baseline action recorded.`);
+    closeSingleSiteBaselineDialog({ restoreFocus: false });
+    await state.singleSite.load({ preferredItemId: mutation.item.itemId, focus: true });
+  } catch (error) {
+    if (controller.signal.aborted) return;
+    if (error.status === 409) {
+      mutation.idempotencyKey = null;
+      try {
+        const result = await refreshSingleSiteBaselineStore(mutation.item);
+        mutation.storeRevision = integerOrNull(result.storeRevision);
+      } catch { /* Preserve the form and authoritative mutation error. */ }
+      elements.baseline_dialog_state.textContent = `Baseline history changed or eligibility was rejected. Current revision reloaded; review the identity and retry. ${friendlyError(error)}`;
+    } else elements.baseline_dialog_state.textContent = `${friendlyError(error)} Your rationale and confirmation remain available for retry.`;
+    announce(`Baseline action failed. ${friendlyError(error)}`);
+  } finally {
+    if (state.singleSiteMutationController === controller) state.singleSiteMutationController = null;
+    if (state.singleSiteMutation === mutation) elements.baseline_submit.disabled = ['approve', 'replace'].includes(mutation.operation) && !mutation.item.eligible;
+  }
+}
+
+function refreshSingleSiteBaselineStore(item) {
+  const query = new URLSearchParams({ limit: '20' });
+  if (item.slotKey) query.set('slotKey', item.slotKey);
+  return loggedJson(state.singleSiteEndpoints.baselineCollection(query), {
+    activityPath: '/api/single-site/visual-baselines', rowCount: (value) => value.items?.length,
+  });
+}
+
+function closeSingleSiteBaselineDialog({ restoreFocus = true } = {}) {
+  state.singleSiteMutationController?.abort();
+  state.singleSiteMutationController = null;
+  const opener = state.singleSiteMutation?.opener;
+  state.singleSiteMutation = null;
+  elements.baseline_dialog_state.textContent = '';
+  elements.baseline_form.reset();
+  if (elements.baseline_dialog.open) elements.baseline_dialog.close();
+  if (restoreFocus) opener?.focus?.();
+}
+
+function appendDefinition(list, label, value) {
+  const term = document.createElement('dt');
+  term.textContent = label;
+  const description = document.createElement('dd');
+  description.textContent = String(value ?? 'Not recorded');
+  list.append(term, description);
+}
+
+function exactIdentityPairs(item) {
+  const rendering = item.identity.rendering && typeof item.identity.rendering === 'object' ? item.identity.rendering : {};
+  const viewport = item.identity.viewport && typeof item.identity.viewport === 'object' ? item.identity.viewport : {};
+  return [
+    ['Source run', state.runId], ['Evidence ID', item.evidenceId ?? 'Not eligible'], ['Audit definition', item.auditId],
+    ['Route', item.route], ['Browser target', item.targetId],
+    ['Viewport', viewport.width && viewport.height ? `${viewport.width} × ${viewport.height}` : 'Not recorded'],
+    ['Theme', item.theme], ['Capture point', item.capturePoint],
+    ['Rendering fingerprint', rendering.fingerprint ?? item.identity.renderingFingerprint ?? 'Not recorded'],
+    ['Current media digest', item.current?.sha256 ?? item.evidence?.artifactSha256 ?? 'Not recorded'],
+    ['Active baseline', item.baseline?.baselineId ?? 'None'],
+  ];
+}
+
+function baselineConfirmation(operation, item) {
+  if (operation === 'approve') return `APPROVE ${item.evidenceId}`;
+  if (operation === 'replace') return `REPLACE ${item.baseline.baselineId} ${item.evidenceId}`;
+  if (operation === 'revoke') return `REVOKE ${item.baseline.baselineId}`;
+  return `DELETE ${item.baseline.baselineId}`;
+}
+
+function baselineMutationSummary(operation) {
+  if (operation === 'approve') return 'Approve this exact completed-run image as the first active baseline for its complete visual identity.';
+  if (operation === 'replace') return 'Replace the active baseline with this exact completed-run image. The previous record remains in supersession history.';
+  if (operation === 'revoke') return 'Revoke this baseline so it no longer matches future captures. Historical provenance remains.';
+  return 'Delete retained baseline media while preserving tombstoned provenance and immutable digests.';
+}
+
+function safeSingleSiteMediaUrl(value, item, view, endpoints) {
+  const fallback = view === 'current' && item.current ? endpoints.currentMedia(item.itemId)
+    : view === 'diff' && item.diff ? endpoints.diffMedia(item.itemId)
+      : view === 'baseline' && item.baseline?.baselineId ? endpoints.baselineMedia(item.baseline.baselineId)
+        : null;
+  const candidate = typeof value === 'string' && value ? value : fallback;
+  if (!candidate || candidate.includes('\\')) return null;
+  let parsedUrl;
+  try { parsedUrl = new URL(candidate, location.origin); } catch { return null; }
+  if (parsedUrl.origin !== location.origin || parsedUrl.username || parsedUrl.password || parsedUrl.hash) return null;
+  if (!parsedUrl.pathname.startsWith('/api/single-site/')) return null;
+  return `${parsedUrl.pathname}${parsedUrl.search}`;
+}
+
+function integerOrNull(value) {
+  return Number.isInteger(value) && value >= 0 ? value : null;
+}
+
+function numberOr(fallback, value) {
+  return Number.isFinite(Number(value)) ? Number(value) : fallback;
+}
+
 function activity(kind, message) {
   const bounded = `${new Date().toLocaleTimeString()} · ${kind} · ${String(message).replace(/[\r\n]+/g, ' ').slice(0, 1000)}`;
   state.activity.push(bounded);
@@ -783,25 +1274,34 @@ function activity(kind, message) {
   elements.gallery_activity_count.textContent = `${state.activity.length} event${state.activity.length === 1 ? '' : 's'} · ${formatBytes(state.activityCharacters)}`;
 }
 
-function parseReviewUrl(url) {
-  const run = url.searchParams.get('run')?.trim() ?? '';
+function parseReviewUrl(parsedUrl) {
+  const route = parsedUrl?.state ?? {};
+  const run = route.run?.trim() ?? '';
+  const runMode = route.mode === 'single-site' ? 'single-site' : 'comparative';
   const query = {};
   for (const [name, [key, allowlist]] of Object.entries(FILTERS)) {
-    query[key] = [...new Set(url.searchParams.getAll(name).filter((value) => validUrlValue(value, allowlist)))].slice(0, 20);
+    const values = Array.isArray(route[name]) ? route[name] : route[name] ? [route[name]] : [];
+    query[key] = [...new Set(values.filter((value) => validUrlValue(value, allowlist)))].slice(0, 20);
   }
-  const search = url.searchParams.get('q')?.replace(/\s+/g, ' ').trim() ?? '';
+  const search = route.q?.replace(/\s+/g, ' ').trim() ?? '';
   query.search = search.length <= 1_200 ? search : '';
-  const group = url.searchParams.get('group'); query.group = ['feature', 'technical', 'none'].includes(group) ? group : 'feature';
-  const sort = url.searchParams.get('sort'); query.sort = ['attention', 'feature', 'technical', 'audit', 'capture-time'].includes(sort) ? sort : 'attention';
-  const member = url.searchParams.get('member');
+  query.group = ['feature', 'technical', 'none'].includes(route.group) ? route.group : 'feature';
+  query.sort = ['attention', 'feature', 'technical', 'audit', 'capture-time'].includes(route.sort) ? route.sort : 'attention';
+  const member = route.member;
   return {
     runId: RUN_ID.test(run) ? run : null,
-    from: ['runs', 'report'].includes(url.searchParams.get('from')) ? url.searchParams.get('from') : 'runs',
-    mode: url.searchParams.get('mode') === 'overview' ? 'overview' : 'workbench',
-    itemId: ITEM_ID.test(url.searchParams.get('item') ?? '') ? url.searchParams.get('item') : null,
+    runMode,
+    from: ['runs', 'report'].includes(route.from) ? route.from : 'runs',
+    mode: route.mode === 'overview' || route.view === 'overview' ? 'overview' : 'workbench',
+    itemId: (runMode === 'single-site' ? SINGLE_SITE_ITEM_ID : ITEM_ID).test(route.item ?? '') ? route.item : null,
     memberId: MEMBER_ID.test(member ?? '') ? member : null,
     query,
-    raw: url.searchParams.get('raw') === '1',
+    singleSiteFilters: {
+      scope: route.review === 'all' ? 'all' : 'attention',
+      kind: route.kind?.[0] ?? '', suite: route.suite?.[0] ?? '', finding: route.finding ?? 'all',
+      coverage: route.coverage ?? 'all', visual: route.visual ?? 'all', query: search,
+    },
+    raw: route.raw === '1',
   };
 }
 
@@ -818,14 +1318,57 @@ function showFatal(error) {
   announce(`${elements.gallery_fatal_title.textContent}. ${elements.gallery_fatal_message.textContent}`);
 }
 
+function terminatePurged(message, { publish = true } = {}) {
+  if (state.purged) return;
+  state.purged = true;
+  state.terminalGeneration += 1;
+  state.deltaGeneration += 1;
+  state.flagGeneration += 1;
+  state.flagMutationGeneration += 1;
+  state.singleSiteMutationController?.abort();
+  state.singleSiteReviewController?.abort();
+  state.flagController?.abort();
+  state.flagMutationController?.abort();
+  state.deltaController?.abort();
+  state.stream?.close();
+  state.stream = null;
+  state.logStream?.close();
+  state.logStream = null;
+  state.singleSite?.destroy?.();
+  state.singleSite = null;
+  state.workbench?.destroy?.();
+  state.workbench = null;
+  clearDetailRequests();
+  state.detailCache.clear();
+  elements.gallery_workbench.replaceChildren();
+  elements.execution_log.replaceChildren();
+  elements.raw_files.replaceChildren();
+  elements.gallery_refresh.disabled = true;
+  elements.reload_execution.disabled = true;
+  elements.load_more_raw.disabled = true;
+  elements.gallery_retry.hidden = true;
+  for (const dialog of [elements.gallery_flag_dialog, elements.baseline_dialog, elements.visual_review_dialog]) {
+    if (dialog?.open) dialog.close();
+  }
+  showFatal(new PortalGalleryError(410, 'GALLERY_RUN_PURGED', message || 'The run and its evidence were permanently purged.'));
+  if (publish) publishRunInvalidation({ window, mode: parsed.runMode, runId: state.runId, reason: 'purged' });
+}
+
 function destroy() {
   state.destroyed = true;
+  state.terminalGeneration += 1;
+  state.singleSiteMutationController?.abort();
+  state.singleSiteReviewController?.abort();
+  state.singleSite?.destroy?.();
   cancelFlagMutation();
   state.flagController?.abort();
   state.deltaController?.abort();
   state.stream?.close();
   state.logStream?.close();
   state.workbench?.destroy();
+  clearDetailRequests();
+  state.invalidation?.destroy();
+  galleryUrlState.destroy();
 }
 
 function announce(value) { elements.gallery_announcer.textContent = String(value ?? '').replace(/\s+/g, ' ').trim().slice(0, 320); }

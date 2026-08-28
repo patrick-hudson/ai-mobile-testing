@@ -1,8 +1,18 @@
+import { readFileSync } from 'node:fs';
+import { promises as fs } from 'node:fs';
+import { dirname } from 'node:path';
 import { expect, test as base, type APIResponse, type Page, type Request, type TestInfo } from '@playwright/test';
 import { ALL_AUDIT_BY_ID } from '../audit/definitions.js';
-import { ENVIRONMENTS, projectMetadata, resolveEnvironmentPath } from '../audit/environments.js';
+import { parseAuditProjectMetadata, resolveProjectPath } from '../audit/environments.js';
+import {
+  AUDIT_CASE_ID_ANNOTATION,
+  auditCaseTag,
+  resolveDeclaredSingleSiteCaseId,
+  type ExecutableAuditCaseRegistry,
+} from '../audit/execution-selection.js';
 import { firstBracketedAuditId } from '../audit/audit-id.js';
 import { interactionVideoDelayMs, type InteractionVideoPhase } from '../audit/interaction-pacing.js';
+import { classifyHorizontalOverflowCandidates } from '../audit/overflow-evidence.js';
 import {
   AUDIT_APPLICABILITY_ANNOTATION,
   AUDIT_EVIDENCE_POLICY_ANNOTATION,
@@ -13,7 +23,7 @@ import {
   serializeEvidencePolicy,
 } from '../audit/evidence-policy.js';
 import { assertAuditDefinition, auditDefinitionsEqual } from '../audit/plugins.js';
-import { LOCAL_AUDIT_TARGETS } from '../audit/targets.js';
+import { LOCAL_AUDIT_TARGETS, SINGLE_SITE_LOCAL_AUDIT_TARGETS } from '../audit/targets.js';
 import {
   GALLERY_CAPTURE_METADATA_CONTENT_TYPE,
   boundedGalleryText,
@@ -21,7 +31,18 @@ import {
   type GalleryCaptureMetadata,
   type GalleryMemberRole,
 } from '../shared/gallery-contract.mjs';
-import { targetMatchesAuditApplicability } from '../shared/target-applicability.mjs';
+import {
+  VISUAL_CAPTURE_METADATA_CONTENT_TYPE,
+  parseVisualBaselineIdentity,
+  visualBaselineDigest,
+  visualBaselineIdentityKey,
+  visualBaselineSlotKey,
+} from '../shared/visual-baseline-contract.mjs';
+import {
+  singleSiteTargetMatchesAuditApplicability,
+  targetMatchesAuditApplicability,
+} from '../shared/target-applicability.mjs';
+import { runnerRevisionDigest } from '../shared/runner-revision.mjs';
 import type {
   AuditDefinition,
   AuditApplicability,
@@ -34,8 +55,22 @@ import type {
   AuditThirdPartyTelemetryDiagnostic,
   AuditStepRecord,
   AuditEnvironment,
+  AuditProjectMetadata,
   PageInspection,
 } from '../audit/types.js';
+
+const executableCaseRegistry = JSON.parse(
+  readFileSync(new URL('../audit/plugins.generated.json', import.meta.url), 'utf8'),
+) as ExecutableAuditCaseRegistry;
+const MAX_STRUCTURED_EVIDENCE_BYTES = 32 * 1_048_576;
+const MAX_AUDIT_RESULT_SUMMARY_BYTES = 64 * 1_024;
+
+function activeRunMode(): 'comparative' | 'single-site' {
+  const value = process.env.AUDIT_RUN_MODE;
+  if (value === undefined || value === '' || value === 'comparative') return 'comparative';
+  if (value === 'single-site') return 'single-site';
+  throw new Error('AUDIT_RUN_MODE must be exactly comparative or single-site.');
+}
 
 function timestamp(): string {
   return new Date().toISOString();
@@ -193,6 +228,7 @@ export class AuditRun {
   readonly page: Page;
   readonly testInfo: TestInfo;
   readonly evidencePolicy: AuditEvidencePolicy;
+  readonly caseId: string | null;
   private currentDefinition: AuditDefinition | null;
   private checkpointCount = 0;
   private interactionActionStepCount = 0;
@@ -201,6 +237,7 @@ export class AuditRun {
   private readonly runtimeExpectations: AuditRuntimeExpectation[] = [];
   private lastRuntimeActivityAt = Date.now();
   private readonly galleryAttachmentOccurrences = new Map<string, number>();
+  private readonly structuredAttachmentOccurrences = new Map<string, number>();
   private readonly loggedTelemetryDiagnostics = new Set<string>();
   readonly startedAt = timestamp();
   readonly steps: AuditStepRecord[] = [];
@@ -228,9 +265,19 @@ export class AuditRun {
     this.evidencePolicy = evidencePolicy;
     const auditId = firstBracketedAuditId(testInfo.title);
     this.currentDefinition = auditId ? (ALL_AUDIT_BY_ID.get(auditId) ?? null) : null;
-    this.coveredEnvironmentSet.add(projectMetadata(testInfo.project.metadata).environment);
+    const project = parseAuditProjectMetadata(testInfo.project.metadata);
+    const declaredCaseIds = testInfo.annotations
+      .filter(({ type }) => type === AUDIT_CASE_ID_ANNOTATION)
+      .map(({ description }) => description?.trim() ?? '')
+      .filter(Boolean);
+    if (project.mode === 'single-site' && declaredCaseIds.length !== 1) {
+      throw new Error(`Single-site execution must bind exactly one compiled case ID; received ${declaredCaseIds.length}.`);
+    }
+    this.caseId = declaredCaseIds[0] ?? null;
+    if (project.mode === 'comparative') this.coveredEnvironmentSet.add(project.environment);
     verboseLog('TEST_START', {
       auditId: auditId ?? 'UNMAPPED',
+      caseId: this.caseId,
       project: testInfo.project.name,
       title: testInfo.title,
       evidencePolicy,
@@ -406,6 +453,9 @@ export class AuditRun {
   }
 
   coverEnvironments(...environments: AuditEnvironment[]): void {
+    if (parseAuditProjectMetadata(this.testInfo.project.metadata).mode === 'single-site') {
+      throw new Error('Single-site evidence cannot claim paired environment coverage.');
+    }
     if (environments.length === 0) throw new Error('coverEnvironments requires at least one environment.');
     for (const environment of environments) {
       if (environment !== 'candidate' && environment !== 'production') {
@@ -416,13 +466,11 @@ export class AuditRun {
   }
 
   environmentBaseURL(): string {
-    const metadata = projectMetadata(this.testInfo.project.metadata);
-    return ENVIRONMENTS[metadata.environment].baseURL;
+    return parseAuditProjectMetadata(this.testInfo.project.metadata).baseURL;
   }
 
   environmentPath(candidatePath: string): string | null {
-    const metadata = projectMetadata(this.testInfo.project.metadata);
-    return resolveEnvironmentPath(metadata.environment, candidatePath);
+    return resolveProjectPath(parseAuditProjectMetadata(this.testInfo.project.metadata), candidatePath);
   }
 
   private async holdInteractionVideo(
@@ -527,10 +575,28 @@ export class AuditRun {
   }
 
   async attachJson(name: string, value: unknown): Promise<void> {
-    await this.testInfo.attach(name, {
-      body: Buffer.from(JSON.stringify(value, null, 2)),
-      contentType: 'application/json',
-    });
+    await this.attachStructuredJson(name, value);
+  }
+
+  private async attachStructuredJson(name: string, value: unknown): Promise<void> {
+    const bytes = Buffer.from(JSON.stringify(value, null, 2));
+    if (bytes.length < 2 || bytes.length > MAX_STRUCTURED_EVIDENCE_BYTES) {
+      throw new Error(`Structured evidence ${name} is empty or exceeds the ${MAX_STRUCTURED_EVIDENCE_BYTES}-byte per-file bound.`);
+    }
+    const occurrence = this.structuredAttachmentOccurrences.get(name) ?? 0;
+    this.structuredAttachmentOccurrences.set(name, occurrence + 1);
+    const safeName = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 100) || 'evidence';
+    const target = this.testInfo.outputPath('structured-evidence', `${safeName}-${occurrence}.json`);
+    const temporary = `${target}.${process.pid}.tmp`;
+    await fs.mkdir(dirname(target), { recursive: true });
+    await fs.writeFile(temporary, bytes, { flag: 'wx' });
+    try { await fs.rename(temporary, target); } finally { await fs.rm(temporary, { force: true }); }
+    try {
+      await this.testInfo.attach(name, { path: target, contentType: 'application/json' });
+    } finally {
+      // Playwright copies path attachments into its owned attachment directory.
+      await fs.rm(target, { force: true });
+    }
   }
 
   async attachVisual(
@@ -598,6 +664,8 @@ export class AuditRun {
     name = assertStaticCheckpoint(this.evidencePolicy, name);
     const safeName = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
     const path = this.testInfo.outputPath(`${safeName || 'checkpoint'}.png`);
+    const attachmentName = `checkpoint-${safeName || 'page'}`;
+    const attachmentOccurrence = this.galleryAttachmentOccurrences.get(attachmentName) ?? 0;
     await this.page.screenshot({
       path,
       fullPage: options.fullPage ?? false,
@@ -605,43 +673,205 @@ export class AuditRun {
       caret: 'hide',
     });
     await this.attachVisual(
-      `checkpoint-${safeName || 'page'}`,
+      attachmentName,
       { path, contentType: 'image/png' },
       {
-        attachmentKey: `checkpoint-${safeName || 'page'}`,
+        attachmentKey: attachmentName,
         observedState: `The ${name} checkpoint is visible.`,
         rationale: this.evidencePolicy.rationale,
       },
     );
+    const project = parseAuditProjectMetadata(this.testInfo.project.metadata);
+    if (project.mode === 'single-site') {
+      const target = SINGLE_SITE_LOCAL_AUDIT_TARGETS.find(({ id }) => id === this.testInfo.project.name);
+      const definition = this.currentDefinition;
+      const viewport = this.page.viewportSize();
+      if (!target || !definition || !viewport) {
+        throw new Error('Single-site visual checkpoint lacks its target, Audit Definition, or viewport.');
+      }
+      const runnerImageDigest = runnerRevisionDigest(process.env.AUDIT_RUNNER_REVISION);
+      const renderingState = await this.page.evaluate(() => ({
+        devicePixelRatio: window.devicePixelRatio,
+        route: `${window.location.pathname}${window.location.search}`,
+        theme: document.documentElement.dataset.theme
+          ?? (document.documentElement.classList.contains('dark') ? 'dark' : 'light'),
+        fonts: [...document.fonts].map((font) => ({
+          family: font.family,
+          style: font.style,
+          weight: font.weight,
+          stretch: font.stretch,
+          status: font.status,
+        })).sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right))),
+      }));
+      const browserVersion = this.page.context().browser()?.version() ?? 'unknown';
+      const identity = parseVisualBaselineIdentity({
+        schemaVersion: 1,
+        mode: 'single-site',
+        deploymentRole: project.deploymentRole,
+        route: renderingState.route,
+        targetId: target.id,
+        viewport,
+        theme: String(renderingState.theme).toLowerCase().replace(/[^a-z0-9._:-]+/g, '-') || 'unknown',
+        auditId: definition.id,
+        auditDefinitionDigest: visualBaselineDigest(definition),
+        capturePoint: safeName || 'checkpoint',
+        browser: {
+          engine: target.engine,
+          product: target.browserProduct,
+          version: browserVersion,
+          build: `${target.browserProduct}-${browserVersion}`,
+        },
+        rendering: {
+          devicePixelRatio: renderingState.devicePixelRatio,
+          captureContractRevision: 'single-site-static-checkpoint-v1',
+          runnerImageDigest,
+          fontPackDigest: visualBaselineDigest(renderingState.fonts),
+        },
+      });
+      const metadata = {
+        schemaVersion: 1,
+        kind: 'single-site-visual-capture',
+        attachmentName,
+        attachmentOccurrence,
+        identity,
+        identityKey: visualBaselineIdentityKey(identity),
+        slotKey: visualBaselineSlotKey(identity),
+      };
+      await this.testInfo.attach(`visual-baseline-capture-${safeName || 'page'}`, {
+        body: Buffer.from(JSON.stringify(metadata)),
+        contentType: VISUAL_CAPTURE_METADATA_CONTENT_TYPE,
+      });
+    }
     this.checkpointCount += 1;
     return path;
   }
 
   async inspectPage(): Promise<PageInspection> {
-    const inspection = await this.page.evaluate(() => {
+    const evaluated = await this.page.evaluate(() => {
       const root = document.documentElement;
+      const viewportWidth = root.clientWidth;
       const brokenImages = [...document.images]
         .filter((image) => image.complete && image.naturalWidth === 0)
         .map((image) => image.currentSrc || image.src);
+      const selectorFor = (element: Element): string => {
+        const segments: string[] = [];
+        let current: Element | null = element;
+        while (current && current !== document.documentElement) {
+          const tag = current.tagName.toLowerCase();
+          if (current.id) {
+            segments.unshift(`${tag}#${CSS.escape(current.id)}`);
+            break;
+          }
+          const parent: Element | null = current.parentElement;
+          if (!parent) {
+            segments.unshift(tag);
+            break;
+          }
+          const sameTagSiblings = [...parent.children].filter((sibling) => sibling.tagName === current!.tagName);
+          const index = sameTagSiblings.indexOf(current) + 1;
+          segments.unshift(`${tag}:nth-of-type(${index})`);
+          current = parent;
+          if (segments.length >= 6) break;
+        }
+        return segments.join(' > ');
+      };
+      const nearestScrollOwnerFor = (element: Element, box: DOMRect) => {
+        let ancestor = element.parentElement;
+        while (ancestor && ancestor !== document.body && ancestor !== root) {
+          const style = window.getComputedStyle(ancestor);
+          if (/(?:auto|scroll|hidden|clip)/.test(style.overflowX)) {
+            const ancestorBox = ancestor.getBoundingClientRect();
+            if (ancestor.scrollWidth > ancestor.clientWidth + 1
+              || box.left < ancestorBox.left - 1
+              || box.right > ancestorBox.right + 1) {
+              return {
+                element: ancestor,
+                selector: selectorFor(ancestor),
+                left: ancestorBox.left,
+                right: ancestorBox.right,
+                clientWidth: ancestor.clientWidth,
+                scrollWidth: ancestor.scrollWidth,
+                overflowX: style.overflowX,
+              };
+            }
+          }
+          ancestor = ancestor.parentElement;
+        }
+        return null;
+      };
+      const rawCandidates = root.scrollWidth <= viewportWidth + 1
+        ? []
+        : [document.body, ...document.body.querySelectorAll<HTMLElement>('*')].flatMap((element) => {
+            const style = window.getComputedStyle(element);
+            const box = element.getBoundingClientRect();
+            if (style.display === 'none' || style.visibility === 'hidden' || box.width <= 0 || box.height <= 0) return [];
+            const scrollOwner = nearestScrollOwnerFor(element, box);
+            const selector = selectorFor(element);
+            let selectorMatchCount = 0;
+            try {
+              selectorMatchCount = document.querySelectorAll(selector).length;
+            } catch {
+              selectorMatchCount = 0;
+            }
+            return [{
+              selector,
+              selectorMatchCount,
+              tagName: element.tagName.toLowerCase(),
+              text: (element.getAttribute('aria-label') || element.textContent || '')
+                .replace(/\s+/g, ' ')
+                .trim()
+                .slice(0, 160),
+              left: box.left,
+              right: box.right,
+              width: box.width,
+              clientWidth: element.clientWidth,
+              scrollWidth: element.scrollWidth,
+              overflowX: style.overflowX,
+              position: style.position,
+              containedByScrollOwner: scrollOwner !== null,
+              nearestScrollOwner: scrollOwner === null ? null : {
+                selector: scrollOwner.selector,
+                left: Math.round(scrollOwner.left * 100) / 100,
+                right: Math.round(scrollOwner.right * 100) / 100,
+                clientWidth: scrollOwner.clientWidth,
+                scrollWidth: scrollOwner.scrollWidth,
+                overflowX: scrollOwner.overflowX,
+              },
+            }];
+          });
       return {
-        url: window.location.href,
-        title: document.title,
-        h1Count: [...document.querySelectorAll('h1')].filter((heading) => {
-          const style = window.getComputedStyle(heading);
-          const box = heading.getBoundingClientRect();
-          return style.display !== 'none' && style.visibility !== 'hidden' && box.width > 0 && box.height > 0;
-        }).length,
-        horizontalOverflowPx: Math.max(0, root.scrollWidth - root.clientWidth),
-        brokenImages,
-        documentHeight: root.scrollHeight,
-        viewportWidth: root.clientWidth,
-        viewportHeight: root.clientHeight,
-        canonical: document.querySelector<HTMLLinkElement>('link[rel="canonical"]')?.href ?? null,
-        robots: document.querySelector<HTMLMetaElement>('meta[name="robots"]')?.content ?? null,
-        description: document.querySelector<HTMLMetaElement>('meta[name="description"]')?.content ?? null,
-        themeMode: root.dataset.themeMode ?? null,
+        base: {
+          url: window.location.href,
+          title: document.title,
+          h1Count: [...document.querySelectorAll('h1')].filter((heading) => {
+            const style = window.getComputedStyle(heading);
+            const box = heading.getBoundingClientRect();
+            return style.display !== 'none' && style.visibility !== 'hidden' && box.width > 0 && box.height > 0;
+          }).length,
+          horizontalOverflowPx: Math.max(0, root.scrollWidth - viewportWidth),
+          brokenImages,
+          documentHeight: root.scrollHeight,
+          viewportWidth,
+          viewportHeight: root.clientHeight,
+          canonical: document.querySelector<HTMLLinkElement>('link[rel="canonical"]')?.href ?? null,
+          robots: document.querySelector<HTMLMetaElement>('meta[name="robots"]')?.content ?? null,
+          description: document.querySelector<HTMLMetaElement>('meta[name="description"]')?.content ?? null,
+          themeMode: root.dataset.themeMode ?? null,
+        },
+        rawCandidates,
       };
     });
+    const overflow = classifyHorizontalOverflowCandidates(
+      evaluated.base.horizontalOverflowPx,
+      evaluated.base.viewportWidth,
+      evaluated.rawCandidates,
+    );
+    const inspection: PageInspection = {
+      ...evaluated.base,
+      horizontalOverflowElements: overflow.elements,
+      horizontalOverflowCandidateCount: overflow.candidateCount,
+      horizontalOverflowTruncated: overflow.truncated,
+    };
     this.pageInspections.push(inspection);
     return inspection;
   }
@@ -781,17 +1011,30 @@ export class AuditRun {
         `Static test "${this.testInfo.title}" passed without a purposeful audit.checkpoint(...) capture.`,
       );
     }
-    const project = projectMetadata(this.testInfo.project.metadata);
+    const project = parseAuditProjectMetadata(this.testInfo.project.metadata);
+    // Legacy report readers still require the compatibility environment while
+    // Single-site report branching is introduced. The explicit mode, role,
+    // base URL, and authority below remain the execution truth.
+    const compatibilityEnvironment: AuditEnvironment = project.mode === 'comparative'
+      ? project.environment
+      : project.deploymentRole === 'preview' ? 'candidate' : 'production';
     const viewport = this.page.viewportSize();
     const idFromTitle = firstBracketedAuditId(this.testInfo.title);
     const record: AuditEvidenceRecord = {
       schemaVersion: 1,
+      ...(this.caseId ? { caseId: this.caseId } : {}),
       auditId: this.definition?.id ?? idFromTitle ?? 'UNMAPPED',
       definition: this.definition,
       evidencePolicy: this.evidencePolicy,
-      environment: project.environment,
-      coveredEnvironments: [...this.coveredEnvironmentSet].sort(),
-      baseURL: ENVIRONMENTS[project.environment].baseURL,
+      environment: compatibilityEnvironment,
+      ...(project.mode === 'comparative'
+        ? { coveredEnvironments: [...this.coveredEnvironmentSet].sort() }
+        : {
+            mode: 'single-site' as const,
+            deploymentRole: project.deploymentRole,
+            evidenceAuthority: project.evidenceAuthority,
+          }),
+      baseURL: project.baseURL,
       project: this.testInfo.project.name,
       browser: project.browserLabel,
       viewport,
@@ -811,19 +1054,35 @@ export class AuditRun {
       runtimeExpectations: this.runtimeExpectations.map((expectation) => ({ ...expectation })),
       thirdPartyTelemetryDiagnostics: this.thirdPartyTelemetryDiagnostics.map((diagnostic) => ({ ...diagnostic })),
     };
-    await this.testInfo.attach('audit-result', {
-      body: Buffer.from(JSON.stringify(record, null, 2)),
+    await this.attachStructuredJson('audit-result', record);
+    const auditSummary = Buffer.from(JSON.stringify({
+      schemaVersion: record.schemaVersion,
+      ...(record.caseId ? { caseId: record.caseId } : {}),
+      auditId: record.auditId,
+      ...(record.mode === 'single-site' ? {
+        mode: record.mode,
+        deploymentRole: record.deploymentRole,
+        evidenceAuthority: record.evidenceAuthority,
+      } : { coveredEnvironments: record.coveredEnvironments }),
+      environment: record.environment,
+      baseURL: record.baseURL,
+      project: record.project,
+      findings: record.findings,
+      steps: record.steps,
+    }));
+    if (auditSummary.length > MAX_AUDIT_RESULT_SUMMARY_BYTES) {
+      throw new Error(`Compact audit-result summary exceeds the ${MAX_AUDIT_RESULT_SUMMARY_BYTES}-byte decision bound.`);
+    }
+    await this.testInfo.attach('audit-result-summary', {
+      body: auditSummary,
       contentType: 'application/json',
     });
     if (this.definition?.evidence.includes('network')) {
-      await this.testInfo.attach('network-evidence', {
-        body: Buffer.from(JSON.stringify({
-          httpResponses: record.httpResponses,
-          failedRequests: record.failedRequests,
-          badResponses: record.badResponses,
-          thirdPartyTelemetryDiagnostics: record.thirdPartyTelemetryDiagnostics,
-        }, null, 2)),
-        contentType: 'application/json',
+      await this.attachStructuredJson('network-evidence', {
+        httpResponses: record.httpResponses,
+        failedRequests: record.failedRequests,
+        badResponses: record.badResponses,
+        thirdPartyTelemetryDiagnostics: record.thirdPartyTelemetryDiagnostics,
       });
     }
     verboseLog('TEST_FINISH', {
@@ -845,10 +1104,15 @@ export type { AuditApplicability } from '../audit/types.js';
 
 interface AuditProjectContext {
   name: string;
-  metadata: ReturnType<typeof projectMetadata>;
+  metadata: AuditProjectMetadata;
 }
 
 export function auditApplies(applicability: AuditApplicability, project: AuditProjectContext): boolean {
+  if (project.metadata.mode === 'single-site') {
+    const target = SINGLE_SITE_LOCAL_AUDIT_TARGETS.find(({ id }) => id === project.name);
+    if (!target) throw new Error(`Playwright project ${project.name} is absent from the validated Single-site target registry.`);
+    return singleSiteTargetMatchesAuditApplicability(applicability, target, LOCAL_AUDIT_TARGETS);
+  }
   const target = LOCAL_AUDIT_TARGETS.find(({ id }) => id === project.name);
   if (!target) throw new Error(`Playwright project ${project.name} is absent from the validated audit target registry.`);
   return targetMatchesAuditApplicability(applicability, target);
@@ -858,7 +1122,7 @@ const auditedBase = base.extend<{ audit: AuditRun }, { auditProject: AuditProjec
   auditProject: [async ({}, use, workerInfo) => {
     await use({
       name: workerInfo.project.name,
-      metadata: projectMetadata(workerInfo.project.metadata),
+      metadata: parseAuditProjectMetadata(workerInfo.project.metadata),
     });
   }, { scope: 'worker' }],
   audit: async ({ page }, use, testInfo) => {
@@ -917,12 +1181,14 @@ function evidenceDetails(
   mode: AuditEvidenceMode,
   rationale: string,
   applicability: AuditApplicability,
+  caseVariant?: string,
 ): {
   annotation: { type: string; description: string };
   applicabilityAnnotation: { type: string; description: string };
   annotations: Array<{ type: string; description: string }>;
   applicability: AuditApplicability;
   tag: string;
+  caseVariant?: string;
 } {
   const policy = createEvidencePolicy(mode, rationale);
   const annotation = {
@@ -933,12 +1199,15 @@ function evidenceDetails(
     type: AUDIT_APPLICABILITY_ANNOTATION,
     description: applicability,
   };
+  const normalizedCaseVariant = caseVariant?.trim();
+  if (caseVariant !== undefined && !normalizedCaseVariant) throw new Error('Audit case variant must be non-empty when provided.');
   return {
     annotation,
     applicabilityAnnotation,
     annotations: [annotation, applicabilityAnnotation],
     applicability,
     tag: `@evidence-${mode}`,
+    ...(normalizedCaseVariant ? { caseVariant: normalizedCaseVariant } : {}),
   };
 }
 
@@ -947,55 +1216,142 @@ type AuditEvidenceDetails = ReturnType<typeof evidenceDetails>;
 export function interactionEvidence(
   rationale: string,
   applicability: AuditApplicability,
+  caseVariant?: string,
 ): AuditEvidenceDetails {
-  return evidenceDetails('interaction-video', rationale, applicability);
+  return evidenceDetails('interaction-video', rationale, applicability, caseVariant);
 }
 
-export function staticEvidence(rationale: string, applicability: AuditApplicability): AuditEvidenceDetails {
-  return evidenceDetails('static-screenshot', rationale, applicability);
+export function staticEvidence(rationale: string, applicability: AuditApplicability, caseVariant?: string): AuditEvidenceDetails {
+  return evidenceDetails('static-screenshot', rationale, applicability, caseVariant);
 }
 
-export function structuredEvidence(rationale: string, applicability: AuditApplicability): AuditEvidenceDetails {
-  return evidenceDetails('structured-data', rationale, applicability);
+export function structuredEvidence(rationale: string, applicability: AuditApplicability, caseVariant?: string): AuditEvidenceDetails {
+  return evidenceDetails('structured-data', rationale, applicability, caseVariant);
+}
+
+export function standaloneStaticEvidence(
+  rationale: string,
+  applicability: AuditApplicability,
+  oracleVariant: string,
+): AuditEvidenceDetails & { oracleVariant: string } {
+  const normalizedOracle = oracleVariant.trim();
+  if (!normalizedOracle) throw new Error('Standalone static evidence requires a named Product Oracle variant.');
+  return { ...evidenceDetails('static-screenshot', rationale, applicability), oracleVariant: normalizedOracle };
 }
 
 type InteractionBody = Parameters<typeof interactionBase>[2];
+
+function declaredSingleSiteCase(
+  title: string,
+  details: AuditEvidenceDetails & { oracleVariant?: string },
+): { caseId: string; tag: string } | null {
+  const auditId = firstBracketedAuditId(title);
+  if (!auditId) throw new Error(`Single-site audit title must begin with a bracketed Audit ID: ${title}`);
+  const caseId = resolveDeclaredSingleSiteCaseId(executableCaseRegistry, {
+    auditId,
+    applicability: details.applicability,
+    ...(details.caseVariant ? { caseVariant: details.caseVariant } : {}),
+    ...(details.oracleVariant ? { oracleVariant: details.oracleVariant } : {}),
+  });
+  return caseId ? { caseId, tag: auditCaseTag(caseId) } : null;
+}
+
+function registrationDetails(
+  details: AuditEvidenceDetails,
+  auditCase: { caseId: string; tag: string } | null,
+): { annotation: Array<{ type: string; description: string }>; tag: string | string[] } {
+  return {
+    annotation: auditCase
+      ? [...details.annotations, { type: AUDIT_CASE_ID_ANNOTATION, description: auditCase.caseId }]
+      : details.annotations,
+    tag: auditCase ? [details.tag, auditCase.tag] : details.tag,
+  };
+}
 
 export function interactionTest(
   title: string,
   details: AuditEvidenceDetails,
   body: InteractionBody,
 ): void {
+  const runMode = activeRunMode();
+  const auditCase = runMode === 'single-site' ? declaredSingleSiteCase(title, details) : null;
+  if (runMode === 'single-site' && !auditCase) return;
   interactionBase.describe(() => {
     interactionBase.skip(
       ({ auditProject }) => !auditApplies(details.applicability, auditProject),
       `Audit evidence applies to ${details.applicability.replaceAll('-', ' ')} only.`,
     );
-    interactionBase(title, { annotation: details.annotations, tag: details.tag }, body);
+    interactionBase(title, registrationDetails(details, auditCase), body);
   });
 }
 
 type StaticBody = Parameters<typeof staticBase>[2];
 
 export function staticTest(title: string, details: AuditEvidenceDetails, body: StaticBody): void {
+  const runMode = activeRunMode();
+  const auditCase = runMode === 'single-site' ? declaredSingleSiteCase(title, details) : null;
+  if (runMode === 'single-site' && !auditCase) return;
   staticBase.describe(() => {
     staticBase.skip(
       ({ auditProject }) => !auditApplies(details.applicability, auditProject),
       `Audit evidence applies to ${details.applicability.replaceAll('-', ' ')} only.`,
     );
-    staticBase(title, { annotation: details.annotations, tag: details.tag }, body);
+    staticBase(title, registrationDetails(details, auditCase), body);
+  });
+}
+
+export function inventoriedStaticTest(
+  title: string,
+  details: AuditEvidenceDetails,
+  caseId: string,
+  body: StaticBody,
+): void {
+  if (activeRunMode() !== 'single-site') return;
+  const normalizedCaseId = caseId.trim();
+  if (!normalizedCaseId) throw new Error('An inventoried static test requires its frozen dynamic case ID.');
+  staticBase.describe(() => {
+    staticBase.skip(
+      ({ auditProject }) => !auditApplies(details.applicability, auditProject),
+      `Audit evidence applies to ${details.applicability.replaceAll('-', ' ')} only.`,
+    );
+    staticBase(title, registrationDetails(details, {
+      caseId: normalizedCaseId,
+      tag: auditCaseTag(normalizedCaseId),
+    }), body);
+  });
+}
+
+export function standaloneStaticTest(
+  title: string,
+  details: AuditEvidenceDetails & { oracleVariant: string },
+  body: StaticBody,
+): void {
+  const runMode = activeRunMode();
+  const auditCase = runMode === 'single-site' ? declaredSingleSiteCase(title, details) : null;
+  if (runMode === 'single-site' && !auditCase) {
+    throw new Error(`Standalone Single-site declaration is absent from the generated executable-case registry: ${title}.`);
+  }
+  staticBase.describe(() => {
+    staticBase.skip(
+      () => process.env.AUDIT_RUN_MODE !== 'single-site',
+      'This independent Product Oracle executes only in Single-site Audit mode.',
+    );
+    staticBase(title, registrationDetails(details, auditCase), body);
   });
 }
 
 type StructuredBody = Parameters<typeof structuredBase>[2];
 
 export function structuredTest(title: string, details: AuditEvidenceDetails, body: StructuredBody): void {
+  const runMode = activeRunMode();
+  const auditCase = runMode === 'single-site' ? declaredSingleSiteCase(title, details) : null;
+  if (runMode === 'single-site' && !auditCase) return;
   structuredBase.describe(() => {
     structuredBase.skip(
       ({ auditProject }) => !auditApplies(details.applicability, auditProject),
       `Audit evidence applies to ${details.applicability.replaceAll('-', ' ')} only.`,
     );
-    structuredBase(title, { annotation: details.annotations, tag: details.tag }, body);
+    structuredBase(title, registrationDetails(details, auditCase), body);
   });
 }
 

@@ -1,5 +1,21 @@
 export type AuditEnvironment = 'production' | 'candidate';
 
+export type AuditRunMode = 'comparative' | 'single-site';
+export type AuditStoredRunMode = AuditRunMode | 'comparative-legacy';
+export type DeploymentRole = 'preview' | 'production';
+export type AuditScopeQualifier = 'FULL' | 'TARGETED';
+export type AuditSingleSiteClassification = 'standalone-compatible' | 'comparison-only' | 'standalone-required';
+
+export interface AuditStandaloneOracle {
+  id: string;
+  expected: string;
+}
+
+export interface AuditEvidenceAuthority {
+  status: 'authoritative' | 'non-authoritative';
+  reasons: Array<'development-certificate-bypass' | 'deployment-revision-unavailable'>;
+}
+
 export type AuditSeverity = 'P0' | 'P1' | 'P2' | 'P3';
 
 export type AuditEvidenceMode = 'interaction-video' | 'static-screenshot' | 'structured-data';
@@ -7,6 +23,7 @@ export type AuditEvidenceMode = 'interaction-video' | 'static-screenshot' | 'str
 export type AuditApplicability =
   | 'all-projects'
   | 'full-sweep-projects'
+  | 'candidate-full-sweep-projects'
   | 'candidate-projects'
   | 'production-projects'
   | 'candidate-non-tablet-projects'
@@ -80,6 +97,8 @@ export interface AuditDefinition {
   expected: string;
   evidence: Array<'video' | 'screenshot' | 'trace' | 'json' | 'axe' | 'network' | 'lighthouse'>;
   evidencePolicy: AuditEvidencePolicy;
+  singleSiteClassification: AuditSingleSiteClassification;
+  standaloneOracle?: AuditStandaloneOracle;
   manual?: boolean;
 }
 
@@ -107,11 +126,39 @@ export interface AuditStepRecord {
   detail?: string;
 }
 
+export interface HorizontalOverflowElement {
+  selector: string;
+  selectorMatchCount: number;
+  tagName: string;
+  text: string;
+  left: number;
+  right: number;
+  width: number;
+  clientWidth: number;
+  scrollWidth: number;
+  overflowX: string;
+  outsideLeftPx: number;
+  outsideRightPx: number;
+  intrinsicOverflowPx: number;
+  reasons: string[];
+  nearestScrollOwner: {
+    selector: string;
+    left: number;
+    right: number;
+    clientWidth: number;
+    scrollWidth: number;
+    overflowX: string;
+  } | null;
+}
+
 export interface PageInspection {
   url: string;
   title: string;
   h1Count: number;
   horizontalOverflowPx: number;
+  horizontalOverflowElements: HorizontalOverflowElement[];
+  horizontalOverflowCandidateCount: number;
+  horizontalOverflowTruncated: boolean;
   brokenImages: string[];
   documentHeight: number;
   viewportWidth: number;
@@ -124,11 +171,16 @@ export interface PageInspection {
 
 export interface AuditEvidenceRecord {
   schemaVersion: 1;
+  /** Missing only on evidence captured before run-mode discrimination. */
+  mode?: AuditRunMode;
+  caseId?: string;
   auditId: string;
   definition: AuditDefinition | null;
   evidencePolicy: AuditEvidencePolicy;
   environment: AuditEnvironment;
   coveredEnvironments?: AuditEnvironment[];
+  deploymentRole?: DeploymentRole;
+  evidenceAuthority?: AuditEvidenceAuthority;
   baseURL: string;
   project: string;
   browser: string;
@@ -158,11 +210,26 @@ export interface AuditEvidenceRecord {
   thirdPartyTelemetryDiagnostics?: AuditThirdPartyTelemetryDiagnostic[];
 }
 
-export interface AuditProjectMetadata {
-  environment: AuditEnvironment;
+export interface AuditProjectMetadataBase {
   browserLabel: string;
   deviceClass: 'mobile' | 'tablet' | 'desktop';
   fullSweep: boolean;
   visual: boolean;
+  baseURL: string;
+  evidenceAuthority: AuditEvidenceAuthority;
+}
+
+export interface ComparativeAuditProjectMetadata extends AuditProjectMetadataBase {
+  mode: 'comparative';
+  environment: AuditEnvironment;
   tlsPolicy: 'strict' | 'ignored-for-development';
 }
+
+export interface SingleSiteAuditProjectMetadata extends AuditProjectMetadataBase {
+  mode: 'single-site';
+  deploymentRole: DeploymentRole;
+  sourceComparativeTargetId: string;
+  tlsPolicy: 'strict' | 'preview-bypass';
+}
+
+export type AuditProjectMetadata = ComparativeAuditProjectMetadata | SingleSiteAuditProjectMetadata;

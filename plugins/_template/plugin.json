@@ -19,9 +19,15 @@
       "evidencePolicy": {
         "mode": "static-screenshot",
         "rationale": "Capture the rendered sample state and its structured audit observations."
+      },
+      "singleSiteClassification": "standalone-compatible",
+      "standaloneOracle": {
+        "id": "STARTER-001:standalone",
+        "expected": "Replace this with an observable result, not a status-only assertion."
       }
     }
   ],
+  "auditFamilies": [],
   "entrySpecs": ["plugins/_template/tests/starter.spec.ts"],
   "supportedProjects": [
     "candidate-mobile-chromium",

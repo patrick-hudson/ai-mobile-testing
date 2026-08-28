@@ -1,5 +1,5 @@
 import { test, expect, interactionEvidence, interactionTest, staticEvidence, staticTest } from '../fixtures/test.js';
-import { meta, readAstroComponentProp } from './helpers.js';
+import { auditMeta, isChromiumAuditProject, usesReviewedSiteContract } from './helpers.js';
 import type { Locator, Page } from '@playwright/test';
 
 const NEXT_PATH = '/next-kratom-support-meeting';
@@ -7,41 +7,36 @@ const NA_PATH = '/virtual-na-meetings-now';
 const SMART_PATH = '/virtual-smart-meetings-now';
 const MEET_FILTER_TOTAL_TIMEOUT_MS = 180_000;
 const MEET_FILTER_PREPARATION_BUDGET_MS = 120_000;
+const KA_WEEKDAY_DISCUSSION_URL = 'https://us06web.zoom.us/j/85416304667?pwd=pkbSAebEMTzfj65ldpcbekavV2Yi0k.1';
+const TIAWO_MAIN_ROOM_URL = 'https://meet.google.com/cza-tyjv-fun';
 
-function candidateChromium(testInfo: Parameters<typeof meta>[0]): boolean {
-  return meta(testInfo).environment === 'candidate' && testInfo.project.name.includes('chromium');
+interface FeaturedOccurrenceOracle {
+  heading: string;
+  schedule: string;
+  platform: string;
+  joinUrl: string;
+}
+
+function featuredMeetingCard(page: Page, occurrence: FeaturedOccurrenceOracle): Locator {
+  return page.getByRole('heading', { level: 2, name: occurrence.heading, exact: true }).locator('..');
+}
+
+async function expectFeaturedOccurrence(page: Page, occurrence: FeaturedOccurrenceOracle): Promise<Locator> {
+  const card = featuredMeetingCard(page, occurrence);
+  await expect(card).toHaveCount(1);
+  await expect(card.getByText(occurrence.schedule, { exact: true })).toBeVisible();
+  await expect(card.getByText(occurrence.platform, { exact: true })).toBeVisible();
+  await expect(card.getByRole('link', { name: `Join in ${occurrence.platform}`, exact: true })).toHaveAttribute('href', occurrence.joinUrl);
+  return card;
+}
+
+function currentSiteChromium(testInfo: Parameters<typeof auditMeta>[0]): boolean {
+  return usesReviewedSiteContract(testInfo) && isChromiumAuditProject(testInfo);
 }
 
 async function waitForHydratedIsland(page: Page, control: Locator): Promise<void> {
   const island = page.locator('astro-island').filter({ has: control }).first();
   await expect(island).not.toHaveAttribute('ssr', '');
-}
-
-interface NaMeetingOracle {
-  id: string;
-  name: string;
-  formatTags: string[];
-  closed: 'Open' | 'Closed';
-  platform: string;
-  joinUrl: string;
-}
-
-interface NaMeetingBundleOracle {
-  meetings: NaMeetingOracle[];
-}
-
-interface SmartMeetingOracle {
-  id: string;
-  name: string;
-  program: string;
-  audiences: string[];
-  languages: string[];
-  pathminderUrl: string;
-  detailUrl: string;
-}
-
-interface SmartMeetingBundleOracle {
-  meetings: SmartMeetingOracle[];
 }
 
 function escapeRegExp(value: string): string {
@@ -59,27 +54,48 @@ async function expectExactMeetingDestinations(page: Page, expected: readonly str
   await expect.poll(() => visibleMeetingDestinations(page)).toEqual([...expected].sort());
 }
 
-async function filterButtonValues(row: Locator): Promise<string[]> {
-  return row.getByRole('button').evaluateAll((buttons) => buttons.map((button) =>
-    (button.textContent ?? '').replace(/\s*\([\d,]+\)\s*$/, '').replace(/\s+/g, ' ').trim(),
-  ).filter(Boolean));
-}
-
 staticTest('[MEET-001] meeting cards cross pre-live, starting, live, and ended boundaries', staticEvidence('Capture the deterministic meeting state at each frozen time boundary with the complete state ledger.', 'candidate-desktop-chromium'), async ({ page, audit }, testInfo) => {
-  test.skip(!candidateChromium(testInfo) || meta(testInfo).deviceClass !== 'desktop', 'One deterministic candidate desktop time-state audit.');
+  test.skip(!currentSiteChromium(testInfo) || auditMeta(testInfo).deviceClass !== 'desktop', 'One deterministic reviewed-site desktop time-state audit.');
   const states = [
-    { at: '2026-08-24T13:50:00Z', expected: 'Starting soon' },
-    { at: '2026-08-24T14:02:00Z', expected: 'Meeting starting' },
-    { at: '2026-08-24T14:10:00Z', expected: 'Live now' },
-    { at: '2026-08-24T15:00:00Z', expected: 'Next up' },
+    {
+      at: '2026-08-24T13:50:00Z',
+      expectedState: 'Starting soon',
+      occurrence: { heading: 'Kratom Anonymous — Discussion', schedule: 'Today at 9:00 AM your time', platform: 'Zoom', joinUrl: KA_WEEKDAY_DISCUSSION_URL },
+    },
+    {
+      at: '2026-08-24T14:02:00Z',
+      expectedState: 'Meeting starting',
+      occurrence: { heading: 'Kratom Anonymous — Discussion', schedule: 'Today at 9:00 AM your time', platform: 'Zoom', joinUrl: KA_WEEKDAY_DISCUSSION_URL },
+    },
+    {
+      at: '2026-08-24T14:10:00Z',
+      expectedState: 'Live now',
+      occurrence: { heading: 'Kratom Anonymous — Discussion', schedule: 'Today at 9:00 AM your time', platform: 'Zoom', joinUrl: KA_WEEKDAY_DISCUSSION_URL },
+    },
+    {
+      at: '2026-08-24T15:00:00Z',
+      expectedState: 'Next up',
+      occurrence: { heading: 'TIAWO — Midday', schedule: 'Today at 11:00 AM your time', platform: 'Google Meet', joinUrl: TIAWO_MAIN_ROOM_URL },
+    },
   ] as const;
 
   for (const state of states) {
-    await audit.step(`Freeze time at ${state.at}`, `The featured meeting state reads “${state.expected}”.`, async () => {
+    await audit.step(`Freeze time at ${state.at}`, `The exact ${state.occurrence.heading} occurrence reads “${state.expectedState}”.`, async () => {
       await page.clock.setFixedTime(new Date(state.at));
       await audit.goto(NEXT_PATH);
-      await expect(page.getByText(state.expected, { exact: true }).first()).toBeVisible();
-      audit.observe(`state at ${state.at}`, state.expected, state.expected);
+      const card = await expectFeaturedOccurrence(page, state.occurrence);
+      await expect(card.getByText(state.expectedState, { exact: true })).toBeVisible();
+      if (state.expectedState === 'Next up') {
+        const noSpecificMeeting = page.locator('aside[aria-labelledby="live-general-meetings-heading"]');
+        await expect(noSpecificMeeting.getByRole('heading', { name: 'Need a meeting before the next 7-OH/kratom meeting?', exact: true })).toBeVisible();
+        await expect(noSpecificMeeting.getByText('No KA or TIAWO meeting is live right now. These general recovery meetings are joinable now.', { exact: true })).toBeVisible();
+      }
+      audit.observe(`featured occurrence at ${state.at}`, JSON.stringify({
+        state: state.expectedState,
+        heading: state.occurrence.heading,
+        schedule: state.occurrence.schedule,
+        joinUrl: state.occurrence.joinUrl,
+      }), 'Exact reviewed occurrence identity and state');
     });
   }
 
@@ -88,52 +104,84 @@ staticTest('[MEET-001] meeting cards cross pre-live, starting, live, and ended b
 });
 
 staticTest('[MEET-002] the same occurrence is converted across representative timezones', staticEvidence('Capture the same meeting occurrence with its exact rendered labels across representative timezones.', 'candidate-desktop-chromium'), async ({ browser, page, audit }, testInfo) => {
-  test.skip(!candidateChromium(testInfo) || meta(testInfo).deviceClass !== 'desktop', 'One deterministic multi-timezone audit.');
-  const fixed = new Date('2026-08-24T12:30:00Z');
+  test.skip(!currentSiteChromium(testInfo) || auditMeta(testInfo).deviceClass !== 'desktop', 'One deterministic reviewed-site multi-timezone audit.');
+  const occurrence: Omit<FeaturedOccurrenceOracle, 'schedule'> = {
+    heading: 'TIAWO — Morning',
+    platform: 'Google Meet',
+    joinUrl: TIAWO_MAIN_ROOM_URL,
+  };
   const cases = [
-    { timezoneId: 'America/Chicago', display: 'Today at 7:00 AM' },
-    { timezoneId: 'America/Los_Angeles', display: 'Today at 5:00 AM' },
-    { timezoneId: 'Europe/London', display: 'Today at 1:00 PM' },
-    { timezoneId: 'Asia/Kolkata', display: 'Today at 5:30 PM' },
-  ];
+    { season: 'summer', fixed: '2026-08-24T11:30:00Z', utcStart: '2026-08-24T12:00:00Z', timezoneId: 'America/Chicago', display: 'Today at 7:00 AM' },
+    { season: 'summer', fixed: '2026-08-24T11:30:00Z', utcStart: '2026-08-24T12:00:00Z', timezoneId: 'America/Los_Angeles', display: 'Today at 5:00 AM' },
+    { season: 'summer', fixed: '2026-08-24T11:30:00Z', utcStart: '2026-08-24T12:00:00Z', timezoneId: 'Europe/London', display: 'Today at 1:00 PM' },
+    { season: 'summer', fixed: '2026-08-24T11:30:00Z', utcStart: '2026-08-24T12:00:00Z', timezoneId: 'Asia/Kolkata', display: 'Today at 5:30 PM' },
+    { season: 'winter', fixed: '2026-01-12T12:30:00Z', utcStart: '2026-01-12T13:00:00Z', timezoneId: 'America/Chicago', display: 'Today at 7:00 AM' },
+    { season: 'winter', fixed: '2026-01-12T12:30:00Z', utcStart: '2026-01-12T13:00:00Z', timezoneId: 'America/Los_Angeles', display: 'Today at 5:00 AM' },
+    { season: 'winter', fixed: '2026-01-12T12:30:00Z', utcStart: '2026-01-12T13:00:00Z', timezoneId: 'Europe/London', display: 'Today at 1:00 PM' },
+    { season: 'winter', fixed: '2026-01-12T12:30:00Z', utcStart: '2026-01-12T13:00:00Z', timezoneId: 'Asia/Kolkata', display: 'Today at 6:30 PM' },
+  ] as const;
   const observed: Record<string, string> = {};
+  const projectContext = testInfo.project.use as {
+    ignoreHTTPSErrors?: boolean;
+    locale?: string;
+    userAgent?: string;
+  };
 
   for (const item of cases) {
-    await audit.step(`Render in ${item.timezoneId}`, `The 8:00 AM Eastern meeting displays as ${item.display}.`, async () => {
-      const context = await browser.newContext({ timezoneId: item.timezoneId, viewport: { width: 1280, height: 800 } });
-      const localPage = await context.newPage();
-      await localPage.clock.setFixedTime(fixed);
-      await localPage.goto(`${audit.environmentBaseURL()}${NEXT_PATH}`, { waitUntil: 'load' });
-      const text = await localPage.getByText(new RegExp(`^${item.display.replaceAll(' ', '\\s')} your time$`)).first().innerText();
-      observed[item.timezoneId] = text;
-      expect(text).toBe(`${item.display} your time`);
-      if (item.timezoneId === 'America/Chicago') {
-        const screenshot = testInfo.outputPath('meeting-timezone-reference.png');
-        await localPage.screenshot({ path: screenshot, fullPage: false });
-        await testInfo.attach('meeting-timezone-reference', { path: screenshot, contentType: 'image/png' });
+    await audit.step(`Render in ${item.timezoneId} during ${item.season}`, `The exact TIAWO Morning occurrence at ${item.utcStart} displays as ${item.display}.`, async () => {
+      const context = await browser.newContext({
+        timezoneId: item.timezoneId,
+        viewport: { width: 1280, height: 800 },
+        ignoreHTTPSErrors: projectContext.ignoreHTTPSErrors ?? false,
+        ...(projectContext.locale ? { locale: projectContext.locale } : {}),
+        ...(projectContext.userAgent ? { userAgent: projectContext.userAgent } : {}),
+      });
+      try {
+        const localPage = await context.newPage();
+        await localPage.clock.setFixedTime(new Date(item.fixed));
+        await localPage.goto(`${audit.environmentBaseURL()}${NEXT_PATH}`, { waitUntil: 'load' });
+        const reviewedOccurrence = { ...occurrence, schedule: `${item.display} your time` };
+        const card = await expectFeaturedOccurrence(localPage, reviewedOccurrence);
+        const text = await card.getByText(reviewedOccurrence.schedule, { exact: true }).innerText();
+        const observationKey = `${item.season}:${item.timezoneId}`;
+        observed[observationKey] = text;
+        expect(text).toBe(reviewedOccurrence.schedule);
+        if (item.season === 'summer' && item.timezoneId === 'America/Chicago') {
+          const screenshot = testInfo.outputPath('meeting-timezone-reference.png');
+          await card.screenshot({ path: screenshot });
+          await testInfo.attach('meeting-timezone-reference', { path: screenshot, contentType: 'image/png' });
+        }
+      } finally {
+        await context.close();
       }
-      await context.close();
     });
   }
 
-  expect(cases, 'The timezone contract must retain all four reviewed regions').toHaveLength(4);
-  expect(Object.keys(observed), 'Every timezone case must produce one exact rendered label').toEqual(cases.map(({ timezoneId }) => timezoneId));
-  await audit.attachJson('timezone-conversions', { occurrence: '2026-08-24T12:00:00Z', observed });
-  await page.clock.setFixedTime(fixed);
+  expect(cases, 'The timezone contract must retain four regions in both DST seasons').toHaveLength(8);
+  expect(Object.keys(observed), 'Every seasonal timezone case must produce one exact rendered label').toEqual(cases.map(({ season, timezoneId }) => `${season}:${timezoneId}`));
+  await audit.attachJson('timezone-conversions', {
+    meeting: occurrence,
+    occurrences: [...new Set(cases.map(({ utcStart }) => utcStart))],
+    observed,
+  });
+  await page.clock.setFixedTime(new Date('2026-08-24T11:30:00Z'));
   await audit.goto(NEXT_PATH);
+  await expectFeaturedOccurrence(page, { ...occurrence, schedule: 'Today at 7:00 AM your time' });
   await audit.checkpoint('meeting-timezone-central-reference');
 });
 
 interactionTest('[MEET-003] a joined room persists across pages and can be cleared', interactionEvidence('Join a featured room, navigate to meeting history, and clear it while showing persistence and removal.', 'candidate-chromium-projects'), async ({ page, context, audit }, testInfo) => {
-  test.skip(!candidateChromium(testInfo), 'Candidate Chromium meeting-history audit.');
+  test.skip(!currentSiteChromium(testInfo), 'Reviewed-site Chromium meeting-history audit.');
   await page.clock.setFixedTime(new Date('2026-08-24T13:30:00Z'));
   await audit.goto(NEXT_PATH);
 
-  await audit.step('Join the featured room', 'The external destination opens and the interaction is recorded locally.', async () => {
-    const join = page.getByRole('link', { name: /Join in/ }).first();
-    const expectedDestination = await join.getAttribute('href');
-    expect(expectedDestination).toMatch(/^https:\/\//);
-    if (!expectedDestination) throw new Error('Featured meeting join action has no destination.');
+  const reviewedHistory = [
+    { provider: 'KA', meetingId: 'ka-weekday-10-discussion', name: 'Kratom Anonymous — Discussion', joinUrl: KA_WEEKDAY_DISCUSSION_URL },
+    { provider: 'KQS', meetingId: 'kqs-daily-12-midday', name: 'TIAWO — Midday', joinUrl: TIAWO_MAIN_ROOM_URL },
+  ] as const;
+
+  const activateExternalJoin = async (join: Locator, expectedDestination: string): Promise<void> => {
+    await expect(join).toHaveAttribute('href', expectedDestination);
     let capturedDestination: string | null = null;
     const routeMatcher = (url: URL) => url.href === expectedDestination;
     await context.route(routeMatcher, async (route) => {
@@ -160,26 +208,64 @@ interactionTest('[MEET-003] a joined room persists across pages and can be clear
       if (popup && !popup.isClosed()) await popup.close();
       await context.unroute(routeMatcher);
     }
+  };
+
+  await audit.step('Join two exact reviewed rooms', 'Each exact external destination opens and creates its own complete history identity.', async () => {
+    const featuredCard = await expectFeaturedOccurrence(page, {
+      heading: reviewedHistory[0].name,
+      schedule: 'Today at 9:00 AM your time',
+      platform: 'Zoom',
+      joinUrl: reviewedHistory[0].joinUrl,
+    });
+    await activateExternalJoin(featuredCard.getByRole('link', { name: 'Join in Zoom', exact: true }), reviewedHistory[0].joinUrl);
+    await activateExternalJoin(page.locator(`a[href="${reviewedHistory[1].joinUrl}"]`).filter({ hasText: /^Join$/ }).first(), reviewedHistory[1].joinUrl);
+    const stored = await page.evaluate(() => JSON.parse(localStorage.getItem('quitting7oh:meeting-history:v1') ?? '[]'));
+    expect(stored).toHaveLength(2);
+    expect(stored.map(({ provider, meetingId, name, joinUrl }: { provider: string; meetingId: string; name: string; joinUrl: string }) =>
+      ({ provider, meetingId, name, joinUrl })).sort((a: { meetingId: string }, b: { meetingId: string }) => a.meetingId.localeCompare(b.meetingId)))
+      .toEqual([...reviewedHistory].sort((a, b) => a.meetingId.localeCompare(b.meetingId)));
   });
 
-  await audit.step('Open another meeting page', 'The previously joined section shows the same saved room.', async () => {
+  await audit.step('Open another meeting page', 'The previously joined section shows both exact saved identities and destinations.', async () => {
     await audit.goto('/resources/meeting-schedules');
-    await expect(page.getByRole('heading', { name: 'Previously joined' })).toBeVisible();
-    await expect(page.getByText(/Kratom Anonymous|TIAWO/).first()).toBeVisible();
+    const history = page.locator('section[aria-labelledby="previously-joined-title"]');
+    await expect(history).toBeVisible();
+    for (const entry of reviewedHistory) {
+      await expect(history.locator(`a[href="${entry.joinUrl}"]`)).toHaveCount(1);
+    }
   });
 
-  await audit.step('Clear history', 'The saved-room section disappears and storage no longer contains meeting records.', async () => {
+  await audit.step('Remove one exact history entry', 'An individual removal control deletes only Kratom Anonymous and leaves TIAWO intact.', async () => {
+    const removal = page.getByRole('button', { name: `Remove ${reviewedHistory[0].name} from history`, exact: true });
+    if (await removal.count() === 0) {
+      audit.finding({
+        severity: 'P1',
+        title: 'Meeting history has no individual removal control',
+        detail: `MEET-003 promises individual and full clearing, but the rendered history exposes only “Clear history”; ${reviewedHistory[0].name} cannot be removed without deleting ${reviewedHistory[1].name}.`,
+        blocking: true,
+      });
+      audit.observe('individual removal controls', 0, 'One accessible removal control per saved meeting');
+      return;
+    }
+    await removal.click();
+    const history = page.locator('section[aria-labelledby="previously-joined-title"]');
+    await expect(history.locator(`a[href="${reviewedHistory[0].joinUrl}"]`)).toHaveCount(0);
+    await expect(history.locator(`a[href="${reviewedHistory[1].joinUrl}"]`)).toHaveCount(1);
+    const stored = await page.evaluate(() => JSON.parse(localStorage.getItem('quitting7oh:meeting-history:v1') ?? '[]'));
+    expect(stored.map(({ meetingId }: { meetingId: string }) => meetingId)).toEqual([reviewedHistory[1].meetingId]);
+  });
+
+  await audit.step('Clear all history', 'The full-clear control removes every remaining exact entry and the dedicated storage record.', async () => {
     await page.getByRole('button', { name: 'Clear history' }).click();
     await expect(page.getByRole('heading', { name: 'Previously joined' })).toHaveCount(0);
-    const historyKeys = await page.evaluate(() => Object.keys(localStorage).filter((key) => /meeting/i.test(key)));
-    expect(historyKeys).toHaveLength(0);
+    expect(await page.evaluate(() => localStorage.getItem('quitting7oh:meeting-history:v1'))).toBeNull();
   });
 
   await audit.assertRuntimeHealthy();
 });
 
 interactionTest('[MEET-004] NA search, type, access, and platform filters combine and clear', interactionEvidence('Combine NA meeting search and filter controls, then clear them and show the result list returning.', 'candidate-desktop-chromium'), async ({ page, audit }, testInfo) => {
-  test.skip(!candidateChromium(testInfo) || meta(testInfo).deviceClass !== 'desktop', 'One candidate desktop NA directory audit.');
+  test.skip(!currentSiteChromium(testInfo) || auditMeta(testInfo).deviceClass !== 'desktop', 'One reviewed-site desktop NA directory audit.');
   testInfo.setTimeout(MEET_FILTER_TOTAL_TIMEOUT_MS);
   const preparationStartedAt = Date.now();
   await page.clock.setFixedTime(new Date('2026-08-24T12:30:00Z'));
@@ -188,34 +274,22 @@ interactionTest('[MEET-004] NA search, type, access, and platform filters combin
   await waitForHydratedIsland(page, search);
   const baseline = await visibleMeetingDestinations(page);
   expect(baseline.length, 'Frozen NA window must contain enough records to expose no-op filters').toBeGreaterThan(1);
-  const bundle = await readAstroComponentProp<NaMeetingBundleOracle>(page, 'VirtualNaMeetings', 'bundle');
-  const tagChips = [
-    ['Newcomer', 'Newcomer'],
-    ['Discussion', 'Discussion'],
-    ['Speaker', 'Speaker'],
-    ['JFT Study', 'Just For Today Study'],
-    ['Basic Text Study', 'Basic Text Study'],
-    ['Step Study', 'Step Study'],
-    ['Literature Study', 'Literature Study'],
-  ] as const;
+  const target = {
+    name: 'Voices or Choices Group',
+    closed: 'Open',
+    platform: 'Zoom',
+    joinUrl: 'https://zoom.us/j/429250064?pwd=740835',
+    correctTag: 'JFT Study',
+    wrongTag: 'Basic Text Study',
+    wrongPlatform: 'Phone Call',
+  } as const;
   const platformRow = page.getByText('Platform:', { exact: true }).locator('..');
-  const visiblePlatforms = await filterButtonValues(platformRow);
-  const target = bundle.meetings.find((meeting) =>
-    baseline.includes(meeting.joinUrl)
-    && bundle.meetings.filter(({ name }) => name === meeting.name).length === 1
-    && tagChips.some(([, tag]) => meeting.formatTags.includes(tag))
-    && visiblePlatforms.includes(meeting.platform)
-    && visiblePlatforms.some((platform) => platform !== meeting.platform));
-  expect(target, 'Frozen NA data needs one uniquely searchable visible record covering type, access, and platform controls').toBeDefined();
-  if (!target) throw new Error('No deterministic NA filter oracle record is available.');
+  expect(baseline, 'The independent reviewed NA fixture must be present in the frozen visible window').toContain(target.joinUrl);
   const expected = [target.joinUrl];
-  const correctTag = tagChips.find(([, tag]) => target.formatTags.includes(tag));
-  const wrongTag = tagChips.find(([, tag]) => !target.formatTags.includes(tag));
-  const wrongPlatform = visiblePlatforms.find((platform) => platform !== target.platform);
-  expect(correctTag, 'Oracle record must expose one visible meeting-type chip').toBeDefined();
-  expect(wrongTag, 'Oracle record needs a nonmatching meeting-type control').toBeDefined();
-  expect(wrongPlatform, 'Oracle record needs a nonmatching platform control').toBeDefined();
-  if (!correctTag || !wrongTag || !wrongPlatform) throw new Error('NA control oracle is incomplete.');
+  await expect(page.getByRole('button', { name: target.correctTag, exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: target.wrongTag, exact: true })).toBeVisible();
+  await expect(platformRow.getByRole('button', { name: new RegExp(`^${target.platform}\\s*\\(`) })).toBeVisible();
+  await expect(platformRow.getByRole('button', { name: new RegExp(`^${target.wrongPlatform}\\s*\\(`) })).toBeVisible();
   const preparationDurationMs = Date.now() - preparationStartedAt;
   audit.observe(
     'NA filter oracle preparation duration (ms)',
@@ -231,10 +305,10 @@ interactionTest('[MEET-004] NA search, type, access, and platform filters combin
     await search.fill(target.name);
     await expectExactMeetingDestinations(page, expected);
 
-    await page.getByRole('button', { name: wrongTag[0], exact: true }).click();
+    await page.getByRole('button', { name: target.wrongTag, exact: true }).click();
     await expectExactMeetingDestinations(page, []);
-    await page.getByRole('button', { name: wrongTag[0], exact: true }).click();
-    await page.getByRole('button', { name: correctTag[0], exact: true }).click();
+    await page.getByRole('button', { name: target.wrongTag, exact: true }).click();
+    await page.getByRole('button', { name: target.correctTag, exact: true }).click();
     await expectExactMeetingDestinations(page, expected);
 
     await page.getByRole('button', { name: target.closed === 'Open' ? /^closed$/i : /^open$/i }).click();
@@ -242,9 +316,9 @@ interactionTest('[MEET-004] NA search, type, access, and platform filters combin
     await page.getByRole('button', { name: new RegExp(`^${target.closed}$`, 'i') }).click();
     await expectExactMeetingDestinations(page, expected);
 
-    await platformRow.getByRole('button', { name: new RegExp(`^${escapeRegExp(wrongPlatform)}\\s*\\(`) }).click();
+    await platformRow.getByRole('button', { name: new RegExp(`^${escapeRegExp(target.wrongPlatform)}\\s*\\(`) }).click();
     await expectExactMeetingDestinations(page, []);
-    await platformRow.getByRole('button', { name: new RegExp(`^${escapeRegExp(wrongPlatform)}\\s*\\(`) }).click();
+    await platformRow.getByRole('button', { name: new RegExp(`^${escapeRegExp(target.wrongPlatform)}\\s*\\(`) }).click();
     await platformRow.getByRole('button', { name: new RegExp(`^${escapeRegExp(target.platform)}\\s*\\(`) }).click();
     await expectExactMeetingDestinations(page, expected);
   });
@@ -255,80 +329,67 @@ interactionTest('[MEET-004] NA search, type, access, and platform filters combin
     await expectExactMeetingDestinations(page, baseline);
   });
 
-  await audit.attachJson('na-filter-oracle', { target, correctTag, wrongTag, wrongPlatform, expected, baseline });
+  await audit.attachJson('na-filter-oracle', { oracle: 'Independent reviewed fixture constant; no candidate bundle metadata is read to choose expectations.', target, expected, baseline });
   await audit.assertRuntimeHealthy();
 });
 
 interactionTest('[MEET-005] SMART program, audience, language, and search filters combine and clear', interactionEvidence('Combine SMART meeting search and filter controls, then clear them and show usable results returning.', 'candidate-desktop-chromium'), async ({ page, audit }, testInfo) => {
-  test.skip(!candidateChromium(testInfo) || meta(testInfo).deviceClass !== 'desktop', 'One candidate desktop SMART directory audit.');
+  test.skip(!currentSiteChromium(testInfo) || auditMeta(testInfo).deviceClass !== 'desktop', 'One reviewed-site desktop SMART directory audit.');
   await page.clock.setFixedTime(new Date('2026-08-24T12:30:00Z'));
   await audit.goto(SMART_PATH);
   const search = page.getByLabel('Search meetings');
   await waitForHydratedIsland(page, search);
   const baseline = await visibleMeetingDestinations(page);
   expect(baseline.length, 'Frozen SMART window must contain enough records to expose no-op filters').toBeGreaterThan(1);
-  const bundle = await readAstroComponentProp<SmartMeetingBundleOracle>(page, 'VirtualSmartMeetings', 'bundle');
+  const target = {
+    name: '4-Point Recovery — Meagan S.',
+    targetDestination: 'https://meetings.smartrecovery.org/meetings/9125/',
+    program: '4-Point Recovery',
+    audience: 'LGBTQIA+',
+    language: 'English',
+    wrongProgram: 'Family & Friends',
+    wrongAudience: 'Women',
+    wrongLanguage: 'Spanish',
+  } as const;
+  expect(baseline, 'The independent reviewed SMART fixture must be present in the frozen visible window').toContain(target.targetDestination);
   const programRow = page.getByText('Program:', { exact: true }).locator('..');
   const audienceRow = page.getByText('Audience:', { exact: true }).locator('..');
   const languageRow = page.getByText('Language:', { exact: true }).locator('..');
-  const [programs, audiences, languages] = await Promise.all([
-    filterButtonValues(programRow),
-    filterButtonValues(audienceRow),
-    filterButtonValues(languageRow),
-  ]);
-  const destinationFor = (meeting: SmartMeetingOracle) =>
-    baseline.find((href) => href === meeting.pathminderUrl || href === meeting.detailUrl);
-  const target = bundle.meetings.find((meeting) =>
-    Boolean(destinationFor(meeting))
-    && bundle.meetings.filter(({ name }) => name === meeting.name).length === 1
-    && programs.includes(meeting.program)
-    && meeting.audiences.some((audience) => audiences.includes(audience))
-    && meeting.languages.some((language) => languages.includes(language))
-    && programs.some((program) => program !== meeting.program)
-    && audiences.some((audience) => !meeting.audiences.includes(audience))
-    && languages.some((language) => !meeting.languages.includes(language)));
-  expect(target, 'Frozen SMART data needs one uniquely searchable record represented by every visible filter group').toBeDefined();
-  if (!target) throw new Error('No deterministic SMART filter oracle record is available; review filter values against the data contract.');
-  const targetDestination = destinationFor(target);
-  const correctAudience = target.audiences.find((audience) => audiences.includes(audience));
-  const correctLanguage = target.languages.find((language) => languages.includes(language));
-  const wrongProgram = programs.find((program) => program !== target.program);
-  const wrongAudience = audiences.find((audience) => !target.audiences.includes(audience));
-  const wrongLanguage = languages.find((language) => !target.languages.includes(language));
-  expect(targetDestination).toBeDefined();
-  expect(correctAudience).toBeDefined();
-  expect(correctLanguage).toBeDefined();
-  expect(wrongProgram).toBeDefined();
-  expect(wrongAudience).toBeDefined();
-  expect(wrongLanguage).toBeDefined();
-  if (!targetDestination || !correctAudience || !correctLanguage || !wrongProgram || !wrongAudience || !wrongLanguage) {
-    throw new Error('SMART control oracle is incomplete.');
-  }
-  const expected = [targetDestination];
+  const expected = [target.targetDestination];
   const countedButton = (row: Locator, value: string) => row.getByRole('button', {
     name: new RegExp(`^${escapeRegExp(value)}\\s*\\(`),
   });
+
+  if (await countedButton(audienceRow, 'Adults').count() === 0) {
+    audit.finding({
+      severity: 'P1',
+      title: 'SMART’s primary Adults audience cannot be selected',
+      detail: 'The reviewed feed labels 380 meetings as “Adults”, but the audience controls offer “Adults Welcome”; the mismatched value hides the chip and prevents readers from selecting the dominant audience.',
+      blocking: true,
+    });
+    audit.observe('Adults audience control', 0, 'One selectable Adults audience control with a nonzero count');
+  }
 
   await audit.step('Prove each SMART filter changes an exact nonempty result set', 'Search isolates one reviewed record; every wrong control removes it and every matching control restores exactly it.', async () => {
     await search.fill(target.name);
     await expectExactMeetingDestinations(page, expected);
 
-    await countedButton(programRow, wrongProgram).click();
+    await countedButton(programRow, target.wrongProgram).click();
     await expectExactMeetingDestinations(page, []);
-    await countedButton(programRow, wrongProgram).click();
+    await countedButton(programRow, target.wrongProgram).click();
     await countedButton(programRow, target.program).click();
     await expectExactMeetingDestinations(page, expected);
 
-    await countedButton(audienceRow, wrongAudience).click();
+    await countedButton(audienceRow, target.wrongAudience).click();
     await expectExactMeetingDestinations(page, []);
-    await countedButton(audienceRow, wrongAudience).click();
-    await countedButton(audienceRow, correctAudience).click();
+    await countedButton(audienceRow, target.wrongAudience).click();
+    await countedButton(audienceRow, target.audience).click();
     await expectExactMeetingDestinations(page, expected);
 
-    await countedButton(languageRow, wrongLanguage).click();
+    await countedButton(languageRow, target.wrongLanguage).click();
     await expectExactMeetingDestinations(page, []);
-    await countedButton(languageRow, wrongLanguage).click();
-    await countedButton(languageRow, correctLanguage).click();
+    await countedButton(languageRow, target.wrongLanguage).click();
+    await countedButton(languageRow, target.language).click();
     await expectExactMeetingDestinations(page, expected);
   });
 
@@ -339,9 +400,8 @@ interactionTest('[MEET-005] SMART program, audience, language, and search filter
   });
 
   await audit.attachJson('smart-filter-oracle', {
+    oracle: 'Independent reviewed fixture constant; no candidate bundle metadata is read to choose expectations.',
     target,
-    targetDestination,
-    controls: { programs, audiences, languages, wrongProgram, wrongAudience, wrongLanguage },
     expected,
     baseline,
   });
@@ -349,29 +409,107 @@ interactionTest('[MEET-005] SMART program, audience, language, and search filter
 });
 
 interactionTest('[MEET-006] meeting copy text agrees with the displayed join destination', interactionEvidence('Activate meeting copy and show the clipboard text matching the visible name, schedule, and join URL.', 'candidate-chromium-projects'), async ({ page, context, audit }, testInfo) => {
-  test.skip(!candidateChromium(testInfo), 'Candidate Chromium meeting copy audit.');
+  test.skip(!currentSiteChromium(testInfo), 'Reviewed-site Chromium meeting copy audit.');
   await context.grantPermissions(['clipboard-read', 'clipboard-write']);
   await page.clock.setFixedTime(new Date('2026-08-24T12:30:00Z'));
   await audit.goto(NA_PATH);
   await waitForHydratedIsland(page, page.getByLabel('Search meetings'));
 
-  await audit.step('Copy the featured 24/7 room', 'Clipboard includes its visible name, availability, platform, and exact join URL.', async () => {
-    const card = page.getByText('Always available', { exact: true }).locator('..').locator('..');
+  const featured = {
+    name: 'NA 24/7 Online Meeting',
+    schedule: '24/7 — join any time',
+    platform: 'Zoom',
+    room: '558 544 927',
+    passcode: '247247',
+    joinUrl: 'https://us02web.zoom.us/j/558544927?pwd=247247',
+    copy: 'NA Meeting: NA 24/7 Online Meeting\nFormat Varies, It Works Study, Step/Tradition · Closed\n24/7 — join any time\nZoom · Room 558 544 927 · Passcode 247247\nhttps://us02web.zoom.us/j/558544927?pwd=247247',
+  } as const;
+  const phone = {
+    name: "It's Another Way Monday Group",
+    schedule: 'Mondays at 6:30 PM (your local time)',
+    displayedTime: '6:30 PM',
+    platform: 'Phone Call',
+    room: '(425) 436-6321',
+    accessCode: '4831484',
+    joinUrl: 'tel:+14254366321',
+    copy: "NA Meeting: It's Another Way Monday Group\nFormat Varies, Just For Today Study, Literature Study, Phone Meeting · Open\nMondays at 6:30 PM (your local time)\nPhone Call · Room (425) 436-6321 · Access code 4831484\ntel:+14254366321",
+  } as const;
+
+  await audit.step('Copy and open the featured 24/7 room', 'The exact featured card agrees on name, schedule, platform, copy payload, and the external navigation request.', async () => {
+    const card = page.getByRole('heading', { level: 2, name: featured.name, exact: true }).locator('..');
+    await expect(card).toHaveCount(1);
+    await expect(card.getByText(featured.schedule, { exact: true })).toBeVisible();
+    await expect(card.getByText(featured.platform, { exact: true })).toBeVisible();
+    await expect(card.getByText(`Room ${featured.room}`, { exact: true })).toBeVisible();
+    await expect(card.getByText(`Passcode ${featured.passcode}`, { exact: true })).toBeVisible();
     const join = card.getByRole('link', { name: 'Join the 24/7 room' });
-    const expectedUrl = await join.getAttribute('href');
+    await expect(join).toHaveAttribute('href', featured.joinUrl);
     await card.getByRole('button', { name: 'Copy meeting details to clipboard' }).click();
     const copied = await page.evaluate(() => navigator.clipboard.readText());
-    expect(copied).toContain('NA Meeting:');
-    expect(copied).toContain('24/7 — join any time');
-    expect(copied).toContain(expectedUrl);
-    audit.observe('copied join URL', expectedUrl, 'Displayed href');
+    expect(copied, 'Featured copy must exactly reproduce every displayed connection detail').toBe(featured.copy);
+
+    let capturedDestination: string | null = null;
+    const routeMatcher = (url: URL) => url.href === featured.joinUrl;
+    await context.route(routeMatcher, async (route) => {
+      expect(route.request().isNavigationRequest(), 'The external join action must initiate document navigation').toBe(true);
+      capturedDestination = route.request().url();
+      await route.fulfill({ status: 200, contentType: 'text/html', body: '<!doctype html><title>NA room captured</title><h1>Exact NA room requested</h1>' });
+    });
+    let popup: Page | null = null;
+    try {
+      [popup] = await Promise.all([page.waitForEvent('popup'), join.click()]);
+      await popup.waitForLoadState('domcontentloaded', { timeout: 10_000 });
+      expect(capturedDestination).toBe(featured.joinUrl);
+      expect(popup.url()).toBe(featured.joinUrl);
+      await expect(popup.getByRole('heading', { name: 'Exact NA room requested', exact: true })).toBeVisible();
+      await audit.holdSecondaryPageOutcome(popup, 'exact featured NA external destination');
+    } finally {
+      if (popup && !popup.isClosed()) await popup.close();
+      await context.unroute(routeMatcher);
+    }
+    audit.observe('featured copy and action', JSON.stringify({ copied, capturedDestination }), JSON.stringify(featured));
+  });
+
+  await audit.step('Copy and activate a reviewed phone meeting', 'The exact phone card agrees on name, local schedule, platform, access code, copy payload, and trusted tel action.', async () => {
+    const search = page.getByLabel('Search meetings');
+    await search.fill(phone.name);
+    const card = page.getByText(phone.name, { exact: true }).locator('xpath=ancestor::li[contains(@class,"field-card")][1]');
+    await expect(card).toHaveCount(1);
+    await expect(card.getByText(phone.displayedTime, { exact: true })).toBeVisible();
+    await expect(card).toContainText(phone.platform);
+    await expect(card).toContainText(`Room ${phone.room}`);
+    await expect(card.getByText(`Access code: ${phone.accessCode}`, { exact: true })).toBeVisible();
+    const call = card.getByRole('link', { name: `Call ${phone.room}`, exact: true });
+    await expect(call).toHaveAttribute('href', phone.joinUrl);
+
+    await card.getByRole('button', { name: 'Copy meeting details to clipboard' }).click();
+    const copied = await page.evaluate(() => navigator.clipboard.readText());
+    expect(copied, 'Phone copy must exactly reproduce the visible schedule and connection details').toBe(phone.copy);
+
+    await page.evaluate(() => {
+      delete (window as Window & { __auditPhoneActivation?: { href: string; trusted: boolean } }).__auditPhoneActivation;
+      document.addEventListener('click', (event) => {
+        const anchor = (event.target as Element | null)?.closest<HTMLAnchorElement>('a[href^="tel:"]');
+        if (!anchor) return;
+        (window as Window & { __auditPhoneActivation?: { href: string; trusted: boolean } }).__auditPhoneActivation = {
+          href: anchor.href,
+          trusted: event.isTrusted,
+        };
+      }, { capture: true, once: true });
+    });
+    await call.click();
+    const activation = await page.evaluate(() =>
+      (window as Window & { __auditPhoneActivation?: { href: string; trusted: boolean } }).__auditPhoneActivation);
+    expect(activation, 'The rendered phone control must receive a trusted browser click').toEqual({ href: phone.joinUrl, trusted: true });
+    expect(phone.schedule).toContain(phone.displayedTime);
+    audit.observe('phone copy and action', JSON.stringify({ copied, activation }), JSON.stringify(phone));
   });
 
   await audit.assertRuntimeHealthy();
 });
 
 staticTest('[MEET-007] a failed live-meeting index becomes an explicit usable fallback', staticEvidence('Capture the explicit meeting-data failure state with both usable directory recovery links.', 'candidate-desktop-chromium'), async ({ page, audit }, testInfo) => {
-  test.skip(!candidateChromium(testInfo) || meta(testInfo).deviceClass !== 'desktop', 'One candidate desktop dependency-failure audit.');
+  test.skip(!currentSiteChromium(testInfo) || auditMeta(testInfo).deviceClass !== 'desktop', 'One reviewed-site desktop dependency-failure audit.');
   await page.clock.setFixedTime(new Date('2026-08-24T15:30:00Z'));
   const emptyIndex = JSON.stringify({
     generatedAt: '2026-08-24T15:30:00.000Z',

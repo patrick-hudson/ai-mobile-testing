@@ -3,7 +3,7 @@ import { mkdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
 import { chromium } from '@playwright/test';
-import { projectMetadata } from '../audit/environments.js';
+import { parseAuditProjectMetadata } from '../audit/environments.js';
 import { REPRESENTATIVE_PERFORMANCE_ROUTES } from '../audit/routes.js';
 import { candidateCertificateBypassApplies, chromiumNetskopeTrustArgument } from '../audit/tls.js';
 import { expect, staticEvidence, staticTest, structuredEvidence, structuredTest, test } from '../fixtures/test.js';
@@ -36,6 +36,7 @@ const LIGHTHOUSE_BUDGETS = {
   totalBlockingTimeMs: 600,
   cumulativeLayoutShift: 0.1,
 };
+const LAYOUT_STABILITY_OBSERVATION_MS = 4_000;
 
 function safeRouteName(route: string): string {
   return route === '/' ? 'home' : route.replace(/^\/+|\/+$/g, '').replace(/[^a-z0-9]+/gi, '-').toLowerCase();
@@ -155,6 +156,33 @@ async function installPerformanceObservers(page: import('@playwright/test').Page
   });
 }
 
+async function waitForApplicableHydration(page: import('@playwright/test').Page): Promise<{ totalIslands: number; pendingApplicableIslands: number }> {
+  const handle = await page.waitForFunction(() => {
+    const islands = [...document.querySelectorAll<HTMLElement>('astro-island')];
+    const pendingApplicable = islands.filter((island) => {
+      if (!island.hasAttribute('ssr')) return false;
+      const strategy = island.getAttribute('client');
+      if (strategy === 'media') {
+        try {
+          const query = (JSON.parse(island.getAttribute('opts') ?? '{}') as { value?: unknown }).value;
+          return typeof query !== 'string' || window.matchMedia(query).matches;
+        } catch {
+          return true;
+        }
+      }
+      if (strategy === 'visible') {
+        const box = island.getBoundingClientRect();
+        return box.bottom > 0 && box.top < innerHeight && box.right > 0 && box.left < innerWidth;
+      }
+      return true;
+    });
+    return pendingApplicable.length === 0
+      ? { totalIslands: islands.length, pendingApplicableIslands: pendingApplicable.length }
+      : false;
+  }, undefined, { timeout: 15_000 });
+  return handle.jsonValue() as Promise<{ totalIslands: number; pendingApplicableIslands: number }>;
+}
+
 function monitorNetworkActivity(page: import('@playwright/test').Page): {
   waitForQuiet(options: { minimumObservationMs: number; quietWindowMs: number; timeoutMs: number }): Promise<{ elapsedMs: number; quietForMs: number; peakInflight: number }>;
   dispose(): void;
@@ -199,9 +227,9 @@ function monitorNetworkActivity(page: import('@playwright/test').Page): {
 }
 
 for (const candidatePath of REPRESENTATIVE_PERFORMANCE_ROUTES) {
-  structuredTest(`[PERF-001] browser resource budget for ${candidatePath}`, structuredEvidence(`Retain bounded network-quiet, browser timing, transfer, and isolated Lighthouse evidence for ${candidatePath} without unrelated media.`, 'full-sweep-projects'), async ({ page, audit }, testInfo) => {
+  structuredTest(`[PERF-001] browser resource budget for ${candidatePath}`, structuredEvidence(`Retain bounded network-quiet, browser timing, transfer, and isolated Lighthouse evidence for ${candidatePath} without unrelated media.`, 'full-sweep-projects', candidatePath), async ({ page, audit }, testInfo) => {
     test.setTimeout(180_000);
-    const metadata = projectMetadata(testInfo.project.metadata);
+    const metadata = parseAuditProjectMetadata(testInfo.project.metadata);
     test.skip(!metadata.fullSweep, 'Performance sampling runs on the representative full-sweep matrix.');
     test.skip(audit.environmentPath(candidatePath) === null, 'No production-baseline equivalent exists.');
 
@@ -338,14 +366,20 @@ for (const candidatePath of REPRESENTATIVE_PERFORMANCE_ROUTES) {
     await audit.assertRuntimeHealthy();
   });
 
-  staticTest(`[PERF-002] layout stability evidence for ${candidatePath}`, staticEvidence(`Capture the post-hydration ${candidatePath} geometry with measured layout-shift records.`, 'full-sweep-projects'), async ({ page, audit }, testInfo) => {
-    const metadata = projectMetadata(testInfo.project.metadata);
+  staticTest(`[PERF-002] layout stability evidence for ${candidatePath}`, staticEvidence(`Capture the post-hydration ${candidatePath} geometry with measured layout-shift records.`, 'full-sweep-projects', candidatePath), async ({ page, audit }, testInfo) => {
+    const metadata = parseAuditProjectMetadata(testInfo.project.metadata);
     test.skip(!metadata.fullSweep, 'Layout-shift sampling runs on the representative full-sweep matrix.');
     test.skip(audit.environmentPath(candidatePath) === null, 'No production-baseline equivalent exists.');
 
     await installPerformanceObservers(page);
     await audit.goto(candidatePath);
-    await page.waitForTimeout(1_000);
+    const hydrationReadiness = await waitForApplicableHydration(page);
+    expect(hydrationReadiness.pendingApplicableIslands, 'Every load, idle, matching-media, and above-fold visible island must hydrate before the late-shift window begins').toBe(0);
+    const initialGeometry = await page.evaluate(() => ({
+      main: document.querySelector('main')?.getBoundingClientRect().toJSON() ?? null,
+      h1: document.querySelector('h1')?.getBoundingClientRect().toJSON() ?? null,
+    }));
+    await page.waitForTimeout(LAYOUT_STABILITY_OBSERVATION_MS);
 
     const evidence = await page.evaluate(() => {
       const state = window as typeof window & {
@@ -371,10 +405,33 @@ for (const candidatePath of REPRESENTATIVE_PERFORMANCE_ROUTES) {
     audit.observe('Cumulative layout shift', Math.round(evidence.cumulativeLayoutShift * 10_000) / 10_000, `<= ${clsBudget}`);
     audit.observe('Observed layout-shift events', evidence.shifts.length);
     audit.observe('Largest contentful paint ms', Math.round(evidence.largestContentfulPaint?.startTime ?? 0));
-    await audit.attachJson('layout-stability-evidence', { path: candidatePath, clsBudget, ...evidence });
+    const geometryMovement = (before: DOMRect | null, after: DOMRect | null) => before && after
+      ? Math.max(
+          Math.abs(after.top - before.top),
+          Math.abs(after.left - before.left),
+          Math.abs(after.width - before.width),
+          Math.abs(after.height - before.height),
+        )
+      : Number.POSITIVE_INFINITY;
+    const lateGeometryMovementPx = Math.max(
+      geometryMovement(initialGeometry.main as DOMRect | null, evidence.finalGeometry.main as DOMRect | null),
+      geometryMovement(initialGeometry.h1 as DOMRect | null, evidence.finalGeometry.h1 as DOMRect | null),
+    );
+    audit.observe('Late-hydration observation window ms', LAYOUT_STABILITY_OBSERVATION_MS, '>= 4000');
+    audit.observe('Late main/title geometry movement px', Math.round(lateGeometryMovementPx * 100) / 100, '<= 4');
+    await audit.attachJson('layout-stability-evidence', {
+      path: candidatePath,
+      clsBudget,
+      observationWindowMs: LAYOUT_STABILITY_OBSERVATION_MS,
+      hydrationReadiness,
+      initialGeometry,
+      lateGeometryMovementPx,
+      ...evidence,
+    });
     expect(evidence.cumulativeLayoutShift, 'Unexpected content movement after first render').toBeLessThanOrEqual(clsBudget);
     expect(evidence.finalGeometry.main, 'The primary content region remains rendered').not.toBeNull();
     expect(evidence.finalGeometry.h1, 'The page title remains rendered').not.toBeNull();
+    expect(lateGeometryMovementPx, 'Main content and title must not move after the bounded late-hydration window begins').toBeLessThanOrEqual(4);
     await audit.checkpoint('post-hydration-layout');
   });
 }

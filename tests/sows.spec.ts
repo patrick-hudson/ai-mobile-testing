@@ -1,10 +1,10 @@
 import { test, expect, interactionEvidence, interactionTest } from '../fixtures/test.js';
-import { meta } from './helpers.js';
+import { auditMeta, isChromiumAuditProject, usesReviewedSiteContract } from './helpers.js';
 
 const SOWS_PATH = '/mat-suboxone/sows-cows-induction-guide';
 
-function candidateChromium(testInfo: Parameters<typeof meta>[0]): boolean {
-  return meta(testInfo).environment === 'candidate' && testInfo.project.name.includes('chromium');
+function currentSiteChromium(testInfo: Parameters<typeof auditMeta>[0]): boolean {
+  return usesReviewedSiteContract(testInfo) && isChromiumAuditProject(testInfo);
 }
 
 async function openCalculator(page: import('@playwright/test').Page) {
@@ -21,7 +21,7 @@ async function answerEveryItem(page: import('@playwright/test').Page, value: num
 }
 
 interactionTest('[SOWS-001] every withdrawal item contributes exactly to the visible total', interactionEvidence('Answer all sixteen withdrawal items and show the visible score updating to the exact total.', 'candidate-chromium-projects'), async ({ page, audit }, testInfo) => {
-  test.skip(!candidateChromium(testInfo), 'Candidate Chromium SOWS audit.');
+  test.skip(!currentSiteChromium(testInfo), 'Reviewed-site Chromium SOWS audit.');
   await audit.goto(SOWS_PATH);
   await openCalculator(page);
 
@@ -45,7 +45,7 @@ interactionTest('[SOWS-001] every withdrawal item contributes exactly to the vis
 });
 
 interactionTest('[SOWS-002] interpretation changes at the induction thresholds', interactionEvidence('Change symptom answers across score thresholds and show each interpretation state responding.', 'candidate-desktop-chromium'), async ({ page, audit }, testInfo) => {
-  test.skip(!candidateChromium(testInfo) || meta(testInfo).deviceClass !== 'desktop', 'One deterministic candidate desktop threshold audit.');
+  test.skip(!currentSiteChromium(testInfo) || auditMeta(testInfo).deviceClass !== 'desktop', 'One deterministic reviewed-site desktop threshold audit.');
   await audit.goto(SOWS_PATH);
   await openCalculator(page);
   const groups = page.getByRole('radiogroup', { name: /^Score for:/ });
@@ -72,7 +72,7 @@ interactionTest('[SOWS-002] interpretation changes at the induction thresholds',
 });
 
 interactionTest('[SOWS-003] completed score can be copied, collapsed, reopened, and reset', interactionEvidence('Copy, collapse, reopen, and reset a completed score and show every visible state transition.', 'candidate-chromium-projects'), async ({ page, context, audit }, testInfo) => {
-  test.skip(!candidateChromium(testInfo), 'Candidate Chromium SOWS audit.');
+  test.skip(!currentSiteChromium(testInfo), 'Reviewed-site Chromium SOWS audit.');
   await context.grantPermissions(['clipboard-read', 'clipboard-write']);
   await page.clock.setFixedTime(new Date('2026-08-24T17:42:00-05:00'));
   await audit.goto(SOWS_PATH);

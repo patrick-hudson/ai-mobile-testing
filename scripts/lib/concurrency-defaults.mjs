@@ -1,0 +1,2 @@
+export const MAX_SINGLE_SITE_WORKER_REPLICAS = 16;
+export const MAX_MEDIA_WORKERS = 8;

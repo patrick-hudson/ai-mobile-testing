@@ -1,5 +1,6 @@
 import { expect, test, type APIRequestContext } from '@playwright/test';
-import { access, mkdir, open, readFile, readdir, rename, symlink, unlink, writeFile } from 'node:fs/promises';
+import { AxeBuilder } from '@axe-core/playwright';
+import { access, mkdir, open, readFile, readdir, readlink, rename, symlink, unlink, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 
@@ -48,36 +49,1018 @@ function runRequest(overrides: Record<string, unknown> = {}) {
   };
 }
 
-test('portal renders the complete launch surface and asynchronous loading state', async ({ page }) => {
-  await page.route('**/api/runs', async (route) => {
-    if (route.request().method() !== 'GET') return route.continue();
-    await new Promise((resolve) => setTimeout(resolve, 400));
+function runWorkspaceSummary(
+  mode: 'comparative' | 'single-site',
+  runId: string,
+  {
+    sourceRevision,
+    executionState = 'running',
+    activityState = 'collecting-evidence',
+    terminal = false,
+    finalizationStatus = mode === 'single-site' ? 'pending' : null,
+  }: {
+    sourceRevision: string;
+    executionState?: string;
+    activityState?: string;
+    terminal?: boolean;
+    finalizationStatus?: string | null;
+  },
+) {
+  return {
+    schemaVersion: 1,
+    apiVersion: 'v1',
+    routeId: 'run-summary',
+    complete: true,
+    freshness: 'current',
+    limitations: [],
+    capabilities: {
+      schemaVersion: 1,
+      items: [{
+        schemaVersion: 1,
+        identity: { mode, runId },
+        contextId: `${mode}-live`,
+        authorityRevision: 'authority-1',
+        actions: [],
+      }],
+    },
+    data: {
+      record: {
+        schemaVersion: 1,
+        mode,
+        runId,
+        recordId: 'run',
+        recordType: 'run',
+        scopeKey: 'all',
+        sourceId: `${mode}-runs`,
+        sourceRevision,
+        sourceUpdatedAt: '2026-08-25T12:03:00.000Z',
+        complete: true,
+        sortKey: 'recent:1',
+        fields: {
+          executionState,
+          activityState,
+          phase: 'browser-checks',
+          terminal,
+          progressTotal: 1,
+          progressCompleted: terminal ? 1 : 0,
+          outcome: null,
+          coverageStatus: 'complete',
+          evidenceAuthorityStatus: 'authoritative',
+          pipelineIntegrityStatus: terminal ? 'complete' : 'running',
+          finalizationStatus,
+          scopeLabel: mode === 'comparative' ? 'Production → candidate' : 'Preview site',
+          destinations: mode === 'comparative'
+            ? [`/run.html?mode=comparative&run=${runId}`, `/report.html?run=${runId}`]
+            : [`/run.html?mode=single-site&run=${runId}`, `/report.html?mode=single-site&run=${runId}`],
+        },
+      },
+    },
+  };
+}
+
+async function countOpenPortalStyleDescriptors(pid: number) {
+  const directory = `/proc/${pid}/fd`;
+  const descriptors = await readdir(directory);
+  const targets = await Promise.all(descriptors.map((descriptor) =>
+    readlink(join(directory, descriptor)).catch(() => '')));
+  return targets.filter((target) => target.endsWith('/portal/public/styles.css')).length;
+}
+
+function acceptedSingleSitePreview(runContract: Record<string, any>, digestCharacter = 'a') {
+  const coverage = {
+    scope: {
+      qualifier: runContract.scope.qualifier,
+      requestedQualifier: runContract.scope.qualifier,
+      filters: {
+        pluginIds: runContract.scope.pluginIds,
+        auditIds: runContract.scope.auditIds,
+        areas: runContract.scope.areas,
+      },
+      selectedTargetIds: runContract.targetIds,
+    },
+    coverageStatus: 'COMPLETE',
+    coverageGaps: [],
+    omissions: { definitions: [], cases: [], targets: [] },
+    outsideMode: [],
+    counts: {
+      selectedDefinitions: 1,
+      executableCases: 1,
+      plannedExecutions: runContract.targetIds.length,
+      manualDefinitions: 0,
+      coverageGaps: 0,
+      omittedDefinitions: 0,
+      outsideModeDefinitions: 0,
+    },
+  };
+  return {
+    schemaVersion: 1,
+    mode: 'single-site',
+    accepted: true,
+    runContract,
+    previewDigest: `sha256:${digestCharacter.repeat(64)}`,
+    coverage,
+    preflight: { evidenceAuthority: { status: 'authoritative', reasons: [] }, issues: [] },
+  };
+}
+
+function rejectedSingleSitePreview(message = 'The selected deployment role does not match this site.') {
+  return {
+    schemaVersion: 1,
+    mode: 'single-site',
+    accepted: false,
+    preflight: {
+      evidenceAuthority: { status: 'non-authoritative', reasons: ['preflight-rejected'] },
+      issues: [{ code: 'PREFLIGHT_DEPLOYMENT_ROLE_MISMATCH', message, focusTarget: 'deploymentRole' }],
+    },
+  };
+}
+
+test('console-shell: direct entry, bounded history, and stale async requests preserve canonical safe state', async ({ page, request }) => {
+  const fixtureResponse = await request.get('/console-shell-fixture.html');
+  expect(fixtureResponse.status()).toBe(200);
+  expect(fixtureResponse.headers()['content-security-policy']).toContain("script-src 'self'");
+  const contractResponse = await request.get('/__e2e__/console-contracts.mjs');
+  expect(contractResponse.status()).toBe(200);
+  expect(contractResponse.headers()['content-type']).toContain('text/javascript');
+  const portalBaseUrl = process.env.PORTAL_E2E_BASE_URL!;
+  expect((await request.get(`${portalBaseUrl}/%2Fconsole-shell-fixture.html`)).status()).toBe(404);
+
+  const externalRequests: string[] = [];
+  const apiRequests: string[] = [];
+  page.on('request', (event) => {
+    const url = new URL(event.url());
+    if (url.origin !== new URL(portalBaseUrl).origin) externalRequests.push(event.url());
+    if (url.pathname.startsWith('/api/')) apiRequests.push(url.pathname);
+  });
+  await page.goto('/console-shell-fixture.html?run=fixture-alpha&inspector=open&sort=risk&unknown=discard-me#unsafe');
+  await expect(page.getByRole('heading', { name: 'Operations workspace' })).toBeVisible();
+  await expect.poll(() => new URL(page.url()).searchParams.has('unknown')).toBe(false);
+  expect(new URL(page.url()).hash).toBe('');
+  await expect(page.locator('#fixture-results')).toHaveAttribute('data-async-state', 'ready');
+  await expect(page.locator('#fixture-results')).toContainText('fixture-alpha');
+
+  await page.getByRole('link', { name: 'Shell fixture' }).click();
+  await expect(page.getByRole('heading', { name: 'Operations workspace' })).toBeVisible();
+  expect(new URL(page.url()).search).toBe('?inspector=closed&mode=all&sort=recent');
+  await page.goBack();
+  await expect.poll(() => new URL(page.url()).searchParams.get('run')).toBe('fixture-alpha');
+  await expect(page.locator('#fixture-results')).toContainText('fixture-alpha');
+
+  const historyLengthBeforePushes = await page.evaluate(() => history.length);
+  // Dispatch both user-visible selections in the same browser task. Awaiting
+  // two separate Playwright clicks lets a heavily loaded CI host finish the
+  // synthetic alpha request between protocol round trips, which stops this
+  // characterization from exercising supersession at all.
+  await page.evaluate(() => {
+    document.querySelector<HTMLButtonElement>('#fixture-alpha')?.click();
+    document.querySelector<HTMLButtonElement>('#fixture-beta')?.click();
+  });
+  await expect(page.locator('#fixture-results')).toHaveAttribute('data-async-state', 'ready');
+  await expect(page.locator('#fixture-results')).toContainText('fixture-beta');
+  await expect(page.locator('#fixture-results')).not.toContainText('Needs review');
+  await expect.poll(async () => Number(await page.locator('#fixture-abort-count').textContent())).toBeGreaterThan(0);
+
+  await page.goBack();
+  await expect.poll(() => new URL(page.url()).searchParams.get('run')).toBe('fixture-alpha');
+  await expect(page.locator('#fixture-results')).toContainText('fixture-alpha');
+  await expect(page.locator('#fixture-alpha')).toBeFocused();
+  await page.goForward();
+  await expect.poll(() => new URL(page.url()).searchParams.get('run')).toBe('fixture-beta');
+  await expect(page.locator('#fixture-results')).toContainText('fixture-beta');
+  await expect(page.locator('#fixture-beta')).toBeFocused();
+  for (let index = 0; index < 12; index += 1) {
+    await page.locator(index % 2 === 0 ? '#fixture-alpha' : '#fixture-beta').click();
+  }
+  expect(await page.evaluate(() => history.length)).toBeLessThanOrEqual(historyLengthBeforePushes + 8);
+  await page.reload();
+  await expect(page.locator('#fixture-results')).toContainText('fixture-beta');
+
+  await page.locator('#fixture-refresh-failure').click();
+  await expect(page.locator('#fixture-results')).toHaveAttribute('data-async-state', 'stale');
+  await expect(page.locator('#fixture-results')).toContainText('fixture-beta');
+  await page.locator('[data-async-retry]').click();
+  await expect(page.locator('#fixture-results')).toHaveAttribute('data-async-state', 'ready');
+
+  for (const hostileSearch of [
+    'run=fixture-alpha&run=fixture-beta',
+    'cursor=unbound-cursor',
+    'run=%252e%252e%252foutside',
+    `q=sk-ant-${'a'.repeat(32)}`,
+    '__proto__=polluted',
+    `q=${'x'.repeat(4_200)}`,
+  ]) {
+    await page.goto(`/console-shell-fixture.html?${hostileSearch}`);
+    await expect(page.getByRole('heading', { name: 'Operations workspace' })).toBeVisible();
+    expect(new URL(page.url()).pathname).toBe('/console-shell-fixture.html');
+    expect(page.url()).not.toContain('outside');
+  }
+  expect(externalRequests).toEqual([]);
+  expect(apiRequests).toEqual([]);
+});
+
+test('console-shell: saved views discard hostile records atomically and survive storage denial in memory', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('audit-console.saved-views.v1', JSON.stringify({
+      schemaVersion: 1,
+      entries: [
+        {
+          schemaVersion: 1,
+          id: 'valid-view',
+          name: 'Valid review view',
+          routeId: 'runs',
+          parameters: { run: 'fixture-alpha', inspector: 'open', sort: 'recent', mode: 'all' },
+          layout: { inspectorWidth: 336 },
+          updatedAt: '2026-08-26T12:00:00.000Z',
+        },
+        JSON.parse('{"schemaVersion":1,"id":"hostile","name":"Hostile","routeId":"runs","parameters":{"__proto__":"polluted"},"layout":{},"updatedAt":"2026-08-26T12:00:00.000Z"}'),
+        {
+          schemaVersion: 0,
+          id: 'stale-view',
+          name: 'Stale view',
+          routeId: 'runs',
+          parameters: { run: 'fixture-beta' },
+          layout: {},
+          updatedAt: '2026-08-26T12:00:00.000Z',
+        },
+      ],
+    }));
+  });
+  await page.goto('/console-shell-fixture.html?run=fixture-alpha');
+  await expect(page.locator('#fixture-storage-status')).toHaveText('1 valid saved views loaded.');
+  expect(await page.evaluate(() => ({} as Record<string, unknown>).polluted)).toBeUndefined();
+
+  const portalBaseUrl = process.env.PORTAL_E2E_BASE_URL;
+  const storageState = process.env.PORTAL_E2E_STORAGE_STATE;
+  expect(portalBaseUrl).toBeTruthy();
+  expect(storageState).toBeTruthy();
+  const denied = await page.context().browser()!.newContext({
+    baseURL: portalBaseUrl!,
+    storageState: storageState!,
+  });
+  await denied.addInitScript(() => {
+    for (const method of ['getItem', 'setItem', 'removeItem'] as const) {
+      Object.defineProperty(Storage.prototype, method, {
+        configurable: true,
+        value() { throw new DOMException('Storage denied by fixture.', 'SecurityError'); },
+      });
+    }
+  });
+  const deniedPage = await denied.newPage();
+  await deniedPage.goto('/console-shell-fixture.html?run=fixture-beta');
+  await deniedPage.locator('#fixture-save-view').click();
+  await expect(deniedPage.locator('#fixture-storage-status')).toContainText('saved in memory');
+  await deniedPage.locator('#fixture-alpha').click();
+  await deniedPage.locator('#fixture-restore-view').click();
+  await expect.poll(() => new URL(deniedPage.url()).searchParams.get('run')).toBe('fixture-beta');
+  await expect(deniedPage.locator('#fixture-results')).toContainText('fixture-beta');
+  await denied.close();
+});
+
+test('console-shell: connection loss freezes durable execution state until an authoritative update', async ({ page }) => {
+  await page.goto('/console-shell-fixture.html?run=fixture-alpha');
+  await page.locator('#fixture-connected').click();
+  await page.locator('#fixture-server-update').click();
+  await expect(page.locator('#fixture-execution')).toHaveText('Completed');
+  await expect(page.locator('#fixture-activity')).toHaveText('Awaiting review');
+  await expect(page.locator('#fixture-freshness')).toContainText('Current at');
+
+  await page.locator('#fixture-reconnect').click();
+  await expect(page.locator('#fixture-connection-detail')).toHaveText('reconnecting');
+  await expect(page.locator('#fixture-freshness')).toContainText('durable values frozen');
+  await expect(page.locator('#fixture-execution')).toHaveText('Completed');
+  await expect(page.locator('#fixture-activity')).toHaveText('Awaiting review');
+  await page.locator('#fixture-offline').click();
+  await expect(page.locator('#fixture-connection-detail')).toHaveText('offline');
+  await expect(page.locator('#fixture-execution')).toHaveText('Completed');
+});
+
+test('console-shell: keyboard focus, splitter, responsive layout, axe, and reduced motion remain usable', async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await page.goto('/console-shell-fixture.html?run=fixture-alpha');
+  await expect(page.locator('#fixture-results')).toHaveAttribute('data-async-state', 'ready');
+
+  const summaryTab = page.getByRole('tab', { name: 'Summary' });
+  const evidenceTab = page.getByRole('tab', { name: 'Evidence' });
+  await summaryTab.focus();
+  await page.keyboard.press('ArrowRight');
+  await expect(evidenceTab).toBeFocused();
+  await expect(summaryTab).toHaveAttribute('aria-selected', 'true');
+  await expect(evidenceTab).toHaveAttribute('aria-selected', 'false');
+  await page.keyboard.press('Enter');
+  await expect(evidenceTab).toHaveAttribute('aria-selected', 'true');
+  await expect(page.getByRole('tabpanel', { name: 'Evidence' })).toContainText('bounded fixture adapter');
+
+  await page.locator('#fixture-open-dialog').focus();
+  await page.keyboard.press('Enter');
+  await expect(page.getByRole('dialog', { name: 'Confirm fixture action' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Confirm fixture action' })).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(page.locator('#fixture-open-dialog')).toBeFocused();
+
+  const separator = page.getByRole('separator', { name: 'Resize inspector' });
+  await separator.focus();
+  const widthBefore = Number(await separator.getAttribute('aria-valuenow'));
+  await page.keyboard.press('ArrowLeft');
+  await expect(separator).toHaveAttribute('aria-valuenow', String(widthBefore + 16));
+  const separatorBox = await separator.boundingBox();
+  expect(separatorBox).toBeTruthy();
+  await page.mouse.move(separatorBox!.x + (separatorBox!.width / 2), separatorBox!.y + 60);
+  await page.mouse.down();
+  await page.mouse.move(separatorBox!.x - 32, separatorBox!.y + 60);
+  await page.mouse.up();
+  const pointerWidth = Number(await separator.getAttribute('aria-valuenow'));
+  expect(pointerWidth).toBeGreaterThan(widthBefore + 16);
+  await page.reload();
+  await expect(separator).toHaveAttribute('aria-valuenow', String(pointerWidth));
+
+  for (const width of [1280, 1440, 1920, 480]) {
+    await page.setViewportSize({ width, height: 800 });
+    await expect.poll(() => page.evaluate(() => ({ viewport: document.documentElement.clientWidth, content: document.documentElement.scrollWidth })))
+      .toEqual({ viewport: width, content: width });
+  }
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await page.locator('#fixture-alpha').click();
+  const animationDuration = await page.locator('[data-async-content]').evaluate((node) => Number.parseFloat(getComputedStyle(node).animationDuration));
+  expect(animationDuration).toBeLessThanOrEqual(0.001);
+  await expect(page.locator('[data-async-status]')).not.toHaveText('');
+
+  const accessibility = await new AxeBuilder({ page }).include('#console-shell-fixture').analyze();
+  expect(accessibility.violations.filter(({ impact }) => impact === 'serious' || impact === 'critical')).toEqual([]);
+});
+
+test('u4: Runs owns the bounded asynchronous run index after the root Overview cutover', async ({ page }) => {
+  let releaseRuns!: () => void;
+  const runsGate = new Promise<void>((resolve) => { releaseRuns = resolve; });
+  let runsRequestUrl = '';
+  await page.route('**/api/console/v1/runs?*', async (route) => {
+    runsRequestUrl = route.request().url();
+    await runsGate;
     return route.continue();
   });
-  await page.goto('/');
-  await expect(page.getByRole('heading', { name: /release audit/i })).toBeVisible();
-  await expect(page.locator('#catalog-summary')).toContainText('81 documented checks');
+  await page.goto('/runs.html');
+  await expect(page.getByRole('heading', { name: 'Runs', exact: true, level: 1 })).toBeVisible();
+  await expect(page.getByRole('link', { name: 'New audit' })).toHaveAttribute('href', '/new-audit.html');
+  await expect(page.getByRole('link', { name: 'Settings' })).toHaveAttribute('href', '/settings.html');
+  await expect(page.locator('#launch-form')).toHaveCount(0);
+  await expect(page.locator('#anthropic-key-settings')).toHaveCount(0);
+  await expect(page.locator('#runs-index')).toHaveAttribute('aria-busy', 'true');
+  await expect(page.locator('#refresh-runs')).toHaveCount(0);
+  releaseRuns();
+  await expect(page.locator('#runs-index')).toHaveAttribute('aria-busy', 'false');
+  expect(new URL(runsRequestUrl).pathname).toBe('/api/console/v1/runs');
+  expect(new URL(runsRequestUrl).searchParams.get('limit')).toBe('50');
+});
+
+test('u5: New Audit owns the full launch catalog behind progressive advanced controls', async ({ page }) => {
+  await page.goto('/new-audit.html');
+  await expect(page.getByRole('heading', { name: 'Configure an audit' })).toBeVisible();
+  await expect(page.locator('#catalog-summary')).toContainText('183 documented checks');
+  await expect(page.locator('#advanced-audit-options')).not.toHaveAttribute('open', '');
   await expect(page.locator('#project-options input[name="targetId"]')).toHaveCount(18);
   await expect(page.locator('#project-options input[name="targetId"]:checked')).toHaveCount(7);
   await expect(page.locator('#project-options input[name="targetId"]:disabled')).toHaveCount(5);
   await expect(page.locator('#plugin-options input')).toHaveCount(5);
-  await expect(page.locator('#audit-options input')).toHaveCount(81);
-  await expect(page.locator('#runs-panel')).toHaveAttribute('aria-busy', 'false');
-  const refreshedRuns = page.waitForResponse((response) => {
-    const url = new URL(response.url());
-    return response.request().method() === 'GET' && url.pathname === '/api/runs';
-  });
-  await page.locator('#refresh-runs').click();
-  await expect(page.locator('#runs-panel')).toHaveAttribute('aria-busy', 'true');
-  await expect(page.locator('#refresh-runs')).toBeDisabled();
-  await expect(page.locator('#refresh-runs')).toHaveText('Refreshing…');
-  await refreshedRuns;
-  await expect(page.locator('#runs-panel')).toHaveAttribute('aria-busy', 'false');
-  await expect(page.locator('#refresh-runs')).toBeEnabled();
-  await expect(page.locator('#refresh-runs')).toHaveText('Refresh');
+  await expect(page.locator('#audit-options input')).toHaveCount(183);
+  await expect(page.locator('#launch-form')).toHaveAttribute('aria-busy', 'false');
+  await expect(page.locator('link[href="/styles.css"]')).toHaveCount(0);
 });
 
-test('reviewer report has bounded loading, empty, and terminal error states without fetching raw evidence', async ({ page }) => {
+test('u5: comparative launch submits the exact legacy contract then navigates without opening a modal', async ({ page }) => {
+  const runId = 'u5-comparative-run';
+  let submitted: Record<string, any> | null = null;
+  await page.route('**/api/runs', async (route) => {
+    if (route.request().method() !== 'POST') return route.fallback();
+    submitted = route.request().postDataJSON();
+    return route.fulfill({ status: 201, json: { id: runId } });
+  });
+
+  await page.goto('/new-audit.html?mode=comparative');
+  const targetIds = await page.locator('#project-options input[name="targetId"]:checked')
+    .evaluateAll((inputs) => inputs.map((input) => (input as HTMLInputElement).value));
+  const aiModel = await page.locator('#ai-model').inputValue();
+  await page.locator('#launch-run').click();
+  await page.waitForURL((url) => url.pathname === '/run.html' && url.searchParams.get('run') === runId);
+
+  expect(submitted).toEqual({
+    profile: 'smoke',
+    targetIds,
+    pluginIds: [],
+    areas: [],
+    auditIds: [],
+    productionUrl: targets.productionUrl,
+    candidateUrl: targets.candidateUrl,
+    candidateIgnoreHTTPSErrors: false,
+    aiReview: false,
+    aiModel,
+  });
+  const runUrl = new URL(page.url());
+  expect(runUrl.searchParams.get('mode')).toBe('comparative');
+  expect(runUrl.searchParams.get('view')).toBe('overview');
+  expect(runUrl.searchParams.get('inspector')).toBe('closed');
+});
+
+test('u5: Settings sections use bounded read-only runtime data and canonical section history', async ({ page }) => {
+  let baselineReads = 0;
+  let baselineMutations = 0;
+  await page.route('**/api/single-site/visual-baselines?*', async (route) => {
+    if (route.request().method() !== 'GET') {
+      baselineMutations += 1;
+      return route.fulfill({ status: 500, json: { error: 'Settings must not mutate baselines.' } });
+    }
+    baselineReads += 1;
+    const url = new URL(route.request().url());
+    expect(url.searchParams.get('offset')).toBe('0');
+    expect(url.searchParams.get('limit')).toBe('50');
+    return route.fulfill({ json: { schemaVersion: 1, items: [], total: 0, offset: 0, limit: 50, storeRevision: 3, historyDigest: `sha256:${'a'.repeat(64)}` } });
+  });
+
+  await page.goto('/settings.html?section=test-catalog');
+  await expect(page.locator('#settings-test-catalog')).toContainText('183');
+  await expect(page.locator('#settings-test-catalog tbody tr')).toHaveCount(50);
+  await page.getByRole('button', { name: 'Baselines' }).click();
+  await expect(page).toHaveURL(/section=baselines/);
+  await expect(page.locator('#settings-baselines')).toContainText(/read-only|No visual baseline records/i);
+  expect(baselineReads).toBe(1);
+  expect(baselineMutations).toBe(0);
+  await page.getByRole('button', { name: 'Environments' }).click();
+  await expect(page).toHaveURL(/section=environments/);
+  await expect(page.locator('#settings-environments')).toContainText(targets.productionUrl);
+  await expect(page.locator('#settings-environments')).toContainText(targets.candidateUrl);
+  await page.goBack();
+  await expect(page.locator('#settings-baselines')).toBeVisible();
+  expect(baselineReads).toBe(1);
+  await expect(page.locator('link[href="/styles.css"]')).toHaveCount(0);
+});
+
+test('aborted file responses release their owned descriptors immediately', async () => {
+  test.skip(process.platform !== 'linux', 'Descriptor accounting uses the Linux process filesystem inside Docker.');
+  const portalBaseUrl = process.env.PORTAL_E2E_BASE_URL;
+  const portalPid = Number(process.env.PORTAL_E2E_SERVER_PID);
+  expect(portalBaseUrl).toBeTruthy();
+  expect(Number.isSafeInteger(portalPid) && portalPid > 0).toBeTruthy();
+  const baseline = await countOpenPortalStyleDescriptors(portalPid);
+  const controllers = Array.from({ length: 16 }, () => new AbortController());
+  const requests = controllers.map((controller, index) => fetch(`${portalBaseUrl}/styles.css?abort-proof=${index}`, {
+    headers: { 'x-portal-e2e-send-file-delay-ms': '500' },
+    signal: controller.signal,
+  }).catch(() => null));
+  let opened = 0;
+  const deadline = Date.now() + 1_000;
+  while (Date.now() < deadline && opened === 0) {
+    opened = await countOpenPortalStyleDescriptors(portalPid);
+    if (opened === 0) await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  expect(opened, 'The failpoint must observe at least one descriptor before clients disconnect.').toBeGreaterThan(0);
+  controllers.forEach((controller) => controller.abort());
+  await Promise.allSettled(requests);
+  const closeDeadline = Date.now() + 1_000;
+  let remaining = await countOpenPortalStyleDescriptors(portalPid);
+  while (Date.now() < closeDeadline && remaining !== baseline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    remaining = await countOpenPortalStyleDescriptors(portalPid);
+  }
+  expect(remaining, 'Every aborted response must close its descriptor without waiting for garbage collection.').toBe(baseline);
+});
+
+test('u5: single-site mode previews exact coverage and navigates an accepted job to the stable run route', async ({ page }) => {
+  const previewDigest = `sha256:${'a'.repeat(64)}`;
+  const runContract = {
+    schemaVersion: 1,
+    mode: 'single-site',
+    url: targets.candidateUrl,
+    deploymentRole: 'preview',
+    certificatePolicy: 'strict',
+    targetIds: [
+      'single-site-mobile-chromium',
+      'single-site-desktop-chromium',
+      'single-site-mobile-webkit',
+      'single-site-tablet-webkit',
+      'single-site-desktop-firefox',
+    ],
+    scope: { qualifier: 'FULL', pluginIds: [], auditIds: [], areas: [] },
+  };
+  const coverage = {
+    scope: {
+      qualifier: 'FULL', requestedQualifier: 'FULL', filters: { pluginIds: [], auditIds: [], areas: [] },
+      selectedTargetIds: runContract.targetIds,
+    },
+    coverageStatus: 'COMPLETE',
+    coverageGaps: [],
+    omissions: { definitions: [], cases: [], targets: [] },
+    outsideMode: [{ definitionId: 'CONTENT-008' }],
+    counts: {
+      selectedDefinitions: 183, executableCases: 192, plannedExecutions: 385,
+      manualDefinitions: 2, coverageGaps: 0, omittedDefinitions: 0, outsideModeDefinitions: 1,
+    },
+  };
+  const preview = {
+    schemaVersion: 1, mode: 'single-site', accepted: true, runContract, previewDigest, coverage,
+    preflight: { evidenceAuthority: { status: 'authoritative', reasons: [] } },
+  };
+  const job = {
+    schemaVersion: 1,
+    id: 'job-aaaaaaaaaaaa-bbbbbbbbbbbb',
+    mode: 'single-site', status: 'queued', activity: 'normal',
+    createdAt: '2026-08-25T12:00:00.000Z', updatedAt: '2026-08-25T12:00:00.000Z',
+    url: targets.candidateUrl, deploymentRole: 'preview', certificatePolicy: 'strict',
+    scope: { qualifier: 'FULL', requestedQualifier: 'FULL', filters: coverage.scope.filters, selectedTargetIds: runContract.targetIds, omissions: coverage.omissions },
+    coverage: { status: 'COMPLETE', counts: coverage.counts, gaps: [], outsideModeCount: 1 },
+    evidenceAuthority: { authoritative: true, reasons: [] },
+    attempt: { number: 0, id: null, fencingToken: 0, infrastructureRetriesUsed: 0, maxInfrastructureRetries: 1 },
+    lease: null, result: null, cancellation: null,
+    stageDeadlines: { inventory: '2030-01-01T00:05:00.000Z', browser: '2030-01-01T01:00:00.000Z', finalizer: '2030-01-01T01:30:00.000Z' },
+    events: [{ at: '2026-08-25T12:00:00.000Z', executionState: 'queued', activityState: 'normal', message: 'Validated job envelope was durably queued.' }],
+    publications: [],
+  };
+  let launched = false;
+  await page.route('**/api/single-site/preflight', (route) => route.fulfill({ status: 200, json: preview }));
+  await page.route('**/api/single-site/runs**', async (route) => {
+    const url = new URL(route.request().url());
+    if (route.request().method() === 'POST' && url.pathname === '/api/single-site/runs') {
+      launched = true;
+      return route.fulfill({ status: 201, json: { schemaVersion: 1, launched: true, idempotent: false, previewDigest, job } });
+    }
+    if (route.request().method() === 'GET' && url.pathname === '/api/single-site/runs') {
+      return route.fulfill({ json: { schemaVersion: 1, jobs: launched ? [job] : [] } });
+    }
+    if (route.request().method() === 'GET' && url.pathname === `/api/single-site/runs/${job.id}`) {
+      return route.fulfill({ json: job });
+    }
+    return route.fallback();
+  });
+
+  await page.goto('/new-audit.html?mode=single-site');
+  await expect(page.locator('#comparative-sites')).toBeHidden();
+  await expect(page.locator('#single-site-settings')).toBeVisible();
+  const configuredSingleSiteTargetIds = await page.evaluate(async () => {
+    const config = await fetch('/api/config').then((response) => response.json());
+    return [...config.targets.singleSiteTargets, ...config.targets.providerTargets]
+      .map((target: { id: string }) => target.id);
+  });
+  const renderedSingleSiteTargetIds = await page.locator('#project-options input[name="targetId"]')
+    .evaluateAll((inputs) => inputs.map((input) => (input as HTMLInputElement).value));
+  expect(renderedSingleSiteTargetIds).toEqual(configuredSingleSiteTargetIds);
+  await expect(page.locator('#project-options input[name="targetId"]:checked')).toHaveCount(5);
+  await expect(page.locator('#launch-run')).toBeDisabled();
+  await page.getByRole('checkbox', { name: /confirm this is the intended deployment role/i }).check();
+  await page.locator('#preview-single-site').click();
+  await expect(page.locator('#single-site-preflight-status')).toContainText(/identity accepted/i);
+  await expect(page.locator('#single-site-coverage')).toContainText('385');
+  await expect(page.locator('#single-site-coverage')).toContainText(/authoritative/i);
+  await expect(page.locator('#launch-run')).toBeEnabled();
+  await page.locator('#launch-run').click();
+  await page.waitForURL((url) => url.pathname === '/run.html' && url.searchParams.get('run') === job.id);
+  const runUrl = new URL(page.url());
+  expect(runUrl.searchParams.get('mode')).toBe('single-site');
+  expect(runUrl.searchParams.get('run')).toBe(job.id);
+  expect(runUrl.searchParams.get('view')).toBe('overview');
+  expect(runUrl.searchParams.get('inspector')).toBe('closed');
+});
+
+test('u5: single-site URL suggestions require explicit role reconfirmation without changing scope or targets', async ({ page }) => {
+  await page.goto('/new-audit.html?mode=single-site');
+  const roleConfirmation = page.getByRole('checkbox', { name: /confirm this is the intended deployment role/i });
+  const previewRole = page.locator('input[name="singleSiteRole"][value="preview"]');
+  const productionRole = page.locator('input[name="singleSiteRole"][value="production"]');
+
+  await page.locator('#advanced-audit-options').evaluate((details: HTMLDetailsElement) => { details.open = true; });
+  await page.getByRole('radio', { name: /target selected audit areas or ids/i }).check();
+  await page.locator('#plugin-options input[name="pluginId"]').first().check();
+  await page.locator('#project-options input[name="targetId"]:checked').first().uncheck();
+  const selectedTargets = await page.locator('#project-options input[name="targetId"]:checked')
+    .evaluateAll((inputs) => inputs.map((input) => (input as HTMLInputElement).value));
+  const selectedPlugins = await page.locator('#plugin-options input[name="pluginId"]:checked')
+    .evaluateAll((inputs) => inputs.map((input) => (input as HTMLInputElement).value));
+
+  await page.locator('#single-site-url').fill('https://beta.example.test/review');
+  await expect(previewRole).toBeChecked();
+  await expect(page.locator('#single-site-role-suggestion')).toContainText(/suggested role: preview/i);
+  await expect(roleConfirmation).not.toBeChecked();
+  await roleConfirmation.check();
+
+  await page.locator('#single-site-url').fill(`${targets.productionUrl}/about/`);
+  await expect(productionRole).toBeChecked();
+  await expect(page.locator('#single-site-role-suggestion')).toContainText(/suggested role: production/i);
+  await expect(roleConfirmation).not.toBeChecked();
+  await expect(page.locator('#preview-single-site')).toBeEnabled();
+
+  await roleConfirmation.check();
+  await previewRole.check();
+  await expect(roleConfirmation).not.toBeChecked();
+  await expect(page.locator('#single-site-role-suggestion')).toContainText(/current selection is preview/i);
+  expect(await page.locator('#project-options input[name="targetId"]:checked')
+    .evaluateAll((inputs) => inputs.map((input) => (input as HTMLInputElement).value))).toEqual(selectedTargets);
+  expect(await page.locator('#plugin-options input[name="pluginId"]:checked')
+    .evaluateAll((inputs) => inputs.map((input) => (input as HTMLInputElement).value))).toEqual(selectedPlugins);
+});
+
+test('u5: single-site rejection creates no job, focuses the resolving role, and retries with preserved selections', async ({ page }) => {
+  const preflightContracts: Record<string, any>[] = [];
+  let launchRequests = 0;
+  await page.route('**/api/single-site/preflight', async (route) => {
+    const contract = route.request().postDataJSON();
+    preflightContracts.push(contract);
+    if (preflightContracts.length === 1) {
+      return route.fulfill({ status: 422, json: rejectedSingleSitePreview() });
+    }
+    return route.fulfill({ status: 200, json: acceptedSingleSitePreview(contract) });
+  });
+  await page.route('**/api/single-site/runs**', async (route) => {
+    const url = new URL(route.request().url());
+    if (route.request().method() === 'POST' && url.pathname === '/api/single-site/runs') {
+      launchRequests += 1;
+      return route.fulfill({ status: 500, json: { error: 'A run must not be created in this journey.' } });
+    }
+    if (route.request().method() === 'GET' && url.pathname === '/api/single-site/runs') {
+      return route.fulfill({ json: { schemaVersion: 1, jobs: [] } });
+    }
+    return route.fallback();
+  });
+
+  await page.goto('/new-audit.html?mode=single-site');
+  await page.locator('#advanced-audit-options').evaluate((details: HTMLDetailsElement) => { details.open = true; });
+  await page.getByRole('radio', { name: /target selected audit areas or ids/i }).check();
+  await page.locator('#plugin-options input[name="pluginId"]').first().check();
+  await page.locator('#project-options input[name="targetId"]:checked').first().uncheck();
+  const expectedTargets = await page.locator('#project-options input[name="targetId"]:checked')
+    .evaluateAll((inputs) => inputs.map((input) => (input as HTMLInputElement).value));
+  const expectedPlugin = await page.locator('#plugin-options input[name="pluginId"]:checked').first().inputValue();
+
+  await page.locator('input[name="singleSiteRole"][value="production"]').check();
+  await page.getByRole('checkbox', { name: /confirm this is the intended deployment role/i }).check();
+  await page.locator('#preview-single-site').click();
+  await expect(page.locator('#single-site-coverage-badge')).toHaveText('Rejected');
+  await expect(page.locator('input[name="singleSiteRole"][value="production"]')).toBeFocused();
+  await expect(page.locator('#launch-run')).toBeDisabled();
+  expect(launchRequests).toBe(0);
+
+  await page.locator('input[name="singleSiteRole"][value="preview"]').check();
+  await expect(page.getByRole('checkbox', { name: /confirm this is the intended deployment role/i })).not.toBeChecked();
+  await page.getByRole('checkbox', { name: /confirm this is the intended deployment role/i }).check();
+  await page.locator('#preview-single-site').click();
+  await expect(page.locator('#single-site-preflight-status')).toContainText(/identity accepted/i);
+  await expect(page.locator('#launch-run')).toBeEnabled();
+  expect(preflightContracts).toHaveLength(2);
+  expect(preflightContracts[0]!.scope).toEqual(preflightContracts[1]!.scope);
+  expect(preflightContracts[1]!.scope).toEqual({ qualifier: 'TARGETED', pluginIds: [expectedPlugin], auditIds: [], areas: [] });
+  expect(preflightContracts[1]!.targetIds).toEqual(expectedTargets);
+  expect(launchRequests).toBe(0);
+});
+
+test('u5: single-site preflight aborts and rejects stale or contract-mismatched responses', async ({ page }) => {
+  test.setTimeout(40_000);
+  let preflightRequests = 0;
+  await page.route('**/api/single-site/preflight', async (route) => {
+    preflightRequests += 1;
+    const contract = route.request().postDataJSON();
+    if (preflightRequests === 1) {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      return route.fulfill({ status: 200, json: acceptedSingleSitePreview(contract, 'a') });
+    }
+    if (preflightRequests === 2) {
+      return route.fulfill({ status: 200, json: acceptedSingleSitePreview({ ...contract, url: 'https://mismatched.example.test' }, 'b') });
+    }
+    return route.fulfill({ status: 200, json: acceptedSingleSitePreview(contract, 'c') });
+  });
+
+  await page.goto('/new-audit.html?mode=single-site');
+  await page.getByRole('checkbox', { name: /confirm this is the intended deployment role/i }).check();
+  const siteUrl = page.locator('#single-site-url');
+  const originalUrl = await siteUrl.inputValue();
+  await page.locator('#preview-single-site').click();
+  await expect.poll(() => preflightRequests).toBe(1);
+  await siteUrl.fill('https://changed-preview.example.test');
+  await expect(page.locator('#single-site-coverage')).toBeHidden();
+  await expect(page.locator('#launch-run')).toBeDisabled();
+
+  await siteUrl.fill(originalUrl);
+  await page.getByRole('checkbox', { name: /confirm this is the intended deployment role/i }).check();
+  await page.locator('#preview-single-site').click();
+  await expect(page.locator('#single-site-preflight-status')).toContainText(/did not match the submitted launch contract/i);
+  await expect(page.locator('#launch-run')).toBeDisabled();
+
+  await page.locator('#preview-single-site').click();
+  await expect(page.locator('#single-site-preflight-status')).toContainText(/identity accepted/i);
+  await expect(page.locator('#launch-run')).toBeEnabled();
+  expect(preflightRequests).toBe(3);
+});
+
+test('u5: single-site launch revalidates stale accepted and newly rejected preflights with bounded focus', async ({ page }) => {
+  const initialPreviewDigest = `sha256:${'a'.repeat(64)}`;
+  const launchBodies: Record<string, any>[] = [];
+  await page.route('**/api/single-site/preflight', async (route) => {
+    const contract = route.request().postDataJSON();
+    return route.fulfill({ status: 200, json: acceptedSingleSitePreview(contract, 'a') });
+  });
+  await page.route('**/api/single-site/runs**', async (route) => {
+    const url = new URL(route.request().url());
+    if (route.request().method() === 'GET' && url.pathname === '/api/single-site/runs') {
+      return route.fulfill({ json: { schemaVersion: 1, jobs: [] } });
+    }
+    if (route.request().method() !== 'POST' || url.pathname !== '/api/single-site/runs') return route.fallback();
+    const body = route.request().postDataJSON();
+    launchBodies.push(body);
+    if (launchBodies.length === 1) {
+      return route.fulfill({
+        status: 409,
+        json: { schemaVersion: 1, launched: false, reason: 'preview-stale', refreshedPreview: acceptedSingleSitePreview(body.runContract, 'b') },
+      });
+    }
+    return route.fulfill({
+      status: 422,
+      json: { schemaVersion: 1, launched: false, reason: 'preflight-rejected', refreshedPreview: rejectedSingleSitePreview() },
+    });
+  });
+
+  await page.goto('/new-audit.html?mode=single-site');
+  await page.getByRole('checkbox', { name: /confirm this is the intended deployment role/i }).check();
+  const expectedTargets = await page.locator('#project-options input[name="targetId"]:checked')
+    .evaluateAll((inputs) => inputs.map((input) => (input as HTMLInputElement).value));
+  await page.locator('#preview-single-site').click();
+  await expect(page.locator('#launch-run')).toBeEnabled();
+
+  await page.locator('#launch-run').click();
+  await expect(page.locator('#form-message')).toContainText(/refreshed coverage is shown/i);
+  await expect(page.locator('#launch-run')).toBeEnabled();
+  await expect(page.locator('#single-site-coverage-title')).toBeFocused();
+  expect(launchBodies[0]!.previewDigest).toBe(initialPreviewDigest);
+
+  await page.locator('#launch-run').click();
+  await expect(page.locator('#form-message')).toContainText(/no run was created/i);
+  await expect(page.locator('#launch-run')).toBeDisabled();
+  await expect(page.locator('input[name="singleSiteRole"][value="preview"]')).toBeFocused();
+  expect(launchBodies).toHaveLength(2);
+  expect(launchBodies[1]!.previewDigest).toBe(`sha256:${'b'.repeat(64)}`);
+  expect(launchBodies[1]!.runContract.targetIds).toEqual(expectedTargets);
+});
+
+test('u5: single-site launch reuses one idempotency key after a lost response for an unchanged frozen request', async ({ page }) => {
+  const runId = 'job-u5retry000001-u5retry000001';
+  const launchBodies: Record<string, any>[] = [];
+  await page.route('**/api/single-site/preflight', async (route) => {
+    const contract = route.request().postDataJSON();
+    return route.fulfill({ status: 200, json: acceptedSingleSitePreview(contract) });
+  });
+  await page.route('**/api/single-site/runs', async (route) => {
+    if (route.request().method() !== 'POST') return route.fallback();
+    launchBodies.push(route.request().postDataJSON());
+    if (launchBodies.length === 1) return route.abort('connectionfailed');
+    return route.fulfill({ status: 201, json: { schemaVersion: 1, launched: true, idempotent: true, job: { id: runId } } });
+  });
+
+  await page.goto('/new-audit.html?mode=single-site');
+  await page.getByRole('checkbox', { name: /confirm this is the intended deployment role/i }).check();
+  await page.locator('#preview-single-site').click();
+  await expect(page.locator('#launch-run')).toBeEnabled();
+  await page.locator('#launch-run').click();
+  await expect.poll(() => launchBodies.length).toBe(1);
+  await expect(page.locator('#launch-run')).toBeEnabled();
+  await page.locator('#launch-run').click();
+  await page.waitForURL((url) => url.pathname === '/run.html' && url.searchParams.get('run') === runId);
+  expect(launchBodies).toHaveLength(2);
+  expect(launchBodies[0]!.idempotencyKey).toMatch(/^portal-[0-9a-f-]{36}$/);
+  expect(launchBodies[1]!.idempotencyKey).toBe(launchBodies[0]!.idempotencyKey);
+  expect(launchBodies[1]!.runContract).toEqual(launchBodies[0]!.runContract);
+  expect(launchBodies[1]!.previewDigest).toBe(launchBodies[0]!.previewDigest);
+});
+
+test('characterization: direct Single-site workspace retains canonical mode and run ownership', async ({ page }) => {
+  test.setTimeout(60_000);
+  const runId = 'job-purgeui000001-purgeui000001';
+  const confirmation = `PURGE ${runId}`;
+  const job = {
+    schemaVersion: 1,
+    id: runId,
+    mode: 'single-site',
+    revision: 2,
+    sourceRevision: 'state-2',
+    status: 'completed',
+    activity: 'normal',
+    createdAt: '2026-08-25T12:00:00.000Z',
+    updatedAt: '2026-08-25T12:05:00.000Z',
+    url: targets.candidateUrl,
+    deploymentRole: 'preview',
+    certificatePolicy: 'strict',
+    scope: {
+      qualifier: 'FULL', requestedQualifier: 'FULL', filters: { pluginIds: [], auditIds: [], areas: [] },
+      selectedTargetIds: ['single-site-mobile-chromium'], omissions: { definitions: [], cases: [], targets: [] },
+    },
+    coverage: {
+      status: 'COMPLETE',
+      counts: { selectedDefinitions: 1, executableCases: 1, plannedExecutions: 1, manualDefinitions: 0, coverageGaps: 0, omittedDefinitions: 0, outsideModeDefinitions: 0 },
+      gaps: [], outsideModeCount: 0,
+    },
+    evidenceAuthority: { authoritative: true, reasons: [] },
+    attempt: { number: 1, id: 'attempt-purge-ui', fencingToken: 1, infrastructureRetriesUsed: 0, maxInfrastructureRetries: 1 },
+    lease: null,
+    result: { kind: 'passed', classification: 'success', reason: 'Fixture completed.' },
+    cancellation: null,
+    finalization: { status: 'complete' },
+    stageDeadlines: { inventory: '2026-08-25T12:01:00.000Z', browser: '2026-08-25T12:04:00.000Z', finalizer: '2026-08-25T12:05:00.000Z' },
+    events: [{ at: '2026-08-25T12:05:00.000Z', executionState: 'completed', activityState: 'normal', message: 'Final report published.' }],
+    publications: [],
+    links: { self: `/api/single-site/runs/${runId}`, cancel: `/api/single-site/runs/${runId}/cancel`, report: `/report.html?mode=single-site&run=${runId}` },
+    purge: { eligible: true, confirmation, baselineBytesPreserved: true },
+  };
+  const activeJob = {
+    ...job,
+    revision: 1,
+    sourceRevision: 'state-1',
+    status: 'running',
+    updatedAt: '2026-08-25T12:03:00.000Z',
+    result: null,
+    finalization: { status: 'pending' },
+    events: [{ at: '2026-08-25T12:03:00.000Z', executionState: 'running', activityState: 'normal', message: 'Browser worker is active.' }],
+    purge: { ...job.purge, eligible: false },
+  };
+  let purged = false;
+  let cancelled = false;
+  let detailRequests = 0;
+  const cancelRequests: Array<{ pathname: string; body: Record<string, unknown> }> = [];
+  const purgeRequests: Array<{ pathname: string; body: Record<string, unknown> }> = [];
+  let releasePurge!: () => void;
+  const purgeGate = new Promise<void>((resolve) => { releasePurge = resolve; });
+  await page.route(`**/api/console/v1/runs/single-site/${runId}`, (route) => route.fulfill({
+    json: runWorkspaceSummary('single-site', runId, { sourceRevision: 'state-1' }),
+  }));
+  await page.route('**/api/single-site/runs**', async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    if (url.pathname === '/api/single-site/runs' && request.method() === 'GET') {
+      return route.fulfill({ json: { schemaVersion: 1, jobs: purged ? [] : [cancelled ? job : activeJob] } });
+    }
+    if (url.pathname === `/api/single-site/runs/${runId}/cancel` && request.method() === 'POST') {
+      cancelRequests.push({ pathname: url.pathname, body: request.postDataJSON() });
+      cancelled = true;
+      return route.fulfill({ status: 202, json: job });
+    }
+    if (url.pathname === `/api/single-site/runs/${runId}` && request.method() === 'DELETE') {
+      purgeRequests.push({ pathname: url.pathname, body: request.postDataJSON() });
+      if (purgeRequests.length === 1) {
+        return route.fulfill({ status: 401, json: { error: 'Operator authorization is required for this fixture.' } });
+      }
+      await purgeGate;
+      purged = true;
+      return route.fulfill({ json: {
+        jobId: runId, purged: true, terminalState: 'completed', filesRemoved: 14,
+        logicalBytesRemoved: 95_833_292, physicalBytesRemoved: null, baselineBytesPreserved: true,
+      } });
+    }
+    if (url.pathname.endsWith('/logs')) return route.fulfill({ json: { log: 'Browser worker is active.', sequence: 1, truncated: false, bytes: 25, sources: [] } });
+    if (url.pathname.endsWith('/artifacts')) return route.fulfill({ json: { files: [], total: 0, offset: 0, limit: 80, hasMore: false } });
+    if (url.pathname === `/api/single-site/runs/${runId}` && request.method() === 'GET') {
+      detailRequests += 1;
+      return route.fulfill({ json: cancelled ? job : activeJob });
+    }
+    return route.fallback();
+  });
+
+  await page.goto(`/run.html?mode=single-site&run=${encodeURIComponent(runId)}&view=overview`);
+  await page.waitForURL((url) => url.pathname === '/run.html' && url.searchParams.get('mode') === 'single-site' && url.searchParams.get('run') === runId);
+  expect(new URL(page.url()).searchParams.get('view')).toBe('overview');
+  await expect(page.getByRole('heading', { name: 'Run workspace' })).toBeVisible();
+  await expect(page.locator('#run-mode')).toHaveText('Single Site');
+  await expect(page.locator('#run-id')).toHaveText(runId);
+  await expect(page.locator('#run-view-region')).toHaveAttribute('data-async-state', 'ready');
+  await expect.poll(() => detailRequests).toBeGreaterThan(1);
+  await expect.poll(() => page.evaluate(() => (window as any).__runWorkspaceDiagnostics.transport.polls)).toBeGreaterThan(0);
+  expect(await page.evaluate(() => (window as any).__runWorkspaceDiagnostics.transport.eventSources)).toBe(0);
+  expect(cancelRequests).toEqual([]);
+  expect(purgeRequests).toEqual([]);
+  releasePurge();
+});
+
+test('characterization: direct comparative workspace owns its live transport without mutating run state', async ({ page }) => {
+  test.setTimeout(30_000);
+  const runId = 'comparative-purge-routing-fixture';
+  const confirmation = `PURGE ${runId}`;
+  const run = {
+    id: runId, mode: 'comparative', sourceRevision: 'source-1', status: 'running', phase: 'Executing browser checks',
+    createdAt: '2026-08-25T12:00:00.000Z', startedAt: '2026-08-25T12:00:00.000Z', finishedAt: null,
+    externalManaged: false, stopRequestedAt: null, exitCode: 1, signal: null,
+    options: {
+      profile: 'release', auditIds: ['ENV-001'], pluginIds: [], projects: ['candidate-mobile-chromium'],
+      productionUrl: targets.productionUrl, candidateUrl: targets.candidateUrl, candidateIgnoreHTTPSErrors: false,
+    },
+    progress: { completed: 0, total: 1 },
+    pipeline: { status: 'running', reason: 'Fixture evidence is being collected.' },
+    release: { decision: 'PENDING', reason: 'Fixture work is active.', decisionBasis: 'Fixture evidence.' },
+    reviewReasons: [], command: ['docker', 'compose', 'run'], stages: {},
+    purge: { eligible: true, confirmation },
+  };
+  let purged = false;
+  let deletePath: string | null = null;
+  let eventRequests = 0;
+  await page.route(`**/api/console/v1/runs/comparative/${runId}`, (route) => route.fulfill({
+    json: runWorkspaceSummary('comparative', runId, { sourceRevision: run.sourceRevision }),
+  }));
+  await page.route('**/api/runs**', async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    if (url.pathname === '/api/runs' && request.method() === 'GET') {
+      return route.fulfill({ json: { runs: purged ? [] : [run] } });
+    }
+    if (url.pathname === `/api/runs/${runId}` && request.method() === 'DELETE') {
+      deletePath = url.pathname;
+      expect(request.postDataJSON()).toEqual({ confirmation });
+      purged = true;
+      return route.fulfill({ json: { id: runId, purged: true, filesRemoved: 2, logicalBytesRemoved: 1_024 } });
+    }
+    if (url.pathname === `/api/runs/${runId}/events`) {
+      eventRequests += 1;
+      return route.fulfill({ status: 503, contentType: 'text/plain', body: 'Synthetic stream interruption.' });
+    }
+    if (url.pathname.endsWith('/logs')) return route.fulfill({ json: { log: 'Fixture complete.', sequence: 0 } });
+    if (url.pathname.endsWith('/artifacts')) return route.fulfill({ json: { files: [], total: 0, offset: 0, limit: 80, hasMore: false } });
+    if (url.pathname.endsWith('/manual-evidence')) return route.fulfill({ json: { attestations: [] } });
+    if (url.pathname === `/api/runs/${runId}` && request.method() === 'GET') return route.fulfill({ json: run });
+    return route.fallback();
+  });
+
+  await page.goto(`/run.html?mode=comparative&run=${encodeURIComponent(runId)}&view=overview`);
+  await page.waitForURL((url) => url.pathname === '/run.html' && url.searchParams.get('mode') === 'comparative' && url.searchParams.get('run') === runId);
+  expect(new URL(page.url()).searchParams.get('view')).toBe('overview');
+  await expect(page.getByRole('heading', { name: 'Run workspace' })).toBeVisible();
+  await expect(page.locator('#run-mode')).toHaveText('Comparative');
+  await expect(page.locator('#run-id')).toHaveText(runId);
+  await expect(page.locator('#run-view-region')).toHaveAttribute('data-async-state', 'ready');
+  await expect.poll(() => eventRequests).toBeGreaterThan(0);
+  expect(deletePath).toBeNull();
+});
+
+test('characterization: direct Single-site report links retain mode, run, and gallery review context', async ({ page }) => {
+  const runId = 'single-site-report-gallery-fixture';
+  const run = {
+    id: runId, mode: 'single-site', status: 'completed', createdAt: '2026-08-25T12:00:00.000Z', updatedAt: '2026-08-25T12:04:00.000Z',
+    url: targets.candidateUrl, scope: { qualifier: 'FULL' },
+    finalization: { status: 'complete' },
+    aiReview: {
+      optedIn: true, model: 'claude-test-model', state: 'unavailable',
+      status: {
+        state: 'unavailable', stateRevision: 2, retryable: true,
+        error: { code: 'credential-unavailable', message: 'The runtime credential was unavailable.' },
+      },
+    },
+  };
+  const report = {
+    schemaVersion: 1, mode: 'single-site', publicationRevision: '11111111111111111111111111111111',
+    generatedAt: '2026-08-25T12:04:00.000Z', auditedUrl: targets.candidateUrl,
+    siteHealth: { verdict: 'FINDINGS', displayLabel: 'Findings', reason: 'Two deterministic findings need review.' },
+    promotion: { statement: 'This advisory Site Health verdict cannot authorize or block promotion.' },
+    coverage: { status: 'COMPLETE', gapCount: 0, limitationCount: 0 },
+    evidenceCompletion: { status: 'COMPLETE' }, evidenceAuthority: { status: 'authoritative' }, pipelineIntegrity: { status: 'complete' },
+    scope: { qualifier: 'FULL', selected: { total: 10 }, omitted: { total: 0 }, outsideMode: { total: 1 } },
+    auditPages: { total: 10 }, findings: { count: 2 }, manual: { status: 'complete', required: 0, complete: 0, outstanding: 0, failedOrBlocked: 0 },
+    visualReview: { total: 5, attentionRequired: 2 },
+  };
+  let retryBody: Record<string, unknown> | null = null;
+  let releaseRetry!: () => void;
+  const retryResponse = new Promise<void>((resolve) => { releaseRetry = resolve; });
+  await page.route(`**/api/single-site/runs/${runId}**`, async (route) => {
+    const url = new URL(route.request().url());
+    if (url.pathname.endsWith('/ai-review') && route.request().method() === 'POST') {
+      retryBody = route.request().postDataJSON();
+      await retryResponse;
+      return route.fulfill({ json: { ...run.aiReview.status, state: 'pending', stateRevision: 3, error: null, retryable: false } });
+    }
+    if (url.pathname.endsWith('/ai-review')) return route.fulfill({ json: {
+      schemaVersion: 1, mode: 'single-site', advisory: true, gating: false,
+      optedIn: true, model: 'claude-test-model', state: 'unavailable',
+      unavailableReason: run.aiReview.status.error.message, status: run.aiReview.status, result: null,
+    } });
+    if (url.pathname.endsWith('/report/audits')) return route.fulfill({ json: { items: [], total: 0, offset: 0, limit: 25, hasMore: false, filters: {} } });
+    if (url.pathname.endsWith('/artifacts')) return route.fulfill({ json: { files: [], total: 0, offset: 0, limit: 80, hasMore: false } });
+    if (url.pathname.endsWith('/report')) return route.fulfill({ json: report });
+    return route.fulfill({ json: run });
+  });
+
+  await page.goto(`/report.html?mode=single-site&run=${runId}`);
+  expect(new URL(page.url()).searchParams.get('mode')).toBe('single-site');
+  expect(new URL(page.url()).searchParams.get('run')).toBe(runId);
+  await expect(page.locator('#visual-gallery-link')).toHaveAttribute('href', `/gallery.html?mode=single-site&run=${runId}&from=report`);
+  await expect(page.getByRole('link', { name: 'Review 2 visual attention items' })).toHaveAttribute('href', `/gallery.html?mode=single-site&run=${runId}&from=report`);
+  await expect(page.getByRole('link', { name: 'Browse all visual evidence' })).toHaveAttribute('href', `/gallery.html?mode=single-site&run=${runId}&from=report&review=all`);
+  await expect(page.locator('#decision-basis')).toContainText(/cannot authorize or block promotion/i);
+  await expect(page.locator('#report-trust-facts')).toContainText('Evidence Authority');
+  await expect(page.locator('#report-trust-facts')).toContainText('Pipeline Integrity');
+  await expect(page.locator('#report-trust-facts')).toContainText('Publication');
+  await expect(page.locator('#ai-summary')).toContainText(/runtime credential was unavailable/i);
+  await expect(page.locator('#ai-summary')).toContainText(/cannot change deterministic findings/i);
+  const retry = page.locator('#ai-review-retry');
+  await expect(retry).toBeVisible();
+  page.once('dialog', (dialog) => dialog.accept());
+  await retry.click();
+  await expect(retry).toBeDisabled();
+  await expect(retry).toHaveAttribute('aria-busy', 'true');
+  await expect.poll(() => retryBody).toEqual({
+    expectedStateRevision: 2,
+    confirmation: `RETRY AI ${runId}`,
+  });
+  releaseRetry();
+  await expect(page.locator('#report-announcer')).toContainText(/retry is queued/i);
+});
+
+test('characterization: direct comparative report uses bounded loading and logs without fetching raw evidence', async ({ page }) => {
   const requestedUrls: string[] = [];
   page.on('request', (request) => requestedUrls.push(request.url()));
   const run = {
@@ -118,11 +1101,24 @@ test('reviewer report has bounded loading, empty, and terminal error states with
   await expect(page.locator('#decision-title')).toContainText(/not ready/i);
   await expect(page.locator('#decision-badge')).toHaveText('Do not release');
   await expect(page.locator('#decision-summary')).toContainText(/additional review requirements/i);
+  await expect(page.locator('#report-trust-facts')).toContainText('Release decision');
+  await expect(page.locator('#report-trust-facts')).toContainText('Evidence Authority');
+  await expect(page.locator('#report-trust-facts')).toContainText('Manual acceptance');
   await expect(page.locator('#top-findings')).toContainText(/no structured findings/i);
   await expect(page.locator('#audit-list')).toContainText(/no checks match/i);
+  await expect(page.locator('#visual-gallery-link')).toHaveAttribute('href', '/gallery.html?run=ui-state-demo&from=report');
   expect(requestedUrls.some((url) => url.endsWith('/checklist/manifest.json'))).toBeFalsy();
   expect(requestedUrls.some((url) => url.includes('/logs'))).toBeFalsy();
   expect(requestedUrls.some((url) => url.includes('revision=11111111111111111111111111111111'))).toBeTruthy();
+
+  await page.route('**/api/runs/ui-state-demo/report', (route) => route.fulfill({
+    status: 503,
+    json: { error: 'Synthetic publication refresh interruption.' },
+  }));
+  await page.locator('#refresh-report').click();
+  await expect(page.locator('#report-connection')).toContainText('showing last known report');
+  await expect(page.locator('#decision-title')).toContainText(/not ready/i);
+  await expect(page.locator('#report-content')).toBeVisible();
 
   await page.route('**/api/runs/ui-state-demo/logs?*', (route) => route.fulfill({
     json: {
@@ -134,12 +1130,130 @@ test('reviewer report has bounded loading, empty, and terminal error states with
   await expect(page.locator('#report-log')).toContainText('bounded redacted output');
   await expect(page.locator('#log-links')).toContainText(/redacted source/i);
   await expect(page.locator('#log-links a')).toHaveCount(0);
+  expect(requestedUrls.some((value) => {
+    const url = new URL(value);
+    return url.pathname === '/api/runs/ui-state-demo/logs' && url.searchParams.get('maxBytes') === '65536';
+  })).toBeTruthy();
+
+  const partialId = 'partial-counts-report-demo';
+  await page.route(`**/api/runs/${partialId}`, (route) => route.fulfill({ json: { ...run, id: partialId } }));
+  await page.route(`**/api/runs/${partialId}/report`, (route) => route.fulfill({ json: {
+    ...report,
+    publicationRevision: '33333333333333333333333333333333',
+    summary: { ...report.summary, total: null, executed: null, artifacts: null, structuredExecutions: null, baselineIssues: null },
+    release: { ...report.release, blockingFailures: null, blockingIncomplete: null },
+    manualEvidence: null,
+  } }));
+  await page.route(`**/api/runs/${partialId}/report/audits?*`, (route) => route.fulfill({ json: { items: [], total: 0, offset: 0, limit: 25, nextOffset: 0, hasMore: false, filters: report.filters } }));
+  await page.route(`**/api/runs/${partialId}/artifacts?*`, (route) => route.fulfill({ json: { files: [], total: 0, knownTotal: 0, totalComplete: true, offset: 0, limit: 80, nextOffset: 0, hasMore: false } }));
+  await page.goto(`/report.html?run=${partialId}`);
+  await expect(page.locator('#report-trust-facts > div').filter({ hasText: 'Coverage' }).locator('strong')).toHaveText('Unavailable');
+  await expect(page.locator('#report-trust-facts > div').filter({ hasText: 'Manual acceptance' }).locator('strong')).toHaveText('Unavailable');
+  await expect(page.locator('.metric-card').filter({ hasText: 'Documented checks' }).locator('strong')).toHaveText('Unavailable');
+  await expect(page.locator('.metric-card').filter({ hasText: 'Release blockers' }).locator('strong')).toHaveText('Unavailable');
 
   await page.route('**/api/runs/missing-report-demo', (route) => route.fulfill({ json: { ...run, id: 'missing-report-demo' } }));
   await page.route('**/api/runs/missing-report-demo/report', (route) => route.fulfill({ status: 404, json: { error: 'Compact report not found.' } }));
   await page.goto('/report.html?run=missing-report-demo');
   await expect(page.locator('#report-error-title')).toHaveText('No reviewer report is available');
   await expect(page.locator('#report-error-message')).toContainText(/finished without a compact reviewer report/i);
+});
+
+test('reviewer report falls back to actionable failed, review, and incomplete outcomes without treating baseline as candidate gating', async ({ page }) => {
+  const runId = 'attention-fallback-demo';
+  const run = {
+    id: runId,
+    status: 'not-ready',
+    startedAt: '2026-08-25T01:38:00.000Z',
+    finishedAt: '2026-08-25T01:40:00.000Z',
+    options: { profile: 'release', auditIds: ['PAGE-BRAND', 'ENV-007'], productionUrl: targets.productionUrl, candidateUrl: targets.candidateUrl },
+    pipeline: { status: 'completed', completed: true, reason: 'Synthetic attention fixture.' },
+    release: { decision: 'NOT_READY', reason: 'Two checks need attention.', decisionBasis: 'Synthetic checklist truth.' },
+    reviewReasons: [],
+  };
+  const report = {
+    schemaVersion: 1,
+    publicationRevision: '22222222222222222222222222222222',
+    generatedAt: run.finishedAt,
+    run: { profile: 'release', startedAt: run.startedAt, finishedAt: run.finishedAt, durationMs: 120_000 },
+    release: { ready: false, decision: 'NOT_READY', blockingFailures: 2, blockingIncomplete: 2, baselineIssues: 1, reason: 'Four checks need attention.', decisionBasis: 'Synthetic checklist truth.' },
+    summary: { total: 4, executed: 2, structuredExecutions: 4, artifacts: 4, videos: 0, posters: 0, baselineIssues: 1, byStatus: { FAIL: 1, REVIEW: 1, NOT_RUN: 1, MANUAL_REQUIRED: 1 }, bySeverity: { P0: 2, P1: 2 } },
+    manualEvidence: { required: 1, complete: 0, outstanding: 1, failedOrBlocked: 0, byStatus: { MANUAL_REQUIRED: 1 } },
+    topFindings: [],
+    topFindingCount: 0,
+    topAttentionCount: 4,
+    topAttention: [{
+      auditId: 'PAGE-BRAND', auditTitle: 'Page audit: /brand', area: 'routes', auditStatus: 'FAIL', severity: 'P1', releaseBlocking: true,
+      scope: 'candidate', detail: 'At least one candidate execution failed.',
+      errorContext: 'Every published page must pass the automated WCAG A/AA scan · tests/page-audit.spec.ts:276',
+      reasonCodes: ['MISSING_REQUIRED_EVIDENCE'], baselineNonGating: true,
+      baselineNote: 'Production issues are preserved as baseline context but do not veto a candidate that fixes them.',
+      evidence: [{ name: 'axe-page-scan', kind: 'axe', href: 'evidence/source/candidate/axe-page-scan.json', sizeBytes: 512, attempt: 2, context: 'final-primary' }],
+    }, {
+      auditId: 'ENV-007', auditTitle: 'Custom not-found recovery page', area: 'environment', auditStatus: 'REVIEW', severity: 'P0', releaseBlocking: true,
+      scope: 'candidate', detail: 'Candidate evidence authority is withheld until strict TLS verification succeeds.',
+      errorContext: null, reasonCodes: ['TLS_BYPASS'], baselineNonGating: false, baselineNote: null, evidence: [],
+    }, {
+      auditId: 'PAGE-HOME', auditTitle: 'Page audit: /', area: 'routes', auditStatus: 'NOT_RUN', severity: 'P1', releaseBlocking: true,
+      scope: 'candidate', detail: 'The selected candidate project emitted no completed execution.',
+      errorContext: null, reasonCodes: [], baselineNonGating: false, baselineNote: null, evidence: [],
+    }, {
+      auditId: 'DEVICE-001', auditTitle: 'Real iPhone Safari acceptance', area: 'responsive', auditStatus: 'MANUAL_REQUIRED', severity: 'P0', releaseBlocking: true,
+      scope: 'unknown', detail: 'This catalog entry requires human acceptance evidence.',
+      errorContext: null, reasonCodes: [], baselineNonGating: false, baselineNote: null, evidence: [],
+    }],
+    filters: { statuses: ['FAIL', 'REVIEW', 'NOT_RUN', 'MANUAL_REQUIRED'], severities: ['P0', 'P1'], areas: ['environment', 'responsive', 'routes'], environments: ['candidate', 'production'] },
+    aiReview: null,
+  };
+  await page.route(`**/api/runs/${runId}`, (route) => route.fulfill({ json: run }));
+  await page.route(`**/api/runs/${runId}/report`, (route) => route.fulfill({ json: report }));
+  await page.route(`**/api/runs/${runId}/report/audits?*`, (route) => route.fulfill({
+    json: { items: [], total: 0, offset: 0, limit: 25, nextOffset: 0, hasMore: false, filters: report.filters },
+  }));
+  await page.route(`**/api/runs/${runId}/artifacts?*`, (route) => route.fulfill({
+    json: { files: [], total: 0, knownTotal: 0, totalComplete: true, offset: 0, limit: 80, nextOffset: 0, hasMore: false },
+  }));
+
+  await page.goto(`/report.html?run=${runId}`);
+  await expect(page.locator('#finding-total')).toHaveText('4 attention outcomes');
+  await expect(page.locator('#top-findings .finding-card')).toHaveCount(4);
+  await expect(page.locator('#top-findings')).toContainText('Every published page must pass the automated WCAG A/AA scan');
+  await expect(page.locator('#top-findings')).toContainText('The selected candidate project emitted no completed execution.');
+  await expect(page.locator('#top-findings')).toContainText('This catalog entry requires human acceptance evidence.');
+  await expect(page.locator('#top-findings')).toContainText('Final attempt 2 · primary');
+  await expect(page.locator('#top-findings')).toContainText(/comparison only; not part of this candidate gate/i);
+  await expect(page.locator('#top-findings')).not.toContainText(/no findings recorded|no structured findings/i);
+  const evidence = page.locator('#top-findings .evidence-link-list a');
+  await expect(evidence).toHaveCount(1);
+  await expect(evidence).toHaveAttribute('href', `/artifacts/${runId}/checklist/evidence/source/candidate/axe-page-scan.json`);
+
+  const combinedRunId = 'combined-finding-attention-demo';
+  const combinedReport = {
+    ...report,
+    publicationRevision: '33333333333333333333333333333333',
+    topFindings: [{
+      auditId: 'CALC-007', auditTitle: 'SR-17 simple-protocol dose conversion', area: 'calculators', auditStatus: 'FAIL',
+      severity: 'P0', releaseBlocking: true, title: 'SR-17 half-quarter tie policy is not clinically approved',
+      detail: 'A named clinical owner must approve the 18.75 to 25 conversion before release.', blocking: true,
+      sourceProject: 'candidate-mobile-chromium', environment: 'candidate', scope: 'candidate', baselineNonGating: false,
+    }],
+    topFindingCount: 1,
+  };
+  await page.route(`**/api/runs/${combinedRunId}`, (route) => route.fulfill({ json: { ...run, id: combinedRunId } }));
+  await page.route(`**/api/runs/${combinedRunId}/report`, (route) => route.fulfill({ json: combinedReport }));
+  await page.route(`**/api/runs/${combinedRunId}/report/audits?*`, (route) => route.fulfill({
+    json: { items: [], total: 0, offset: 0, limit: 25, nextOffset: 0, hasMore: false, filters: report.filters },
+  }));
+  await page.route(`**/api/runs/${combinedRunId}/artifacts?*`, (route) => route.fulfill({
+    json: { files: [], total: 0, knownTotal: 0, totalComplete: true, offset: 0, limit: 80, nextOffset: 0, hasMore: false },
+  }));
+
+  await page.goto(`/report.html?run=${combinedRunId}`);
+  await expect(page.locator('#finding-total')).toHaveText('1 structured finding · 4 other attention outcomes');
+  await expect(page.locator('#top-findings .finding-card')).toHaveCount(5);
+  await expect(page.locator('#top-findings')).toContainText('Observed on Candidate Mobile Chromium · release-blocking execution');
+  await expect(page.locator('#top-findings')).toContainText('SR-17 half-quarter tie policy is not clinically approved');
+  await expect(page.locator('#top-findings')).toContainText('The selected candidate project emitted no completed execution.');
 });
 
 test('reviewer report never presents a READY checklist as release authority when review is required', async ({ page }) => {
@@ -158,7 +1272,7 @@ test('reviewer report never presents a READY checklist as release authority when
     generatedAt: run.finishedAt,
     run: { profile: 'release', startedAt: run.startedAt, finishedAt: run.finishedAt, durationMs: 60_000 },
     release: { ready: true, decision: 'READY', blockingFailures: 0, blockingIncomplete: 0, baselineIssues: 0, reason: 'Every checklist row passed.', decisionBasis: 'Synthetic checklist truth.' },
-    summary: { total: 81, executed: 81, structuredExecutions: 81, artifacts: 81, videos: 10, posters: 10, baselineIssues: 0, byStatus: { PASS: 81 }, bySeverity: { P0: 81 } },
+    summary: { total: 183, executed: 183, structuredExecutions: 183, artifacts: 183, videos: 10, posters: 10, baselineIssues: 0, byStatus: { PASS: 183 }, bySeverity: { P0: 183 } },
     manualEvidence: { required: 0, complete: 0, outstanding: 0, failedOrBlocked: 0, byStatus: {} },
     topFindings: [], topFindingCount: 0,
     filters: { statuses: ['PASS'], severities: ['P0'], areas: ['environment'], environments: ['candidate', 'production'] },
@@ -192,13 +1306,32 @@ test('reviewer report never presents a READY checklist as release authority when
   await expect(page.locator('#decision-summary')).toContainText(/no durable terminal evidence/i);
 });
 
-test('credential vault UI saves, reloads, fingerprints, and deletes without returning plaintext', async ({ page }) => {
+test('u5: Settings credential vault clears plaintext and returns only non-secret metadata', async ({ page }) => {
+  const initialCapability = await (await page.request.get('/api/settings/anthropic-key')).json();
+  test.skip(initialCapability.storageEnabled !== true, 'The host-run portal intentionally disables credential storage without isolated worker identities.');
   const syntheticKey = ['sk', 'ant', 'portal-e2e', '0'.repeat(40)].join('-');
-  await page.goto('/');
+  await page.goto('/settings.html?section=credentials');
   await page.locator('#anthropic-key-input').fill(syntheticKey);
+  const saveResponsePromise = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return response.request().method() === 'PUT' && url.pathname === '/api/settings/anthropic-key';
+  });
   await page.locator('#save-anthropic-key').click();
-  await expect(page.locator('#anthropic-key-message')).toContainText(/saved/i);
   await expect(page.locator('#anthropic-key-input')).toHaveValue('');
+  const saveResponse = await saveResponsePromise;
+  await expect(page.locator('#anthropic-key-message')).toContainText(/saved/i);
+  expect(saveResponse.url()).not.toContain(syntheticKey);
+  expect(await saveResponse.text()).not.toContain(syntheticKey);
+
+  const browserResidue = await page.evaluate(() => ({
+    href: window.location.href,
+    documentText: document.body.innerText,
+    documentMarkup: document.documentElement.outerHTML,
+    localStorage: Object.entries(window.localStorage),
+    sessionStorage: Object.entries(window.sessionStorage),
+    resourceUrls: performance.getEntriesByType('resource').map((entry) => entry.name),
+  }));
+  expect(JSON.stringify(browserResidue)).not.toContain(syntheticKey);
 
   const stateResponse = await page.request.get('/api/settings/anthropic-key');
   expect(stateResponse.ok()).toBeTruthy();
@@ -210,18 +1343,67 @@ test('credential vault UI saves, reloads, fingerprints, and deletes without retu
     unavailableReason: null,
   });
   expect(JSON.stringify(state)).not.toContain(syntheticKey);
+  expect(await (await page.request.get('/api/config')).text()).not.toContain(syntheticKey);
 
   await page.reload();
   await expect(page.locator('#anthropic-key-state')).toContainText(/configured/i);
   await page.locator('#delete-anthropic-key').click();
+  await expect(page.locator('#delete-anthropic-key')).toHaveText('Confirm delete');
+  await page.getByRole('button', { name: 'Test Catalog' }).click();
+  await page.getByRole('button', { name: 'Credentials' }).click();
+  await expect(page.locator('#delete-anthropic-key')).toHaveText('Delete key');
   await page.locator('#delete-anthropic-key').click();
+  const deleteResponsePromise = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return response.request().method() === 'DELETE' && url.pathname === '/api/settings/anthropic-key';
+  });
+  await page.locator('#delete-anthropic-key').click();
+  const deleteResponse = await deleteResponsePromise;
   await expect(page.locator('#anthropic-key-message')).toContainText(/deleted/i);
+  expect(await deleteResponse.text()).not.toContain(syntheticKey);
   expect(await (await page.request.get('/api/settings/anthropic-key')).json()).toMatchObject({
     configured: false, fingerprint: null, storageEnabled: true, unavailableReason: null,
   });
 });
 
-test('mutation security and production certificate guards fail closed', async ({ request, playwright }) => {
+test('u5: Settings reconciles a lost credential save response without repeating the secret mutation', async ({ page }) => {
+  const syntheticKey = ['sk', 'ant', 'lost-response', '8'.repeat(40)].join('-');
+  let configured = false;
+  let putRequests = 0;
+  await page.route('**/api/settings/anthropic-key', async (route) => {
+    if (route.request().method() === 'GET') {
+      return route.fulfill({ json: {
+        configured,
+        fingerprint: configured ? 'sha256:123456789abc' : null,
+        storageEnabled: true,
+        unavailableReason: null,
+      } });
+    }
+    if (route.request().method() === 'PUT') {
+      putRequests += 1;
+      expect(route.request().postDataJSON()).toEqual({ apiKey: syntheticKey });
+      configured = true;
+      return route.abort('connectionfailed');
+    }
+    return route.fallback();
+  });
+
+  await page.goto('/settings.html?section=credentials');
+  await expect(page.locator('#anthropic-key-state')).toHaveText('Not configured');
+  await page.locator('#anthropic-key-input').fill(syntheticKey);
+  await page.locator('#save-anthropic-key').click();
+  await expect(page.locator('#anthropic-key-input')).toHaveValue('');
+  await expect(page.locator('#anthropic-key-message')).toContainText(/response was lost.*configured.*without repeating/i);
+  await expect(page.locator('#anthropic-key-state')).toContainText(/configured/i);
+  expect(putRequests).toBe(1);
+  expect(await page.locator('body').innerText()).not.toContain(syntheticKey);
+  expect(await page.evaluate(() => JSON.stringify({
+    localStorage: Object.entries(localStorage),
+    sessionStorage: Object.entries(sessionStorage),
+  }))).not.toContain(syntheticKey);
+});
+
+test('characterization: mutation security and production certificate guards fail closed', async ({ request, playwright }) => {
   const portalBaseUrl = process.env.PORTAL_E2E_BASE_URL;
   if (!portalBaseUrl) throw new Error('PORTAL_E2E_BASE_URL is required for portal acceptance tests.');
   const crossOrigin = await playwright.request.newContext({
@@ -286,17 +1468,25 @@ test('mutation security and production certificate guards fail closed', async ({
     data: runRequest({ candidateUrl: targets.productionUrl, candidateIgnoreHTTPSErrors: true }),
   });
   expect(blockedTls.status()).toBe(400);
-  expect(await blockedTls.text()).toContain('cannot be used for the production origin');
+  expect(await blockedTls.text()).toContain('cannot restrict it to one exact origin');
+  const blockedDevelopmentTls = await request.post('/api/runs', {
+    data: runRequest({ candidateIgnoreHTTPSErrors: true }),
+  });
+  expect(blockedDevelopmentTls.status()).toBe(400);
+  expect(await blockedDevelopmentTls.text()).toContain('cannot restrict it to one exact origin');
 });
 
-test('targeted portal run streams verbose evidence and cannot report a false release pass', async ({ page, request, playwright }) => {
-  await page.goto('/');
+test('characterization: bounded live output and manual evidence preserve credential non-disclosure', async ({ page, request, playwright }) => {
+  await page.goto('/runs.html');
   const portalBaseUrl = process.env.PORTAL_E2E_BASE_URL;
   if (!portalBaseUrl) throw new Error('PORTAL_E2E_BASE_URL is required for portal acceptance tests.');
   const syntheticKey = ['sk', 'ant', 'isolated-stage', '7'.repeat(40)].join('-');
   const savedCredential = await request.put('/api/settings/anthropic-key', { data: { apiKey: syntheticKey } });
   expect(savedCredential.status(), await savedCredential.text()).toBe(200);
-  const parallelRequest = await playwright.request.newContext({ baseURL: portalBaseUrl });
+  const parallelRequest = await playwright.request.newContext({
+    baseURL: portalBaseUrl,
+    extraHTTPHeaders: { 'X-Portal-Operator-Token': process.env.PORTAL_E2E_OPERATOR_TOKEN ?? '' },
+  });
   const launchAttempts = await Promise.all([
     request.post('/api/runs', { data: runRequest({ auditIds: ['SEARCH-001'], aiReview: true }) }),
     parallelRequest.post('/api/runs', { data: runRequest({ auditIds: ['SEARCH-001'], aiReview: true }) }),
@@ -304,13 +1494,13 @@ test('targeted portal run streams verbose evidence and cannot report a false rel
   expect(launchAttempts.map((response) => response.status()).sort()).toEqual([202, 409]);
   const launch = launchAttempts.find((response) => response.status() === 202)!;
   const started = await launch.json();
-  await page.reload();
-  await expect(page.locator(`a.run-gallery-link[aria-label*="${started.id}"]`)).toHaveAttribute(
-    'href', `/gallery.html?run=${started.id}&from=runs`,
+  await page.goto(`/run.html?mode=comparative&run=${encodeURIComponent(started.id)}&view=logs`);
+  await expect(page.locator('[data-run-destination="gallery"]')).toHaveAttribute(
+    'href', `/gallery.html?mode=comparative&run=${started.id}&from=runs`,
   );
-  await page.locator('#run-list .run-card-button').first().click();
-  await expect(page.locator('#live-log')).toContainText(/Command started:/, { timeout: 60_000 });
-  await expect(page.locator('#live-log')).toContainText(/AUDIT_(HTTP|STEP|TEST)/, { timeout: 120_000 });
+  expect(new URL(page.url()).searchParams.get('view')).toBe('logs');
+  await expect(page.locator('#run-log-list')).toContainText(/Command started:/, { timeout: 60_000 });
+  await expect(page.locator('#run-log-list')).toContainText(/AUDIT_(HTTP|STEP|TEST)/, { timeout: 120_000 });
 
   const finished = await waitForTerminal(request, started.id);
   expect(finished.pipeline).toMatchObject({ completed: true, status: 'completed' });
@@ -380,17 +1570,16 @@ test('targeted portal run streams verbose evidence and cannot report a false rel
   await unlink(disappearingArtifact);
   expect((await request.get(`/artifacts/${started.id}/disappearing-artifact.txt`)).status()).toBe(404);
 
-  await page.reload();
-  await page.locator('#run-list .run-card-button').first().click();
-  await expect(page.locator('#dialog-status')).toContainText(/review|required|not ready/i);
-  await expect(page.locator('#open-run-report')).toBeVisible();
-  await expect(page.locator('#open-run-gallery')).toHaveAttribute('href', `/gallery.html?run=${started.id}&from=runs`);
-  await expect(page.locator('#open-checklist')).toBeVisible();
-  await expect(page.locator('#open-checklist')).toHaveAttribute('download', `${started.id}-complete-checklist.json`);
-  await expect(page.locator('#open-checklist')).toHaveAttribute('href', /\/checklist\/manifest\.json$/);
-  await expect(page.locator('#load-more-artifacts')).toBeVisible();
-  await page.locator('#load-more-artifacts').click();
-  await expect(page.locator('#artifact-status')).toContainText(/files indexed|of \d+ files/);
+  await page.goto(`/run.html?mode=comparative&run=${encodeURIComponent(started.id)}&view=evidence`);
+  await expect(page.locator('#run-execution-state')).toContainText(/review|required|not ready/i);
+  await expect(page.locator('[data-run-destination="report"]')).toHaveAttribute('href', `/report.html?run=${started.id}`);
+  await expect(page.locator('[data-run-destination="gallery"]')).toHaveAttribute('href', `/gallery.html?mode=comparative&run=${started.id}&from=runs`);
+  expect(new URL(page.url()).searchParams.get('view')).toBe('evidence');
+  await expect(page.locator('.run-artifact-list')).toContainText(/checklist\/manifest\.json/);
+  await expect(page.locator('[data-artifact-more]')).toBeVisible();
+  const firstArtifactCount = await page.locator('.run-artifact-list li').count();
+  await page.locator('[data-artifact-more]').click();
+  await expect.poll(() => page.locator('.run-artifact-list li').count()).toBeGreaterThan(firstArtifactCount);
 
   const reportRequests: string[] = [];
   page.on('request', (request) => reportRequests.push(request.url()));
@@ -418,12 +1607,34 @@ test('targeted portal run streams verbose evidence and cannot report a false rel
   expect(reportRequests.filter((url) => url.includes('/logs?maxBytes=65536')).length).toBe(1);
 
   const validPng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64');
-  const validPngUpload = await request.post(`/api/runs/${started.id}/manual-uploads?auditId=DEVICE-001&filename=valid-pixel.png`, {
+  const unauthorizedUpload = await playwright.request.newContext({
+    baseURL: portalBaseUrl,
+    storageState: { cookies: [], origins: [] },
+    extraHTTPHeaders: { Origin: portalBaseUrl },
+  });
+  const unauthorizedUploadResponse = await unauthorizedUpload.post(`/api/runs/${started.id}/manual-uploads?auditId=DEVICE-001&filename=unauthorized.png&idempotencyKey=manual-00000000-0000-4000-8000-000000000000`, {
     headers: { 'Content-Type': 'image/png' }, data: validPng,
   });
-  expect(validPngUpload.status(), await validPngUpload.text()).toBe(201);
+  expect(unauthorizedUploadResponse.status()).toBe(401);
+  expect(await access(join(artifactRoot, started.id, 'manual-evidence')).then(() => true, () => false)).toBe(false);
+  await unauthorizedUpload.dispose();
+  const validPngUpload = await request.post(`/api/runs/${started.id}/manual-uploads?auditId=DEVICE-001&filename=valid-pixel.png&idempotencyKey=manual-00000000-0000-4000-8000-000000000001`, {
+    headers: { 'Content-Type': 'image/png' }, data: validPng,
+  });
+  const validPngUploadBody = await validPngUpload.text();
+  expect(validPngUpload.status(), validPngUploadBody).toBe(201);
+  const validPngIdentity = JSON.parse(validPngUploadBody).id;
+  const pngDirectory = join(artifactRoot, started.id, 'manual-evidence', 'DEVICE-001');
+  const filesAfterFirstPng = await readdir(pngDirectory);
+  const repeatedPngUpload = await request.post(`/api/runs/${started.id}/manual-uploads?auditId=DEVICE-001&filename=valid-pixel.png&idempotencyKey=manual-00000000-0000-4000-8000-000000000001`, {
+    headers: { 'Content-Type': 'image/png' }, data: validPng,
+  });
+  const repeatedPngBody = await repeatedPngUpload.text();
+  expect(repeatedPngUpload.status(), repeatedPngBody).toBe(200);
+  expect(JSON.parse(repeatedPngBody)).toMatchObject({ id: validPngIdentity, replayed: true });
+  expect(await readdir(pngDirectory)).toEqual(filesAfterFirstPng);
   const retainedWebm = await readFile(join(artifactRoot, started.id, ...video!.path.split('/')));
-  const validWebmUpload = await request.post(`/api/runs/${started.id}/manual-uploads?auditId=DEVICE-001&filename=retained-interaction.webm`, {
+  const validWebmUpload = await request.post(`/api/runs/${started.id}/manual-uploads?auditId=DEVICE-001&filename=retained-interaction.webm&idempotencyKey=manual-00000000-0000-4000-8000-000000000002`, {
     headers: { 'Content-Type': 'video/webm' }, data: retainedWebm,
   });
   expect(validWebmUpload.status(), await validWebmUpload.text()).toBe(201);
@@ -431,10 +1642,10 @@ test('targeted portal run streams verbose evidence and cannot report a false rel
   const fakePng = Buffer.alloc(8 * 1024 * 1024);
   Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(fakePng);
   const invalidUploads = await Promise.all([
-    request.post(`/api/runs/${started.id}/manual-uploads?auditId=DEVICE-001&filename=fake-one.png`, {
+    request.post(`/api/runs/${started.id}/manual-uploads?auditId=DEVICE-001&filename=fake-one.png&idempotencyKey=manual-00000000-0000-4000-8000-000000000003`, {
       headers: { 'Content-Type': 'image/png' }, data: fakePng,
     }),
-    parallelRequest.post(`/api/runs/${started.id}/manual-uploads?auditId=DEVICE-001&filename=fake-two.png`, {
+    parallelRequest.post(`/api/runs/${started.id}/manual-uploads?auditId=DEVICE-001&filename=fake-two.png&idempotencyKey=manual-00000000-0000-4000-8000-000000000004`, {
       headers: { 'Content-Type': 'image/png' }, data: fakePng,
     }),
   ]);
@@ -457,7 +1668,7 @@ test('targeted portal run streams verbose evidence and cannot report a false rel
   await parallelRequest.dispose();
 });
 
-test('active work can be stopped and purge closes both live event streams', async ({ page, request }) => {
+test('characterization: comparative stop and purge retain their endpoints and close both live streams', async ({ page, request }) => {
   const launch = await request.post('/api/runs', {
     data: runRequest({ auditIds: ['CONTENT-002'], targetIds: ['candidate-desktop-chromium'] }),
   });
@@ -482,7 +1693,7 @@ test('active work can be stopped and purge closes both live event streams', asyn
   expect(wrongConfirmation.status()).toBe(400);
   expect(await wrongConfirmation.text()).toContain(`PURGE ${started.id}`);
 
-  await page.goto('/');
+  await page.goto('/runs.html');
   await page.evaluate(async (id) => {
     const testWindow = window as any;
     testWindow.__purgeStreamEvents = { run: [], gallery: [] };
@@ -782,11 +1993,17 @@ test('externally launched shards are discovered while active and retained with l
   expect(videoRange.status()).toBe(206);
   expect(videoRange.headers()['content-length']).toBe('1024');
 
-  await page.goto('/');
-  await expect(page.locator('#run-list')).toContainText('External sharded release');
-  await page.locator('#run-list .run-card-button').first().click();
-  await expect(page.locator('#dialog-status')).toContainText(id);
-  await expect(page.locator('#purge-run')).toBeVisible();
+  await page.goto(`/runs.html?inspector=open&mode=comparative&run=${encodeURIComponent(id)}`);
+  const comparativeTitle = `${new URL(targets.productionUrl).host} → ${new URL(targets.candidateUrl).host}`;
+  await expect(page.getByRole('heading', { name: comparativeTitle })).toBeVisible();
+  const workspace = page.getByRole('link', { name: 'Open run workspace' });
+  await expect(workspace).toHaveAttribute('href', `/run.html?mode=comparative&run=${id}&view=overview`);
+  await workspace.click();
+  await expect(page.locator('#run-id')).toHaveText(id);
+  await expect(page.locator('[data-run-action="purge"]')).toBeVisible();
+  await page.locator('[data-run-view-link="timeline"]').click();
+  const findingShard = page.locator('.run-timeline-list li').filter({ hasText: /shard1|shard 1/i });
+  await expect(findingShard).toContainText(/completed/i);
 
   const heldDirectory = join(shardedRoot!, `.${id}.held`);
   await rename(directory, heldDirectory);
@@ -800,16 +2017,15 @@ test('externally launched shards are discovered while active and retained with l
   await unlink(directory);
   await rename(heldDirectory, directory);
 
-  await page.locator('#purge-run').click();
-  await expect(page.locator('#purge-confirmation')).toBeVisible();
-  await expect(page.locator('#confirm-purge')).toBeDisabled();
-  await page.locator('#purge-confirmation-input').fill(id);
-  await expect(page.locator('#confirm-purge')).toBeDisabled();
-  await page.locator('#purge-confirmation-input').fill(`PURGE ${id}`);
-  await expect(page.locator('#confirm-purge')).toBeEnabled();
-  await page.locator('#confirm-purge').click();
-  await expect(page.locator('#run-dialog')).not.toBeVisible();
-  await expect(page.locator('#runs-status')).toContainText(/removed|deleted/i);
+  await page.locator('[data-run-action="purge"]').click();
+  await expect(page.locator('#run-action-dialog')).toBeVisible();
+  await expect(page.locator('[data-action-submit]')).toBeDisabled();
+  await page.locator('#run-action-confirmation').fill(id);
+  await expect(page.locator('[data-action-submit]')).toBeDisabled();
+  await page.locator('#run-action-confirmation').fill(`PURGE ${id}`);
+  await expect(page.locator('[data-action-submit]')).toBeEnabled();
+  await page.locator('[data-action-submit]').click();
+  await expect(page.getByRole('heading', { name: 'Run evidence purged' })).toBeVisible();
   expect((await request.get(`/api/runs/${encodeURIComponent(id)}`)).status()).toBe(404);
   expect(await access(directory).then(() => true, () => false)).toBe(false);
 });

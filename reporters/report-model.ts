@@ -1,7 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { copyFile, mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { ALL_AUDIT_CATALOG, INSTALLED_PLUGIN_REGISTRY } from '../audit/definitions.js';
 import {
   evidenceKindsForPolicy,
@@ -18,6 +17,11 @@ import type {
   AuditProjectMetadata,
 } from '../audit/types.js';
 import { targetMatchesAuditApplicability } from '../shared/target-applicability.mjs';
+import {
+  type SingleSiteReportInput,
+  type SingleSiteReportSummary,
+} from '../scripts/lib/site-health-report.mjs';
+import { writeSingleSiteReportPublication } from '../scripts/lib/single-site-report-writer.mjs';
 import type { GalleryArchiveDescriptor, GalleryCatalog } from '../shared/gallery-contract.mjs';
 import {
   buildGalleryEvidenceModel,
@@ -272,6 +276,29 @@ interface PortalReportFinding {
   blocking: boolean;
 }
 
+interface PortalReportAttentionItem {
+  auditId: string;
+  auditTitle: string;
+  area: AuditDefinition['area'];
+  auditStatus: ChecklistStatus;
+  severity: AuditDefinition['severity'];
+  releaseBlocking: boolean;
+  scope: 'candidate' | 'cross-environment' | 'unknown';
+  detail: string;
+  errorContext: string | null;
+  reasonCodes: ReportExecution['reasonCodes'];
+  baselineNonGating: boolean;
+  baselineNote: string | null;
+  evidence: Array<{
+    name: string;
+    kind: ReportArtifact['kind'];
+    href: string;
+    sizeBytes: number | null;
+    attempt: number;
+    context: 'final-primary' | 'final-diagnostic';
+  }>;
+}
+
 interface PortalReportAuditRow {
   id: string;
   area: AuditDefinition['area'];
@@ -303,6 +330,8 @@ const PORTAL_REPORT_MAX_ARTIFACTS = 16;
 const PORTAL_REPORT_MAX_EVIDENCE_ITEMS = 16;
 
 export interface GenerateReportOptions {
+  /** Omitted only for legacy comparative callers. */
+  mode?: 'comparative';
   outputDir: string;
   tests: ReportTestInput[];
   run: ReportRunInput;
@@ -337,6 +366,15 @@ function reportProjectEngine(projectName: string): string {
   return 'unknown';
 }
 
+function comparativeMetadataEnvironment(
+  metadata: Partial<AuditProjectMetadata> | undefined,
+): AuditEnvironment | undefined {
+  if (!metadata || !('environment' in metadata)) return undefined;
+  return metadata.environment === 'candidate' || metadata.environment === 'production'
+    ? metadata.environment
+    : undefined;
+}
+
 function resolvedSelectedProjects(options: GenerateReportOptions): ReportProjectInput[] {
   if (options.selectedProjects !== undefined) {
     return [...options.selectedProjects].sort((left, right) => left.name.localeCompare(right.name));
@@ -353,12 +391,13 @@ function resolvedSelectedProjects(options: GenerateReportOptions): ReportProject
 
 function projectMatchesApplicability(project: ReportProjectInput, applicability: AuditApplicability): boolean {
   const metadata = project.metadata;
-  if (!metadata?.environment || !metadata.deviceClass) return false;
+  const environment = comparativeMetadataEnvironment(metadata);
+  if (!environment || !metadata?.deviceClass) return false;
   return targetMatchesAuditApplicability(applicability, {
     // Applicability IDs are public project names. Playwright JSON's optional
     // internal project ID is only useful while resolving result rows.
     id: project.name,
-    environment: metadata.environment,
+    environment,
     deviceClass: metadata.deviceClass,
     engine: reportProjectEngine(project.name),
     fullSweep: metadata.fullSweep === true,
@@ -585,7 +624,7 @@ async function buildExecutions(
       const latestAttemptRecords = recordsByAttempt[recordsByAttempt.length - 1] ?? [];
       const record = latestAttemptRecords.find((candidate) => candidate.auditId === auditId) ?? null;
 
-      const environment = record?.environment ?? test.projectMetadata?.environment ?? 'unknown';
+      const environment = record?.environment ?? comparativeMetadataEnvironment(test.projectMetadata) ?? 'unknown';
       const coveredEnvironments = [...new Set(
         (record?.coveredEnvironments ?? (environment === 'unknown' ? [] : [environment]))
           .filter((candidate): candidate is AuditEnvironment => candidate === 'candidate' || candidate === 'production'),
@@ -622,13 +661,14 @@ async function buildExecutions(
       const evidencePolicy = parseEvidencePolicyAnnotation(test.annotations);
       const applicability = parseAuditApplicabilityAnnotation(test.annotations);
       const projectMetadata = test.projectMetadata;
-      const applicableToProject = applicability && projectMetadata?.environment
+      const projectEnvironment = comparativeMetadataEnvironment(projectMetadata);
+      const applicableToProject = applicability && projectEnvironment
         ? targetMatchesAuditApplicability(applicability, {
             id: test.projectName,
-            environment: projectMetadata.environment,
-            deviceClass: projectMetadata.deviceClass ?? 'desktop',
+            environment: projectEnvironment,
+            deviceClass: projectMetadata?.deviceClass ?? 'desktop',
             engine: reportProjectEngine(test.projectName),
-            fullSweep: projectMetadata.fullSweep === true,
+            fullSweep: projectMetadata?.fullSweep === true,
           })
         : null;
       const requiredEvidence = evidencePolicy
@@ -782,7 +822,25 @@ export interface AuditReportModels {
   galleryCatalog: GalleryCatalog;
 }
 
+function assertComparativeReportInput(options: GenerateReportOptions): void {
+  if ((options as GenerateReportOptions & { mode?: unknown }).mode !== undefined && options.mode !== 'comparative') {
+    throw new Error('Single-site data cannot be passed to the comparative release report builder.');
+  }
+  const singleSiteProjects = [
+    ...options.tests.map(({ projectName, projectMetadata }) => ({ name: projectName, metadata: projectMetadata })),
+    ...(options.selectedProjects ?? []).map(({ name, metadata }) => ({ name, metadata })),
+  ].filter(({ metadata }) => metadata?.mode === 'single-site');
+  if (singleSiteProjects.length > 0) {
+    const names = [...new Set(singleSiteProjects.map(({ name }) => name))].sort();
+    throw new Error(
+      `Single-site project data cannot be passed to the comparative release report builder: ${names.join(', ')}. `
+      + 'Finalize it with writeSingleSiteAuditReport and frozen Site Health input instead.',
+    );
+  }
+}
+
 export async function buildAuditModels(options: GenerateReportOptions): Promise<AuditReportModels> {
+  assertComparativeReportInput(options);
   const outputDir = path.resolve(options.cwd ?? process.cwd(), options.outputDir);
   await mkdir(outputDir, { recursive: true });
   const warnings: string[] = [];
@@ -823,20 +881,20 @@ export async function buildAuditModels(options: GenerateReportOptions): Promise<
       const crossEnvironmentGate = CROSS_ENVIRONMENT_GATES.has(definition.id);
       const releaseExecutions = crossEnvironmentGate ? executions : [...candidateExecutions, ...unknownExecutions];
       const releaseMissingProjects = missingApplicableProjects.filter(({ metadata }) => (
-        crossEnvironmentGate || metadata?.environment !== 'production'
+        crossEnvironmentGate || comparativeMetadataEnvironment(metadata) !== 'production'
       ));
       let aggregate = withMissingApplicableProjects(aggregateStatus(definition, releaseExecutions), releaseMissingProjects);
       const candidateAggregate = withMissingApplicableProjects(
         aggregateStatus(definition, candidateExecutions),
-        missingApplicableProjects.filter(({ metadata }) => metadata?.environment === 'candidate'),
+        missingApplicableProjects.filter(({ metadata }) => comparativeMetadataEnvironment(metadata) === 'candidate'),
       );
       const productionAggregate = withMissingApplicableProjects(
         aggregateStatus(definition, productionExecutions),
-        missingApplicableProjects.filter(({ metadata }) => metadata?.environment === 'production'),
+        missingApplicableProjects.filter(({ metadata }) => comparativeMetadataEnvironment(metadata) === 'production'),
       );
       const unknownAggregate = withMissingApplicableProjects(
         aggregateStatus(definition, unknownExecutions),
-        missingApplicableProjects.filter(({ metadata }) => !metadata?.environment),
+        missingApplicableProjects.filter(({ metadata }) => !comparativeMetadataEnvironment(metadata)),
       );
       if (
         crossEnvironmentGate
@@ -884,9 +942,9 @@ export async function buildAuditModels(options: GenerateReportOptions): Promise<
       const applicableCoverage = coverageCounts(applicableExecutions);
       const skippedCoverage = coverageCounts(skippedExecutions);
       const missingApplicableCoverage = {
-        production: missingApplicableProjects.filter(({ metadata }) => metadata?.environment === 'production').length,
-        candidate: missingApplicableProjects.filter(({ metadata }) => metadata?.environment === 'candidate').length,
-        unknown: missingApplicableProjects.filter(({ metadata }) => !metadata?.environment).length,
+        production: missingApplicableProjects.filter(({ metadata }) => comparativeMetadataEnvironment(metadata) === 'production').length,
+        candidate: missingApplicableProjects.filter(({ metadata }) => comparativeMetadataEnvironment(metadata) === 'candidate').length,
+        unknown: missingApplicableProjects.filter(({ metadata }) => !comparativeMetadataEnvironment(metadata)).length,
         total: missingApplicableProjects.length,
       };
       return {
@@ -1070,17 +1128,34 @@ export async function writeAuditReport(options: GenerateReportOptions): Promise<
     catalog: galleryCatalog,
     exportedAt: manifest.generatedAt,
   });
-  const assetsDir = path.join(outputDir, 'assets');
-  await mkdir(assetsDir, { recursive: true });
-  const sourceAssets = path.join(path.dirname(fileURLToPath(import.meta.url)), 'assets');
-  await Promise.all([
-    copyFile(path.join(sourceAssets, 'report.css'), path.join(assetsDir, 'report.css')),
-    copyFile(path.join(sourceAssets, 'report.js'), path.join(assetsDir, 'report.js')),
-  ]);
   await writeFile(path.join(outputDir, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
   await writeFile(path.join(outputDir, 'index.html'), reportHtml(manifest, galleryDescriptor), 'utf8');
   await writePortalReportData(outputDir, manifest);
   return manifest;
+}
+
+export interface WriteSingleSiteAuditReportOptions {
+  outputDir: string;
+  input: SingleSiteReportInput;
+  cwd?: string;
+  /** Test-only deterministic revision injection; production callers should omit it. */
+  publicationRevision?: string;
+}
+
+/**
+ * Finalizer-facing publication API for Single-site Audit. It intentionally
+ * accepts already-frozen Site Health input instead of interpreting Playwright
+ * rows as comparative candidate/release evidence.
+ */
+export async function writeSingleSiteAuditReport(
+  options: WriteSingleSiteAuditReportOptions,
+): Promise<SingleSiteReportSummary> {
+  const outputDir = path.resolve(options.cwd ?? process.cwd(), options.outputDir);
+  return writeSingleSiteReportPublication({
+    outputDir,
+    input: options.input,
+    ...(options.publicationRevision ? { publicationRevision: options.publicationRevision } : {}),
+  });
 }
 
 function portalText(value: unknown, maximum = PORTAL_REPORT_MAX_TEXT): string {
@@ -1094,6 +1169,135 @@ function portalFinding(finding: AuditFinding): PortalReportFinding {
     title: portalText(finding.title, 300),
     detail: portalText(finding.detail),
     blocking: finding.blocking,
+  };
+}
+
+const PORTAL_ATTENTION_STATUSES = new Set<ChecklistStatus>([
+  'FAIL',
+  'BLOCKED',
+  'FLAKY',
+  'REVIEW',
+  'NOT_RUN',
+  'MANUAL_REQUIRED',
+]);
+const PORTAL_ATTENTION_STATUS_ORDER: ChecklistStatus[] = [
+  'FAIL',
+  'BLOCKED',
+  'FLAKY',
+  'REVIEW',
+  'NOT_RUN',
+  'MANUAL_REQUIRED',
+];
+
+function conciseAssertionError(executions: readonly ReportExecution[]): string | null {
+  const raw = executions.flatMap(({ errors }) => errors)
+    .map(({ message, snippet, value }) => message ?? snippet ?? value ?? '')
+    .find((value) => value.trim().length > 0);
+  if (!raw) return null;
+  const lines = raw
+    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '')
+    .replaceAll('\r', '')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const headline = lines[0]?.replace(/^Error:\s*/, '') ?? '';
+  const specificMessage = lines
+    .map((line) => line.match(/^\+\s+"(?:message|failureSummary)":\s+"([^"]{4,300})/)?.[1] ?? null)
+    .find((line): line is string => Boolean(line));
+  const standaloneDetail = lines
+    .map((line) => line.match(/^\+\s+"([^"]{4,300})"[,]?$/)?.[1] ?? null)
+    .find((line): line is string => Boolean(line && /\s/.test(line) && !/^[.#\[<{]/.test(line)));
+  const specific = specificMessage ?? standaloneDetail;
+  const location = lines
+    .map((line) => line.match(/(?:at\s+)?([^\s()]+\.(?:spec|test)\.[cm]?[jt]s:\d+(?::\d+)?)/)?.[1] ?? null)
+    .find((line): line is string => Boolean(line));
+  const parts = [...new Set([headline, specific, location].filter((value): value is string => Boolean(value)))];
+  return parts.length > 0 ? portalText(parts.join(' · '), 700) : null;
+}
+
+function safeAttentionArtifact(
+  artifact: ReportArtifact,
+  attempt: number,
+  context: PortalReportAttentionItem['evidence'][number]['context'],
+): PortalReportAttentionItem['evidence'][number] | null {
+  if (!artifact.available || !artifact.href || artifact.href.includes('\\')) return null;
+  const segments = artifact.href.split('/');
+  if (artifact.href.startsWith('/') || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(artifact.href)
+    || segments.some((segment) => segment === '' || segment === '.' || segment === '..')) return null;
+  return {
+    name: portalText(artifact.name, 300),
+    kind: artifact.kind,
+    href: artifact.href,
+    sizeBytes: artifact.sizeBytes,
+    attempt,
+    context,
+  };
+}
+
+function portalAttentionItem(audit: AuditChecklistItem): PortalReportAttentionItem {
+  const relevantEnvironments = audit.crossEnvironmentGate
+    ? new Set<ReportExecution['environment']>(['candidate', 'production', 'unknown'])
+    : new Set<ReportExecution['environment']>(['candidate', 'unknown']);
+  const executions = audit.executions.filter((execution) => (
+    relevantEnvironments.has(execution.environment)
+    && (PORTAL_ATTENTION_STATUSES.has(execution.status) || execution.evidenceAuthority === 'withheld')
+  ));
+  const scope: PortalReportAttentionItem['scope'] = audit.crossEnvironmentGate
+    ? 'cross-environment'
+    : executions.some(({ environment }) => environment === 'candidate')
+      || audit.coverage.missingApplicable.candidate > 0
+      ? 'candidate'
+      : 'unknown';
+  const evidenceRank: Record<ReportArtifact['kind'], number> = {
+    screenshot: 0,
+    axe: 1,
+    video: 2,
+    trace: 3,
+    json: 4,
+    network: 5,
+    lighthouse: 6,
+    other: 7,
+  };
+  const rankedEvidence = [...new Map(executions
+    .flatMap((execution) => {
+      const finalAttempt = execution.attemptHistory.at(-1);
+      if (!finalAttempt) return [];
+      return finalAttempt.artifacts.map((artifact) => safeAttentionArtifact(
+        artifact,
+        finalAttempt.attempt,
+        execution.primaryArtifacts.includes(artifact) ? 'final-primary' : 'final-diagnostic',
+      ));
+    })
+    .filter((artifact): artifact is PortalReportAttentionItem['evidence'][number] => artifact !== null)
+    .sort((left, right) => Number(left.context === 'final-diagnostic') - Number(right.context === 'final-diagnostic')
+      || evidenceRank[left.kind] - evidenceRank[right.kind])
+    .map((artifact) => [artifact.href, artifact])).values()];
+  const evidence: PortalReportAttentionItem['evidence'] = [];
+  const evidenceKinds = new Set<ReportArtifact['kind']>();
+  for (const artifact of rankedEvidence) {
+    if (evidenceKinds.has(artifact.kind)) continue;
+    evidence.push(artifact);
+    evidenceKinds.add(artifact.kind);
+    if (evidence.length === 3) break;
+  }
+  const baselineNonGating = audit.baseline.hasIssues && !audit.crossEnvironmentGate;
+  const detail = baselineNonGating
+    ? audit.reason.replace(/\s+\d+ production-baseline execution[\s\S]*$/, '')
+    : audit.reason;
+  return {
+    auditId: audit.id,
+    auditTitle: portalText(audit.definition.title, 400),
+    area: audit.definition.area,
+    auditStatus: audit.status,
+    severity: audit.definition.severity,
+    releaseBlocking: audit.definition.releaseBlocking,
+    scope,
+    detail: portalText(detail),
+    errorContext: conciseAssertionError(executions),
+    reasonCodes: [...new Set(executions.flatMap(({ reasonCodes }) => reasonCodes))].slice(0, 12),
+    baselineNonGating,
+    baselineNote: baselineNonGating ? portalText(audit.baseline.note, 800) : null,
+    evidence,
   };
 }
 
@@ -1217,6 +1421,32 @@ function portalEvidence(record: AuditEvidenceRecord | null): Record<string, unkn
       title: portalText(inspection.title, 300),
       h1Count: inspection.h1Count,
       horizontalOverflowPx: inspection.horizontalOverflowPx,
+      horizontalOverflowCandidateCount: inspection.horizontalOverflowCandidateCount ?? inspection.horizontalOverflowElements?.length ?? 0,
+      horizontalOverflowTruncated: inspection.horizontalOverflowTruncated ?? false,
+      horizontalOverflowElements: (inspection.horizontalOverflowElements ?? []).slice(0, 20).map((element) => ({
+        selector: portalText(element.selector, 700),
+        selectorMatchCount: element.selectorMatchCount,
+        tagName: portalText(element.tagName, 80),
+        text: portalText(element.text, 200),
+        left: element.left,
+        right: element.right,
+        width: element.width,
+        clientWidth: element.clientWidth,
+        scrollWidth: element.scrollWidth,
+        overflowX: portalText(element.overflowX, 80),
+        outsideLeftPx: element.outsideLeftPx,
+        outsideRightPx: element.outsideRightPx,
+        intrinsicOverflowPx: element.intrinsicOverflowPx,
+        reasons: element.reasons,
+        nearestScrollOwner: element.nearestScrollOwner ? {
+          selector: portalText(element.nearestScrollOwner.selector, 700),
+          left: element.nearestScrollOwner.left,
+          right: element.nearestScrollOwner.right,
+          clientWidth: element.nearestScrollOwner.clientWidth,
+          scrollWidth: element.nearestScrollOwner.scrollWidth,
+          overflowX: portalText(element.nearestScrollOwner.overflowX, 80),
+        } : null,
+      })),
       brokenImageCount: inspection.brokenImages.length,
       documentHeight: inspection.documentHeight,
       viewportWidth: inspection.viewportWidth,
@@ -1462,17 +1692,40 @@ async function writePortalReportData(outputDir: string, manifest: AuditManifest)
   const rows = manifest.audits.map(portalAuditRow);
   const manualAudits = rows.filter(({ manual }) => manual);
   const topFindings = manifest.audits
-    .flatMap((audit) => audit.findings.map((finding) => ({
-      auditId: audit.id,
-      auditTitle: portalText(audit.definition.title, 400),
-      area: audit.definition.area,
-      auditStatus: audit.status,
-      releaseBlocking: audit.definition.releaseBlocking,
-      ...portalFinding(finding),
-    })))
-    .sort((left, right) => Number(right.blocking) - Number(left.blocking)
+    .flatMap((audit) => audit.executions.flatMap((execution) => {
+      const coversCandidate = execution.coveredEnvironments.includes('candidate');
+      const coversProduction = execution.coveredEnvironments.includes('production');
+      const productionBaselineOnly = coversProduction && !coversCandidate && !audit.crossEnvironmentGate;
+      const scope = audit.crossEnvironmentGate
+        ? 'cross-environment'
+        : productionBaselineOnly
+          ? 'production-baseline'
+          : coversCandidate
+            ? 'candidate'
+            : 'unknown';
+      return (execution.evidence?.findings ?? []).map((finding) => ({
+        auditId: audit.id,
+        auditTitle: portalText(audit.definition.title, 400),
+        area: audit.definition.area,
+        auditStatus: audit.status,
+        environment: execution.environment,
+        coveredEnvironments: execution.coveredEnvironments,
+        sourceProject: portalText(execution.project, 300),
+        scope,
+        baselineNonGating: productionBaselineOnly,
+        releaseBlocking: audit.definition.releaseBlocking && !productionBaselineOnly,
+        ...portalFinding(finding),
+      }));
+    }))
+    .sort((left, right) => Number(right.releaseBlocking) - Number(left.releaseBlocking)
+      || Number(right.blocking) - Number(left.blocking)
       || ['P0', 'P1', 'P2', 'P3'].indexOf(left.severity) - ['P0', 'P1', 'P2', 'P3'].indexOf(right.severity))
     .slice(0, 20);
+  const attentionItems = manifest.audits
+    .filter((audit) => audit.findings.length === 0 && PORTAL_ATTENTION_STATUSES.has(audit.status))
+    .sort((left, right) => PORTAL_ATTENTION_STATUS_ORDER.indexOf(left.status) - PORTAL_ATTENTION_STATUS_ORDER.indexOf(right.status)
+      || ['P0', 'P1', 'P2', 'P3'].indexOf(left.definition.severity) - ['P0', 'P1', 'P2', 'P3'].indexOf(right.definition.severity)
+      || left.id.localeCompare(right.id));
   const aiReview = await portalAiReview(outputDir);
   const publicationRevision = randomUUID().replaceAll('-', '');
   const summary = {
@@ -1494,6 +1747,8 @@ async function writePortalReportData(outputDir: string, manifest: AuditManifest)
     },
     topFindings,
     topFindingCount: manifest.audits.reduce((count, audit) => count + audit.findings.length, 0),
+    topAttention: attentionItems.slice(0, 20).map(portalAttentionItem),
+    topAttentionCount: attentionItems.length,
     filters: {
       statuses: [...new Set(rows.map(({ status }) => status))].sort(),
       severities: [...new Set(rows.map(({ severity }) => severity))].sort(),
@@ -1574,6 +1829,8 @@ function inlineJson(value: unknown): string {
 }
 
 function reportHtml(manifest: AuditManifest, galleryDescriptor: GalleryArchiveDescriptor): string {
+  const bundle = galleryDescriptor.archiveBundle;
+  if (!bundle) throw new Error('Generated report requires a pinned archive runtime bundle.');
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -1581,10 +1838,14 @@ function reportHtml(manifest: AuditManifest, galleryDescriptor: GalleryArchiveDe
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark light">
   <title>Quitting7OH release audit</title>
-  <link rel="stylesheet" href="assets/report.css">
+  <link rel="stylesheet" href="${bundle.assetBase}/report.css">
 </head>
 <body>
   <a class="skip-link" href="#audit-list">Skip to audit results</a>
+  <section id="archive-runtime-fatal" hidden role="alert">
+    <h1>This sealed report cannot open</h1>
+    <p id="archive-runtime-fatal-message"></p>
+  </section>
   <header class="masthead">
     <div>
       <p class="eyebrow">Quitting7OH release evidence</p>
@@ -1626,9 +1887,11 @@ function reportHtml(manifest: AuditManifest, galleryDescriptor: GalleryArchiveDe
     </section>
     <section id="run-diagnostics" class="run-diagnostics" aria-labelledby="diagnostics-heading"></section>
   </main>
+  <script id="archive-bundle" type="application/json">${inlineJson(bundle)}</script>
   <script id="audit-manifest" type="application/json">${inlineJson(manifest)}</script>
   <script id="gallery-archive-head" type="application/json">${inlineJson(galleryDescriptor)}</script>
-  <script src="assets/report.js"></script>
+  <script src="${bundle.assetBase}/archive-runtime.js"></script>
+  <script src="${bundle.assetBase}/report.js"></script>
 </body>
 </html>`;
 }

@@ -12,9 +12,11 @@ import {
   normalizeLeadingBlankVideoAsync,
   probeVideoQuality,
   recommendedLeadingBlankTrimSeconds,
+  recommendedPosterSeekSeconds,
   removeRejectedVideoAttachments,
   reportableAttachments,
 } from './lib/video-retention.js';
+import { mergeVideoRetentionHistory } from './lib/video-manifest-history.js';
 
 const root = await fs.mkdtemp(path.join(os.tmpdir(), 'video-retention-'));
 const raw = path.join(root, 'shards', 'shard-1-of-2', 'raw');
@@ -82,6 +84,11 @@ const staticPolicy = {
   }),
 };
 const video = (source: string) => ({ name: 'video', contentType: 'video/webm', path: source });
+const auditResult = (steps: Array<{ kind: 'interaction' | 'runtime-health'; status: 'passed' | 'failed' }>) => ({
+  name: 'audit-result',
+  contentType: 'application/json',
+  body: Buffer.from(JSON.stringify({ steps })).toString('base64'),
+});
 const report = {
   suites: [{
     specs: [
@@ -165,6 +172,56 @@ assert.deepEqual(
   reportableAttachments([video(skipped), { name: 'trace', contentType: 'application/zip' }], 'skipped', [interaction]),
   [{ name: 'trace', contentType: 'application/zip' }],
 );
+assert.equal(recommendedPosterSeekSeconds({
+  path: '/tmp/representative.webm',
+  durationSeconds: 22.32,
+  sampledFrames: 89,
+  maxFrameDifference: 12,
+  changedFrames: 12,
+  postContentChangedFrames: 12,
+  blankFrameRatio: 0,
+  initialNonBlankRatio: 1,
+  finalNonBlankRatio: 1,
+  leadingBlankSeconds: 0,
+  usable: true,
+  reasons: [],
+}), 21.32, 'Posters must represent the sustained final response rather than the startup frame.');
+assert.equal(recommendedPosterSeekSeconds(null), 0.5, 'Unknown metadata keeps the conservative fallback seek.');
+const repeatedMediaHistory = mergeVideoRetentionHistory({
+  eligibleExecutions: 2,
+  rejectedExecutions: 0,
+  skippedExecutions: 0,
+  policyRejectedExecutions: 0,
+  qualityRejectedClips: 0,
+  normalizedLeadingBlankClips: 0,
+  diagnosticRetainedClips: 0,
+  removedVideoAttachments: 0,
+  eligibleHashes: 2,
+  retainedFiles: 8,
+  prunedFiles: 0,
+  prunedBytes: 0,
+  integrityErrors: [],
+  qualityAssessments: [{ video: 'kept.webm', usable: true }],
+  normalizations: [],
+  pruned: [],
+}, {
+  qualityRejectedClips: 3,
+  normalizedLeadingBlankClips: 1,
+  removedVideoAttachments: 3,
+  prunedFiles: 3,
+  prunedBytes: 900,
+  integrityErrors: [],
+  qualityAssessments: [{ video: 'rejected.webm', usable: false }, { video: 'kept.webm', usable: true }],
+  normalizations: [{ originalVideo: 'blank.webm', normalizedVideo: 'normalized.webm' }],
+  pruned: [{ relativePath: 'rejected.webm', sha256: 'abc' }],
+});
+assert.equal(repeatedMediaHistory.qualityRejectedClips, 3);
+assert.equal(repeatedMediaHistory.normalizedLeadingBlankClips, 1);
+assert.equal(repeatedMediaHistory.removedVideoAttachments, 3);
+assert.equal(repeatedMediaHistory.qualityAssessments.length, 2);
+assert.equal(repeatedMediaHistory.normalizations.length, 1);
+assert.equal(repeatedMediaHistory.pruned.length, 1);
+assert.equal(repeatedMediaHistory.prunedBytes, 900, 'A repeat poster pass must not erase prior retention history.');
 assert.deepEqual(reportableAttachments([video(staticVideo)], 'passed', [staticPolicy]), []);
 assert.equal(reportableAttachments([video(failed)], 'failed', [interaction]).length, 1);
 
@@ -205,6 +262,151 @@ assert.deepEqual(
   { usable: false, reasons: ['no visual response was measured after the page content settled'] },
   'A page-load transition without a subsequent visual response is not interaction evidence.',
 );
+
+const nonResponseVideo = path.join(raw, 'failed-visible-nonresponse.webm');
+await fs.writeFile(nonResponseVideo, Buffer.from('visible action followed by an unchanged failed response'));
+const nonResponseReport = {
+  suites: [{ specs: [{
+    title: 'failed visible nonresponse',
+    tests: [{ annotations: [interaction], results: [{
+      status: 'failed',
+      attachments: [
+        video(nonResponseVideo),
+        auditResult([{ kind: 'interaction', status: 'failed' }]),
+      ],
+    }] }],
+  }] }],
+};
+const nonResponsePlan = await buildVideoRetentionPlan(nonResponseReport, root, resultsFile, {
+  probeVideo: (file) => ({
+    path: file,
+    durationSeconds: 4.24,
+    sampledFrames: 17,
+    maxFrameDifference: 6.4,
+    changedFrames: 2,
+    postContentChangedFrames: 0,
+    blankFrameRatio: 0,
+    initialNonBlankRatio: 1,
+    finalNonBlankRatio: 1,
+    leadingBlankSeconds: 0,
+    usable: false,
+    reasons: ['no visual response was measured after the page content settled'],
+  }),
+});
+assert.deepEqual(nonResponsePlan.errors, [], 'A visible, adequately paced failed nonresponse must not become a media-integrity failure.');
+assert.equal(nonResponsePlan.diagnosticRetainedClips, 1);
+assert.equal(nonResponsePlan.diagnosticPaths.has(nonResponseVideo), true);
+
+const unrelatedEarlierActionVideo = path.join(raw, 'failed-after-unrelated-earlier-action.webm');
+await fs.writeFile(unrelatedEarlierActionVideo, Buffer.from('earlier action moved but the final failure was not an interaction response'));
+const unrelatedEarlierActionReport = {
+  suites: [{ specs: [{
+    title: 'failed after an unrelated earlier interaction',
+    tests: [{ annotations: [interaction], results: [{
+      status: 'failed',
+      attachments: [
+        video(unrelatedEarlierActionVideo),
+        auditResult([
+          { kind: 'interaction', status: 'passed' },
+          { kind: 'runtime-health', status: 'failed' },
+        ]),
+      ],
+    }] }],
+  }] }],
+};
+const unrelatedEarlierActionPlan = await buildVideoRetentionPlan(unrelatedEarlierActionReport, root, resultsFile, {
+  probeVideo: (file) => ({
+    path: file,
+    durationSeconds: 4.24,
+    sampledFrames: 17,
+    maxFrameDifference: 6.4,
+    changedFrames: 2,
+    postContentChangedFrames: 0,
+    blankFrameRatio: 0,
+    initialNonBlankRatio: 1,
+    finalNonBlankRatio: 1,
+    leadingBlankSeconds: 0,
+    usable: false,
+    reasons: ['no visual response was measured after the page content settled'],
+  }),
+});
+assert.equal(unrelatedEarlierActionPlan.diagnosticRetainedClips, 0,
+  'An earlier passed interaction must not satisfy media integrity for a later non-interaction failure.');
+assert.equal(unrelatedEarlierActionPlan.qualityRejectedClips, 1);
+assert.equal(unrelatedEarlierActionPlan.errors.length, 1);
+
+const failedAfterEarlierActionVideo = path.join(raw, 'failed-interaction-after-earlier-action.webm');
+await fs.writeFile(failedAfterEarlierActionVideo, Buffer.from('earlier action passed and the later interaction response failed visibly'));
+const failedAfterEarlierActionReport = {
+  suites: [{ specs: [{
+    title: 'failed interaction after an earlier successful interaction',
+    tests: [{ annotations: [interaction], results: [{
+      status: 'failed',
+      attachments: [
+        video(failedAfterEarlierActionVideo),
+        auditResult([
+          { kind: 'interaction', status: 'passed' },
+          { kind: 'interaction', status: 'failed' },
+        ]),
+      ],
+    }] }],
+  }] }],
+};
+const failedAfterEarlierActionPlan = await buildVideoRetentionPlan(failedAfterEarlierActionReport, root, resultsFile, {
+  probeVideo: (file) => ({
+    path: file,
+    durationSeconds: 4.24,
+    sampledFrames: 17,
+    maxFrameDifference: 6.4,
+    changedFrames: 2,
+    postContentChangedFrames: 0,
+    blankFrameRatio: 0,
+    initialNonBlankRatio: 1,
+    finalNonBlankRatio: 1,
+    leadingBlankSeconds: 0,
+    usable: false,
+    reasons: ['no visual response was measured after the page content settled'],
+  }),
+});
+assert.deepEqual(failedAfterEarlierActionPlan.errors, [],
+  'A failed interaction step must qualify its visible nonresponse even when an earlier action passed.');
+assert.equal(failedAfterEarlierActionPlan.diagnosticRetainedClips, 1);
+
+const noActionNonResponseVideo = path.join(raw, 'failed-visible-before-action.webm');
+await fs.writeFile(noActionNonResponseVideo, Buffer.from('visible page-load motion before an action ran'));
+const noActionNonResponseReport = {
+  suites: [{ specs: [{
+    title: 'failed before interaction action',
+    tests: [{ annotations: [interaction], results: [{
+      status: 'failed',
+      attachments: [
+        video(noActionNonResponseVideo),
+        auditResult([{ kind: 'runtime-health', status: 'passed' }]),
+      ],
+    }] }],
+  }] }],
+};
+const noActionNonResponsePlan = await buildVideoRetentionPlan(noActionNonResponseReport, root, resultsFile, {
+  probeVideo: (file) => ({
+    path: file,
+    durationSeconds: 4.24,
+    sampledFrames: 17,
+    maxFrameDifference: 6.4,
+    changedFrames: 2,
+    postContentChangedFrames: 0,
+    blankFrameRatio: 0,
+    initialNonBlankRatio: 1,
+    finalNonBlankRatio: 1,
+    leadingBlankSeconds: 0,
+    usable: false,
+    reasons: ['no visual response was measured after the page content settled'],
+  }),
+});
+assert.equal(noActionNonResponsePlan.diagnosticRetainedClips, 0,
+  'Page-load motion must not become diagnostic interaction evidence when no user action passed.');
+assert.equal(noActionNonResponsePlan.qualityRejectedClips, 1);
+assert.equal(noActionNonResponsePlan.errors.length, 1,
+  'A failed attempt with no proven user action must remain a media-integrity failure.');
 
 const leadingBlankAssessment = {
   path: path.join(root, 'leading-blank.webm'),

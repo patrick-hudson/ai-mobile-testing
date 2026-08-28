@@ -7,6 +7,7 @@ export function targetMatchesAuditApplicability(applicability, target) {
   switch (applicability) {
     case 'all-projects': return true;
     case 'full-sweep-projects': return target.fullSweep === true;
+    case 'candidate-full-sweep-projects': return candidate && target.fullSweep === true;
     case 'candidate-projects': return candidate;
     case 'production-projects': return production;
     case 'candidate-non-tablet-projects': return candidate && target.deviceClass !== 'tablet';
@@ -26,5 +27,22 @@ export function targetMatchesAuditApplicability(applicability, target) {
 export function applicableTargetIds(applicability, targets) {
   return targets
     .filter((target) => targetMatchesAuditApplicability(applicability, target))
+    .map(({ id }) => id);
+}
+
+export function singleSiteTargetMatchesAuditApplicability(applicability, target, comparativeTargets) {
+  if (!target || typeof target.sourceComparativeTargetId !== 'string' || 'environment' in target) {
+    throw new Error('Single-site applicability requires a neutral target with comparative template provenance.');
+  }
+  const source = comparativeTargets.find(({ id }) => id === target.sourceComparativeTargetId);
+  if (!source || source.environment !== 'candidate') {
+    throw new Error(`Single-site target ${target.id ?? '<unknown>'} references an invalid candidate applicability template.`);
+  }
+  return targetMatchesAuditApplicability(applicability, source);
+}
+
+export function applicableSingleSiteTargetIds(applicability, targets, comparativeTargets) {
+  return targets
+    .filter((target) => singleSiteTargetMatchesAuditApplicability(applicability, target, comparativeTargets))
     .map(({ id }) => id);
 }

@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 ARG PLAYWRIGHT_VERSION=1.62.1
-FROM mcr.microsoft.com/playwright:v${PLAYWRIGHT_VERSION}-noble
+FROM mcr.microsoft.com/playwright:v${PLAYWRIGHT_VERSION}-noble AS audit-source
 
 ARG INSTALL_MSEDGE=0
 
@@ -57,14 +57,26 @@ RUN case "$INSTALL_MSEDGE" in \
     esac
 
 COPY . .
-RUN npm run validate
-RUN mkdir -p /work/artifacts/runs /var/lib/ai-mobile-testing/secrets \
+RUN node scripts/write-runner-revision.mjs /work/.audit-runner-revision
+RUN mkdir -p /work/artifacts/runs /var/lib/ai-mobile-testing/secrets /var/lib/ai-mobile-testing/jobs /var/lib/ai-mobile-testing/finalizations /var/lib/ai-mobile-testing/baselines \
     && chmod 700 /var/lib/ai-mobile-testing/secrets \
-    && chmod 755 /work/docker/entrypoint.sh /work/docker/firefox-with-ca.sh
+    && chown pwuser:pwuser /var/lib/ai-mobile-testing/jobs \
+    && chmod 700 /var/lib/ai-mobile-testing/jobs /var/lib/ai-mobile-testing/finalizations /var/lib/ai-mobile-testing/baselines \
+    && chmod 755 /work/docker/entrypoint.sh /work/docker/firefox-with-ca.sh /work/docker/init-single-site-volumes.sh
 
 EXPOSE 4173
-VOLUME ["/work/artifacts", "/var/lib/ai-mobile-testing/secrets"]
+VOLUME ["/work/artifacts", "/var/lib/ai-mobile-testing/secrets", "/var/lib/ai-mobile-testing/jobs", "/var/lib/ai-mobile-testing/finalizations", "/var/lib/ai-mobile-testing/baselines"]
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 CMD ["node", "-e", "fetch('http://127.0.0.1:4173/healthz').then(response => { if (!response.ok) process.exit(1) }).catch(() => process.exit(1))"]
 
 ENTRYPOINT ["/work/docker/entrypoint.sh"]
 CMD ["npm", "run", "portal:container"]
+
+# The maximum-load lease proof needs the exact image dependencies, identities,
+# entrypoint, and filesystem layout, but is intentionally isolated from
+# unrelated repository-wide assertions so a separate failing test cannot
+# manufacture or suppress its timing evidence.
+FROM audit-source AS lease-load-proof
+
+FROM audit-source AS final
+RUN npm run validate
+RUN npm run single-site-browser-egress:self-test

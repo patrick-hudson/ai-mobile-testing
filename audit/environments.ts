@@ -1,4 +1,9 @@
-import type { AuditEnvironment, AuditProjectMetadata } from './types.js';
+import { assertProjectEvidenceAuthority } from './evidence-policy.js';
+import type {
+  AuditEnvironment,
+  AuditProjectMetadata,
+  ComparativeAuditProjectMetadata,
+} from './types.js';
 
 export const ENVIRONMENTS: Record<AuditEnvironment, { label: string; baseURL: string }> = {
   production: {
@@ -12,6 +17,8 @@ export const ENVIRONMENTS: Record<AuditEnvironment, { label: string; baseURL: st
 };
 
 export const APPROVED_CANDIDATE_ADDITION_PATHS = [
+  '/search',
+  '/about/acknowledgments',
   '/start-here/7-oh-withdrawal-quickstart',
   '/start-here/7-oh-withdrawal-guide',
   '/about/site-architecture',
@@ -39,8 +46,6 @@ export const APPROVED_PRODUCTION_REMOVALS: Readonly<Record<string, string>> = Ob
 
 const candidateToProductionOverrides = new Map<string, string>([
   ['/medications-supplements', '/other-tools'],
-  ['/medications-supplements/helper-meds', '/other-tools/helper-meds-info'],
-  ['/about/acknowledgments', '/about/for-fly'],
 ]);
 
 function normalizeRoutePath(path: string): string {
@@ -92,17 +97,114 @@ export function productionRouteDisposition(productionPath: string): ProductionRo
   return { disposition: 'mapped', productionPath: normalized, candidatePath: normalized };
 }
 
-export function projectMetadata(value: unknown): AuditProjectMetadata {
-  const metadata = value as Partial<AuditProjectMetadata> | undefined;
+function normalizedProjectOrigin(value: unknown, label: string): string {
+  if (typeof value !== 'string' || !value.trim()) throw new Error(`${label} must be a non-empty origin.`);
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error(`${label} must be a valid HTTP(S) origin.`);
+  }
+  if ((parsed.protocol !== 'http:' && parsed.protocol !== 'https:')
+    || parsed.username || parsed.password || parsed.pathname !== '/' || parsed.search || parsed.hash) {
+    throw new Error(`${label} must be an HTTP(S) origin without credentials, path, query, or fragment.`);
+  }
+  return parsed.origin;
+}
+
+function commonProjectMetadata(value: Record<string, unknown>) {
+  if (typeof value.browserLabel !== 'string' || !value.browserLabel.trim()) {
+    throw new Error('Playwright project metadata browserLabel must be non-empty.');
+  }
+  if (value.deviceClass !== 'mobile' && value.deviceClass !== 'tablet' && value.deviceClass !== 'desktop') {
+    throw new Error('Playwright project metadata deviceClass is invalid.');
+  }
+  if (typeof value.fullSweep !== 'boolean' || typeof value.visual !== 'boolean') {
+    throw new Error('Playwright project metadata fullSweep and visual must be boolean.');
+  }
+  return {
+    browserLabel: value.browserLabel,
+    deviceClass: value.deviceClass,
+    fullSweep: value.fullSweep,
+    visual: value.visual,
+    baseURL: normalizedProjectOrigin(value.baseURL, 'Playwright project metadata baseURL'),
+  } as const;
+}
+
+export function parseAuditProjectMetadata(value: unknown): AuditProjectMetadata {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Playwright project metadata must be an object.');
+  }
+  const metadata = value as Record<string, unknown>;
+  const common = commonProjectMetadata(metadata);
+  let parsed: AuditProjectMetadata;
+  if (metadata.mode === 'comparative') {
+    if ((metadata.environment !== 'production' && metadata.environment !== 'candidate')
+      || (metadata.tlsPolicy !== 'strict' && metadata.tlsPolicy !== 'ignored-for-development')
+      || metadata.deploymentRole !== undefined || metadata.sourceComparativeTargetId !== undefined) {
+      throw new Error('Comparative Playwright project metadata has invalid or mixed mode fields.');
+    }
+    parsed = {
+      ...common,
+      mode: 'comparative',
+      environment: metadata.environment,
+      tlsPolicy: metadata.tlsPolicy,
+      evidenceAuthority: metadata.evidenceAuthority as AuditProjectMetadata['evidenceAuthority'],
+    };
+  } else if (metadata.mode === 'single-site') {
+    if ((metadata.deploymentRole !== 'preview' && metadata.deploymentRole !== 'production')
+      || (metadata.tlsPolicy !== 'strict' && metadata.tlsPolicy !== 'preview-bypass')
+      || typeof metadata.sourceComparativeTargetId !== 'string' || !metadata.sourceComparativeTargetId.trim()
+      || metadata.environment !== undefined) {
+      throw new Error('Single-site Playwright project metadata has invalid or mixed mode fields.');
+    }
+    parsed = {
+      ...common,
+      mode: 'single-site',
+      deploymentRole: metadata.deploymentRole,
+      sourceComparativeTargetId: metadata.sourceComparativeTargetId,
+      tlsPolicy: metadata.tlsPolicy,
+      evidenceAuthority: metadata.evidenceAuthority as AuditProjectMetadata['evidenceAuthority'],
+    };
+  } else {
+    throw new Error('Playwright project metadata mode must be comparative or single-site.');
+  }
+  parsed.evidenceAuthority = assertProjectEvidenceAuthority(parsed);
+  return parsed;
+}
+
+/** Comparative-only compatibility reader for existing tests and stored fixtures. */
+export function projectMetadata(value: unknown): ComparativeAuditProjectMetadata {
+  const metadata = value as Partial<ComparativeAuditProjectMetadata> | undefined;
+  if ((value as { mode?: unknown } | undefined)?.mode === 'single-site') {
+    throw new Error('Comparative projectMetadata() cannot read explicit Single-site metadata.');
+  }
   if (metadata?.environment !== 'production' && metadata?.environment !== 'candidate') {
     throw new Error('Playwright project is missing valid audit environment metadata.');
   }
-  return {
+  const normalized: ComparativeAuditProjectMetadata = {
+    mode: 'comparative',
     environment: metadata.environment,
     browserLabel: metadata.browserLabel ?? 'unknown',
     deviceClass: metadata.deviceClass ?? 'desktop',
     fullSweep: metadata.fullSweep ?? false,
     visual: metadata.visual ?? false,
+    baseURL: normalizedProjectOrigin(metadata.baseURL ?? ENVIRONMENTS[metadata.environment].baseURL, 'Playwright project metadata baseURL'),
     tlsPolicy: metadata.tlsPolicy === 'ignored-for-development' ? 'ignored-for-development' : 'strict',
+    evidenceAuthority: metadata.evidenceAuthority ?? (metadata.tlsPolicy === 'ignored-for-development'
+      ? { status: 'non-authoritative', reasons: ['development-certificate-bypass'] }
+      : { status: 'authoritative', reasons: [] }),
   };
+  normalized.evidenceAuthority = assertProjectEvidenceAuthority(normalized);
+  return normalized;
+}
+
+export function projectBaseURL(metadata: AuditProjectMetadata): string {
+  return metadata.baseURL;
+}
+
+export function resolveProjectPath(metadata: AuditProjectMetadata, reviewedPath: string): string | null {
+  return metadata.mode === 'comparative'
+    ? resolveEnvironmentPath(metadata.environment, reviewedPath)
+    : normalizeRoutePath(reviewedPath);
 }

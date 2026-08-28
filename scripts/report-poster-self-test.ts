@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { AuditDefinition } from '../audit/types.js';
 import { AUDIT_EVIDENCE_POLICY_ANNOTATION, serializeEvidencePolicy } from '../audit/evidence-policy.js';
+import { ARCHIVE_ASSET_DIRECTORY } from '../reporters/archive-bundle.js';
 import { writeAuditReport, type ReportTestInput } from '../reporters/report-model.js';
 import { galleryItemHref, type GalleryArchiveDescriptor, type GalleryQueryIndexRow } from '../shared/gallery-contract.mjs';
 
@@ -45,6 +46,11 @@ try {
     evidencePolicy: {
       mode: 'interaction-video',
       rationale: 'Exercise the synthetic action and verify its response video receives the correct poster.',
+    },
+    singleSiteClassification: 'standalone-compatible',
+    standaloneOracle: {
+      id: 'VIDEO-001:standalone',
+      expected: 'The report copies and links the generated poster without requiring one.',
     },
   };
   const tests: ReportTestInput[] = [{
@@ -113,7 +119,7 @@ try {
   assert.equal(manifest.summary.posters, 2);
   assert.equal(manifest.summary.artifacts, 5);
 
-  const reportScript = await readFile(path.join(outputDir, 'assets', 'report.js'), 'utf8');
+  const reportScript = await readFile(path.join(outputDir, 'assets', ARCHIVE_ASSET_DIRECTORY, 'report.js'), 'utf8');
   assert.match(reportScript, /poster=/);
   assert.match(reportScript, /Open video poster/);
 

@@ -3,35 +3,46 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="color-scheme" content="dark" />
+    <meta name="color-scheme" content="light" />
     <title>Quitting 7-OH · Visual evidence gallery</title>
     <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/console-shell.css" />
     <link rel="stylesheet" href="/gallery.css" />
+    <script src="/gallery-shell.js" type="module"></script>
     <script src="/gallery.js" type="module"></script>
   </head>
   <body class="gallery-page">
-    <a class="skip-link" href="#gallery-main">Skip to visual evidence</a>
-    <header class="gallery-page-nav">
-      <a id="gallery-back" class="report-back" href="/">← Release audit console</a>
-      <div class="gallery-page-status">
-        <span id="gallery-connection" role="status" aria-live="polite">Connecting…</span>
-        <button id="gallery-refresh" class="secondary-button" type="button">Refresh status</button>
-      </div>
-    </header>
-
-    <main id="gallery-main" class="gallery-page-shell">
-      <section class="gallery-page-hero" aria-labelledby="gallery-title">
+    <div id="gallery-console" class="console-shell">
+      <a class="console-skip-link" href="#gallery-main">Skip to visual evidence</a>
+      <nav class="console-navigation" aria-label="Console">
+        <p class="console-product">AUDIT CONSOLE</p>
+        <ul class="console-navigation-list">
+          <li><a href="/">Overview</a></li>
+          <li><a href="/runs.html">Runs</a></li>
+          <li><a href="/findings.html">Findings</a></li>
+          <li><a href="/evidence.html" aria-current="page">Evidence</a></li>
+          <li><a href="/new-audit.html">New audit</a></li>
+          <li><a href="/settings.html">Settings</a></li>
+        </ul>
+      </nav>
+      <div class="console-workspace">
+        <header class="console-context-header">
+          <h1 id="gallery-title" tabindex="-1">Visual evidence review</h1>
+          <p>Review screenshots and interaction videos in a bounded queue with test, attempt, and source context.</p>
+          <div class="console-context-actions gallery-page-status">
+            <a id="gallery-back" class="console-button console-button-secondary" href="/runs.html">Run workspace</a>
+            <span id="gallery-connection" role="status" aria-live="polite">Connecting…</span>
+            <button id="gallery-refresh" class="console-button" type="button">Refresh status</button>
+          </div>
+        </header>
+        <div class="console-workspace-body gallery-workspace-body">
+          <main id="gallery-main" class="console-main gallery-page-shell" aria-labelledby="gallery-title">
+      <section class="gallery-run-state" aria-labelledby="gallery-run-state-title">
         <div>
           <p class="eyebrow">RUN VISUAL EVIDENCE</p>
-          <h1 id="gallery-title">Test-first visual review</h1>
+          <h2 id="gallery-run-state-title">Review queue</h2>
           <p id="gallery-lifecycle" class="lede">Checking the run lifecycle and available evidence…</p>
         </div>
-        <dl class="gallery-revision-card">
-          <div><dt>Run</dt><dd id="gallery-run-id"></dd></div>
-          <div><dt>Catalog</dt><dd id="gallery-phase">Loading</dd></div>
-          <div><dt>Logical evidence</dt><dd id="gallery-counts">Loading</dd></div>
-          <div><dt>Accepted revision</dt><dd id="gallery-revision">Not loaded</dd></div>
-        </dl>
       </section>
 
       <section id="gallery-fatal" class="report-state-card" hidden>
@@ -72,7 +83,21 @@
           <div id="raw-files" class="artifact-list"></div>
         </div>
       </details>
-    </main>
+          </main>
+          <div id="gallery-separator" class="console-separator" role="separator" tabindex="0" aria-label="Resize gallery context" aria-orientation="vertical" aria-controls="gallery-inspector" aria-valuemin="240" aria-valuemax="560" aria-valuenow="320"></div>
+          <aside id="gallery-inspector" class="console-inspector" aria-label="Gallery run context">
+            <h2>Run context</h2>
+            <p class="gallery-inspector-note">Accepted publication identity for the bounded review queue.</p>
+            <dl class="gallery-revision-card">
+              <div><dt>Run</dt><dd id="gallery-run-id"></dd></div>
+              <div><dt>Catalog</dt><dd id="gallery-phase">Loading</dd></div>
+              <div><dt>Logical evidence</dt><dd id="gallery-counts">Loading</dd></div>
+              <div><dt>Accepted revision</dt><dd id="gallery-revision">Not loaded</dd></div>
+            </dl>
+          </aside>
+        </div>
+      </div>
+    </div>
 
     <dialog id="gallery-flag-dialog" class="run-dialog gallery-flag-dialog" aria-labelledby="gallery-flag-title">
       <form id="gallery-flag-form">
@@ -84,6 +109,69 @@
         <label class="field"><span id="gallery-flag-copy">Detailed observation</span><textarea id="gallery-flag-note" required minlength="3" maxlength="4000" rows="5"></textarea></label>
         <p id="gallery-flag-state" class="form-message" role="status" aria-live="polite"></p>
         <div class="dialog-actions"><button id="gallery-flag-cancel" class="secondary-button" type="button">Cancel</button><button id="gallery-flag-submit" class="primary-button" type="submit">Save reviewer flag</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="baseline-dialog" class="run-dialog baseline-dialog" aria-labelledby="baseline-dialog-title">
+      <form id="baseline-form">
+        <div class="dialog-header">
+          <div><p class="step-label">HUMAN BASELINE CONTROL</p><h2 id="baseline-dialog-title">Review baseline action</h2></div>
+          <button id="baseline-close" class="icon-button" type="button" aria-label="Close baseline action">×</button>
+        </div>
+        <p id="baseline-dialog-summary" class="lede"></p>
+        <dl id="baseline-identity" class="baseline-identity" aria-label="Exact visual evidence identity"></dl>
+        <p id="baseline-policy" class="bounded-note"></p>
+        <label class="field">
+          <span>Required rationale</span>
+          <textarea id="baseline-reason" required minlength="3" maxlength="1200" rows="4"></textarea>
+        </label>
+        <label id="baseline-waiver-field" class="field" hidden>
+          <span>Finding waiver rationale</span>
+          <textarea id="baseline-waiver" minlength="3" maxlength="1200" rows="4"></textarea>
+        </label>
+        <label class="field">
+          <span>Type the exact confirmation shown below</span>
+          <code id="baseline-confirmation-copy" class="baseline-confirmation"></code>
+          <input id="baseline-confirmation" required autocomplete="off" spellcheck="false" />
+        </label>
+        <p id="baseline-dialog-state" class="form-message" role="status" aria-live="polite"></p>
+        <div class="dialog-actions">
+          <button id="baseline-cancel" class="secondary-button" type="button">Cancel</button>
+          <button id="baseline-submit" class="primary-button" type="submit">Confirm baseline action</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="visual-review-dialog" class="run-dialog baseline-dialog" aria-labelledby="visual-review-dialog-title">
+      <form id="visual-review-form">
+        <div class="dialog-header">
+          <div><p class="step-label">HUMAN VISUAL DISPOSITION</p><h2 id="visual-review-dialog-title">Review changed visual</h2></div>
+          <button id="visual-review-close" class="icon-button" type="button" aria-label="Close visual disposition">×</button>
+        </div>
+        <p class="lede">Record what the reviewer concluded about this exact changed comparison.</p>
+        <dl id="visual-review-identity" class="baseline-identity" aria-label="Exact changed visual identity"></dl>
+        <p class="bounded-note">This disposition changes visual review state only. It does not alter deterministic Findings, coverage, Site Health, or promotion authority.</p>
+        <label class="field">
+          <span>Disposition</span>
+          <select id="visual-review-disposition" required>
+            <option value="accepted-change">Accepted redesign change</option>
+            <option value="known-defect">Known defect retained for follow-up</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>Required review rationale</span>
+          <textarea id="visual-review-rationale" required minlength="3" maxlength="1200" rows="4"></textarea>
+        </label>
+        <label class="field">
+          <span>Type the exact visual review confirmation shown below</span>
+          <code id="visual-review-confirmation-copy" class="baseline-confirmation"></code>
+          <input id="visual-review-confirmation" required autocomplete="off" spellcheck="false" />
+        </label>
+        <p id="visual-review-dialog-state" class="form-message" role="status" aria-live="polite"></p>
+        <div class="dialog-actions">
+          <button id="visual-review-cancel" class="secondary-button" type="button">Cancel</button>
+          <button id="visual-review-submit" class="primary-button" type="submit">Record visual disposition</button>
+        </div>
       </form>
     </dialog>
 

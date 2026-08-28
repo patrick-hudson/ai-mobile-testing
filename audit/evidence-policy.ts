@@ -3,6 +3,8 @@ import type {
   AuditApplicability,
   AuditEvidenceMode,
   AuditEvidencePolicy,
+  AuditEvidenceAuthority,
+  AuditProjectMetadata,
   AuditStatusOverride,
   AuditStatusWaiver,
 } from './types.js';
@@ -15,9 +17,15 @@ export const AUDIT_STATUS_WAIVER_ANNOTATION = 'audit-status-waiver';
 const MODES = new Set<AuditEvidenceMode>(['interaction-video', 'static-screenshot', 'structured-data']);
 const MEDIA_KINDS = new Set<AuditDefinition['evidence'][number]>(['video', 'screenshot']);
 const STATUS_OVERRIDES = new Set<AuditStatusOverride>(['REVIEW', 'INTENDED_CHANGE', 'BLOCKED']);
+const EVIDENCE_AUTHORITY_REASONS: readonly AuditEvidenceAuthority['reasons'][number][] = [
+  'development-certificate-bypass',
+  'deployment-revision-unavailable',
+];
+const EVIDENCE_AUTHORITY_REASON_SET = new Set(EVIDENCE_AUTHORITY_REASONS);
 export const AUDIT_APPLICABILITIES = Object.freeze<AuditApplicability[]>([
   'all-projects',
   'full-sweep-projects',
+  'candidate-full-sweep-projects',
   'candidate-projects',
   'production-projects',
   'candidate-non-tablet-projects',
@@ -34,6 +42,51 @@ export const AUDIT_APPLICABILITIES = Object.freeze<AuditApplicability[]>([
   'candidate-desktop-firefox',
 ]);
 const APPLICABILITIES = new Set<AuditApplicability>(AUDIT_APPLICABILITIES);
+
+export function evidenceAuthority(
+  reasons: readonly AuditEvidenceAuthority['reasons'][number][] = [],
+): AuditEvidenceAuthority {
+  const unique = EVIDENCE_AUTHORITY_REASONS.filter((reason) => reasons.includes(reason));
+  if (unique.length !== new Set(reasons).size
+    || reasons.some((reason) => !EVIDENCE_AUTHORITY_REASON_SET.has(reason))) {
+    throw new Error('Evidence Authority contains an unknown or duplicate limitation reason.');
+  }
+  return unique.length === 0
+    ? { status: 'authoritative', reasons: [] }
+    : { status: 'non-authoritative', reasons: unique };
+}
+
+export function assertEvidenceAuthority(value: unknown, label = 'evidenceAuthority'): AuditEvidenceAuthority {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`${label} must be an object.`);
+  }
+  const candidate = value as Partial<AuditEvidenceAuthority>;
+  if (!Array.isArray(candidate.reasons)
+    || candidate.reasons.some((reason) => typeof reason !== 'string' || !EVIDENCE_AUTHORITY_REASON_SET.has(reason))) {
+    throw new Error(`${label}.reasons contains an unknown value.`);
+  }
+  const normalized = evidenceAuthority(candidate.reasons);
+  if (candidate.status !== normalized.status
+    || JSON.stringify(candidate.reasons) !== JSON.stringify(normalized.reasons)) {
+    throw new Error(`${label} status and reasons are inconsistent or not canonically ordered.`);
+  }
+  return normalized;
+}
+
+export function assertProjectEvidenceAuthority(metadata: AuditProjectMetadata): AuditEvidenceAuthority {
+  const authority = assertEvidenceAuthority(metadata.evidenceAuthority, 'project metadata evidenceAuthority');
+  const bypassed = metadata.tlsPolicy === 'ignored-for-development' || metadata.tlsPolicy === 'preview-bypass';
+  const recordsBypass = authority.reasons.includes('development-certificate-bypass');
+  if (bypassed !== recordsBypass) {
+    throw new Error('Project TLS policy and Evidence Authority certificate-bypass reason must agree.');
+  }
+  if (metadata.mode === 'single-site'
+    && metadata.deploymentRole === 'production'
+    && metadata.tlsPolicy !== 'strict') {
+    throw new Error('Production-role Single-site project metadata must enforce strict certificates.');
+  }
+  return authority;
+}
 
 export function createEvidencePolicy(mode: AuditEvidenceMode, rationale: string): AuditEvidencePolicy {
   const normalized = rationale.replace(/\s+/g, ' ').trim();

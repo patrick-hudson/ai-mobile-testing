@@ -4,6 +4,12 @@
 
 Find visual, behavioral, content, accessibility, reliability, and release-engineering defects before the redesigned quitting7oh.org replaces production. Production is evidence about the current reader experience; the beta is the launch candidate. Existing production defects remain visible as baseline findings, while the release decision is driven by candidate failures and explicit cross-environment migration/parity contracts.
 
+## Single-site Audit mode
+
+Single-site Audit tests one explicitly identified Preview or Production deployment without inventing a second origin. It executes only cases with reviewed standalone Product Oracles; comparison-only migration and parity contracts remain outside the mode, while missing required standalone variants or target coverage remain explicit Coverage Gaps. `FULL` means the complete versioned Single-site profile, and any plugin, audit, area, or target narrowing is `TARGETED`.
+
+Its final report keeps advisory Site Health, Coverage, manual acceptance, Visual Review, Evidence Authority, and Pipeline Integrity independent. A passing automated check cannot close a Coverage Gap or manual row, a visual disposition cannot erase a deterministic Finding, and a Preview TLS bypass makes the evidence non-authoritative. Single-site results provide diagnostic and review evidence only: they neither authorize nor block promotion. The comparative pass and release rules below remain unchanged.
+
 ## Test layers
 
 1. **Environment contracts** verify HTTPS, response types, redirects, cache/security headers, data endpoints, canonical and robots intent, sitemap coverage, static assets, and custom error behavior.
@@ -72,18 +78,24 @@ The target catalog contains provider-ready metadata for current and previous rea
 
 Review the portal in this order:
 
-1. confirm selected origins, profile, plugins/audits, and projects;
-2. watch live logs for container, browser, response, and runtime problems;
-3. inspect all candidate P0/P1 failures and their videos/traces first;
-4. compare corresponding production evidence to distinguish regression from baseline;
-5. inspect P2/P3 and incomplete/manual rows;
-6. review advisory AI findings against source evidence;
-7. complete physical device/screen-reader checks;
-8. record owners, waivers, and final launch decision.
+1. start on Overview and inspect the ordered Product Risk queue; an empty queue is a factual index result, not release approval;
+2. inspect Run Trust beside it for coverage, evidence authority, evidence completion, pipeline integrity, finalization, manual acceptance, source time, and limitations;
+3. open active work or the latest terminal run in its stable run workspace and verify execution, activity, and connection state independently;
+4. confirm selected origins, profile, plugins/audits, projects, and the exact run identity before acting;
+5. watch bounded live logs for container commands, browser activity, HTTP responses, FFmpeg work, source, shard/stage, redaction, and freshness;
+6. inspect candidate P0/P1 findings and their interaction videos, static screenshots, traces, and exact attempts first;
+7. compare corresponding production evidence to distinguish regression from baseline, then inspect P2/P3 and incomplete/manual rows;
+8. review advisory AI findings against their source evidence, complete physical-device/screen-reader checks, and record owners, waivers, and the final launch decision.
+
+Overview, Runs, Findings, and Evidence use bounded server projections rather than client-side report fan-out. Filters, sorts, selections, inspectors, reload, and back/forward must preserve canonical safe URL state. A selected record excluded by a filter remains identified as outside the current page rather than silently switching. Each async region owns cancellation, request identity, freshness, retry, and stale-data presentation; a permission error, offline state, stale cursor, partial source, and unavailable source are distinct. Counts open exact collections, while computed values disclose population, formula, source, timestamp, and completeness. Media bytes are requested only after selecting one evidence record.
+
+The deterministic portal snapshot suite covers the approved dense desktop hierarchy at 1280, 1440, and 1920 pixels plus the narrow emergency fallback. Baselines are updated only with `npm run portal:e2e:update-snapshots` in Docker and only after inspecting the images; update mode is never a way to dismiss a mismatch. The subsequent normal Docker suite must pass with no page-level horizontal overflow, clipped focus/action state, serious or critical axe violation, or missing truth dimension.
 
 ## Visual gallery acceptance
 
 The gallery reviews logical test evidence, not storage copies. Posters, raw copies, rejected helper recordings, blank/static/short videos, and transient files never become primary items. Validated action-and-response recordings are videos; placement, typography, and other static visual assertions remain screenshots. A test retry/project/attempt keeps its own stable context even when media bytes are shared.
+
+The first usable live gallery view is bounded. Comparative and Single-site adapters load a head contract plus one page; a deep link resolves its selected identity and a bounded surrounding window without downloading preceding pages. Single-site cursors and anchors bind publication, baseline-store, review, filter, and ordering revisions. Revision mismatch, superseded filter/search work, and aborted detail/media requests fail locally and cannot overwrite the final selection. Continuation occurs only near a loaded boundary, while queue position and an excluded deep-linked selection remain explicit. Media bytes still load only for the selected logical item.
 
 Portal and archive use the exact shared reducer, keyboard contract, responsive breakpoints, and CSS. Left/Right moves one item without wrapping; Up/Down moves test groups while preserving the closest local member; `[`/`]` changes comparison members; Space controls only a selected video while the viewer owns focus; `I`, `F`, Escape, and `?` control context, fullscreen, one-layer unwind, and help. Modified, editable, composing, dialog-owned, and native-media events are suppressed. Mobile controls are at least 44 × 44 CSS pixels, reduced motion removes nonessential animation, and focus returns to the opener after panels/dialogs close.
 

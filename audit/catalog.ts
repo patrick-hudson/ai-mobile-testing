@@ -1,9 +1,14 @@
-import type { AuditArea, AuditDefinition, AuditSeverity } from './types.js';
+import type {
+  AuditArea,
+  AuditDefinition,
+  AuditSeverity,
+  AuditSingleSiteClassification,
+} from './types.js';
 import { createEvidencePolicy, evidenceKindsForPolicy } from './evidence-policy.js';
 
 const INTERACTION_VIDEO_RATIONALES = new Map<string, string>([
   ['SHELL-001', 'Dismiss the scheduling notice, reload, and show that the notice remains dismissed.'],
-  ['SHELL-003', 'Move keyboard focus to the skip link, activate it, and show focus reaching main content.'],
+  ['SHELL-003', 'Move keyboard focus to the skip link, activate it, and show the main fragment becoming the next sequential-focus entry point.'],
   ['SHELL-005', 'Scroll a long page, activate Back to top, and show the viewport returning to the beginning.'],
   ['NAV-001', 'Open, operate, and close the mobile guide drawer while showing focus and scroll restoration.'],
   ['NAV-002', 'Expand and collapse mobile guide categories and show their links and current-page state responding.'],
@@ -18,13 +23,13 @@ const INTERACTION_VIDEO_RATIONALES = new Map<string, string>([
   ['SEARCH-002', 'Enter a known query and show relevant search results and excerpts responding.'],
   ['SEARCH-003', 'Use keyboard result navigation and show Enter opening the active destination.'],
   ['SEARCH-004', 'Apply search filters and show the result set and URL state updating together.'],
-  ['SEARCH-005', 'Enter a query with no results and use the recovery suggestions that appear.'],
+  ['SEARCH-005', 'Enter one absent token, verify the no-result state, then replace it with a known treatment and use the recovered results.'],
   ['SEARCH-006', 'Enter a search while its index request fails and show the usable sitemap fallback.'],
   ['ENV-007', 'Open an unknown URL, use its accessible search, and activate a known recovery destination.'],
   ['HOME-001', 'Activate a primary homepage starting path and show the intended guide destination loading.'],
   ['CONTENT-007', 'Scroll progressively through long references and show that reading and navigation remain responsive.'],
   ['CALC-001', 'Select calculator inputs and show derived dose totals updating coherently.'],
-  ['CALC-002', 'Enter boundary and malformed calculator values and show visible safe handling.'],
+  ['CALC-002', 'Enter boundary and malformed calculator drafts and show exact preserve, reject, restore, and clamp responses.'],
   ['CALC-003', 'Configure a custom taper and show the generated day-by-day schedule responding.'],
   ['CALC-004', 'Change calculator inputs at a mobile viewport and show responsive output remaining usable.'],
   ['CALC-005', 'Change, reload, and reset calculator inputs and show persistence followed by deliberate clearing.'],
@@ -61,6 +66,43 @@ const STRUCTURED_DATA_AUDIT_IDS = new Set([
   'ENV-003', 'ENV-004', 'ENV-008', 'CONTENT-003', 'PERF-001', 'SEO-002',
 ]);
 
+const COMPARISON_ONLY_AUDIT_IDS = new Set([
+  'ENV-003',
+  'CONTENT-008',
+]);
+
+const STANDALONE_REQUIRED_AUDIT_IDS = new Set([
+  'CONTENT-002',
+]);
+
+const STANDALONE_ORACLE_OVERRIDES = new Map<string, string>([
+  ['ENV-001', 'The configured deployment origin returns usable, meaningful HTML over HTTPS.'],
+  ['ENV-002', 'Every reviewed route for the audited deployment returns successful HTML with the expected canonical route.'],
+  ['ENV-005', 'The confirmed Deployment Role has the intended indexing policy and internally consistent canonical metadata.'],
+  ['ENV-006', 'The audited deployment returns the required security headers and long-lived caching for immutable assets.'],
+  ['ENV-008', 'All first-party assets and JSON endpoints for the audited deployment load with correct status and content type.'],
+  ['SEO-002', 'The audited deployment sitemap contains only live canonical pages and excludes drafts, aliases, and error pages.'],
+]);
+
+function singleSiteDefinitionMetadata(
+  id: string,
+  expected: string,
+): Pick<AuditDefinition, 'singleSiteClassification' | 'standaloneOracle'> {
+  const classification: AuditSingleSiteClassification = COMPARISON_ONLY_AUDIT_IDS.has(id)
+    ? 'comparison-only'
+    : STANDALONE_REQUIRED_AUDIT_IDS.has(id)
+      ? 'standalone-required'
+      : 'standalone-compatible';
+  if (classification !== 'standalone-compatible') return { singleSiteClassification: classification };
+  return {
+    singleSiteClassification: classification,
+    standaloneOracle: {
+      id: `${id}:standalone`,
+      expected: STANDALONE_ORACLE_OVERRIDES.get(id) ?? expected,
+    },
+  };
+}
+
 function coreEvidencePolicy(id: string, expected: string): AuditDefinition['evidencePolicy'] {
   const actionRationale = INTERACTION_VIDEO_RATIONALES.get(id);
   if (actionRationale) return createEvidencePolicy('interaction-video', actionRationale);
@@ -94,6 +136,7 @@ function audit(
     releaseBlocking: severity === 'P0' || severity === 'P1',
     evidence: evidenceKindsForPolicy(evidence, evidencePolicy),
     evidencePolicy,
+    ...singleSiteDefinitionMetadata(id, expected),
     manual,
   };
 }
@@ -110,14 +153,14 @@ export const AUDIT_CATALOG: AuditDefinition[] = [
 
   audit('SHELL-001', 'shell', 'Scheduling notice', 'Readers see current scheduling information without losing access to the page.', 'The notice renders, links correctly, dismisses, and remains dismissed after reload.', 'P1'),
   audit('SHELL-002', 'shell', 'Responsive header', 'Primary actions remain reachable at every supported width.', 'Header controls follow their documented breakpoint behavior without clipping or overlap.', 'P0'),
-  audit('SHELL-003', 'shell', 'Skip link', 'Keyboard users can bypass repeated navigation.', 'The skip link becomes visible on focus and moves focus to main content.', 'P1', ['video', 'screenshot', 'axe', 'json']),
+  audit('SHELL-003', 'shell', 'Skip link', 'Keyboard users can bypass repeated navigation.', 'The skip link becomes visible, targets visible main content, and makes its first control the next Tab stop.', 'P1', ['video', 'screenshot', 'axe', 'json']),
   audit('SHELL-004', 'shell', 'Footer navigation', 'Readers can reach urgent help, site information, and community destinations.', 'Footer links, labels, and external-link behavior are correct on mobile and desktop.', 'P1'),
   audit('SHELL-005', 'shell', 'Back to top', 'Long articles provide a reliable escape back to the beginning.', 'The control appears after meaningful scroll, returns to the top, and respects reduced motion.', 'P2'),
   audit('SHELL-006', 'responsive', 'Horizontal overflow guard', 'No reader must pan sideways to read ordinary pages.', 'Document width never exceeds viewport width except inside intentional scroll containers.', 'P0', ['video', 'screenshot', 'json']),
 
   audit('NAV-001', 'navigation', 'Mobile guide drawer', 'Mobile readers can browse the complete guide without losing their place.', 'Drawer opens, traps focus, closes by all expected methods, restores focus, and preserves scroll.', 'P0', ['video', 'screenshot', 'axe', 'json']),
   audit('NAV-002', 'navigation', 'Mobile category expansion', 'All category pages remain discoverable on a phone.', 'Category groups expand and collapse, current location is exposed, and links navigate correctly.', 'P1'),
-  audit('NAV-003', 'navigation', 'Desktop sidebar persistence', 'Desktop readers can control reading space without layout jumps.', 'Collapse state persists and toggling does not move document scroll or focus unexpectedly.', 'P1'),
+  audit('NAV-003', 'navigation', 'Desktop sidebar persistence', 'Desktop readers can control reading space without losing their place.', 'Collapse state persists and the same visible reading anchor remains in view within a user-meaningful movement tolerance.', 'P1'),
   audit('NAV-004', 'navigation', 'Breadcrumb navigation and sharing', 'Readers know where they are and can copy a stable link.', 'Breadcrumb links navigate and copy produces the canonical page URL with confirmation.', 'P1'),
   audit('NAV-005', 'navigation', 'Table of contents', 'Readers can navigate long medical references reliably.', 'TOC links align headings below sticky chrome and active state tracks reading position.', 'P1'),
   audit('NAV-006', 'navigation', 'Heading permalinks', 'Readers can share a precise section.', 'Heading links update the hash, copy the URL, and announce success without a scroll jump.', 'P2'),
@@ -133,7 +176,7 @@ export const AUDIT_CATALOG: AuditDefinition[] = [
   audit('SEARCH-002', 'search', 'Search result quality', 'Queries return relevant, understandable destinations.', 'Known terms return expected pages, highlights, categories, and excerpts.', 'P0'),
   audit('SEARCH-003', 'search', 'Search keyboard navigation', 'Search can be completed without a pointer.', 'Arrow keys move through results, Enter opens the active result, and Escape behaves by context.', 'P1'),
   audit('SEARCH-004', 'search', 'Search page filters', 'Readers can narrow a broad result set.', 'Topic and result-type filters combine correctly and persist in the URL.', 'P1'),
-  audit('SEARCH-005', 'search', 'No-result guidance', 'A failed query does not become a dead end.', 'No-result copy and suggestions appear and suggested searches are usable.', 'P2'),
+  audit('SEARCH-005', 'search', 'No-result guidance', 'A failed query does not become a dead end.', 'No-result guidance appears and replacing the query with a known treatment produces named, navigable results.', 'P2'),
   audit('SEARCH-006', 'reliability', 'Search failure fallback', 'A data-loading problem still leaves a route to content.', 'A failed index request shows the sitemap fallback and no indefinite spinner.', 'P1', ['video', 'screenshot', 'network', 'json']),
 
   audit('HOME-001', 'homepage', 'Homepage starting paths', 'A reader in distress can quickly choose the right next step.', 'Primary calls to action and common starting points are present and navigate correctly.', 'P0'),
@@ -153,7 +196,7 @@ export const AUDIT_CATALOG: AuditDefinition[] = [
   audit('CONTENT-008', 'content', 'Content parity ledger', 'Intentional redesign edits are distinguished from accidental omissions.', 'Critical headings, safety warnings, and CTA destinations remain present; every missing production heading must match the exact reviewed-difference ledger.', 'P0', ['screenshot', 'json']),
 
   audit('CALC-001', 'calculators', 'Taper defaults and derived totals', 'Calculator defaults produce an internally coherent plan.', 'Defaults and total-daily math match each selected substance.', 'P0'),
-  audit('CALC-002', 'calculators', 'Taper input boundaries', 'Unexpected input cannot create a misleading or broken plan.', 'Blank, decimal, minimum, maximum, and malformed input are handled visibly and safely.', 'P0'),
+  audit('CALC-002', 'calculators', 'Taper input boundaries', 'Unexpected input cannot create a misleading or broken plan.', 'Blank and malformed drafts preserve the committed plan, explicit zero rejects it, and valid or overflowing boundaries produce exact restored or clamped output.', 'P0'),
   audit('CALC-003', 'calculators', 'Taper schedule generation', 'A reader receives mathematically correct day-by-day output.', 'Preset and custom schedules reach the requested jump-off with correct totals and frequency transitions.', 'P0'),
   audit('CALC-004', 'calculators', 'Calculator responsive output', 'Charts and schedules remain readable on a phone.', 'Chart, summary cards, tables, and touch hints render without page-level overflow.', 'P1'),
   audit('CALC-005', 'calculators', 'Calculator persistence and reset', 'Work survives an accidental reload and can be deliberately cleared.', 'Inputs persist per calculator, do not leak between tools, and reset to documented defaults.', 'P1'),
@@ -200,10 +243,10 @@ export const AUDIT_BY_ID = new Map(AUDIT_CATALOG.map((definition) => [definition
 export function pageAuditDefinition(path: string): AuditDefinition {
   return audit(
     `PAGE-${path === '/' ? 'HOME' : path.slice(1).replaceAll('/', '-').toUpperCase()}`,
-    'content',
+    'routes',
     `Page audit: ${path}`,
     'This published destination renders completely and remains usable.',
-    'The route returns valid HTML with one H1, metadata, loaded images, no page overflow, and no runtime failures.',
+    'The exact route returns valid HTML with matching page identity, substantive route-specific content, one H1, metadata, loaded images, diagnosed overflow, and no runtime failures.',
     'P1',
     ['video', 'screenshot', 'network', 'axe', 'json'],
   );

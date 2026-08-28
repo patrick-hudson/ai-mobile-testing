@@ -1,14 +1,24 @@
 # Docker execution and audit portal
 
-The Docker image is the canonical way to run this suite. It pins the Playwright browser image to the same Playwright release used by the project, contains all three browser engines, and writes every result to the host-mounted `artifacts/` directory.
+The Docker image is the canonical way to run this suite. It pins the Playwright browser image to the same Playwright release used by the project and contains all three browser engines. Comparative results use the host-mounted `artifacts/` directory; durable Single-site jobs, immutable finalizations, and copied visual baselines use dedicated Docker named volumes.
 
 ## Start the portal
 
 ```sh
-docker compose up --build portal
+npm run portal
 ```
 
 Open <http://localhost:4173>. The port is bound to localhost by default so the process-launching interface is not exposed to the network.
+
+`npm run portal` runs `docker compose up --build --scale single-site-worker=2 portal single-site-worker single-site-finalizer`. This is the supported complete stack: starting only the `portal` service does not provide a Single-site executor or finalizer. Set `SINGLE_SITE_WORKER_REPLICAS` from 1 through 16 to increase the number of queued jobs that can be claimed concurrently:
+
+```sh
+SINGLE_SITE_WORKER_REPLICAS=4 npm run portal
+```
+
+Replica count increases throughput across jobs; it does not split one job across several workers. Do not scale the portal itself.
+
+The desktop console has stable direct entries: `/` for Overview, `/runs.html`, `/findings.html`, `/evidence.html`, `/new-audit.html`, `/settings.html`, and `/run.html?mode=<comparative|single-site>&run=<id>` for a live workspace. The report and gallery preserve that mode/run identity. Overview is an operational projection, not a new release authority: Product Risk, Run Trust, active work, and the latest terminal run stay independently sourced. Index responses are cursor-bounded and expose source revision, freshness, completeness, limitations, and work performed. Browser code does not scan every retained report or artifact tree to answer a global page.
 
 The portal lets a reviewer:
 
@@ -26,6 +36,8 @@ The portal lets a reviewer:
 
 Run selection, detail loading, artifact enumeration, manual evidence, credential settings, start, and stop operations are asynchronous. Accessible busy states and progress announcements remain visible until each request resolves, and duplicate mutations are disabled while pending. Evidence files are incrementally indexed and server-paged, so a full 1,407-test artifact tree does not force the browser to scan or render tens of thousands of links at once.
 
+The stable run workspace owns exactly one mode-appropriate live transport: comparative runs use bounded resumable SSE and Single-site runs use bounded revision polling. Execution, activity, connection, report/finalization, coverage, Evidence Authority, Pipeline Integrity, and manual acceptance remain separate. Logs disclose the visible bounded window, timestamps, source, stage/shard, commands, HTTP responses, FFmpeg context, freshness, pause/tail state, and redaction. A transport failure freezes durable state and reports reconnection; it cannot mutate the run or imply that server work stopped.
+
 The reviewer report is the browser-safe Long Build Checklist. Report generation writes compact summary, audit-index, and bounded per-audit detail documents into `checklist/data/revisions/<revision>/`, hashes every document in that revision's publication manifest, and makes the set authoritative only with the final atomic `checklist/data/current.json` rename. The report page pins filtered and detail requests to the exact revision returned with its summary; external terminal runs fail evidence integrity if any declared document is missing, substituted, or from another generation. Compatibility mirrors remain at `checklist/data/summary.json`, `checklist/data/audits.json`, and `checklist/data/audits/`, but they are not release-authoritative. The portal enforces 256 KiB, 2 MiB, and 512 KiB limits for the three layers, filters and paginates audits on the server, aborts superseded browser requests, and keeps the DOM bounded to one 25-row page and one audit detail. The 59 MB-class `checklist/manifest.json` is never fetched by the report page; it is offered only as an explicitly large download. Likewise, the recent-log panel is opt-in and capped at 64 KiB while complete persisted log files remain direct evidence downloads.
 
 The general run console also stays bounded: its log endpoint defaults to a 256 KiB UTF-8-safe tail with a hard 1 MiB ceiling and reports each source file's complete size and truncation state. SSE replay is capped at 512 KiB, slow clients receive an overflow notice instead of accumulating an unbounded queue, and the browser batches incoming lines before one DOM update. Large media and traces stream with `Content-Length`, `Accept-Ranges`, and HTTP 206 support instead of being buffered in memory.
@@ -34,17 +46,19 @@ Known external-run reads use stale-while-revalidate behavior: the portal returns
 
 Evidence labels reflect the capture policy instead of implying every check has a video. Action-to-response interactions may show a playable video and FFmpeg poster with their recorded rationale. Static visual verification uses screenshots. Each audit displays the actual video and screenshot counts available for that run.
 
+The live gallery does not load an entire Single-site inventory before it becomes usable. It requests the immutable head and one bounded page, resolves an out-of-window deep link through a revision-bound anchor with queue position, and loads next/previous windows on demand. Publication, baseline-store, review, filter, and order revisions bind those reads; stale cursors and superseded selection requests cannot commit. The generated archive is a separate immutable versioned asset/data bundle with no live API, credential, EventSource, saved-view, stop, purge, or disposition dependency. Runtime N accepts the documented legacy N-1 descriptor, rejects unsupported future or mismatched bundles, and remains usable through direct `file://` with networking unavailable.
+
 Every launch receives an isolated directory at `artifacts/runs/<run-id>/`. Its `run.json` records the targets, selection, browser projects, safe command arguments, progress, timestamps, and exit result. `logs/runner.log` preserves the complete timestamped process output. The test reporters write their evidence into the same run directory through `AUDIT_ARTIFACT_DIR`.
 
 Portal status has three independent parts. `pipeline.status` says whether browser execution and required evidence processing completed. `release.decision` preserves the checklist result. `executionProvenance` and `reviewReasons` say whether that result is eligible for final signoff. A portal-launched release always records `portal-single-container` / `review-evidence-only` provenance, so even a `READY` checklist becomes `review-required`; final authority comes only from a new-ID sharded run with the isolated performance container. TLS bypass, flaky checks, smoke, and reduced scope also withhold signoff. The browser process exit code remains visible as diagnostic data, but it cannot overrule the checklist or provenance.
 
 After Playwright exits—whether its checks pass or fail—the portal runs a visible evidence pipeline: video hashing/poster indexing, optional AI evidence review, then a final checklist rebuild. That rebuild discovers each FFmpeg-generated sibling `*-poster.jpg`, copies it into the checklist evidence directory, records its size and checksum, uses it as the video preview, and exposes a separate poster link. Videos without a generated poster remain playable and linked exactly as before. Each command has a persisted lifecycle record with start/end time, duration, exit status, and live stage-prefixed output. A required video/report failure produces the distinct non-green `evidence-failed` result. AI remains advisory and cannot turn a failed deterministic audit green.
 
-The portal does not accept commands or test paths. It starts the local Playwright executable directly—without a shell—and only after checking projects, profiles, audit areas, and audit IDs against allowlists loaded from the repository. Target URLs must be plain HTTP(S) origins without credentials, paths, query strings, or fragments. Only one run is allowed at a time by default; a synchronous reservation closes concurrent-launch races before filesystem work begins. Runner and lifecycle append streams must report that they opened before registration/spawn proceeds, and retain error handlers afterward; stream, persistence, or spawn-setup failure becomes a terminal failure without holding capacity. Manual rebuild streams use the same open/error contract. Every request first crosses a loopback/explicit Host allowlist, and every mutation also enforces same-origin browser metadata. This blocks DNS-rebinding requests even when an attacker supplies an Origin matching their forged Host. `PORTAL_ALLOWED_HOSTS` may add an intentional local hostname; do not expose the portal as a shared unauthenticated service.
+The portal does not accept commands or test paths. It starts the local Playwright executable directly—without a shell—and only after checking projects, profiles, audit areas, and audit IDs against allowlists loaded from the repository. Target URLs must be plain HTTP(S) origins without credentials, paths, query strings, or fragments. Only one run is allowed at a time by default; a synchronous reservation closes concurrent-launch races before filesystem work begins. Runner and lifecycle append streams must report that they opened before registration/spawn proceeds, and retain error handlers afterward; stream, persistence, or spawn-setup failure becomes a terminal failure without holding capacity. Manual rebuild streams use the same open/error contract. Every request first crosses a loopback/explicit Host allowlist, and every mutation additionally requires the root-derived operator capability plus same-origin browser metadata. On startup, append the operator unlock path from the portal service log to the published portal origin and open it once; it exchanges the capability for a process-local HttpOnly, strict same-site cookie and immediately removes the token from the address bar. Logging a path rather than a fixed URL keeps custom Compose host-port mappings truthful. Workers never receive that capability. This blocks co-resident workers, DNS rebinding, and cross-origin artifact documents from controlling credentials, runs, or purge. `PORTAL_ALLOWED_HOSTS` may add an intentional local hostname; do not expose the portal as a shared service.
 
 Manual uploads are serialized with attestations and checklist rebuilds per run, so concurrent requests return `409` instead of overwriting `manual-evidence.json`. PNG, JPEG, WebM, and MP4 declarations are checked against their byte signatures, probed for a visual stream and valid dimensions, and decoded through the first frame under a bounded timeout before the file is renamed or can support a passing attestation. Invalid and interrupted temporary/final files are removed. Artifact responses open the contained final file with no-follow semantics before headers, stream from that descriptor with range support, and handle disappear/stream errors without crashing the portal.
 
-Installed test suites come only from the generated, validated `audit/plugins.generated.json` registry. Selecting a suite merges and deduplicates its allowlisted spec paths, constrains the selected browser projects to the plugin's supported-project list, and builds an escaped audit-ID grep from that suite's definitions. A shared spec can therefore serve several suites without accidentally executing its sibling checks. The portal never accepts a spec path from the browser.
+Installed test suites come only from the generated, validated `audit/plugins.generated.json` registry. The registry includes the 102 expanded `PAGE-*` route checks, so those checks appear individually in the portal instead of existing only inside an implicit loop. Selecting a suite merges and deduplicates its allowlisted spec paths, constrains the selected browser projects to the plugin's supported-project list, and builds an escaped audit-ID grep from that suite's definitions. A shared spec can therefore serve several suites without accidentally executing its sibling checks. The portal never accepts a spec path from the browser.
 
 ### Optional AI evidence review
 
@@ -52,9 +66,134 @@ AI review is opt-in for each portal run. Open Claude settings in the portal to s
 
 Compose deliberately does not forward `ANTHROPIC_API_KEY`: container environment/configuration is inspectable and frequently captured in diagnostics. Save the key in the portal instead. A separately managed deployment may still inject an environment key directly into the supervisor, but operators must treat its container configuration as secret-bearing.
 
-The root portal supervisor owns the mode-0700 vault. Playwright and video processing run as the image's non-root `pwuser`; AI review runs as non-root `aiworker`; and checklist generation runs as a distinct non-root `reportworker`. Every worker environment removes the vault path and every key source. `aiworker` shares only the completed run-artifact group and cannot read the vault or inspect browser processes as the same UID. The supervisor sends the selected key once over an anonymous stdin pipe, so it does not appear in the AI worker environment. Before any request, the AI worker freezes bounded regular evidence files through contained canonical paths, rejects every symbolic-link component, and opens the final file with no-follow semantics. After browser, media, and AI work, the supervisor removes symlinks, rejects hard links and non-regular artifacts, makes the run tree read-only to worker identities, gives `reportworker` one private staging directory, and atomically publishes the completed checklist. Credential settings and AI launch are disabled unless all three worker identities are established. A portal-saved key is accepted only by the dedicated same-origin credential endpoint and is never echoed. No key reaches a run manifest, event stream, log, command summary, report, or artifact. The default model is `claude-sonnet-5`; override it with `ANTHROPIC_MODEL` at container startup or in the validated model field for one launch. `AI_REVIEW_DRY_RUN=1` exercises the stage and output contract without an API request.
+The root portal supervisor owns the mode-0700 vault. Playwright and video processing run as the image's non-root `pwuser`; AI review runs as non-root `aiworker`; and checklist generation runs as a distinct non-root `reportworker`. Every worker environment removes the vault path, operator capability, and every key source. `aiworker` shares only the completed run-artifact group and cannot read the vault or inspect browser processes as the same UID. The supervisor sends the selected key once over an anonymous stdin pipe, so it does not appear in the AI worker environment. Artifact downloads walk from a pinned run-directory descriptor and open every component with no-follow semantics, so an ancestor rename cannot redirect a root portal read into the vault. Before any request, the AI worker likewise freezes bounded regular evidence files through contained canonical paths. After browser, media, and AI work, the supervisor removes symlinks, rejects hard links and non-regular artifacts, makes the run tree read-only to worker identities, gives `reportworker` one private staging directory, and atomically publishes the completed checklist. Credential settings and AI launch are disabled unless all three worker identities are established. A portal-saved key is accepted only by the operator-authorized credential endpoint and is never echoed. No key reaches a run manifest, event stream, log, command summary, report, or artifact. The default model is `claude-sonnet-5`; override it with `ANTHROPIC_MODEL` at container startup or in the validated model field for one launch. `AI_REVIEW_DRY_RUN=1` exercises the stage and output contract without an API request.
 
 The review appears under `ai-review/` as `review.json`, `index.html`, `review.md`, and a provider-safe lifecycle log. The portal displays only allowlisted telemetry: model, response status, latency, and token usage. It does not display request/response bodies or headers.
+
+## Single-site Audit operations
+
+Single-site Audit tests one quitting7oh deployment with standalone Product Oracles; it does not need a production/candidate pair. In the portal, choose **Audit one site**, enter an HTTP(S) origin, confirm its **Preview** or **Production** deployment role, choose the certificate policy, and select **Check site and preview coverage**. Preflight is side-effect-free and creates no run. It verifies quitting7oh identity and shows the proposed targets, definitions, executable cases, comparison-only exclusions, and Coverage Gaps. Launch repeats preflight and compilation atomically so a stale preview cannot silently become a job.
+
+Choose scope deliberately:
+
+- `FULL` is the complete versioned Single-site profile with all default neutral targets and no plugin, audit, area, or target narrowing.
+- `TARGETED` is a selected subset. Filtering by plugin, audit ID, area, or target is targeted evidence even if every selected check passes.
+
+The default Single-site matrix is mobile Chromium, desktop Chromium, mobile WebKit, tablet WebKit, and desktop Firefox. The target picker also exposes reviewed opt-in iPhone/iOS, Pixel/Android, Galaxy/Android, Edge-compatible Chromium, and capability-gated branded Edge profiles. These mobile profiles are Docker browser emulations, not physical iOS, Mobile Safari, Android Chrome, or real devices; required physical-device and assistive-technology checks remain manual.
+
+The run page follows durable execution state, worker lease/activity, last event, bounded live logs, finalizer progress, report publication, and advisory AI independently of the browser's SSE connection. A dropped browser connection does not stop work. Once finalized, open the Single-site report at `/report.html?mode=single-site&run=<run-id>` and the evidence workbench at `/gallery.html?mode=single-site&run=<run-id>`.
+
+The report does not collapse different kinds of truth into one green mark:
+
+| Dimension | Meaning |
+| --- | --- |
+| Site Health | `HEALTHY`, `FINDINGS`, or `INCOMPLETE` for the executed automated scope. A required execution, action video, media stage, or report-integrity failure yields `INCOMPLETE`. It is advisory and never authorizes promotion. |
+| Scope | Always `FULL` or `TARGETED`; a targeted `HEALTHY` verdict describes only that subset. |
+| Coverage | `COMPLETE`, `GAPS`, or `UNKNOWN`, independently reporting missing standalone oracles, executable variants, targets, and route limitations. |
+| Manual acceptance | Human-only outstanding, passed, failed, or blocked work. Automation and AI cannot complete it. |
+| Visual Review | `UNCHANGED`, `CHANGED`, or human-dispositioned `REVIEWED` for compatible same-site baselines, plus explicit absent, incompatible, and unavailable states. It routes visual drift to review and never changes a deterministic Finding, Coverage, or Site Health. |
+| Evidence Authority | Authoritative only when the deployment revision and certificate policy support it. Preview certificate bypass makes the run non-authoritative. |
+| Pipeline Integrity | Whether evidence collection, FFmpeg processing, immutable publication, and report generation completed safely. |
+
+Comparison-only migration mappings and production/candidate content-parity definitions are recorded as outside Single-site mode; they are not run against one origin and do not masquerade as Coverage Gaps. Route discovery is bounded and source-attributed, so undiscovered or unsupported route coverage remains visible as a limitation.
+
+### Command launch
+
+Keep `npm run portal` running, then submit a job from a second terminal through the portal container so it uses the same durable named volume:
+
+```sh
+docker compose exec portal node scripts/run-single-site.mjs \
+  --queue-root /var/lib/ai-mobile-testing/jobs \
+  --url https://beta.quitting7oh-org.pages.dev \
+  --role preview \
+  --scope FULL
+```
+
+The complete command contract is:
+
+```text
+node scripts/run-single-site.mjs --queue-root <path> \
+  (--launch <launch.json> | --url <origin> --role <preview|production> \
+  [--certificate-policy strict|preview-bypass] [--scope FULL|TARGETED] \
+  [--targets id,...] [--plugins id,...] [--audits id,...] [--areas name,...] \
+  [--ai-review model-id] [--idempotency-key key])
+```
+
+`AUDIT_JOB_QUEUE_ROOT` may supply `--queue-root`. Omitting `--targets` selects the complete default Single-site target profile. Omitting `--scope` derives `TARGETED` when plugin, audit, or area filters are present and otherwise derives `FULL`; set it explicitly in automation. `--launch` consumes a previously prepared, validated launch document instead of performing a direct URL preflight. The adapter prints accepted preflight/coverage and created-or-reused job JSON, then returns; execution and finalization continue asynchronously in the pools. `--ai-review` opts that run into the named advisory model, but the portal supervisor still needs an available saved credential or `AI_REVIEW_DRY_RUN=1`.
+
+### Reproducible beta proofs
+
+With the complete portal, worker, and finalizer stack running, these commands submit named beta scenarios, print accepted coverage, follow durable queue events and finalization state, and finish with the exact report and gallery links:
+
+```sh
+npm run single-site:beta:smoke
+npm run single-site:beta:targeted
+npm run single-site:beta:full
+npm run single-site:beta:baseline-follow-up
+```
+
+The smoke proof covers interaction contracts on mobile Chromium and the desktop `CONTENT-001` named visual capture required for the baseline workflow. The targeted proof covers navigation, search, and calculators on mobile and desktop Chromium. The full proof uses the complete versioned Single-site target profile. Before the baseline follow-up proof, inspect and approve the eligible desktop `CONTENT-001` screenshot from the smoke run in the gallery; the follow-up intentionally repeats the same Preview role, desktop target, Audit Definition, and rendering identity so compatible comparison is possible. Baseline approval remains an explicit human action and is never performed by the proof command.
+
+Each proof defaults to strict certificates. Pass extra arguments after `--` to choose the bounded Preview exception or a different timeout, for example `npm run single-site:beta:smoke -- --certificate-policy preview-bypass --timeout-minutes 120`. The origin must also appear exactly in `AUDIT_PREVIEW_TLS_BYPASS_ALLOWLIST`; bypass evidence remains non-authoritative.
+
+The terminal `proof-finished` event includes a compact receipt that binds the named scenario and canonical run scope to runner/source, preflight, coverage, route-inventory, and reconstructed preview revisions; the terminal queue result and fencing token; the exact authoritative worker-publication attempt and digests; finalization/report/gallery/media/visual publication digests; the proof command's result mapping derived from terminal finalization status; and report/gallery URLs. The `command.exitCode` field is that deterministic mapping (`complete` maps to `0`, every other terminal finalization maps to `2`), not an independently observed operating-system process exit.
+
+Before that event is printed, the content-addressed receipt is atomically published and read back as `<single-site-finalization>/<run-id>/beta-proof-receipt.json`. Verification rereads the digest-bound queue job and canonical worker input, validates its coverage and route-inventory documents, reconstructs the accepted preview digest, rederives the durable finalization from the queue, and opens every referenced report, gallery, media, and visual publication. A missing or corrupt referenced publication, or a recomputed status/receipt that disagrees with the durable finalization, is rejected. An identical restart reuses the receipt, while older finalizations with no receipt remain readable as receipt-absent. Optional revision fields remain `null` when the corresponding older authority did not publish them. The receipt caps the displayed publication list and includes a digest and count for the complete current set; it never copies event logs, result reasons, evidence bodies, credentials, or AI payloads.
+
+After the named proofs finish, generate a bounded machine-readable closeout manifest from their durable job IDs. The generator re-verifies every receipt and publication before copying report truth and gallery/media/visual counts; it marks Single-site evidence advisory and non-blocking and calls out that the embedded runner revision is not an OCI image ID:
+
+```sh
+node scripts/single-site-completion-evidence.mjs \
+  --jobs <smoke-job>,<targeted-job>,<full-job>,<follow-up-job> \
+  --output /work/single-site-completion-evidence.json
+```
+
+The generated manifest deliberately does not claim that a baseline approval or `REVIEWED` disposition occurred. Record the exact baseline-store revision/history digest, baseline identity/media, and review-store event separately when closing that human workflow.
+
+After approving the source screenshot and completing the compatible follow-up run, generate that separate digest-bound human-workflow record. It re-verifies both run receipts, the source eligibility publication, baseline history and copied media bytes, the follow-up comparison, and the optional review history. A compatible `UNCHANGED` or `CHANGED` result is sufficient; `REVIEWED` is included only when a matching disposition actually exists:
+
+```sh
+node scripts/single-site-baseline-follow-up-evidence.mjs \
+  --source-job <source-job> \
+  --follow-up-job <follow-up-job> \
+  --output /work/single-site-baseline-follow-up-evidence.json
+```
+
+The emitted record contains both receipt digests, baseline `storeRevision` and `historyDigest`, the exact baseline identity and media SHA-256, the approval event, the follow-up current/baseline/diff SHA-256 values and comparison status, plus `reviewRevision`, review `historyDigest`, and event when the item is `REVIEWED`.
+
+### Worker and finalizer boundaries
+
+The `single-site-worker` replicas run Playwright as `pwuser` and claim durable jobs from the `single-site-jobs` volume. The `single-site-finalizer` consumes sealed attempts, processes videos with FFmpeg, builds a contained processed copy, computes visual comparisons, and crash-safely publishes immutable report and gallery revisions to `single-site-finalizations`. Neither service receives the `portal-secrets` volume or a Docker socket. Visual baseline media is copied independently into `single-site-baselines`.
+
+`AUDIT_QUEUE_POLL_MS` controls both pools' idle polling interval from 100 through 60000 milliseconds; the default is `1000`. More worker replicas improve throughput for multiple jobs. Keep `single-site-finalizer` at one replica: the current pool safely verifies/reuses immutable output after restart, but it does not claim a per-job finalization lease for active/active replicas. The finalizer is a separate service so browser work and evidence publication recover independently, not so one run is concurrently published by several containers.
+
+### Same-site visual baselines and Finding waivers
+
+The gallery compares only exact compatible identities: deployment role, route, target, viewport, theme, audit definition, named capture point/state, and rendering-contract fingerprint. A completed eligible screenshot can be approved; an active baseline can later be replaced, revoked, or have retained media deleted. Baselines never advance automatically.
+
+- No compatible baseline yields an `absent` visual state; the run can still complete and the current screenshot remains reviewable.
+- A rendering-contract mismatch yields `incompatible`, not `CHANGED`.
+- An eligible difference yields `CHANGED`; an exact match yields `UNCHANGED`. A reviewer may record either an accepted-change or known-defect disposition with a required rationale and exact `REVIEW <item-id>` confirmation. The append-only review record is bound to the exact run, item, comparison, active baseline media, and store revision. A stale baseline is rejected and must be reloaded before review; successful disposition yields `REVIEWED` without changing deterministic Findings, Site Health, Coverage, or the sealed run publication.
+- Approving or replacing evidence that has an unresolved Finding requires a written `findingWaiverReason`. The waiver accepts that image as a baseline only; it does not remove the Finding or change Site Health.
+
+Mutation dialogs preview the exact identity and require the displayed phrase: `APPROVE <evidence-id>`, `REPLACE <baseline-id> <evidence-id>`, `REVOKE <baseline-id>`, or `DELETE <baseline-id>`. Approval copies media into the independent baseline volume, records append-only provenance and digests, and does not modify repository screenshot expectations. Deleting retained media preserves the tombstoned baseline history. There is currently no automatic age-based baseline garbage collector; revoke or delete retained media explicitly according to the team's retention policy.
+
+### Retention and purge
+
+Single-site jobs, finalizations, and baselines are Docker named-volume data, not files under `artifacts/`. Back them up or export required evidence before Docker volume removal. There is currently no automatic age-based run retention policy.
+
+To reclaim a terminal Single-site run, choose **Purge run and evidence** and type `PURGE <run-id>` exactly. Active work is refused. Purge validates the direct job/finalization children, symlinks, mounts, and baseline mutation state, then journals and atomically moves the run into a private quarantine before deletion. It is irreversible. Independently copied active baseline bytes and their lifecycle history survive; links back to the purged source run may no longer resolve.
+
+### Recovery and troubleshooting
+
+- **Run is queued indefinitely:** confirm that `single-site-worker` is running and that `single-site-volume-init` completed successfully. Start the full stack with `npm run portal`, not `docker compose up portal`. Inspect the live portal log and `docker compose logs single-site-worker`.
+- **Browser work finished but no report appears:** confirm `single-site-finalizer` is running and inspect `docker compose logs single-site-finalizer`. A required FFmpeg/media/report failure must publish `INCOMPLETE`, never a stale `HEALTHY` result.
+- **A worker or host restarted:** queued state and sealed attempts persist in the named volume. An expired lease can be reclaimed with a higher fencing token; late output from the old attempt cannot publish. Restart the full stack and follow the retained log rather than resubmitting immediately.
+- **Finalization restarted:** complete immutable publications are verified and reused; incomplete temporary output is safely rebuilt. Sealed worker attempt bytes are never modified by video processing or report generation.
+- **The portal disconnected:** execution state comes from the durable queue, not the SSE connection. Refresh or use the reconnect control; retained logs remain authoritative.
+- **An interrupted purge appears as `evidence-failed`:** retry purge from that retained row. Recovery targets only the journaled quarantine child.
+- **AI was pending or running during restart:** deterministic finalization remains complete, while that AI attempt becomes unavailable and can be retried after a credential is available. The key is not persisted with the run.
+- **A run is non-authoritative:** inspect Evidence Authority. A Preview certificate bypass or unavailable deployment revision is not repaired by passing browser checks; rerun strict against a revision-identifiable deployment for authoritative evidence.
 
 ## Run without the portal
 
@@ -77,6 +216,14 @@ npm run portal:e2e
 ```
 
 That command starts a temporary portal inside the Playwright image, drives it with Chromium, executes a small real candidate audit through the portal, checks live logs and fail-closed release truth, exercises hostile Host/origin requests and concurrent launch/manual mutations, rejects fake media, verifies contained descriptor/range artifact serving and purge stream closure, tests the credential UI with a synthetic key, and removes its temporary secret/run storage afterward. Before every invocation, the runner safely clears only the exact `artifacts/portal-e2e/` directory and starts a truncated server log, so interrupted or failed evidence cannot be mistaken for a prior green run. `portal-e2e-run.json` records the current invocation as running, passed, or failed. Its Playwright report and server log remain under that directory.
+
+Intentional console visual changes use a separate Docker-only update command:
+
+```sh
+npm run portal:e2e:update-snapshots
+```
+
+Inspect every regenerated image at 1280, 1440, 1920, and the narrow fallback before retaining it. Update mode does not satisfy the gate; rerun `npm run portal:e2e` normally and require it to pass against the reviewed files. The container runs as the host artifact owner, so Linux-generated reports and snapshots do not require a root cleanup step.
 
 Run the canonical large-gallery profile independently while iterating:
 
@@ -193,7 +340,7 @@ Use the coordinator command rather than invoking `audit-release-merge` directly.
 
 Keep the portal running while launching this command from another terminal. It watches `artifacts/sharded/` every second and discovers a run as soon as `logs/coordinator.log` appears—before `sharded-run.json` exists. The run detail view follows the Docker build, every functional shard, the aggregate shard stage, the isolated one-worker performance stage, merge preflight, FFmpeg processing, and checklist rebuild; new log lines stream through the same live console used by portal-managed runs. Known-run requests stay responsive through cached snapshots and asynchronous bounded refreshes, and a portal restart restores exact coordinator progress from the heartbeat sidecar before incremental logs catch up. Once `sharded-run.json` is written, the authoritative pipeline and release fields replace inferred state and the completed run remains visible after portal/container restarts. External execution is read-only in the portal: stop active work from the terminal that launched the coordinator. After it reaches a terminal state, its complete sharded evidence directory may be purged from the portal with the same typed confirmation used for portal-managed runs.
 
-Candidate TLS remains strict by default (`CANDIDATE_IGNORE_HTTPS_ERRORS=0`), production is always strict, and the image-baked/development CA flow is unchanged. If the explicit candidate-only development bypass is used, its value is recorded in `sharded-run.json` and printed in the coordinator/shard logs.
+Candidate and production TLS remain strict (`CANDIDATE_IGNORE_HTTPS_ERRORS=0`), and the image-baked/development CA flow handles inspected development traffic. A value of `1` fails before browser launch because Playwright and Chromium expose only context/process-wide bypasses, which cannot enforce the promised exact candidate-origin scope.
 
 ### Memory-constrained hosts and container boundaries
 
@@ -211,7 +358,7 @@ AUDIT_SHARD_TOTAL=8 AUDIT_SHARD_CONCURRENCY=2 AUDIT_SHARD_WORKERS=1 npm run audi
 
 Each running audit container has a 1 GB shared-memory area and its browser processes use additional host memory. More shards and workers primarily trade memory for elapsed time; they do not add audit coverage. Keep `PORTAL_MAX_CONCURRENT_RUNS=1` and `AUDIT_WORKERS=1` when launching from the portal on a constrained machine.
 
-Horizontal portal replicas are not supported. The portal queue, live run registry, and in-flight credential are process-local, while `artifacts/` and the named credential volume are shared storage. Scaling the portal can therefore bypass its concurrency limit and give different replicas incomplete live state. The supported multi-container topology is the shard coordinator above: each audit shard writes a distinct directory, and exactly one merge container creates the authoritative reports after every shard exits.
+Horizontal portal replicas are not supported. The portal live registry and in-flight credential are process-local, while evidence and named volumes are shared storage. Scaling the portal can therefore bypass its concurrency limit and give different replicas incomplete live state. Supported parallelism is the comparative shard coordinator described above and up to 16 Single-site worker replicas across queued jobs. Keep one portal, one Single-site finalizer, and exactly one comparative merge publisher.
 
 The Compose-project-scoped `portal-secrets` volume is a single-deployment trust boundary: it contains both the encrypted credential envelope and its file-protected master key. Compose project names produce independent volumes by default; do not deliberately attach one project's volume to another deployment. Host administrators or any container granted access to that volume must be treated as able to recover the credential. Use a distinct Compose project name, artifact root, and host port for an intentionally independent portal deployment.
 
@@ -241,13 +388,30 @@ PLAYWRIGHT_VERSION=1.62.1 docker compose build --pull portal
 
 The image bakes in this team's public Netskope root CA from `certs/development-ca.crt`, updates the Linux trust store, and exposes it to Node through `NODE_EXTRA_CA_CERTS`. Startup logs confirm the active trust source. This keeps Chromium, Firefox, WebKit, curl, Node requests, and Lighthouse strict while working inside the inspected network.
 
-`CANDIDATE_IGNORE_HTTPS_ERRORS` accepts only `0` or `1` and defaults to `0`. The portal exposes the same policy as an explicit candidate-only checkbox. Playwright configuration fails before browser launch if a portal, direct Compose, or sharded command requests the bypass for the configured production hostname or a protected Quitting7OH production hostname. An allowed development bypass is recorded in `run.json` and live logs and changes otherwise-passing candidate executions to `REVIEW`; it cannot produce a release-ready checklist. CI explicitly forces `0` and runs the negative TLS policy checks inside the built image.
+Comparative `CANDIDATE_IGNORE_HTTPS_ERRORS` accepts only `0` or `1` and defaults to `0`, but `1` is deliberately rejected for every origin. Playwright's `ignoreHTTPSErrors` and Chromium's `--ignore-certificate-errors` apply beyond one origin to redirects and subresources, so labeling either mechanism “candidate-only” would be false. Install the development/Netskope CA instead. The portal keeps the comparative control disabled with that explanation, and CI forces `0` and runs the fail-closed TLS policy checks inside the built image.
+
+Single-site Audit supports an explicitly bounded development exception because only one deployment origin is authoritative. `--certificate-policy preview-bypass` and the portal's Preview bypass option are accepted only when both conditions hold:
+
+1. the operator confirms deployment role `preview`; and
+2. the exact normalized origin is present in comma-separated `AUDIT_PREVIEW_TLS_BYPASS_ALLOWLIST`.
+
+For the shipped beta origin:
+
+```sh
+AUDIT_PREVIEW_TLS_BYPASS_ALLOWLIST=https://beta.quitting7oh-org.pages.dev npm run portal
+```
+
+Production-role Single-site runs always use strict TLS. The allowlist constrains which audited origin may request the exception; Playwright's browser-context bypass can still cover that run's redirects and subresources. The exception therefore does not make invalid certificates trustworthy: it records `development-certificate-bypass`, downgrades Evidence Authority to non-authoritative, and prevents the result from being presented as unqualified healthy promotion evidence. Prefer installing the correct public Netskope/development CA; use bypass only to diagnose an explicitly allowlisted Preview deployment.
 
 ## Durable evidence and permissions
 
 `./artifacts` is bind-mounted to `/work/artifacts`. Back up release-candidate run directories to durable object storage; CI artifacts are useful for review but are not permanent archives. Keep the run manifest with its reports and videos so the evidence retains its target URLs and execution context.
 
-To reclaim local storage, open a terminal-state run in the portal, choose **Purge run and evidence**, and type the displayed `PURGE <run-id>` phrase exactly. The operation asynchronously counts and removes that run's complete directory, then reports files and bytes reclaimed. It is intentionally unavailable while a run is starting, running, stopping, or rebuilding manual evidence. The server resolves the selected run to one exact direct child of `PORTAL_ARTIFACT_ROOT` or `PORTAL_SHARDED_ARTIFACT_ROOT`, rejects broad roots and symlinked run directories, and never follows a browser-supplied filesystem path. Purging is irreversible and is not an archive workflow.
+On Linux and Docker Desktop, the entrypoint aligns `pwuser` with the numeric owner of the artifact bind mount and puts the distinct AI/report workers in that artifact group. The `portal-e2e` service additionally drops from root to the bind mount's numeric owner with a private temporary home, cleared supplementary groups, and `no-new-privs`, so its retained test evidence remains readable and removable by the host user. This avoids host-specific `chown` failures without weakening the root-only credential volume. If a Linux login was newly added to the `docker` group, start a new login shell or run `newgrp docker` before invoking Compose. `npm run docker:identity:self-test` proves real bind ownership, UID/GID collisions, queue collaboration, certificate mounts, and fail-closed root-owned targets.
+
+If a mounted filesystem still refuses ownership transitions, the run records `portable-bind` permission provenance: completed files, subdirectories, and the run root remain read-only to the worker group. The root supervisor temporarily opens only the exact publication or manual-evidence paths it owns, never makes the parent group-writable, and reseals every success, rollback, and error path. The three workers retain distinct UIDs and none can read the mode-0700 vault.
+
+To reclaim local storage, open a terminal-state run in the portal, choose **Purge run and evidence**, and type the displayed `PURGE <run-id>` phrase exactly. The operation is unavailable while work is active. It validates the exact direct-child path, refuses symlinked or nested mounted content, writes a root-only durable journal, and atomically renames the run beneath `.portal-purge-quarantine` before recursive deletion. Success removes the journal and portal row. A crash or partial deletion leaves a durable `evidence-failed` quarantine row after restart; retrying purge targets only that validated random quarantine child. Purging is irreversible and is not an archive workflow.
 
 Direct smoke/release services use the official Playwright image's root execution model and are intended only for the two trusted project origins. Portal launches use a stricter four-identity split: the root supervisor owns the credential vault and lifecycle state; Playwright and FFmpeg run as `pwuser`; advisory AI review runs as `aiworker` with one-shot stdin secret delivery; and checklist generation runs as `reportworker` against a frozen source tree and private staging directory. All workers receive sanitized environments and none can read the vault. Do not point this suite at arbitrary untrusted sites. A deployment designed for hostile origins also needs Playwright's recommended seccomp profile and a separately reviewed container boundary.
 
@@ -265,6 +429,9 @@ These optional variables affect the portal container:
 | --- | --- | --- |
 | `PORTAL_PORT` | `4173` | Host port mapped to the portal. |
 | `PORTAL_MAX_CONCURRENT_RUNS` | `1` | Concurrent launches, capped by the server at four. |
+| `SINGLE_SITE_WORKER_REPLICAS` | `2` | Worker service replicas started by `npm run portal`; allowed range 1–16. Increases throughput across queued jobs, not within one job. |
+| `AUDIT_QUEUE_POLL_MS` | `1000` | Idle polling interval for the Single-site worker and finalizer pools; allowed range 100–60000 ms. |
+| `AUDIT_PREVIEW_TLS_BYPASS_ALLOWLIST` | unset | Exact comma-separated Preview origins allowed to request Single-site `preview-bypass`; the result is non-authoritative. Production and comparative runs remain strict. |
 | `PORTAL_SHARDED_ARTIFACT_ROOT` | `/work/artifacts/sharded` | Discovery/evidence root for terminal-launched releases; active execution stays read-only, terminal evidence may be purged with confirmation. |
 | `PORTAL_ALLOWED_HOSTS` | unset | Optional comma-separated extra local hostnames accepted by the request Host guard; loopback names are always allowed. |
 | `PORTAL_EXTERNAL_RUN_SYNC_MS` | `1000` | External-run log and lifecycle refresh interval; allowed range 250–30000 ms. |
@@ -277,7 +444,7 @@ These optional variables affect the portal container:
 | `AUDIT_SHARD_CONCURRENCY` | `4` | Maximum functional shard containers active at once; allowed range 1 through `AUDIT_SHARD_TOTAL`. Reduce this first on memory-constrained hosts. |
 | `AUDIT_SHARD_WORKERS` | `1` | Playwright workers inside each functional shard; allowed range 1–16. The isolated performance container always uses one. |
 | `AUDIT_SHARDED_RUN_ID` | generated | Optional unique 8–80 character lowercase run directory name; an existing directory is refused without mutation. |
-| `CANDIDATE_IGNORE_HTTPS_ERRORS` | `0` | Explicit development-only candidate bypass; affected evidence requires review. |
+| `CANDIDATE_IGNORE_HTTPS_ERRORS` | `0` | Must remain `0`; browser-wide bypass requests fail closed because exact-origin scope is unavailable. |
 | `PLAYWRIGHT_VERSION` | `1.62.1` | Official image tag version. Must match the package. |
 | `INSTALL_MSEDGE` | `0` | Build-time `0`/`1` switch for the optional branded Microsoft Edge channel. |
 | `ANTHROPIC_MODEL` | `claude-sonnet-5` | Default advisory evidence-review model. |

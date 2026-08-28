@@ -5,17 +5,88 @@ import { fileURLToPath } from 'node:url';
 import {
   candidateCertificateBypassAllowed,
   candidateCertificateBypassApplies,
+  parsePreviewTlsBypassAllowlist,
+  resolveAuditTlsPolicy,
 } from '../audit/tls.js';
+import { parseRunContract } from '../shared/run-contract.mjs';
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const productionUrl = 'https://quitting7oh.org';
 const candidateUrl = 'https://beta.quitting7oh-org.pages.dev';
 
-assert.equal(candidateCertificateBypassAllowed(candidateUrl, productionUrl), true);
+assert.equal(candidateCertificateBypassAllowed(candidateUrl, productionUrl), false);
 assert.equal(candidateCertificateBypassAllowed(productionUrl, productionUrl), false);
 assert.equal(candidateCertificateBypassAllowed('http://quitting7oh.org:8080', productionUrl), false);
 assert.equal(candidateCertificateBypassAllowed('https://quitting7oh.org.', 'https://baseline.example'), false);
 assert.equal(candidateCertificateBypassAllowed('https://www.quitting7oh.org', 'https://baseline.example'), false);
+
+const fullScope = { qualifier: 'FULL' as const, pluginIds: [], auditIds: [], areas: [] };
+const comparativeContract = parseRunContract({
+  schemaVersion: 1,
+  mode: 'comparative',
+  productionUrl,
+  candidateUrl,
+  targetIds: ['candidate-mobile-chromium'],
+  scope: fullScope,
+});
+assert.deepEqual(resolveAuditTlsPolicy(comparativeContract), {
+  certificatePolicy: 'strict',
+  browserIgnoreHTTPSErrors: false,
+  bypassOrigin: null,
+  evidenceAuthority: { status: 'authoritative', reasons: [] },
+});
+
+const strictPreviewContract = parseRunContract({
+  schemaVersion: 1,
+  mode: 'single-site',
+  url: candidateUrl,
+  deploymentRole: 'preview',
+  certificatePolicy: 'strict',
+  targetIds: ['single-site-mobile-chromium'],
+  scope: fullScope,
+});
+assert.equal(resolveAuditTlsPolicy(strictPreviewContract).evidenceAuthority.status, 'authoritative');
+
+const bypassContract = parseRunContract({
+  schemaVersion: 1,
+  mode: 'single-site',
+  url: `${candidateUrl}/`,
+  deploymentRole: 'preview',
+  certificatePolicy: 'preview-bypass',
+  targetIds: ['single-site-mobile-chromium'],
+  scope: fullScope,
+});
+const allowlist = parsePreviewTlsBypassAllowlist(`${candidateUrl}/`);
+assert.deepEqual(allowlist, [candidateUrl]);
+assert.deepEqual(resolveAuditTlsPolicy(bypassContract, { previewBypassOrigins: allowlist }), {
+  certificatePolicy: 'preview-bypass',
+  browserIgnoreHTTPSErrors: true,
+  bypassOrigin: candidateUrl,
+  evidenceAuthority: { status: 'non-authoritative', reasons: ['development-certificate-bypass'] },
+});
+assert.throws(
+  () => resolveAuditTlsPolicy(bypassContract, { previewBypassOrigins: ['https://evil.example'] }),
+  /not present in the exact Preview origin allowlist/,
+);
+assert.throws(
+  () => resolveAuditTlsPolicy(bypassContract, { previewBypassOrigins: [`${candidateUrl}.evil.example`] }),
+  /not present in the exact Preview origin allowlist/,
+);
+for (const invalid of [
+  'http://beta.example',
+  'https://user:secret@beta.example',
+  'https://beta.example:8443',
+  'https://beta.example/path',
+  'https://beta.example?mode=unsafe',
+  'https://beta.example#unsafe',
+  'https://*.example',
+]) {
+  assert.throws(() => parsePreviewTlsBypassAllowlist(invalid), /exact HTTPS origin|default port/);
+}
+assert.throws(
+  () => parsePreviewTlsBypassAllowlist(`${candidateUrl},${candidateUrl}/`),
+  /must not contain duplicate origins/,
+);
 
 const originalEnvironment = {
   candidate: process.env.CANDIDATE_URL,
@@ -26,7 +97,7 @@ try {
   process.env.CANDIDATE_URL = candidateUrl;
   process.env.PRODUCTION_URL = productionUrl;
   process.env.CANDIDATE_IGNORE_HTTPS_ERRORS = '1';
-  assert.equal(candidateCertificateBypassApplies(candidateUrl), true);
+  assert.equal(candidateCertificateBypassApplies(candidateUrl), false);
   assert.equal(candidateCertificateBypassApplies(productionUrl), false);
 } finally {
   restoreEnvironment('CANDIDATE_URL', originalEnvironment.candidate);
@@ -42,22 +113,19 @@ const blockedConfig = importPlaywrightConfig({
 assert.notEqual(blockedConfig.status, 0, 'Playwright configuration must reject a production-host certificate bypass.');
 assert.match(
   `${blockedConfig.stdout}\n${blockedConfig.stderr}`,
-  /CANDIDATE_IGNORE_HTTPS_ERRORS=1 is forbidden/,
-  'The rejected Playwright configuration should explain the protected-host policy.',
+  /cannot be restricted to the exact candidate origin/,
+  'The rejected Playwright configuration should explain why browser-wide bypass is unsafe.',
 );
 
-const allowedConfig = importPlaywrightConfig({
+const developmentConfig = importPlaywrightConfig({
   CANDIDATE_URL: candidateUrl,
   PRODUCTION_URL: productionUrl,
   CANDIDATE_IGNORE_HTTPS_ERRORS: '1',
 });
-assert.equal(
-  allowedConfig.status,
-  0,
-  `A distinct development candidate should remain eligible for the explicit bypass.\n${allowedConfig.stderr}`,
-);
+assert.notEqual(developmentConfig.status, 0, 'A browser-wide development bypass must fail closed even for a distinct candidate.');
+assert.match(`${developmentConfig.stdout}\n${developmentConfig.stderr}`, /cannot be restricted to the exact candidate origin/i);
 
-process.stdout.write('TLS policy validation passed: production/protected hosts fail closed and the distinct development candidate remains explicitly eligible.\n');
+process.stdout.write('TLS policy validation passed: browser-wide certificate bypass is rejected for every origin and CA-based trust remains strict.\n');
 
 function importPlaywrightConfig(environment: Record<string, string>): ReturnType<typeof spawnSync> {
   return spawnSync(

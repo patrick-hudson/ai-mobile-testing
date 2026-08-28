@@ -1,0 +1,72 @@
+.settings-section-nav {
+  display: flex;
+  max-width: 100%;
+  overflow-x: auto;
+  margin-bottom: 0.75rem;
+  border: 1px solid var(--console-rule);
+  background: var(--console-surface-muted);
+}
+
+.settings-section-nav button {
+  flex: 0 0 auto;
+  min-height: 2.75rem;
+  border: 0;
+  border-right: 1px solid var(--console-rule);
+  padding: 0.55rem 0.85rem;
+  background: transparent;
+  color: var(--console-ink);
+  cursor: pointer;
+}
+.settings-section-nav button[aria-current="page"] { box-shadow: inset 0 -3px var(--console-accent); background: var(--console-surface); font-weight: 750; }
+
+.settings-region { min-width: 0; border: 1px solid var(--console-rule); background: var(--console-surface); }
+.settings-region-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; padding: 0.8rem 1rem; border-bottom: 1px solid var(--console-rule); }
+.settings-region-heading h2 { margin: 0; font-size: 1.05rem; }
+.settings-kicker { margin: 0 0 0.18rem; color: var(--console-accent); font-size: 0.68rem; font-weight: 800; letter-spacing: 0.09em; }
+.settings-region-status { min-height: 1.35rem; margin: 0; padding: 0.65rem 1rem 0; color: var(--console-muted); font-size: 0.8rem; }
+.settings-region-body { min-height: 6rem; padding: 0.8rem 1rem 1rem; }
+.settings-region[data-async-state="initial-loading"] .settings-region-body,
+.settings-region[data-async-state="refreshing"] .settings-region-body { box-shadow: inset 0 3px var(--console-accent-soft); }
+.settings-region[data-async-state="stale"] { border-color: #b18742; }
+.settings-retry { margin: 0 1rem 1rem; }
+.settings-muted { margin: 0 0 0.8rem; color: var(--console-muted); font-size: 0.8rem; line-height: 1.5; }
+
+.settings-state { flex: none; color: var(--console-muted); font-size: 0.72rem; font-weight: 800; }
+.settings-state.configured, .settings-success { color: var(--console-success); }
+.settings-state.error, .settings-error { color: var(--console-danger); }
+.settings-state.loading { color: var(--console-accent); }
+.settings-message { min-height: 1.3rem; margin: 0.75rem 0 0; color: var(--console-muted); font-size: 0.8rem; }
+.settings-message.error { color: var(--console-danger); }
+.settings-message.success { color: var(--console-success); }
+
+.key-controls { display: grid; grid-template-columns: minmax(16rem, 1fr) auto auto auto; gap: 0.5rem; align-items: end; }
+.settings-field { display: block; }
+.settings-field span { display: block; margin-bottom: 0.3rem; color: var(--console-muted); font-size: 0.75rem; font-weight: 700; }
+.settings-field input { width: 100%; min-height: 2.75rem; border: 1px solid var(--console-rule-strong); border-radius: 2px; padding: 0.55rem 0.65rem; background: var(--console-surface); color: var(--console-ink); }
+.settings-danger-button { border-color: #bb7777; color: var(--console-danger); }
+button:disabled, input:disabled { opacity: 0.55; cursor: not-allowed; }
+
+.settings-summary-list { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; margin: 0 0 0.8rem; background: var(--console-rule); }
+.settings-summary-list div { min-width: 0; padding: 0.65rem; background: var(--console-surface-muted); }
+.settings-summary-list dt { color: var(--console-muted); font-size: 0.66rem; font-weight: 800; text-transform: uppercase; }
+.settings-summary-list dd { margin: 0.18rem 0 0; overflow-wrap: anywhere; font-size: 0.8rem; font-weight: 700; }
+.settings-table { width: 100%; border-collapse: collapse; font-size: 0.78rem; }
+.settings-table th, .settings-table td { padding: 0.5rem; border-bottom: 1px solid var(--console-rule); text-align: left; vertical-align: top; }
+.settings-table th { color: var(--console-muted); font-size: 0.68rem; letter-spacing: 0.04em; text-transform: uppercase; }
+.settings-table td { overflow-wrap: anywhere; }
+.settings-table a { color: var(--console-accent); }
+.settings-table-scroll { max-width: 100%; overflow-x: auto; }
+.settings-capability-note { margin: 0.6rem 0; padding: 0.6rem; border-left: 3px solid var(--console-rule-strong); background: var(--console-surface-muted); color: var(--console-muted); font-size: 0.78rem; }
+
+@media (max-width: 760px) {
+  .key-controls { grid-template-columns: 1fr 1fr; }
+  .key-controls .settings-field { grid-column: 1 / -1; }
+  .settings-summary-list { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 520px) {
+  .settings-region-heading { align-items: flex-start; flex-direction: column; }
+  .key-controls { grid-template-columns: 1fr; }
+  .key-controls .settings-field { grid-column: auto; }
+  .key-controls button { width: 100%; }
+}

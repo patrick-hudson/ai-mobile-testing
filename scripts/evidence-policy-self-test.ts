@@ -6,15 +6,19 @@ import {
   AUDIT_APPLICABILITY_ANNOTATION,
   AUDIT_STATUS_ANNOTATION,
   AUDIT_STATUS_WAIVER_ANNOTATION,
+  assertEvidenceAuthority,
+  assertProjectEvidenceAuthority,
   assertStaticCheckpoint,
   createEvidencePolicy,
   evidenceKindsForPolicy,
+  evidenceAuthority,
   parseAuditStatusAnnotation,
   parseAuditApplicabilityAnnotation,
   parseEvidencePolicyAnnotation,
   serializeEvidencePolicy,
   validateDefinitionEvidencePolicy,
 } from '../audit/evidence-policy.js';
+import { parseAuditProjectMetadata, projectMetadata } from '../audit/environments.js';
 import { INSTALLED_PLUGIN_REGISTRY } from '../audit/definitions.js';
 import { INTERACTION_VIDEO_PACING_MS, interactionVideoDelayMs } from '../audit/interaction-pacing.js';
 
@@ -28,6 +32,13 @@ for (const [phase, delayMs] of Object.entries(INTERACTION_VIDEO_PACING_MS)) {
 assert(
   INTERACTION_VIDEO_PACING_MS['initial-state'] + INTERACTION_VIDEO_PACING_MS['final-outcome'] >= 1_800,
   'Even a one-action clip must establish context and leave a reviewable final outcome.',
+);
+assert(
+  INTERACTION_VIDEO_PACING_MS['initial-state']
+    + INTERACTION_VIDEO_PACING_MS['before-action']
+    + INTERACTION_VIDEO_PACING_MS.response
+    + INTERACTION_VIDEO_PACING_MS['final-outcome'] >= 2_300,
+  'A contextual one-action journey must remain safely above the two-second media evidence floor.',
 );
 assert(
   INTERACTION_VIDEO_PACING_MS['secondary-outcome'] >= 2_000,
@@ -136,11 +147,60 @@ assert.equal(
   'INTENDED_CHANGE',
 );
 
+assert.deepEqual(evidenceAuthority(), { status: 'authoritative', reasons: [] });
+assert.deepEqual(evidenceAuthority(['deployment-revision-unavailable', 'development-certificate-bypass']), {
+  status: 'non-authoritative',
+  reasons: ['development-certificate-bypass', 'deployment-revision-unavailable'],
+});
+assert.throws(
+  () => assertEvidenceAuthority({ status: 'authoritative', reasons: ['deployment-revision-unavailable'] }),
+  /inconsistent or not canonically ordered/,
+);
+assert.throws(
+  () => assertEvidenceAuthority({ status: 'non-authoritative', reasons: [] }),
+  /inconsistent or not canonically ordered/,
+);
+
+const strictSingleSiteMetadata = parseAuditProjectMetadata({
+  mode: 'single-site',
+  deploymentRole: 'preview',
+  sourceComparativeTargetId: 'candidate-mobile-chromium',
+  baseURL: 'https://beta.quitting7oh-org.pages.dev/',
+  browserLabel: 'Chromium / mobile',
+  deviceClass: 'mobile',
+  fullSweep: true,
+  visual: true,
+  tlsPolicy: 'strict',
+  evidenceAuthority: { status: 'authoritative', reasons: [] },
+});
+assert.equal(strictSingleSiteMetadata.mode, 'single-site');
+assert.equal(strictSingleSiteMetadata.baseURL, 'https://beta.quitting7oh-org.pages.dev');
+assert.equal('environment' in strictSingleSiteMetadata, false);
+
+const bypassSingleSiteMetadata = parseAuditProjectMetadata({
+  ...strictSingleSiteMetadata,
+  tlsPolicy: 'preview-bypass',
+  evidenceAuthority: { status: 'non-authoritative', reasons: ['development-certificate-bypass'] },
+});
+assert.deepEqual(assertProjectEvidenceAuthority(bypassSingleSiteMetadata), bypassSingleSiteMetadata.evidenceAuthority);
+assert.throws(() => parseAuditProjectMetadata({
+  ...bypassSingleSiteMetadata,
+  deploymentRole: 'production',
+}), /Production-role Single-site/);
+assert.throws(() => parseAuditProjectMetadata({
+  ...strictSingleSiteMetadata,
+  environment: 'candidate',
+}), /mixed mode fields/);
+assert.equal(projectMetadata({ environment: 'candidate' }).mode, 'comparative');
+assert.throws(() => projectMetadata(strictSingleSiteMetadata), /cannot read explicit Single-site/);
+
 const repositoryRoot = process.cwd();
 const enabledSpecs = [...new Set(INSTALLED_PLUGIN_REGISTRY.plugins.flatMap(({ entrySpecs }) => entrySpecs))];
 let interactionDeclarations = 0;
 let staticDeclarations = 0;
 let structuredDeclarations = 0;
+let standaloneStaticDeclarations = 0;
+let inventoriedStaticDeclarations = 0;
 for (const entrySpec of enabledSpecs) {
   const source = readFileSync(path.join(repositoryRoot, entrySpec), 'utf8');
   assert.doesNotMatch(
@@ -151,6 +211,8 @@ for (const entrySpec of enabledSpecs) {
   interactionDeclarations += [...source.matchAll(/\binteractionTest\s*\(/g)].length;
   staticDeclarations += [...source.matchAll(/\bstaticTest\s*\(/g)].length;
   structuredDeclarations += [...source.matchAll(/\bstructuredTest\s*\(/g)].length;
+  standaloneStaticDeclarations += [...source.matchAll(/\bstandaloneStaticTest\s*\(/g)].length;
+  inventoriedStaticDeclarations += [...source.matchAll(/\binventoriedStaticTest\s*\(/g)].length;
   assert.equal(
     [...source.matchAll(/\binteractionTest\s*\([^\n]*\binteractionEvidence\s*\(/g)].length,
     [...source.matchAll(/\binteractionTest\s*\(/g)].length,
@@ -187,11 +249,18 @@ for (const entrySpec of enabledSpecs) {
     [...source.matchAll(/\bstructuredTest\s*\(/g)].length,
     `${entrySpec} has a data-only test without a matching structured-evidence rationale.`,
   );
+  assert.equal(
+    [...source.matchAll(/\binventoriedStaticTest\s*\([^\n]*\bstaticEvidence\s*\(/g)].length,
+    [...source.matchAll(/\binventoriedStaticTest\s*\(/g)].length,
+    `${entrySpec} has an inventoried static test without a matching screenshot rationale.`,
+  );
 }
 assert(interactionDeclarations > 0, 'Enabled plugins must include interaction evidence.');
 assert(staticDeclarations > 0, 'Enabled plugins must include static evidence.');
 assert(structuredDeclarations > 0, 'Enabled plugins must include structured evidence.');
+assert(standaloneStaticDeclarations > 0, 'Enabled plugins must include an explicit standalone-only evidence case.');
+assert(inventoriedStaticDeclarations > 0, 'Enabled plugins must register frozen inventoried routes through an explicit evidence helper.');
 
 process.stdout.write(
-  `Evidence policy self-test passed: ${AUDIT_CATALOG.length} catalog audits and ${interactionDeclarations + staticDeclarations + structuredDeclarations} enabled test declarations explicitly separate evidence modes; all interaction clips have bounded pacing and a labeled action/response checkpoint.\n`,
+  `Evidence policy self-test passed: ${AUDIT_CATALOG.length} catalog audits and ${interactionDeclarations + staticDeclarations + structuredDeclarations + standaloneStaticDeclarations + inventoriedStaticDeclarations} enabled test declarations explicitly separate evidence modes; all interaction clips have bounded pacing and a labeled action/response checkpoint.\n`,
 );

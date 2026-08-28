@@ -1,7 +1,26 @@
 (() => {
   'use strict';
 
-  const manifest = JSON.parse(document.getElementById('audit-manifest').textContent);
+  let manifest;
+  try {
+    manifest = JSON.parse(document.getElementById('audit-manifest').textContent);
+    const galleryDescriptor = JSON.parse(document.getElementById('gallery-archive-head').textContent);
+    const archiveRuntime = globalThis.Quitting7ohArchiveRuntime;
+    if (!archiveRuntime?.readEmbeddedContract) throw new TypeError('The pinned archive runtime bundle is unavailable.');
+    archiveRuntime.readEmbeddedContract(
+      document,
+      galleryDescriptor.archiveBundle ?? null,
+      galleryDescriptor.schemaVersion,
+    );
+  } catch (error) {
+    const fatal = document.getElementById('archive-runtime-fatal');
+    if (fatal) fatal.hidden = false;
+    const message = document.getElementById('archive-runtime-fatal-message');
+    if (message) message.textContent = error instanceof Error ? error.message : 'Archive runtime validation failed.';
+    document.querySelector('.masthead')?.setAttribute('hidden', '');
+    document.querySelector('main')?.setAttribute('hidden', '');
+    return;
+  }
   const list = document.getElementById('audit-list');
   const controls = {
     search: document.getElementById('search'),
@@ -230,6 +249,10 @@
 
   async function renderAiReview() {
     const state = document.getElementById('ai-review-state');
+    if (location.protocol === 'file:') {
+      state.textContent = 'No AI advisory is packaged with this offline report. The sealed checklist remains authoritative.';
+      return;
+    }
     try {
       const response = await fetch('../ai-review/review.json', { cache: 'no-store' });
       if (!response.ok) throw new Error('not generated');
