@@ -148,6 +148,18 @@ The private, journaled location to which a terminal run's validated queue/finali
 
 ## Portal presentation
 
+### Visual Evidence Gallery
+
+A run-scoped review surface that presents visual audit evidence as contextual Logical Media Items rather than as an undifferentiated file list.
+
+The active selection owns foreground priority. Adjacent previews are background conveniences: they wait until selected evidence is usable, and obsolete work cannot change the accepted selection after navigation or revision changes.
+
+### Logical Media Item
+
+One contextual occurrence of visual evidence for an Audit Execution, retaining its test, target, capture, and audit associations while grouping the member media needed to review that occurrence.
+
+Logical Media Items are distinct from stored media blobs: identical bytes captured by different tests remain separate review items because their audit context differs.
+
 ### Product Risk
 
 A non-authoritative portal attention queue that orders canonical Findings and explicitly labelled visual-review or manual-attention records for operator review. Every item retains its source type and authority; Product Risk is not a Release Decision, Site Health Verdict, or durable audit state.
