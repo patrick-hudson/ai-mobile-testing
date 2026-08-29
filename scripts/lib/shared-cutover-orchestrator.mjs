@@ -9,6 +9,11 @@ import {
   nonEmptyString,
 } from '../../shared/canonical-contract.mjs';
 import { parseShadowValidationReport } from '../../shared/shadow-validation.mjs';
+import { parseRunContract } from '../../shared/run-contract.mjs';
+import {
+  probeTargetPreflightSet,
+  targetPreflightInputsForRunContract,
+} from '../../shared/target-preflight-set.mjs';
 import {
   SHADOW_ACCEPTANCE_CASE_IDS,
   SHADOW_CORRUPTION_CASE_IDS,
@@ -29,6 +34,7 @@ import {
   readStoreCoordinator,
   readReleaseAuthoritySelector,
   transitionReleaseAuthority,
+  transitionReleaseAuthorityWithPublicationFence,
 } from './parent-run-store.mjs';
 import { listRecoverableSharedLaunchOperations } from './shared-launch-operation-store.mjs';
 import { inspectLegacyAuthorityDrainSources } from './legacy-authority-drain-source.mjs';
@@ -168,10 +174,16 @@ function admissionGateHandle(storage, { clock }) {
     });
   }
 
-  async function withOpen(operation) {
+  async function withState(operation) {
     if (typeof operation !== 'function') fail('CUTOVER_INPUT_INVALID', 'Admission operation is required.');
     return withDirectoryLock(storage, lockPath, async () => {
       const current = await read();
+      return operation(current);
+    });
+  }
+
+  async function withOpen(operation) {
+    return withState((current) => {
       if (current.state !== 'OPEN') {
         const error = new SharedCutoverError(
           'CUTOVER_ADMISSION_CLOSED',
@@ -188,6 +200,7 @@ function admissionGateHandle(storage, { clock }) {
   return Object.freeze({
     root: storage.root,
     read,
+    withState,
     withOpen,
     close: (expectedDigest, cutoverId) => transition({ expectedDigest, state: 'CLOSED', cutoverId }),
     open: (expectedDigest, cutoverId) => transition({ expectedDigest, state: 'OPEN', cutoverId }),
@@ -223,13 +236,377 @@ export async function openCutoverAdmissionGate(options = {}) {
 
 const RELEASE_CHANGING_MUTATIONS = new Set(['cancel', 'rekick', 'visual-disposition', 'purge']);
 
-export function createCutoverAdmissionPolicy({ admissionGate } = {}) {
-  if (!admissionGate || typeof admissionGate.withOpen !== 'function') {
+const CUTOVER_CANARY_MODES = Object.freeze(['single-site', 'comparative']);
+const MAX_CUTOVER_CANARY_PERMITS_PER_MODE = 3;
+
+function requestIdentity(value) {
+  if (typeof value !== 'string' || value.length < 16 || value.length > 128
+    || !/^[A-Za-z0-9][A-Za-z0-9._:-]+$/u.test(value)) {
+    fail('CUTOVER_INPUT_INVALID', 'Canary requestId is invalid.');
+  }
+  return value;
+}
+
+function parseCanaryActor(value) {
+  if (!isRecord(value)) fail('CUTOVER_INPUT_INVALID', 'Canary launch actor is required.');
+  exactKeys(value, ['id', 'kind'], 'canary launch actor');
+  if (typeof value.id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(value.id)
+    || !['human', 'service'].includes(value.kind)) {
+    fail('CUTOVER_INPUT_INVALID', 'Canary launch actor is invalid.');
+  }
+  return Object.freeze({ id: value.id, kind: value.kind });
+}
+
+function parseCanaryIntent(value, mode) {
+  if (!isRecord(value)) fail('CUTOVER_INPUT_INVALID', 'Canary launch intent is required.');
+  exactKeys(value, ['schemaVersion', 'runContract'], 'canary launch intent');
+  if (value.schemaVersion !== 1) fail('CUTOVER_INPUT_INVALID', 'Canary launch intent schemaVersion is invalid.');
+  let runContract;
+  try { runContract = parseRunContract(value.runContract); } catch (error) {
+    fail('CUTOVER_INPUT_INVALID', `Canary run contract is invalid: ${error.message}`);
+  }
+  if (runContract.mode !== mode || runContract.scope.qualifier !== 'FULL') {
+    fail('CUTOVER_CANARY_LAUNCH_MISMATCH', 'Cutover canaries require the exact requested mode and FULL authority.');
+  }
+  return Object.freeze({ schemaVersion: 1, runContract });
+}
+
+function cutoverStoreBinding(store) {
+  const manifest = store?.manifest;
+  if (!isRecord(manifest)) fail('CUTOVER_STORE_MISMATCH', 'Canary launch requires the opened canonical store.');
+  return Object.freeze({
+    deploymentIdentity: manifest.deploymentIdentity,
+    volumeIdentity: manifest.volumeIdentity,
+    storeMarkerDigest: manifest.storeMarkerDigest,
+    storeGeneration: manifest.storeGeneration,
+    schemaVersion: manifest.schemaVersion,
+    schemaFloor: manifest.schemaFloor,
+    writerProtocol: manifest.currentWriterProtocol,
+    buildIdentity: store.buildIdentity,
+    digest: canonicalDigest({
+      deploymentIdentity: manifest.deploymentIdentity,
+      volumeIdentity: manifest.volumeIdentity,
+      storeMarkerDigest: manifest.storeMarkerDigest,
+      storeGeneration: manifest.storeGeneration,
+      schemaVersion: manifest.schemaVersion,
+      schemaFloor: manifest.schemaFloor,
+      writerProtocol: manifest.currentWriterProtocol,
+      buildIdentity: store.buildIdentity,
+    }),
+  });
+}
+
+function parseTrustedTargetIdentity(value, label) {
+  if (!isRecord(value)) fail('CUTOVER_CANARY_TARGET_MISMATCH', `${label} is missing.`);
+  exactKeys(value, ['kind', 'value'], label);
+  if (value.kind !== 'target-preflight-set') fail('CUTOVER_CANARY_TARGET_MISMATCH', `${label} kind is invalid.`);
+  assertDigest(value.value, `${label}.value`);
+  return clone(value);
+}
+
+function canaryLaunchPermitPath(root, cutoverId, mode) {
+  return containedPath(root, `cutover-canary-${safeId(cutoverId, 'cutoverId')}-${mode}.json`);
+}
+
+function canaryLaunchPermitBody(value) {
+  return {
+    schemaVersion: 1,
+    kind: 'release-cutover-canary-launch-permit',
+    cutoverId: value.cutoverId,
+    mode: value.mode,
+    revision: value.revision,
+    previousPermitDigest: value.previousPermitDigest,
+    requestId: value.requestId,
+    actor: value.actor,
+    intentDigest: value.intentDigest,
+    authoritySelectorDigest: value.authoritySelectorDigest,
+    admissionGateDigest: value.admissionGateDigest,
+    cutoverReportDigest: value.cutoverReportDigest,
+    activeBuildIdentity: value.activeBuildIdentity,
+    cutoverConfigurationDigest: value.cutoverConfigurationDigest,
+    storeBindingDigest: value.storeBindingDigest,
+    targetIdentity: value.targetIdentity,
+    supersedesRunId: value.supersedesRunId,
+    supersedeReason: value.supersedeReason,
+    state: value.state,
+    runId: value.runId,
+    operationId: value.operationId,
+    runRunnerRevision: value.runRunnerRevision,
+    runConfigurationRevision: value.runConfigurationRevision,
+    authorizedAt: value.authorizedAt,
+    consumedAt: value.consumedAt,
+  };
+}
+
+function parseCanaryLaunchPermit(value, { cutoverId = null, mode = null } = {}) {
+  parseSealed(value, 'Cutover canary launch permit');
+  exactKeys(value, [...Object.keys(canaryLaunchPermitBody(value)), 'digest'], 'Cutover canary launch permit');
+  if (value.schemaVersion !== 1 || value.kind !== 'release-cutover-canary-launch-permit'
+    || !CUTOVER_CANARY_MODES.includes(value.mode) || (cutoverId !== null && value.cutoverId !== cutoverId)
+    || (mode !== null && value.mode !== mode) || !SAFE_ID.test(value.cutoverId)
+    || !Number.isSafeInteger(value.revision) || value.revision < 1
+    || value.revision > MAX_CUTOVER_CANARY_PERMITS_PER_MODE) {
+    fail('CUTOVER_DOCUMENT_INVALID', 'Cutover canary launch permit identity is invalid.');
+  }
+  if (value.previousPermitDigest !== null) assertDigest(value.previousPermitDigest, 'Cutover canary previousPermitDigest');
+  if ((value.revision === 1) !== (value.previousPermitDigest === null)) {
+    fail('CUTOVER_DOCUMENT_INVALID', 'Cutover canary permit revision chain is invalid.');
+  }
+  requestIdentity(value.requestId);
+  parseCanaryActor(value.actor);
+  for (const [key, digest] of Object.entries({
+    intentDigest: value.intentDigest,
+    authoritySelectorDigest: value.authoritySelectorDigest,
+    admissionGateDigest: value.admissionGateDigest,
+    cutoverReportDigest: value.cutoverReportDigest,
+    cutoverConfigurationDigest: value.cutoverConfigurationDigest,
+    storeBindingDigest: value.storeBindingDigest,
+  })) assertDigest(digest, `Cutover canary permit ${key}`);
+  nonEmptyString(value.activeBuildIdentity, 'Cutover canary permit activeBuildIdentity');
+  parseTrustedTargetIdentity(value.targetIdentity, 'Cutover canary target identity');
+  if (value.revision === 1) {
+    if (value.supersedesRunId !== null || value.supersedeReason !== null) {
+      fail('CUTOVER_DOCUMENT_INVALID', 'Initial cutover canary permit cannot supersede a run.');
+    }
+  } else {
+    safeId(value.supersedesRunId, 'Cutover canary supersedesRunId');
+    nonEmptyString(value.supersedeReason, 'Cutover canary supersedeReason');
+  }
+  canonicalTimestamp(value.authorizedAt, 'Cutover canary authorizedAt');
+  if (!['AUTHORIZED', 'CONSUMED'].includes(value.state)) fail('CUTOVER_DOCUMENT_INVALID', 'Cutover canary permit state is invalid.');
+  if (value.state === 'AUTHORIZED') {
+    if (value.runId !== null || value.operationId !== null || value.runRunnerRevision !== null
+      || value.runConfigurationRevision !== null || value.consumedAt !== null) {
+      fail('CUTOVER_DOCUMENT_INVALID', 'Unconsumed canary permit contains launch output.');
+    }
+  } else {
+    safeId(value.runId, 'Cutover canary runId');
+    if (typeof value.operationId !== 'string' || !/^[a-f0-9]{64}$/u.test(value.operationId)) {
+      fail('CUTOVER_DOCUMENT_INVALID', 'Cutover canary operationId is invalid.');
+    }
+    assertDigest(value.runRunnerRevision, 'Cutover canary runRunnerRevision');
+    assertDigest(value.runConfigurationRevision, 'Cutover canary runConfigurationRevision');
+    canonicalTimestamp(value.consumedAt, 'Cutover canary consumedAt');
+  }
+  return clone(value);
+}
+
+async function readCanaryLaunchPermit(admissionGate, cutoverId, mode) {
+  const storage = await openAtomicStorage({ root: admissionGate.root, verify: false });
+  const file = canaryLaunchPermitPath(storage.root, cutoverId, mode);
+  if (!await pathExists(storage.fs, file)) return null;
+  return parseCanaryLaunchPermit(await readBoundedJson(storage, file, {
+    label: 'cutover canary launch permit', maximumBytes: 256 * 1_024,
+  }), { cutoverId, mode });
+}
+
+async function persistCanaryLaunchPermit(storage, permit) {
+  const history = containedPath(storage.root, 'cutover-canary-permits');
+  await storage.fs.mkdir(history, { recursive: true, mode: 0o700 });
+  const immutable = containedPath(history, `${permit.digest.slice('sha256:'.length)}.json`);
+  if (!await pathExists(storage.fs, immutable)) await atomicWriteJson(storage, immutable, permit, { exclusive: true });
+  await atomicWriteJson(storage, canaryLaunchPermitPath(storage.root, permit.cutoverId, permit.mode), permit);
+}
+
+async function assertCanaryPermitReplaceable(store, permit) {
+  let state;
+  try { state = await readParentRun(store, permit.runId); } catch (error) {
+    fail('CUTOVER_CANARY_REPLACEMENT_BLOCKED', 'Failed canary replacement requires a durable terminal parent run.');
+  }
+  try {
+    const publication = await readCurrentEnvelope(store, permit.runId);
+    if (publication.decision?.ready === true) {
+      fail('CUTOVER_CANARY_REPLACEMENT_BLOCKED', 'A current ready canary cannot be replaced.');
+    }
+  } catch (error) {
+    if (error?.code !== 'PUBLICATION_UNAVAILABLE') throw error;
+  }
+  const workItems = Object.values(state.workItems ?? {});
+  const terminal = workItems.length > 0 && workItems.every((item) => (
+    ['completed_pass', 'completed_product_failure', 'cancelled', 'incomplete'].includes(item.state)
+  ));
+  if (!terminal) {
+    fail('CUTOVER_CANARY_REPLACEMENT_BLOCKED', 'Canary replacement requires a terminal non-ready run.');
+  }
+}
+
+async function defaultProbeCanaryTargetIdentity(intent) {
+  const contract = intent.runContract;
+  const preflightOptions = contract.mode === 'single-site' && contract.certificatePolicy === 'preview-bypass'
+    ? { previewBypassOrigins: [contract.url], tlsBypassRequestOptions: { rejectUnauthorized: false } }
+    : {};
+  return (await probeTargetPreflightSet(targetPreflightInputsForRunContract(contract), { preflightOptions })).identity;
+}
+
+export async function authorizeSharedCutoverCanaryLaunch({
+  store, admissionGate, reportDirectory, cutoverId, mode, requestId, actor: rawActor, intent: rawIntent,
+  supersedeReason = null,
+  probeTargetIdentity = defaultProbeCanaryTargetIdentity,
+  clock = store?.clock ?? (() => Date.now()),
+} = {}) {
+  safeId(cutoverId, 'cutoverId');
+  if (!CUTOVER_CANARY_MODES.includes(mode)) fail('CUTOVER_INPUT_INVALID', 'Canary mode is invalid.');
+  requestIdentity(requestId);
+  const actor = parseCanaryActor(rawActor);
+  const intent = parseCanaryIntent(rawIntent, mode);
+  if (typeof probeTargetIdentity !== 'function') fail('CUTOVER_INPUT_INVALID', 'A trusted target probe is required.');
+  const targetIdentity = parseTrustedTargetIdentity(
+    await probeTargetIdentity(intent),
+    'Trusted canary target identity',
+  );
+  const reportStorage = await openReportStorage(reportDirectory);
+  const report = parseSealed(await readBoundedJson(
+    reportStorage,
+    reportStoragePath(reportStorage, cutoverId, '.json'),
+    { label: 'cutover report', maximumBytes: 4 * 1_048_576 },
+  ), 'Cutover report');
+  if (report.kind !== 'release-authority-cutover-report' || report.cutoverId !== cutoverId
+    || report.status !== 'ACTIVE_ADMISSION_CLOSED') {
+    fail('CUTOVER_REPORT_CONFLICT', 'Canary launch requires this cutover active report.');
+  }
+  const storage = await openAtomicStorage({ root: admissionGate.root, verify: false });
+  return admissionGate.withState(async (gate) => {
+    const selector = await readReleaseAuthoritySelector(store);
+    assertActivatedCutover(selector, gate, cutoverId);
+    if (selector.digest !== report.selectorAfter?.digest || store.buildIdentity !== selector.activeBuildIdentity) {
+      fail('CUTOVER_CANARY_LAUNCH_MISMATCH', 'Canary permit is not bound to the active cutover build and selector.');
+    }
+    const binding = cutoverStoreBinding(store);
+    const file = canaryLaunchPermitPath(storage.root, cutoverId, mode);
+    if (await pathExists(storage.fs, file)) {
+      const existing = parseCanaryLaunchPermit(await readBoundedJson(storage, file, {
+        label: 'cutover canary launch permit', maximumBytes: 256 * 1_024,
+      }), { cutoverId, mode });
+      if (existing.requestId === requestId && canonicalJson(existing.actor) === canonicalJson(actor)
+        && existing.intentDigest === canonicalDigest(intent)
+        && canonicalJson(existing.targetIdentity) === canonicalJson(targetIdentity)) {
+        return existing;
+      }
+      if (existing.state !== 'CONSUMED' || existing.revision >= MAX_CUTOVER_CANARY_PERMITS_PER_MODE) {
+        fail('CUTOVER_CANARY_LAUNCH_CONFLICT', `A different ${mode} canary launch is already authorized or the retry bound is exhausted.`);
+      }
+      nonEmptyString(supersedeReason, 'Canary supersedeReason');
+      await assertCanaryPermitReplaceable(store, existing);
+      const replacement = seal(canaryLaunchPermitBody({
+        ...existing,
+        revision: existing.revision + 1,
+        previousPermitDigest: existing.digest,
+        requestId,
+        actor,
+        intentDigest: canonicalDigest(intent),
+        targetIdentity: clone(targetIdentity),
+        supersedesRunId: existing.runId,
+        supersedeReason,
+        state: 'AUTHORIZED',
+        runId: null,
+        operationId: null,
+        runRunnerRevision: null,
+        runConfigurationRevision: null,
+        authorizedAt: timestamp(clock),
+        consumedAt: null,
+      }));
+      await persistCanaryLaunchPermit(storage, replacement);
+      return clone(replacement);
+    }
+    const permit = seal(canaryLaunchPermitBody({
+      cutoverId,
+      mode,
+      revision: 1,
+      previousPermitDigest: null,
+      requestId,
+      actor,
+      intentDigest: canonicalDigest(intent),
+      authoritySelectorDigest: selector.digest,
+      admissionGateDigest: gate.digest,
+      cutoverReportDigest: report.digest,
+      activeBuildIdentity: selector.activeBuildIdentity,
+      cutoverConfigurationDigest: report.operatorReview?.configurationDigest,
+      storeBindingDigest: binding.digest,
+      targetIdentity: clone(targetIdentity),
+      supersedesRunId: null,
+      supersedeReason: null,
+      state: 'AUTHORIZED',
+      runId: null,
+      operationId: null,
+      runRunnerRevision: null,
+      runConfigurationRevision: null,
+      authorizedAt: timestamp(clock),
+      consumedAt: null,
+    }));
+    assertDigest(permit.cutoverConfigurationDigest, 'Cutover report configurationDigest');
+    await persistCanaryLaunchPermit(storage, permit);
+    return clone(permit);
+  });
+}
+
+export function createCutoverAdmissionPolicy({ admissionGate, store = null } = {}) {
+  if (!admissionGate || typeof admissionGate.withOpen !== 'function' || typeof admissionGate.withState !== 'function') {
     fail('CUTOVER_ADMISSION_UNAVAILABLE', 'A durable release-admission gate is required.', undefined, 503);
   }
   return Object.freeze({
-    withLaunchAdmission(_requestId, operation) {
-      return admissionGate.withOpen(operation);
+    withLaunchAdmission(requestId, intentOrOperation, maybeOperation) {
+      const operation = maybeOperation ?? intentOrOperation;
+      const intent = maybeOperation ? intentOrOperation : null;
+      if (typeof operation !== 'function') fail('CUTOVER_INPUT_INVALID', 'Admission operation is required.');
+      return admissionGate.withState(async (gate) => {
+        if (gate.state === 'OPEN') return operation(gate);
+        if (!store || intent === null) {
+          fail('CUTOVER_ADMISSION_CLOSED', `Release admission is closed by ${gate.cutoverId}; retry after the cutover completes.`, {
+            cutoverId: gate.cutoverId, gateDigest: gate.digest,
+          }, 503);
+        }
+        requestIdentity(requestId);
+        const mode = intent?.runContract?.mode;
+        if (!CUTOVER_CANARY_MODES.includes(mode)) fail('CUTOVER_CANARY_LAUNCH_MISMATCH', 'Closed admission accepts only a cutover canary.');
+        const normalizedIntent = parseCanaryIntent(intent, mode);
+        const selector = await readReleaseAuthoritySelector(store);
+        assertActivatedCutover(selector, gate, gate.cutoverId);
+        const permit = await readCanaryLaunchPermit(admissionGate, gate.cutoverId, mode);
+        const binding = cutoverStoreBinding(store);
+        if (!permit) {
+          fail('CUTOVER_ADMISSION_CLOSED', `Release admission is closed by ${gate.cutoverId}; no ${mode} canary permit is active.`, {
+            cutoverId: gate.cutoverId, gateDigest: gate.digest,
+          }, 503);
+        }
+        if (permit.requestId !== requestId || permit.intentDigest !== canonicalDigest(normalizedIntent)
+          || permit.authoritySelectorDigest !== selector.digest || permit.admissionGateDigest !== gate.digest
+          || permit.activeBuildIdentity !== selector.activeBuildIdentity || permit.activeBuildIdentity !== store.buildIdentity
+          || permit.storeBindingDigest !== binding.digest) {
+          fail('CUTOVER_CANARY_LAUNCH_MISMATCH', 'Closed-admission launch does not match the active cutover canary permit.');
+        }
+        const launched = await operation(gate);
+        const runnerRevision = launched?.compiledPlan?.createParentRunInput?.runnerRevision;
+        const configurationRevision = launched?.compiledPlan?.createParentRunInput?.subjectCore?.revisions?.configuration;
+        if (!isRecord(launched) || !SAFE_ID.test(launched.runId ?? '')
+          || !/^[a-f0-9]{64}$/u.test(launched.operationId ?? '')) {
+          fail('CUTOVER_CANARY_LAUNCH_MISMATCH', 'Canary launch returned an invalid durable operation identity.');
+        }
+        if (!isRecord(launched.actor) || canonicalJson(launched.actor) !== canonicalJson(permit.actor)) {
+          fail('CUTOVER_CANARY_LAUNCH_MISMATCH', 'Canary launch actor does not match its one-time permit.');
+        }
+        assertDigest(runnerRevision, 'Canary launch runner revision');
+        assertDigest(configurationRevision, 'Canary launch configuration revision');
+        if (permit.state === 'CONSUMED') {
+          if (permit.runId !== launched.runId || permit.operationId !== launched.operationId
+            || permit.runRunnerRevision !== runnerRevision
+            || permit.runConfigurationRevision !== configurationRevision) {
+            fail('CUTOVER_CANARY_LAUNCH_CONFLICT', 'Canary launch replay returned different immutable output.');
+          }
+          return launched;
+        }
+        const consumed = seal(canaryLaunchPermitBody({
+          ...permit,
+          state: 'CONSUMED',
+          runId: launched.runId,
+          operationId: launched.operationId,
+          runRunnerRevision: runnerRevision,
+          runConfigurationRevision: configurationRevision,
+          consumedAt: timestamp(store.clock ?? (() => Date.now())),
+        }));
+        const storage = await openAtomicStorage({ root: admissionGate.root, verify: false });
+        await persistCanaryLaunchPermit(storage, consumed);
+        return launched;
+      });
     },
     withPromotionAdmission(_requestId, operation) {
       return admissionGate.withOpen(operation);
@@ -782,35 +1159,88 @@ export async function activateSharedAuthorityCutover({
   });
 }
 
-const CUTOVER_CANARY_MODES = Object.freeze(['single-site', 'comparative']);
-
-async function defaultReadCanaryEvidence(store, runId) {
+async function defaultReadCanaryEvidence(store, runId, { probeTargetIdentity } = {}) {
+  if (typeof probeTargetIdentity !== 'function') {
+    fail('CUTOVER_CANARY_REPROBE_REQUIRED', 'Canary authority requires a trusted current target re-probe.');
+  }
   const [state, publication] = await Promise.all([
     readParentRun(store, runId),
     readCurrentEnvelope(store, runId),
   ]);
+  const trustedReprobeIdentity = await probeTargetIdentity(clone(state));
   return {
+    runId,
     mode: state.finalSubject?.mode,
+    createdAt: state.createdAt,
+    subjectCoreDigest: state.subjectCoreDigest,
     finalSubjectDigest: state.finalSubjectDigest,
     publicationDigest: publication.digest,
     decisionCode: publication.decision?.code,
     decisionRevision: publication.decisionRevision,
+    grantedAuthority: publication.decision?.grantedAuthority,
+    deploymentIdentity: state.finalSubject?.deploymentIdentity,
+    trustedReprobeIdentity,
+    runnerRevision: state.runnerRevision,
+    configurationRevision: state.subjectCore?.revisions?.configuration,
+    activeBuildIdentity: store.buildIdentity,
   };
 }
 
-function parseCanaryEvidence(value, { mode, runId }) {
+function parseCanaryEvidence(value, {
+  mode, runId, selector, store, minimumCreatedAt = null, launchPermit = null,
+}) {
   if (!isRecord(value) || value.mode !== mode || value.decisionCode !== 'RELEASE_READY'
+    || value.grantedAuthority !== 'FULL' || value.runId !== runId
     || !Number.isSafeInteger(value.decisionRevision) || value.decisionRevision < 1) {
     fail('CUTOVER_CANARY_NOT_READY', `${mode} canary ${runId} is not a full current ready publication.`);
   }
+  canonicalTimestamp(value.createdAt, 'Canary createdAt');
   assertDigest(value.finalSubjectDigest, 'Canary finalSubjectDigest');
+  assertDigest(value.subjectCoreDigest, 'Canary subjectCoreDigest');
   assertDigest(value.publicationDigest, 'Canary publicationDigest');
+  assertDigest(value.runnerRevision, 'Canary runnerRevision');
+  assertDigest(value.configurationRevision, 'Canary configurationRevision');
+  nonEmptyString(value.activeBuildIdentity, 'Canary activeBuildIdentity');
+  const deploymentIdentity = parseTrustedTargetIdentity(value.deploymentIdentity, 'Canary deployment identity');
+  const trustedReprobeIdentity = parseTrustedTargetIdentity(value.trustedReprobeIdentity, 'Canary trusted re-probe identity');
+  if (canonicalJson(deploymentIdentity) !== canonicalJson(trustedReprobeIdentity)) {
+    fail('CUTOVER_CANARY_TARGET_MISMATCH', `${mode} canary target identity changed at trusted re-probe.`);
+  }
+  const storeBinding = cutoverStoreBinding(store);
+  if (value.activeBuildIdentity !== selector.activeBuildIdentity
+    || value.activeBuildIdentity !== store.buildIdentity) {
+    fail('CUTOVER_CANARY_BUILD_MISMATCH', `${mode} canary is not bound to the active cutover build.`);
+  }
+  if (minimumCreatedAt !== null && Date.parse(value.createdAt) < Date.parse(minimumCreatedAt)) {
+    fail('CUTOVER_CANARY_STALE', `${mode} canary predates the authority event it must prove.`);
+  }
+  if (launchPermit) {
+    if (launchPermit.state !== 'CONSUMED' || launchPermit.runId !== runId
+      || launchPermit.activeBuildIdentity !== value.activeBuildIdentity
+      || launchPermit.storeBindingDigest !== storeBinding.digest
+      || launchPermit.runRunnerRevision !== value.runnerRevision
+      || launchPermit.runConfigurationRevision !== value.configurationRevision
+      || canonicalJson(launchPermit.targetIdentity) !== canonicalJson(value.deploymentIdentity)
+      || Date.parse(value.createdAt) < Date.parse(launchPermit.authorizedAt)
+      || Date.parse(value.createdAt) > Date.parse(launchPermit.consumedAt)) {
+      fail('CUTOVER_CANARY_LAUNCH_MISMATCH', `${mode} canary evidence does not match its one-time cutover launch permit.`);
+    }
+  }
   return {
     mode, runId,
+    createdAt: value.createdAt,
+    subjectCoreDigest: value.subjectCoreDigest,
     finalSubjectDigest: value.finalSubjectDigest,
     publicationDigest: value.publicationDigest,
     decisionCode: value.decisionCode,
     decisionRevision: value.decisionRevision,
+    grantedAuthority: value.grantedAuthority,
+    deploymentIdentity,
+    trustedReprobeIdentity,
+    runnerRevision: value.runnerRevision,
+    configurationRevision: value.configurationRevision,
+    activeBuildIdentity: value.activeBuildIdentity,
+    storeBindingDigest: storeBinding.digest,
   };
 }
 
@@ -848,6 +1278,8 @@ function parseCanaryHead(value, cutoverId) {
     assertDigest(receipt.publicationDigest, `Cutover ${mode} canary publicationDigest`);
     assertDigest(receipt.receiptDigest, `Cutover ${mode} canary receiptDigest`);
     assertDigest(receipt.admissionGateDigest, `Cutover ${mode} canary admissionGateDigest`);
+    assertDigest(receipt.launchPermitDigest, `Cutover ${mode} canary launchPermitDigest`);
+    assertDigest(receipt.storeBindingDigest, `Cutover ${mode} canary storeBindingDigest`);
   }
   return clone(value);
 }
@@ -872,6 +1304,7 @@ function assertActivatedCutover(selector, gate, cutoverId) {
 export async function recordSharedCutoverCanary({
   store, admissionGate, reportDirectory, cutoverId, mode, runId,
   readCanaryEvidence = defaultReadCanaryEvidence,
+  probeTargetIdentity,
   clock = store?.clock ?? (() => Date.now()),
 } = {}) {
   safeId(cutoverId, 'cutoverId');
@@ -883,7 +1316,16 @@ export async function recordSharedCutoverCanary({
       readReleaseAuthoritySelector(store), admissionGate.read(),
     ]);
     assertActivatedCutover(selector, gate, cutoverId);
-    const evidence = parseCanaryEvidence(await readCanaryEvidence(store, runId), { mode, runId });
+    const launchPermit = await readCanaryLaunchPermit(admissionGate, cutoverId, mode);
+    if (!launchPermit) fail('CUTOVER_CANARY_LAUNCH_MISMATCH', `${mode} canary has no cutover launch permit.`);
+    const evidence = parseCanaryEvidence(await readCanaryEvidence(store, runId, { probeTargetIdentity }), {
+      mode,
+      runId,
+      selector,
+      store,
+      minimumCreatedAt: selector.activatedAt,
+      launchPermit,
+    });
     const current = await readCanaryHead(storage, cutoverId);
     const prior = current?.receipts[mode];
     if (prior && prior.runId === evidence.runId
@@ -897,6 +1339,9 @@ export async function recordSharedCutoverCanary({
       ...evidence,
       authoritySelectorDigest: selector.digest,
       admissionGateDigest: gate.digest,
+      launchPermitDigest: launchPermit.digest,
+      cutoverReportDigest: launchPermit.cutoverReportDigest,
+      cutoverConfigurationDigest: launchPermit.cutoverConfigurationDigest,
       recordedAt: timestamp(clock),
     };
     const receipt = seal(receiptBody);
@@ -906,7 +1351,12 @@ export async function recordSharedCutoverCanary({
     if (!await pathExists(storage.fs, receiptPath)) {
       await atomicWriteJson(storage, receiptPath, receipt, { exclusive: true });
     }
-    const summarized = { ...evidence, receiptDigest: receipt.digest, admissionGateDigest: gate.digest };
+    const summarized = {
+      ...evidence,
+      receiptDigest: receipt.digest,
+      admissionGateDigest: gate.digest,
+      launchPermitDigest: launchPermit.digest,
+    };
     const next = seal(canaryHeadBody({
       cutoverId,
       revision: (current?.revision ?? 0) + 1,
@@ -926,6 +1376,7 @@ export async function recordSharedCutoverCanary({
 export async function reopenSharedAdmissionAfterCanaries({
   store, admissionGate, reportDirectory, cutoverId,
   readCanaryEvidence = defaultReadCanaryEvidence,
+  probeTargetIdentity,
   clock = store?.clock ?? (() => Date.now()),
   hooks = {},
 } = {}) {
@@ -958,8 +1409,17 @@ export async function reopenSharedAdmissionAfterCanaries({
     }
     for (const mode of CUTOVER_CANARY_MODES) {
       const receipt = canaries.receipts[mode];
-      const current = parseCanaryEvidence(await readCanaryEvidence(store, receipt.runId), {
-        mode, runId: receipt.runId,
+      const launchPermit = await readCanaryLaunchPermit(admissionGate, cutoverId, mode);
+      if (!launchPermit || launchPermit.digest !== receipt.launchPermitDigest) {
+        fail('CUTOVER_CANARY_LAUNCH_MISMATCH', `${mode} canary launch permit changed after recording.`);
+      }
+      const current = parseCanaryEvidence(await readCanaryEvidence(store, receipt.runId, { probeTargetIdentity }), {
+        mode,
+        runId: receipt.runId,
+        selector,
+        store,
+        minimumCreatedAt: selector.activatedAt,
+        launchPermit,
       });
       if (current.finalSubjectDigest !== receipt.finalSubjectDigest
         || current.publicationDigest !== receipt.publicationDigest
@@ -1043,7 +1503,19 @@ export async function rollbackSharedAuthorityBeforeActivation({
   });
 }
 
-export async function setSharedPromotionAvailability({ store, coordinator, phase, buildIdentity } = {}) {
+export async function setSharedPromotionAvailability({
+  store,
+  coordinator,
+  phase,
+  buildIdentity,
+  reportDirectory = null,
+  cutoverId = null,
+  healthCanaries = null,
+  readCanaryEvidence = defaultReadCanaryEvidence,
+  probeTargetIdentity,
+  transitionWithPublicationFence = transitionReleaseAuthorityWithPublicationFence,
+  clock = store?.clock ?? (() => Date.now()),
+} = {}) {
   ensureCoordinator(coordinator);
   if (!['ACTIVE', 'PROMOTION_DISABLED'].includes(phase)) {
     fail('CUTOVER_INPUT_INVALID', 'Post-activation authority may only be ACTIVE or PROMOTION_DISABLED.');
@@ -1055,10 +1527,73 @@ export async function setSharedPromotionAvailability({ store, coordinator, phase
   if (!selector.prequalifiedRollbackBuilds.includes(buildIdentity) || store.buildIdentity !== buildIdentity) {
     fail('CUTOVER_ROLLBACK_BUILD_UNQUALIFIED', 'Post-activation operation requires the exact opened prequalified build.');
   }
-  return transitionReleaseAuthority(store, coordinator, {
+  if (phase === selector.phase) return clone(selector);
+  if (phase === 'PROMOTION_DISABLED') {
+    return transitionReleaseAuthority(store, coordinator, {
+      expectedSelectorDigest: selector.digest,
+      phase,
+      activationRevision: selector.activationRevision,
+      buildIdentity,
+    });
+  }
+  if (!isRecord(healthCanaries)) {
+    fail('CUTOVER_PROMOTION_HEALTH_REQUIRED', 'Promotion re-enable requires fresh Single-site and Comparative health canaries.');
+  }
+  exactKeys(healthCanaries, CUTOVER_CANARY_MODES, 'promotion health canaries');
+  safeId(cutoverId, 'cutoverId');
+  const evidence = {};
+  for (const mode of CUTOVER_CANARY_MODES) {
+    const runId = safeId(healthCanaries[mode], `${mode} health canary runId`);
+    evidence[mode] = parseCanaryEvidence(
+      await readCanaryEvidence(store, runId, { probeTargetIdentity }),
+      { mode, runId, selector, store, minimumCreatedAt: selector.updatedAt },
+    );
+  }
+  const storage = await openReportStorage(reportDirectory);
+  const healthBinding = {
+    schemaVersion: 1,
+    kind: 'release-promotion-health-receipt',
+    cutoverId,
+    selectorBeforeDigest: selector.digest,
+    activeBuildIdentity: selector.activeBuildIdentity,
+    storeBindingDigest: cutoverStoreBinding(store).digest,
+    canaries: evidence,
+  };
+  const evidenceTime = Math.max(...CUTOVER_CANARY_MODES.map((mode) => Date.parse(evidence[mode].createdAt)));
+  const healthReceipt = seal({ ...healthBinding, recordedAt: new Date(evidenceTime).toISOString() });
+  const healthPath = reportStoragePath(
+    storage,
+    cutoverId,
+    `.promotion-health-${healthReceipt.digest.slice('sha256:'.length)}.json`,
+  );
+  if (!await pathExists(storage.fs, healthPath)) {
+    await atomicWriteJson(storage, healthPath, healthReceipt, { exclusive: true });
+  }
+  if (typeof transitionWithPublicationFence !== 'function') {
+    fail('CUTOVER_INPUT_INVALID', 'Promotion health publication fence is required.');
+  }
+  const activated = await transitionWithPublicationFence(store, coordinator, {
     expectedSelectorDigest: selector.digest,
     phase,
     activationRevision: selector.activationRevision,
     buildIdentity,
+    expectedPublications: CUTOVER_CANARY_MODES.map((mode) => ({
+      runId: evidence[mode].runId,
+      envelopeDigest: evidence[mode].publicationDigest,
+    })),
   });
+  const reenableReport = seal({
+    schemaVersion: 1,
+    kind: 'release-promotion-reenable-report',
+    cutoverId,
+    selectorBefore: selector,
+    selectorAfter: activated,
+    healthReceiptDigest: healthReceipt.digest,
+    completedAt: timestamp(clock),
+  });
+  const reenablePath = reportStoragePath(storage, cutoverId, `.promotion-reenable-${selector.revision}.json`);
+  if (!await pathExists(storage.fs, reenablePath)) {
+    await atomicWriteJson(storage, reenablePath, reenableReport, { exclusive: true });
+  }
+  return Object.freeze({ selector: activated, healthReceipt: clone(healthReceipt) });
 }

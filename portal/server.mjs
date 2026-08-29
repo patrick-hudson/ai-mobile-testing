@@ -589,7 +589,7 @@ if (process.env.PORTAL_SHARED_CONTROL === '1') {
     );
   }
   const admissionGate = await openCutoverAdmissionGate({ root: admissionRoot });
-  const admissionPolicy = createCutoverAdmissionPolicy({ admissionGate });
+  const admissionPolicy = createCutoverAdmissionPolicy({ admissionGate, store: controlStore });
   sharedProjectId = process.env.AUDIT_SHARED_PROJECT_ID ?? 'default';
   const sharedLaunchService = createSharedLaunchService({
     operationStore: launchOperationStore,

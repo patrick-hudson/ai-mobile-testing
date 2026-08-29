@@ -4,6 +4,10 @@ import path from 'node:path';
 
 import { canonicalDigest } from '../shared/canonical-contract.mjs';
 import {
+  probeTargetPreflightSet,
+  targetPreflightInputsForRunContract,
+} from '../shared/target-preflight-set.mjs';
+import {
   PARENT_RUN_STORE_SCHEMA_VERSION,
   PARENT_RUN_WRITER_PROTOCOL,
   acquireStoreCoordinator,
@@ -12,6 +16,7 @@ import {
 } from './lib/parent-run-store.mjs';
 import {
   activateSharedAuthorityCutover,
+  authorizeSharedCutoverCanaryLaunch,
   captureSharedAuthorityDrainObservation,
   initializeCutoverAdmissionGate,
   openCutoverAdmissionGate,
@@ -21,6 +26,8 @@ import {
   rollbackSharedAuthorityBeforeActivation,
   setSharedPromotionAvailability,
 } from './lib/shared-cutover-orchestrator.mjs';
+import { createSharedReleaseHttpClient } from './lib/shared-release-ci.mjs';
+import { readCredentialFile } from './lib/credential-file.mjs';
 import {
   initializeLegacyAuthorityFence,
   openLegacyAuthorityFence,
@@ -29,12 +36,13 @@ import { openSharedLaunchOperationStore } from './lib/shared-launch-operation-st
 import { readTrustedStoreMarker } from './lib/shared-store-runtime.mjs';
 
 const ACTIONS = new Set([
-  'prepare', 'activate', 'record-single-site-canary', 'record-comparative-canary', 'reopen',
+  'prepare', 'activate', 'launch-single-site-canary', 'launch-comparative-canary',
+  'record-single-site-canary', 'record-comparative-canary', 'reopen',
   'rollback', 'disable-promotion', 'enable-promotion',
 ]);
 
 function usage() {
-  return 'Usage: run-shared-authority-cutover.mjs <prepare|activate|record-single-site-canary|record-comparative-canary|reopen|rollback|disable-promotion|enable-promotion> --config <operator-config.json>';
+  return 'Usage: run-shared-authority-cutover.mjs <prepare|activate|launch-single-site-canary|launch-comparative-canary|record-single-site-canary|record-comparative-canary|reopen|rollback|disable-promotion|enable-promotion> --config <operator-config.json>';
 }
 
 function parseArguments(argv) {
@@ -87,9 +95,42 @@ async function openConfiguredStore(config, action, marker) {
     return await openParentRunStore(options);
   } catch (error) {
     if (error?.code !== 'STORE_GENERATION_MISMATCH'
-      || !['activate', 'record-single-site-canary', 'record-comparative-canary', 'reopen', 'disable-promotion', 'enable-promotion'].includes(action)) throw error;
+      || !['activate', 'launch-single-site-canary', 'launch-comparative-canary', 'record-single-site-canary', 'record-comparative-canary', 'reopen', 'disable-promotion', 'enable-promotion'].includes(action)) throw error;
     return openParentRunStore({ ...options, expectedStoreGeneration: originalGeneration + 1 });
   }
+}
+
+function configuredCanary(config, mode, collection = 'canaries') {
+  const values = requiredObject(config[collection], `config.${collection}`);
+  return requiredObject(values[mode], `config.${collection}.${mode}`);
+}
+
+async function readCanaryIntent(config, mode, collection = 'canaries') {
+  const canary = configuredCanary(config, mode, collection);
+  return {
+    canary,
+    intent: await readBoundedJsonFile(canary.intentFile, `${mode} canary intent`),
+  };
+}
+
+async function reprobeCanaryIntent(intent) {
+  const contract = requiredObject(intent.runContract, 'canary intent runContract');
+  const preflightOptions = contract.mode === 'single-site' && contract.certificatePolicy === 'preview-bypass'
+    ? { previewBypassOrigins: [contract.url], tlsBypassRequestOptions: { rejectUnauthorized: false } }
+    : {};
+  return (await probeTargetPreflightSet(targetPreflightInputsForRunContract(contract), { preflightOptions })).identity;
+}
+
+async function canaryReprobeByMode(config, collection = 'canaries') {
+  const intents = new Map();
+  for (const mode of ['single-site', 'comparative']) {
+    intents.set(mode, (await readCanaryIntent(config, mode, collection)).intent);
+  }
+  return async (state) => {
+    const mode = state?.finalSubject?.mode;
+    if (!intents.has(mode)) throw new TypeError('Canary evidence mode has no configured trusted target intent.');
+    return reprobeCanaryIntent(intents.get(mode));
+  };
 }
 
 async function main() {
@@ -183,16 +224,38 @@ async function main() {
       reportDirectory: config.reportDirectory, input: commonInput,
       drainObservation,
     });
+  } else if (action === 'launch-single-site-canary' || action === 'launch-comparative-canary') {
+    const mode = action === 'launch-single-site-canary' ? 'single-site' : 'comparative';
+    const { canary, intent } = await readCanaryIntent(config, mode);
+    const control = requiredObject(config.control, 'config.control');
+    const permit = await authorizeSharedCutoverCanaryLaunch({
+      store,
+      admissionGate,
+      reportDirectory: config.reportDirectory,
+      cutoverId: config.cutoverId,
+      mode,
+      requestId: canary.requestId,
+      actor: canary.actor,
+      intent,
+      supersedeReason: canary.supersedeReason ?? null,
+    });
+    const client = createSharedReleaseHttpClient({
+      baseUrl: control.server,
+      token: await readCredentialFile(control.credentialFile, { label: 'Cutover control credential' }),
+    });
+    result = { permit, operation: await client.launch({ requestId: canary.requestId, intent }) };
   } else if (action === 'record-single-site-canary' || action === 'record-comparative-canary') {
     const mode = action === 'record-single-site-canary' ? 'single-site' : 'comparative';
-    const canaries = requiredObject(config.canaries, 'config.canaries');
+    const { canary, intent } = await readCanaryIntent(config, mode);
     result = await recordSharedCutoverCanary({
       store, admissionGate, reportDirectory: config.reportDirectory, cutoverId: config.cutoverId,
-      mode, runId: canaries[mode],
+      mode, runId: canary.runId,
+      probeTargetIdentity: () => reprobeCanaryIntent(intent),
     });
   } else if (action === 'reopen') {
     result = await reopenSharedAdmissionAfterCanaries({
       store, admissionGate, reportDirectory: config.reportDirectory, cutoverId: config.cutoverId,
+      probeTargetIdentity: await canaryReprobeByMode(config),
     });
   } else if (action === 'rollback') {
     result = await rollbackSharedAuthorityBeforeActivation({
@@ -200,11 +263,21 @@ async function main() {
       cutoverId: config.cutoverId, buildIdentity: config.store.buildIdentity, operatorReview,
     });
   } else {
+    const enable = action === 'enable-promotion';
+    const healthCanaries = enable
+      ? Object.fromEntries((await Promise.all(['single-site', 'comparative'].map(async (mode) => [
+        mode, configuredCanary(config, mode, 'promotionHealth').runId,
+      ]))))
+      : null;
     result = await setSharedPromotionAvailability({
       store,
       coordinator,
-      phase: action === 'disable-promotion' ? 'PROMOTION_DISABLED' : 'ACTIVE',
+      phase: enable ? 'ACTIVE' : 'PROMOTION_DISABLED',
       buildIdentity: config.store.buildIdentity,
+      reportDirectory: config.reportDirectory,
+      cutoverId: config.cutoverId,
+      healthCanaries,
+      probeTargetIdentity: enable ? await canaryReprobeByMode(config, 'promotionHealth') : undefined,
     });
   }
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);

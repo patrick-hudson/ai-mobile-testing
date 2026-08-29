@@ -31,7 +31,9 @@ import {
 } from './lib/parent-run-store.mjs';
 import {
   activateSharedAuthorityCutover,
+  authorizeSharedCutoverCanaryLaunch,
   captureSharedAuthorityDrainObservation,
+  createCutoverAdmissionPolicy,
   initializeCutoverAdmissionGate,
   prepareSharedAuthorityCutover,
   recordSharedCutoverCanary,
@@ -81,6 +83,50 @@ function review() {
   };
 }
 
+const digest = (character) => `sha256:${character.repeat(64)}`;
+const targetIdentity = Object.freeze({ kind: 'target-preflight-set', value: digest('9') });
+
+function canaryEvidence({
+  mode,
+  runId,
+  createdAt = new Date(now).toISOString(),
+  finalSubjectDigest = digest(mode === 'single-site' ? '1' : '3'),
+  publicationDigest = digest(mode === 'single-site' ? '2' : '4'),
+  configurationRevision = digest(mode === 'single-site' ? '6' : '7'),
+} = {}) {
+  return {
+    mode,
+    runId,
+    createdAt,
+    subjectCoreDigest: digest(mode === 'single-site' ? 'a' : 'b'),
+    finalSubjectDigest,
+    publicationDigest,
+    decisionCode: 'RELEASE_READY',
+    decisionRevision: 1,
+    grantedAuthority: 'FULL',
+    deploymentIdentity: targetIdentity,
+    trustedReprobeIdentity: targetIdentity,
+    runnerRevision: digest('8'),
+    configurationRevision,
+    activeBuildIdentity: build,
+  };
+}
+
+function canaryIntent(mode) {
+  const common = {
+    schemaVersion: 1,
+    mode,
+    targetIds: mode === 'single-site' ? ['audited'] : ['candidate', 'production'],
+    scope: { qualifier: 'FULL', pluginIds: [], auditIds: [], areas: [] },
+  };
+  return {
+    schemaVersion: 1,
+    runContract: mode === 'single-site'
+      ? { ...common, url: 'https://candidate.example.test', deploymentRole: 'preview', certificatePolicy: 'strict' }
+      : { ...common, candidateUrl: 'https://candidate.example.test', productionUrl: 'https://production.example.test' },
+  };
+}
+
 function cutoverConfigurationDigest(input) {
   return canonicalDigest({
     cutoverId: input.cutoverId,
@@ -101,8 +147,6 @@ function cutoverReview(input) {
     configurationDigest: cutoverConfigurationDigest(input),
   };
 }
-
-const digest = (character) => `sha256:${character.repeat(64)}`;
 
 function sealedRunInput(runId, workItemId) {
   const subjectCore = sealReleaseSubjectCore({
@@ -294,20 +338,135 @@ try {
     assert.equal(report.digest, canonicalDigest(Object.fromEntries(Object.entries(report).filter(([key]) => key !== 'digest'))));
     assert.equal(JSON.parse(await readFile(path.join(directory, 'reports', 'cutover-happy.json'), 'utf8')).digest, report.digest);
 
-    const canaryEvidence = new Map([
-      ['canary-single-site', {
-        mode: 'single-site', finalSubjectDigest: `sha256:${'1'.repeat(64)}`,
-        publicationDigest: `sha256:${'2'.repeat(64)}`, decisionCode: 'RELEASE_READY', decisionRevision: 1,
-      }],
-      ['canary-comparative', {
-        mode: 'comparative', finalSubjectDigest: `sha256:${'3'.repeat(64)}`,
-        publicationDigest: `sha256:${'4'.repeat(64)}`, decisionCode: 'RELEASE_READY', decisionRevision: 1,
-      }],
-    ]);
-    const readCanaryEvidence = async (_store, runId) => structuredClone(canaryEvidence.get(runId));
+    now += 100;
+    const policy = createCutoverAdmissionPolicy({ admissionGate, store });
+    await expectCode('CUTOVER_ADMISSION_CLOSED', () => policy.withLaunchAdmission(
+      'ordinary-launch-closed-0001', canaryIntent('single-site'), async () => ({ runId: 'must-not-launch' }),
+    ));
+    const evidenceByRun = new Map();
+    let singleCanaryRunId = 'canary-single-site';
+    for (const [mode, runId] of [['single-site', 'canary-single-site'], ['comparative', 'canary-comparative']]) {
+      const intent = canaryIntent(mode);
+      const requestId = `cutover-${mode}-canary-0001`;
+      const permit = await authorizeSharedCutoverCanaryLaunch({
+        store,
+        admissionGate,
+        reportDirectory: path.join(directory, 'reports'),
+        cutoverId: input.cutoverId,
+        mode,
+        requestId,
+        actor: { id: 'operator:cutover-canary', kind: 'human' },
+        intent,
+        probeTargetIdentity: async () => targetIdentity,
+        clock,
+      });
+      assert.equal(permit.mode, mode);
+      const wrongIntent = structuredClone(intent);
+      if (mode === 'single-site') wrongIntent.runContract.url = 'https://changed.example.test';
+      else wrongIntent.runContract.candidateUrl = 'https://changed.example.test';
+      await expectCode('CUTOVER_CANARY_LAUNCH_MISMATCH', () => policy.withLaunchAdmission(
+        requestId, wrongIntent,
+        async () => ({ runId: 'wrong-intent' }),
+      ));
+      const evidence = canaryEvidence({ mode, runId });
+      const operation = await policy.withLaunchAdmission(requestId, intent, async () => ({
+        operationId: digest(mode === 'single-site' ? 'c' : 'd').slice(7),
+        actor: { id: 'operator:cutover-canary', kind: 'human' },
+        runId,
+        acceptedAt: new Date(now).toISOString(),
+        compiledPlan: {
+          createParentRunInput: {
+            runnerRevision: evidence.runnerRevision,
+            subjectCore: { revisions: { configuration: evidence.configurationRevision } },
+          },
+        },
+      }));
+      assert.equal(operation.runId, runId);
+      evidenceByRun.set(runId, evidence);
+    }
+    await expectCode('CUTOVER_CANARY_REPLACEMENT_BLOCKED', () => authorizeSharedCutoverCanaryLaunch({
+      store,
+      admissionGate,
+      reportDirectory: path.join(directory, 'reports'),
+      cutoverId: input.cutoverId,
+      mode: 'single-site',
+      requestId: 'cutover-single-site-canary-0002',
+      actor: { id: 'operator:cutover-canary', kind: 'human' },
+      intent: canaryIntent('single-site'),
+      supersedeReason: 'Initial canary has not produced terminal evidence.',
+      probeTargetIdentity: async () => targetIdentity,
+      clock,
+    }));
+    await createParentRun(store, sealedRunInput(singleCanaryRunId, 'work-canary-single-site'));
+    const failedCanaryLease = await claimWorkItem(store, singleCanaryRunId, coordinator, {
+      workerId: 'worker-canary-single-site', capabilities: ['browser:chromium'],
+      resourceClasses: ['ordinary'], leaseMs: 30_000,
+    });
+    const failedCanaryInbox = await publishAttemptEvidence(store, singleCanaryRunId, failedCanaryLease, {
+      outcome: 'completed_product_failure', reason: 'canary-assertion-failed', artifacts: [],
+      executionDescriptorDigest: failedCanaryLease.executionDescriptorDigest,
+    });
+    await adoptAttemptEvidence(store, singleCanaryRunId, coordinator, failedCanaryInbox);
+    const retryIntent = canaryIntent('single-site');
+    const retryPermit = await authorizeSharedCutoverCanaryLaunch({
+      store,
+      admissionGate,
+      reportDirectory: path.join(directory, 'reports'),
+      cutoverId: input.cutoverId,
+      mode: 'single-site',
+      requestId: 'cutover-single-site-canary-0002',
+      actor: { id: 'operator:cutover-canary', kind: 'human' },
+      intent: retryIntent,
+      supersedeReason: 'Initial canary reached a terminal product failure after the deployment was repaired.',
+      probeTargetIdentity: async () => targetIdentity,
+      clock,
+    });
+    assert.equal(retryPermit.revision, 2);
+    assert.equal(retryPermit.supersedesRunId, singleCanaryRunId);
+    singleCanaryRunId = 'canary-single-site-retry';
+    const retryEvidence = canaryEvidence({ mode: 'single-site', runId: singleCanaryRunId });
+    await policy.withLaunchAdmission('cutover-single-site-canary-0002', retryIntent, async () => ({
+      operationId: digest('e').slice(7),
+      actor: { id: 'operator:cutover-canary', kind: 'human' },
+      runId: singleCanaryRunId,
+      acceptedAt: new Date(now).toISOString(),
+      compiledPlan: { createParentRunInput: {
+        runnerRevision: retryEvidence.runnerRevision,
+        subjectCore: { revisions: { configuration: retryEvidence.configurationRevision } },
+      } },
+    }));
+    evidenceByRun.set(singleCanaryRunId, retryEvidence);
+    const readCanaryEvidence = async (_store, runId) => structuredClone(evidenceByRun.get(runId));
+    const staleSingle = evidenceByRun.get(singleCanaryRunId);
+    evidenceByRun.set(singleCanaryRunId, {
+      ...staleSingle,
+      createdAt: new Date(Date.parse(report.selectorAfter.activatedAt) - 1).toISOString(),
+    });
+    await expectCode('CUTOVER_CANARY_STALE', () => recordSharedCutoverCanary({
+      store, admissionGate, reportDirectory: path.join(directory, 'reports'), cutoverId: input.cutoverId,
+      mode: 'single-site', runId: singleCanaryRunId, readCanaryEvidence, clock,
+    }));
+    evidenceByRun.set(singleCanaryRunId, {
+      ...staleSingle,
+      createdAt: report.selectorAfter.activatedAt,
+    });
+    await expectCode('CUTOVER_CANARY_LAUNCH_MISMATCH', () => recordSharedCutoverCanary({
+      store, admissionGate, reportDirectory: path.join(directory, 'reports'), cutoverId: input.cutoverId,
+      mode: 'single-site', runId: singleCanaryRunId, readCanaryEvidence, clock,
+    }));
+    evidenceByRun.set(singleCanaryRunId, staleSingle);
+    evidenceByRun.set(singleCanaryRunId, {
+      ...staleSingle,
+      trustedReprobeIdentity: { kind: 'target-preflight-set', value: digest('0') },
+    });
+    await expectCode('CUTOVER_CANARY_TARGET_MISMATCH', () => recordSharedCutoverCanary({
+      store, admissionGate, reportDirectory: path.join(directory, 'reports'), cutoverId: input.cutoverId,
+      mode: 'single-site', runId: singleCanaryRunId, readCanaryEvidence, clock,
+    }));
+    evidenceByRun.set(singleCanaryRunId, staleSingle);
     await recordSharedCutoverCanary({
       store, admissionGate, reportDirectory: path.join(directory, 'reports'), cutoverId: input.cutoverId,
-      mode: 'single-site', runId: 'canary-single-site', readCanaryEvidence, clock,
+      mode: 'single-site', runId: singleCanaryRunId, readCanaryEvidence, clock,
     });
     await expectCode('CUTOVER_CANARIES_INCOMPLETE', () => reopenSharedAdmissionAfterCanaries({
       store, admissionGate, reportDirectory: path.join(directory, 'reports'), cutoverId: input.cutoverId,
@@ -318,13 +477,13 @@ try {
       store, admissionGate, reportDirectory: path.join(directory, 'reports'), cutoverId: input.cutoverId,
       mode: 'comparative', runId: 'canary-comparative', readCanaryEvidence, clock,
     });
-    canaryEvidence.get('canary-comparative').publicationDigest = `sha256:${'5'.repeat(64)}`;
+    evidenceByRun.get('canary-comparative').publicationDigest = `sha256:${'5'.repeat(64)}`;
     await expectCode('CUTOVER_CANARY_STALE', () => reopenSharedAdmissionAfterCanaries({
       store, admissionGate, reportDirectory: path.join(directory, 'reports'), cutoverId: input.cutoverId,
       readCanaryEvidence, clock,
     }));
     assert.equal((await admissionGate.read()).state, 'CLOSED');
-    canaryEvidence.get('canary-comparative').publicationDigest = `sha256:${'4'.repeat(64)}`;
+    evidenceByRun.get('canary-comparative').publicationDigest = `sha256:${'4'.repeat(64)}`;
     await assert.rejects(reopenSharedAdmissionAfterCanaries({
       store, admissionGate, reportDirectory: path.join(directory, 'reports'), cutoverId: input.cutoverId,
       readCanaryEvidence, clock,
@@ -355,10 +514,46 @@ try {
       store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'),
       cutoverId: input.cutoverId, buildIdentity: build, operatorReview: review(),
     }));
+    await expectCode('CUTOVER_PROMOTION_HEALTH_REQUIRED', () => setSharedPromotionAvailability({
+      store, coordinator, phase: 'ACTIVE', buildIdentity: build,
+      reportDirectory: path.join(directory, 'reports'), cutoverId: input.cutoverId,
+      readCanaryEvidence, clock,
+    }));
+    now = Date.parse(disabled.updatedAt) + 1;
+    evidenceByRun.set('health-single-site', canaryEvidence({ mode: 'single-site', runId: 'health-single-site' }));
+    evidenceByRun.set('health-comparative', canaryEvidence({ mode: 'comparative', runId: 'health-comparative' }));
+    await expectCode('CUTOVER_INPUT_INVALID', () => setSharedPromotionAvailability({
+      store, coordinator, phase: 'ACTIVE', buildIdentity: build,
+      reportDirectory: path.join(directory, 'reports'), cutoverId: input.cutoverId,
+      healthCanaries: { 'single-site': 'health-single-site' }, readCanaryEvidence, clock,
+    }));
+    evidenceByRun.get('health-comparative').createdAt = new Date(Date.parse(disabled.updatedAt) - 1).toISOString();
+    await expectCode('CUTOVER_CANARY_STALE', () => setSharedPromotionAvailability({
+      store, coordinator, phase: 'ACTIVE', buildIdentity: build,
+      reportDirectory: path.join(directory, 'reports'), cutoverId: input.cutoverId,
+      healthCanaries: { 'single-site': 'health-single-site', comparative: 'health-comparative' },
+      readCanaryEvidence, clock,
+    }));
+    evidenceByRun.get('health-comparative').createdAt = new Date(now).toISOString();
     const reenabled = await setSharedPromotionAvailability({
       store, coordinator, phase: 'ACTIVE', buildIdentity: build,
+      reportDirectory: path.join(directory, 'reports'), cutoverId: input.cutoverId,
+      healthCanaries: { 'single-site': 'health-single-site', comparative: 'health-comparative' },
+      readCanaryEvidence, clock,
+      transitionWithPublicationFence: async (fencedStore, fencedCoordinator, transition) => {
+        assert.deepEqual(transition.expectedPublications, [
+          { runId: 'health-single-site', envelopeDigest: evidenceByRun.get('health-single-site').publicationDigest },
+          { runId: 'health-comparative', envelopeDigest: evidenceByRun.get('health-comparative').publicationDigest },
+        ]);
+        const unfenced = { ...transition };
+        delete unfenced.expectedPublications;
+        return (await import('./lib/parent-run-store.mjs')).transitionReleaseAuthority(
+          fencedStore, fencedCoordinator, unfenced,
+        );
+      },
     });
-    assert.equal(reenabled.phase, 'ACTIVE');
+    assert.equal(reenabled.selector.phase, 'ACTIVE');
+    assert.equal(reenabled.healthReceipt.kind, 'release-promotion-health-receipt');
   }
 
   {

@@ -579,10 +579,10 @@ function authorityBinding(store, selector) {
   return Object.freeze({ ...body, digest: canonicalDigest(body) });
 }
 
-async function requireActiveAuthority(store) {
+async function requirePublicationAuthority(store) {
   const selector = await readAuthoritySelectorUnlocked(store);
-  if (selector.phase !== 'ACTIVE') {
-    fail('RELEASE_AUTHORITY_INACTIVE', `Direct release authority requires ACTIVE; current phase is ${selector.phase}.`);
+  if (!['ACTIVE', 'PROMOTION_DISABLED'].includes(selector.phase)) {
+    fail('RELEASE_AUTHORITY_INACTIVE', `Direct release publication requires activated shared authority; current phase is ${selector.phase}.`);
   }
   if (!selector.prequalifiedRollbackBuilds.includes(store.buildIdentity)
     || selector.activeWriterProtocol !== store.manifest.currentWriterProtocol) {
@@ -1444,8 +1444,7 @@ export async function readReleaseAuthorityContext(store, { requireActive = false
   return Object.freeze({ selector: clone(selector), binding: authorityBinding(store, selector) });
 }
 
-export function transitionReleaseAuthority(store, coordinator, input = {}) {
-  return withDirectoryLock(store.storage, globalLockPath(store), async () => {
+async function transitionReleaseAuthorityUnlocked(store, coordinator, input = {}) {
     await validateCoordinator(store, coordinator);
     const current = await readAuthoritySelectorUnlocked(store);
     if (input.expectedSelectorDigest !== current.digest) {
@@ -1546,6 +1545,42 @@ export function transitionReleaseAuthority(store, coordinator, input = {}) {
     if (firstActivation) await store.storage.fs.rm(authorityActivationIntentPath(store), { force: true });
     await input.hooks?.afterCommit?.(clone(next));
     return clone(next);
+}
+
+export function transitionReleaseAuthority(store, coordinator, input = {}) {
+  return withDirectoryLock(store.storage, globalLockPath(store), () => (
+    transitionReleaseAuthorityUnlocked(store, coordinator, input)
+  ));
+}
+
+export function transitionReleaseAuthorityWithPublicationFence(store, coordinator, input = {}) {
+  return withDirectoryLock(store.storage, globalLockPath(store), async () => {
+    if (!Array.isArray(input.expectedPublications) || input.expectedPublications.length === 0) {
+      fail('AUTHORITY_HEALTH_EVIDENCE_REQUIRED', 'Authority transition requires current publication fences.');
+    }
+    const runIds = input.expectedPublications.map(({ runId }) => safeId(runId, 'health runId'));
+    if (new Set(runIds).size !== runIds.length) {
+      fail('AUTHORITY_HEALTH_EVIDENCE_INVALID', 'Authority health publication fences must name unique runs.');
+    }
+    for (const expected of input.expectedPublications) {
+      if (!DIGEST_PATTERN.test(expected.envelopeDigest ?? '')) {
+        fail('AUTHORITY_HEALTH_EVIDENCE_INVALID', 'Authority health publication digest is invalid.');
+      }
+      const state = await recoverUnlocked(store, expected.runId);
+      if (state.currentPublicationDigest !== expected.envelopeDigest
+        || state.currentPublicationAuthorityBinding === null) {
+        fail('AUTHORITY_HEALTH_EVIDENCE_STALE', `Health run ${expected.runId} no longer has the expected current publication.`);
+      }
+      const selector = await readAuthoritySelectorUnlocked(store);
+      validatePublicationAuthorityBinding(store, selector, state.currentPublicationAuthorityBinding);
+      const current = (await readPublicationChain(store, expected.runId, state.currentPublicationDigest)).at(-1);
+      if (current.digest !== expected.envelopeDigest) {
+        fail('AUTHORITY_HEALTH_EVIDENCE_STALE', `Health run ${expected.runId} publication chain changed.`);
+      }
+    }
+    const transitionInput = { ...input };
+    delete transitionInput.expectedPublications;
+    return transitionReleaseAuthorityUnlocked(store, coordinator, transitionInput);
   });
 }
 
@@ -3563,7 +3598,7 @@ export async function publishCurrentEnvelope(store, runId, coordinator, envelope
   return withDirectoryLock(store.storage, globalLockPath(store), () => withDirectoryLock(store.storage, lockPath(store, runId), async () => {
     const state = await recoverUnlocked(store, runId);
     await validateCoordinator(store, coordinator);
-    const { selector, binding } = await requireActiveAuthority(store);
+    const { selector, binding } = await requirePublicationAuthority(store);
     if (state.compilationState === 'failed') {
       if (!state.compilationFailure || !Object.hasOwn(envelope, 'subjectCoreDigest')
         || envelope.subjectCoreDigest !== state.subjectCoreDigest || envelope.finalSubjectDigest !== null

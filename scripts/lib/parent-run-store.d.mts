@@ -43,6 +43,10 @@ export function transitionReleaseAuthority(store: ParentRunStore, coordinator: C
   buildIdentity: string; activationRevision?: number;
   hooks?: { beforeCommit?(selector: any): void | Promise<void>; afterActivationIntent?(selector: any): void | Promise<void>; afterActivationFence?(selector: any): void | Promise<void>; afterCommit?(selector: any): void | Promise<void> };
 }): Promise<any>;
+export function transitionReleaseAuthorityWithPublicationFence(store: ParentRunStore, coordinator: CoordinatorFence, input: {
+  expectedSelectorDigest: string; phase: 'ACTIVE'; buildIdentity: string; activationRevision: number;
+  expectedPublications: Array<{ runId: string; envelopeDigest: string }>;
+}): Promise<any>;
 export function heartbeatCoordinator(store: ParentRunStore, coordinator: CoordinatorFence, input: { leaseMs: number }): Promise<CoordinatorFence>;
 export function requestPerformanceDrain(store: ParentRunStore, runId: string, coordinator: CoordinatorFence, input: { workerId: string; leaseMs?: number }): Promise<StorePerformanceReservation>;
 export function requestStorePerformanceDrain(store: ParentRunStore, coordinator: CoordinatorFence, input: { workerId: string; capabilities: string[]; resourceClasses: Array<'performance'>; runIds: string[]; leaseMs?: number }): Promise<StorePerformanceReservation>;

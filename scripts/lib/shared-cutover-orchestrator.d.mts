@@ -20,6 +20,7 @@ export interface CutoverAdmissionGateDocument {
 export interface CutoverAdmissionGate {
   root: string;
   read(): Promise<CutoverAdmissionGateDocument>;
+  withState<T>(operation: (gate: CutoverAdmissionGateDocument) => Promise<T> | T): Promise<T>;
   withOpen<T>(operation: (gate: CutoverAdmissionGateDocument) => Promise<T> | T): Promise<T>;
   close(expectedDigest: string, cutoverId: string): Promise<CutoverAdmissionGateDocument>;
   open(expectedDigest: string, cutoverId: string): Promise<CutoverAdmissionGateDocument>;
@@ -87,11 +88,27 @@ export function initializeCutoverAdmissionGate(options: {
 
 export function createCutoverAdmissionPolicy(options: {
   admissionGate: CutoverAdmissionGate;
+  store?: ParentRunStore | null;
 }): {
   withLaunchAdmission<T>(requestId: string, operation: () => Promise<T>): Promise<T>;
+  withLaunchAdmission<T>(requestId: string, intent: unknown, operation: () => Promise<T>): Promise<T>;
   withPromotionAdmission<T>(requestId: string, operation: () => Promise<T>): Promise<T>;
   withMutationAdmission<T>(kind: string, requestId: string, operation: () => Promise<T>): Promise<T>;
 };
+
+export function authorizeSharedCutoverCanaryLaunch(options: {
+  store: ParentRunStore;
+  admissionGate: CutoverAdmissionGate;
+  reportDirectory: string;
+  cutoverId: string;
+  mode: 'single-site' | 'comparative';
+  requestId: string;
+  actor: { id: string; kind: 'human' | 'service' };
+  intent: unknown;
+  supersedeReason?: string | null;
+  probeTargetIdentity?: (intent: unknown) => Promise<unknown> | unknown;
+  clock?: () => number;
+}): Promise<any>;
 
 export function captureSharedAuthorityDrainObservation(options: {
   store: ParentRunStore;
@@ -147,6 +164,10 @@ export function recordSharedCutoverCanary(options: {
   cutoverId: string;
   mode: 'single-site' | 'comparative';
   runId: string;
+  probeTargetIdentity?: (state: unknown) => Promise<unknown> | unknown;
+  readCanaryEvidence?: (store: ParentRunStore, runId: string, options?: {
+    probeTargetIdentity?: (state: unknown) => Promise<unknown> | unknown;
+  }) => Promise<unknown> | unknown;
   clock?: () => number;
 }): Promise<any>;
 
@@ -155,6 +176,10 @@ export function reopenSharedAdmissionAfterCanaries(options: {
   admissionGate: CutoverAdmissionGate;
   reportDirectory: string;
   cutoverId: string;
+  probeTargetIdentity?: (state: unknown) => Promise<unknown> | unknown;
+  readCanaryEvidence?: (store: ParentRunStore, runId: string, options?: {
+    probeTargetIdentity?: (state: unknown) => Promise<unknown> | unknown;
+  }) => Promise<unknown> | unknown;
   clock?: () => number;
 }): Promise<any>;
 
@@ -163,4 +188,13 @@ export function setSharedPromotionAvailability(options: {
   coordinator: CoordinatorFence;
   phase: 'ACTIVE' | 'PROMOTION_DISABLED';
   buildIdentity: string;
+  reportDirectory?: string | null;
+  cutoverId?: string | null;
+  healthCanaries?: { 'single-site': string; comparative: string } | null;
+  probeTargetIdentity?: (state: unknown) => Promise<unknown> | unknown;
+  readCanaryEvidence?: (store: ParentRunStore, runId: string, options?: {
+    probeTargetIdentity?: (state: unknown) => Promise<unknown> | unknown;
+  }) => Promise<unknown> | unknown;
+  transitionWithPublicationFence?: (store: ParentRunStore, coordinator: CoordinatorFence, input: unknown) => Promise<unknown>;
+  clock?: () => number;
 }): Promise<any>;

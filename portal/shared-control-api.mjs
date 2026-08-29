@@ -62,7 +62,7 @@ export function createSharedControlApi({
           const requestId = requireIdempotencyKey(request);
           const accept = () => launch(principal, { requestId, intent });
           const operation = admissionPolicy
-            ? await admissionPolicy.withLaunchAdmission(requestId, accept)
+            ? await admissionPolicy.withLaunchAdmission(requestId, intent, accept)
             : await accept();
           const statusUrl = `${SHARED_CONTROL_API_PREFIX}/launch-operations/${operation.operationId}`;
           return accepted({ ...launchOperationView(operation), statusUrl }, { location: statusUrl });

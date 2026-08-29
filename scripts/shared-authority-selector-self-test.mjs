@@ -16,6 +16,7 @@ import {
   readReleaseAuthoritySelector,
   takeOverStoreCoordinator,
   transitionReleaseAuthority,
+  transitionReleaseAuthorityWithPublicationFence,
   withCurrentEnvelopeFence,
 } from './lib/parent-run-store.mjs';
 import {
@@ -199,7 +200,7 @@ try {
     expectedSubjectDigest: published.finalSubjectDigest,
     withCurrentPublication: (callback) => callback(published, staleContext),
   }));
-  const disabled = await transitionReleaseAuthority(store, takeover, {
+  let disabled = await transitionReleaseAuthority(store, takeover, {
     expectedSelectorDigest: active.digest,
     phase: 'PROMOTION_DISABLED',
     buildIdentity: build,
@@ -217,9 +218,42 @@ try {
     expectedSubjectDigest: published.finalSubjectDigest,
     withCurrentPublication: (callback) => withCurrentEnvelopeFence(store, 'run-selector', callback),
   }));
-  await expectCode('RELEASE_AUTHORITY_INACTIVE', () => publishCurrentEnvelope(
-    store, 'run-selector', takeover, published,
+  const disabledHealthEnvelope = appendPublicationEnvelope(published, {
+    schemaVersion: 1,
+    runId: 'run-selector',
+    runRevision: 2,
+    decisionRevision: 1,
+    riskRevision: 1,
+    ledgerSequences: { observations: 1, decisions: 2, risks: 0 },
+    finalSubjectDigest: digest,
+    decision: published.decision,
+    riskRegister: published.riskRegister,
+  });
+  const publishedWhilePromotionDisabled = await publishCurrentEnvelope(
+    store, 'run-selector', takeover, disabledHealthEnvelope,
+  );
+  assert.equal((await readCurrentEnvelope(store, 'run-selector')).digest, publishedWhilePromotionDisabled.digest,
+    'promotion disable must preserve authoritative publication needed for repair-forward health canaries');
+  await expectCode('AUTHORITY_HEALTH_EVIDENCE_STALE', () => transitionReleaseAuthorityWithPublicationFence(
+    store, takeover, {
+      expectedSelectorDigest: disabled.digest,
+      phase: 'ACTIVE',
+      activationRevision: disabled.activationRevision,
+      buildIdentity: build,
+      expectedPublications: [{ runId: 'run-selector', envelopeDigest: canonicalDigest({ stale: true }) }],
+    },
   ));
+  const repaired = await transitionReleaseAuthorityWithPublicationFence(store, takeover, {
+    expectedSelectorDigest: disabled.digest,
+    phase: 'ACTIVE',
+    activationRevision: disabled.activationRevision,
+    buildIdentity: build,
+    expectedPublications: [{ runId: 'run-selector', envelopeDigest: publishedWhilePromotionDisabled.digest }],
+  });
+  assert.equal(repaired.phase, 'ACTIVE');
+  disabled = await transitionReleaseAuthority(store, takeover, {
+    expectedSelectorDigest: repaired.digest, phase: 'PROMOTION_DISABLED', buildIdentity: build,
+  });
   await expectCode('AUTHORITY_TRANSITION_INVALID', () => transitionReleaseAuthority(store, takeover, {
     expectedSelectorDigest: disabled.digest,
     phase: 'DRAINING',
