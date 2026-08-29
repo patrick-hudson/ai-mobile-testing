@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { lstatSync, readFileSync } from 'node:fs';
 import { defineConfig, devices, type ReporterDescription } from '@playwright/test';
 import {
   parseSelectedSingleSiteCaseIds,
@@ -25,6 +25,11 @@ import {
   verifySingleSiteRouteInventoryPublication,
   type SingleSiteRouteInventoryPublication,
 } from './shared/single-site-route-plan.mjs';
+import {
+  canonicalPlaywrightSelection,
+  parseCanonicalExecutionGraph,
+  type CanonicalExecutionGraph,
+} from './shared/execution-graph-compiler.mjs';
 
 const ci = Boolean(process.env.CI);
 const artifactRoot = process.env.AUDIT_ARTIFACT_DIR ?? './artifacts';
@@ -51,11 +56,13 @@ const firefoxCorporateTrust = {
 const pluginRegistry = JSON.parse(readFileSync(new URL('./audit/plugins.generated.json', import.meta.url), 'utf8')) as {
   plugins: Array<ExecutableAuditCaseRegistry['plugins'][number] & { entrySpecs: string[] }>;
 } & ExecutableAuditCaseRegistry;
+const canonicalGraph = loadCanonicalGraph(process.env.AUDIT_CANONICAL_GRAPH_PATH, runMode);
+const canonicalSelection = canonicalGraph ? canonicalPlaywrightSelection(canonicalGraph) : null;
 const selectedSingleSiteTargets = runMode === 'single-site'
-  ? resolveSingleSiteTargetSelection(process.env.AUDIT_TARGET_IDS)
+  ? resolveSingleSiteTargetSelection(canonicalSelection?.targetIds.join(',') ?? process.env.AUDIT_TARGET_IDS)
   : null;
 const selectedComparativeTargets = runMode === 'comparative'
-  ? resolveAuditTargetSelection(process.env.AUDIT_TARGET_IDS)
+  ? resolveAuditTargetSelection(canonicalSelection?.targetIds.join(',') ?? process.env.AUDIT_TARGET_IDS)
   : null;
 const singleSiteContract = runMode === 'single-site'
   ? singleSiteRunContract(selectedSingleSiteTargets!)
@@ -67,7 +74,7 @@ const singleSiteTls = singleSiteContract
   : null;
 const selectedSingleSiteCaseIds = runMode === 'single-site'
   ? parseSelectedSingleSiteCaseIds(
-      process.env.AUDIT_SINGLE_SITE_CASE_IDS,
+      canonicalSelection ? JSON.stringify(canonicalSelection.caseIds) : process.env.AUDIT_SINGLE_SITE_CASE_IDS,
       pluginRegistry,
       selectedSingleSiteTargets!.map(({ sourceComparativeTargetId }) => sourceComparativeTargetId),
     )
@@ -174,7 +181,13 @@ function projectForTarget(target: AuditTargetDefinition | SingleSiteAuditTargetD
               .map(({ caseId }) => caseId),
           ]),
         }
-      : {}),
+      : canonicalGraph
+        ? {
+            grep: selectedAuditCaseGrep([...canonicalGraph.workItemPlans, ...canonicalGraph.contextPlans]
+              .filter(({ targetId }) => targetId === target.id)
+              .map(({ caseId }) => caseId)),
+          }
+        : {}),
     metadata: runMode === 'single-site'
       ? singleSiteMetadata(target as SingleSiteAuditTargetDefinition)
       : comparativeMetadata(target as AuditTargetDefinition),
@@ -223,6 +236,23 @@ function loadSingleSiteRouteInventory(value: string | undefined): SingleSiteRout
     throw new Error('Generic route executions do not match the worker-selected canonical target.');
   }
   return document;
+}
+
+function loadCanonicalGraph(value: string | undefined, mode: 'comparative' | 'single-site'): CanonicalExecutionGraph | null {
+  if (value === undefined || value === '') return null;
+  let document: unknown;
+  try {
+    const stat = lstatSync(value);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size < 2 || stat.size > 50 * 1024 * 1024) {
+      throw new Error('input must be a bounded regular file, not a symlink');
+    }
+    document = JSON.parse(readFileSync(value, 'utf8'));
+  } catch (error) {
+    throw new Error(`AUDIT_CANONICAL_GRAPH_PATH could not be read as JSON: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const graph = parseCanonicalExecutionGraph(document);
+  if (graph.mode !== mode) throw new Error(`Canonical graph mode ${graph.mode} does not match requested ${mode} execution.`);
+  return graph;
 }
 
 function auditRunMode(value: string | undefined): 'comparative' | 'single-site' {
