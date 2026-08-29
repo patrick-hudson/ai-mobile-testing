@@ -37,11 +37,11 @@ import { appendPublicationEnvelope } from '../shared/publication-envelope.mjs';
 import { projectSharedReleaseView } from '../shared/release-projection.mjs';
 import { sealFinalReleaseSubject, sealReleaseSubjectCore } from '../shared/release-subject.mjs';
 import { CONTROL_EXIT_CODES, controlExitCode } from '../shared/control-client-contract.mjs';
+import { canonicalDigest } from '../shared/canonical-contract.mjs';
 import {
-  acceptSharedLaunchOperation,
-  getSharedLaunchOperation,
   openSharedLaunchOperationStore,
 } from './lib/shared-launch-operation-store.mjs';
+import { createSharedLaunchService } from './lib/shared-launch-service.mjs';
 
 const root = await mkdtemp(path.join(tmpdir(), 'shared-control-plane-'));
 let now = Date.parse('2026-08-28T20:00:00.000Z');
@@ -312,6 +312,9 @@ try {
   const operatorIssued = await authority.createPrincipal({
     id: 'operator-1', kind: 'human', roles: ['operator'], projectIds: ['project-1'], runIds: ['run-1'],
   });
+  const launchOperatorIssued = await authority.createPrincipal({
+    id: 'launch-operator', kind: 'human', roles: ['operator'], projectIds: ['project-1'], runIds: ['*'],
+  });
   const operator = await authority.authenticateCredential(operatorIssued.credential);
   const control = createSharedControlService({ store: parentStore, projectId: 'project-1' });
   const firstOperation = await control.acceptMutation(operator, 'run-1', {
@@ -535,25 +538,43 @@ try {
       scope: { qualifier: 'FULL', pluginIds: [], auditIds: [], areas: [] },
     },
   };
-  const launch = async (principal, request) => acceptSharedLaunchOperation(launchOperationStore, {
-    principal,
-    projectId: 'project-1',
-    requestId: request.requestId,
-    intent: request.intent,
-  });
-  const readLaunchOperation = async (principal, operationId) => {
-    const operation = await getSharedLaunchOperation(launchOperationStore, operationId);
-    assertPrincipalAuthorized(principal, CONTROL_ACTIONS.OPERATION_READ, { projectId: operation.projectId });
-    return operation;
+  let launchCompileCalls = 0;
+  const compileLaunchPlan = async (intent) => {
+    launchCompileCalls += 1;
+    const body = {
+      schemaVersion: 1,
+      kind: 'shared-launch-plan',
+      intentDigest: canonicalDigest(intent),
+      state: 'pending-inventory',
+      subjectCore: null,
+      inventoryBarrier: null,
+      executionGraph: null,
+      createParentRunInput: {
+        subjectCoreDigest: canonicalDigest(intent),
+        compilationState: 'pending',
+        runnerRevision: 'launch-runner-v1',
+        workItems: [{
+          id: 'inventory-launch', maxAttempts: 3, capability: 'inventory:http',
+          resourceClass: 'ordinary', targetId: 'single-mobile', specAffinity: null,
+        }],
+      },
+    };
+    return { ...body, digest: canonicalDigest(body) };
   };
+  const launchService = createSharedLaunchService({
+    operationStore: launchOperationStore,
+    parentRunStore: reopenedStore,
+    projectId: 'project-1',
+    compilePlan: compileLaunchPlan,
+  });
   const api = createSharedControlApi({
     authority, service: reopenedControl, claimStore, expectedOrigin: 'https://audit.example.test', sessionCookiePath: '/',
-    launch, readLaunchOperation,
+    launch: launchService.accept, readLaunchOperation: launchService.read,
   });
   const callerAuthoredAuthority = await api.handle({
     method: 'POST', url: '/api/control/v1/runs',
     headers: {
-      authorization: `Bearer ${operatorIssued.credential}`,
+      authorization: `Bearer ${launchOperatorIssued.credential}`,
       'content-type': 'application/json',
       'idempotency-key': 'launch-request-0001',
     },
@@ -562,14 +583,25 @@ try {
   assert.equal(callerAuthoredAuthority.status, 400, 'launch must reject caller-authored run IDs and release authority');
   const missingLaunchKey = await api.handle({
     method: 'POST', url: '/api/control/v1/runs',
-    headers: { authorization: `Bearer ${operatorIssued.credential}`, 'content-type': 'application/json' },
+    headers: { authorization: `Bearer ${launchOperatorIssued.credential}`, 'content-type': 'application/json' },
     body: launchIntent,
   });
   assert.equal(missingLaunchKey.status, 400, 'launch must require an idempotency key');
-  const acceptedLaunch = await api.handle({
+  const narrowlyScopedLaunch = await api.handle({
     method: 'POST', url: '/api/control/v1/runs',
     headers: {
       authorization: `Bearer ${operatorIssued.credential}`,
+      'content-type': 'application/json',
+      'idempotency-key': 'scoped-launch-0001',
+    },
+    body: launchIntent,
+  });
+  assert.equal(narrowlyScopedLaunch.status, 403,
+    'a principal scoped only to existing run IDs cannot launch a new server-derived run it would be unable to inspect');
+  const acceptedLaunch = await api.handle({
+    method: 'POST', url: '/api/control/v1/runs',
+    headers: {
+      authorization: `Bearer ${launchOperatorIssued.credential}`,
       'content-type': 'application/json',
       'idempotency-key': 'launch-request-0001',
     },
@@ -577,14 +609,17 @@ try {
   });
   assert.equal(acceptedLaunch.status, 202);
   assert.match(acceptedLaunch.body.data.operationId, /^[a-f0-9]{64}$/u);
-  assert.equal(acceptedLaunch.body.data.runId, null, 'the run ID does not exist until the durable launch operation materializes it');
+  assert.match(acceptedLaunch.body.data.runId, /^run-[a-f0-9]{32}$/u,
+    'the server must reserve a deterministic safe run ID from the durable launch-operation namespace');
   assert.equal(acceptedLaunch.body.data.statusUrl,
     `/api/control/v1/launch-operations/${acceptedLaunch.body.data.operationId}`);
   assert.equal(acceptedLaunch.headers.location, acceptedLaunch.body.data.statusUrl);
+  assert.equal('intent' in acceptedLaunch.body.data, false, 'launch status must not echo the full intent');
+  assert.equal('compiledPlan' in acceptedLaunch.body.data, false, 'launch status must not return the internal execution plan');
   const duplicateLaunch = await api.handle({
     method: 'POST', url: '/api/control/v1/runs',
     headers: {
-      authorization: `Bearer ${operatorIssued.credential}`,
+      authorization: `Bearer ${launchOperatorIssued.credential}`,
       'content-type': 'application/json',
       'idempotency-key': 'launch-request-0001',
     },
@@ -592,10 +627,11 @@ try {
   });
   assert.deepEqual(duplicateLaunch.body.data, acceptedLaunch.body.data,
     'an exact launch retry must return the same durable operation');
+  assert.equal(launchCompileCalls, 1, 'an exact retry must recover the pinned plan without recompiling live server state');
   const conflictingLaunch = await api.handle({
     method: 'POST', url: '/api/control/v1/runs',
     headers: {
-      authorization: `Bearer ${operatorIssued.credential}`,
+      authorization: `Bearer ${launchOperatorIssued.credential}`,
       'content-type': 'application/json',
       'idempotency-key': 'launch-request-0001',
     },
@@ -604,24 +640,41 @@ try {
   assert.equal(conflictingLaunch.status, 409);
   assert.equal(conflictingLaunch.body.error.code, 'IDEMPOTENCY_CONFLICT');
   const reopenedLaunchStore = await openSharedLaunchOperationStore({ root: launchOperationRoot, clock });
+  const restartedLaunchService = createSharedLaunchService({
+    operationStore: reopenedLaunchStore,
+    parentRunStore: reopenedStore,
+    projectId: 'project-1',
+    compilePlan: async () => { throw new Error('restart recovery must not recompile an accepted launch'); },
+  });
   const restartApi = createSharedControlApi({
     authority, service: reopenedControl, claimStore, expectedOrigin: 'https://audit.example.test',
-    launch: async (principal, request) => acceptSharedLaunchOperation(reopenedLaunchStore, {
-      principal, projectId: 'project-1', requestId: request.requestId, intent: request.intent,
-    }),
-    readLaunchOperation: async (principal, operationId) => {
-      const operation = await getSharedLaunchOperation(reopenedLaunchStore, operationId);
-      assertPrincipalAuthorized(principal, CONTROL_ACTIONS.OPERATION_READ, { projectId: operation.projectId });
-      return operation;
-    },
+    launch: restartedLaunchService.accept,
+    readLaunchOperation: restartedLaunchService.read,
   });
   const recoveredLaunch = await restartApi.handle({
     method: 'GET', url: acceptedLaunch.body.data.statusUrl,
-    headers: { authorization: `Bearer ${operatorIssued.credential}` },
+    headers: { authorization: `Bearer ${launchOperatorIssued.credential}` },
   });
   assert.equal(recoveredLaunch.status, 200);
   assert.equal(recoveredLaunch.body.data.operationId, acceptedLaunch.body.data.operationId,
     'accepted launch operation must remain retrievable after portal/service restart');
+  assert.equal('compiledPlan' in recoveredLaunch.body.data, false);
+  assert.equal('intent' in recoveredLaunch.body.data, false);
+  const narrowLaunchRead = await restartApi.handle({
+    method: 'GET', url: acceptedLaunch.body.data.statusUrl,
+    headers: { authorization: `Bearer ${operatorIssued.credential}` },
+  });
+  assert.equal(narrowLaunchRead.status, 403,
+    'launch-operation reads must enforce the reserved run identity as well as project scope');
+  const recoveredMaterializations = await restartedLaunchService.recover();
+  assert.equal(recoveredMaterializations.completed.length, 1);
+  assert.equal(recoveredMaterializations.completed[0].state, 'completed');
+  assert.equal(recoveredMaterializations.completed[0].outcome.status, 'succeeded');
+  const materializedParent = await recoverParentRun(reopenedStore, acceptedLaunch.body.data.runId);
+  assert.equal(materializedParent.subjectCoreDigest, canonicalDigest(launchIntent));
+  assert.deepEqual(Object.keys(materializedParent.workItems), ['inventory-launch']);
+  assert.equal((await restartedLaunchService.recover()).completed.length, 0,
+    'a completed launch must not materialize a duplicate parent run');
   const viewerLaunch = await restartApi.handle({
     method: 'POST', url: '/api/control/v1/runs',
     headers: {

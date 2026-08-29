@@ -63,14 +63,14 @@ export function createSharedControlApi({
             intent,
           });
           const statusUrl = `${SHARED_CONTROL_API_PREFIX}/launch-operations/${operation.operationId}`;
-          return accepted({ ...operation, statusUrl }, { location: statusUrl });
+          return accepted({ ...launchOperationView(operation), statusUrl }, { location: statusUrl });
         }
         const launchOperationMatch = new RegExp(`^${SHARED_CONTROL_API_PREFIX}/launch-operations/([a-f0-9]{64})$`).exec(url.pathname);
         if (request.method === 'GET' && launchOperationMatch) {
           if (typeof readLaunchOperation !== 'function') {
             throw new ControlPlaneError('LAUNCH_UNAVAILABLE', 'Shared launch operation reads are unavailable.', 503);
           }
-          return ok(await readLaunchOperation(principal, launchOperationMatch[1]));
+          return ok(launchOperationView(await readLaunchOperation(principal, launchOperationMatch[1])));
         }
         if (!runMatch) return error('CONTROL_ROUTE_NOT_FOUND', 'Control route was not found.', 404);
         const [, runId, suffix = ''] = runMatch;
@@ -175,6 +175,15 @@ function parseLaunchIntent(value) {
   } catch (error) {
     throw new ControlPlaneError('LAUNCH_INTENT_INVALID', error instanceof Error ? error.message : String(error), 400);
   }
+}
+function launchOperationView(operation) {
+  const { intent, compiledPlan, ...safe } = operation;
+  return Object.freeze({
+    ...safe,
+    mode: intent.runContract.mode,
+    requestedAuthority: intent.runContract.scope.qualifier,
+    planState: compiledPlan.state,
+  });
 }
 function sessionToken(request) {
   return String(request.headers?.cookie ?? '').split(';').map((part) => part.trim()).find((part) => part.startsWith('audit_session='))?.slice(14) ?? '';

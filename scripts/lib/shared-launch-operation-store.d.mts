@@ -8,8 +8,10 @@ export interface SharedLaunchOperation {
   requestId: string;
   requestDigest: string;
   intent: { schemaVersion: 1; runContract: unknown };
+  planDigest: string;
+  compiledPlan: any;
   state: 'accepted' | 'running' | 'completed';
-  runId: string | null;
+  runId: string;
   outcome: unknown | null;
   acceptedAt: string;
   updatedAt: string;
@@ -22,5 +24,18 @@ export function acceptSharedLaunchOperation(store: SharedLaunchOperationStore, i
   projectId: string;
   requestId: string;
   intent: SharedLaunchOperation['intent'];
+  compiledPlan: any;
 }): Promise<SharedLaunchOperation>;
 export function getSharedLaunchOperation(store: SharedLaunchOperationStore, operationId: string): Promise<SharedLaunchOperation>;
+export function findSharedLaunchOperation(store: SharedLaunchOperationStore, input: {
+  principal: { id: string; kind: 'human' | 'service' };
+  projectId: string;
+  requestId: string;
+  intent: SharedLaunchOperation['intent'];
+}): Promise<SharedLaunchOperation | null>;
+export function completeSharedLaunchOperation(store: SharedLaunchOperationStore, operationId: string, outcome: any): Promise<SharedLaunchOperation>;
+export interface SharedLaunchRecoveryError { operationId: string; code: string; message: string }
+export function listRecoverableSharedLaunchOperations(store: SharedLaunchOperationStore, options?: { limit?: number }): Promise<{
+  operations: readonly SharedLaunchOperation[];
+  errors: readonly SharedLaunchRecoveryError[];
+}>;

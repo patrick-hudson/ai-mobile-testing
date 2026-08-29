@@ -22,16 +22,17 @@ import { createConsoleApi, handleConsoleApiRequest } from './console-api.mjs';
 import { createSharedControlApi, createSharedRequestAuthorizer } from './shared-control-api.mjs';
 import { rejectRetiredLegacyMutation } from './shared-legacy-mutation-policy.mjs';
 import { openScopedCredentialAuthority } from './scoped-credential-authority.mjs';
-import { assertPrincipalAuthorized, CONTROL_ACTIONS, validateMutationDeployment } from '../shared/control-plane-contract.mjs';
+import { ControlPlaneError, validateMutationDeployment } from '../shared/control-plane-contract.mjs';
 import { assertSharedListScope, classifySharedReadRequest } from './shared-read-policy.mjs';
 import { openParentRunStore } from '../scripts/lib/parent-run-store.mjs';
 import { createSharedControlService } from '../scripts/lib/shared-control-service.mjs';
 import { openPromotionClaimStore } from '../scripts/lib/promotion-claim-store.mjs';
 import {
-  acceptSharedLaunchOperation,
-  getSharedLaunchOperation,
   openSharedLaunchOperationStore,
 } from '../scripts/lib/shared-launch-operation-store.mjs';
+import { createSharedLaunchService } from '../scripts/lib/shared-launch-service.mjs';
+import { compileSharedLaunchPlan } from '../shared/launch-plan-compiler.mjs';
+import { canonicalDigest } from '../shared/canonical-contract.mjs';
 import {
   getConsoleCapabilities,
   resolveConsoleActionAvailability,
@@ -150,7 +151,7 @@ import {
   openVisualReviewStore,
 } from './visual-review-dispositions.mjs';
 import { preflightQuitting7ohSite } from '../shared/site-preflight.mjs';
-import { resolveRunnerRevision } from '../shared/runner-revision.mjs';
+import { resolveRunnerRevision, runnerRevisionDigest } from '../shared/runner-revision.mjs';
 import {
   parseVisualBaselineEvidence,
   parseVisualBaselineIdentity,
@@ -530,6 +531,63 @@ if (process.env.PORTAL_SHARED_CONTROL === '1') {
     root: join(controlStore.root, 'launch-operations'),
   });
   sharedProjectId = process.env.AUDIT_SHARED_PROJECT_ID ?? 'default';
+  const sharedLaunchService = createSharedLaunchService({
+    operationStore: launchOperationStore,
+    parentRunStore: controlStore,
+    projectId: sharedProjectId,
+    compilePlan: async (intent) => {
+      const contract = intent.runContract;
+      const preflightInputs = contract.mode === 'single-site'
+        ? [{ url: contract.url, deploymentRole: contract.deploymentRole, certificatePolicy: contract.certificatePolicy }]
+        : [
+          { url: contract.productionUrl, deploymentRole: 'production', certificatePolicy: 'strict' },
+          { url: contract.candidateUrl, deploymentRole: 'preview', certificatePolicy: 'strict' },
+        ];
+      const preflights = await Promise.all(preflightInputs.map((input) => preflightQuitting7ohSite(input, {
+        previewBypassOrigins: previewTlsBypassOrigins,
+        tlsBypassRequestOptions: { rejectUnauthorized: false },
+      })));
+      const rejected = preflights.find((result) => !result.accepted || !result.preflightDigest);
+      if (rejected) {
+        throw new ControlPlaneError(
+          'SHARED_LAUNCH_PREFLIGHT_REJECTED',
+          rejected.issues?.[0]?.message ?? 'Shared launch preflight rejected a target.',
+          422,
+        );
+      }
+      const deploymentIdentity = {
+        kind: 'target-preflight-set',
+        value: canonicalDigest(preflights.map((result) => ({
+          origin: result.origin,
+          role: result.deploymentRole,
+          identityFingerprint: result.identityFingerprint,
+          deploymentRevision: result.deploymentRevision.fingerprint,
+          preflightDigest: result.preflightDigest,
+        }))),
+      };
+      return compileSharedLaunchPlan({
+        intent,
+        pluginRegistry: pluginRegistryDocument,
+        targetRegistry: targetRegistryDocument,
+        runnerRevision: runnerRevisionDigest(singleSiteRunnerRevision),
+        configurationRevision: canonicalDigest({
+          schemaVersion: 1,
+          launchProtocol: 'shared-launch-v1',
+          inventoryMaxAttempts: 3,
+          ordinaryMaxAttempts: 3,
+          performanceMaxAttempts: 2,
+        }),
+        environmentRevision: canonicalDigest({
+          schemaVersion: 1,
+          deploymentIdentity: controlStore.manifest.deploymentIdentity,
+          volumeIdentity: controlStore.manifest.volumeIdentity,
+          writerProtocol: controlStore.manifest.writerProtocol,
+          runnerRevision: singleSiteRunnerRevision,
+        }),
+        deploymentIdentity,
+      });
+    },
+  });
   sharedRequestAuthorizer = createSharedRequestAuthorizer({ authority: credentialAuthority });
   sharedControlApi = createSharedControlApi({
     authority: credentialAuthority,
@@ -538,18 +596,30 @@ if (process.env.PORTAL_SHARED_CONTROL === '1') {
     claimStore,
     expectedOrigin: deployment.publishedOrigin,
     sessionCookiePath: '/',
-    launch: (principal, request) => acceptSharedLaunchOperation(launchOperationStore, {
-      principal,
-      projectId: sharedProjectId,
-      requestId: request.requestId,
-      intent: request.intent,
-    }),
-    readLaunchOperation: async (principal, operationId) => {
-      const operation = await getSharedLaunchOperation(launchOperationStore, operationId);
-      assertPrincipalAuthorized(principal, CONTROL_ACTIONS.OPERATION_READ, { projectId: operation.projectId });
+    launch: async (principal, request) => {
+      const operation = await sharedLaunchService.accept(principal, request);
+      setImmediate(() => {
+        void sharedLaunchService.materialize(operation.operationId).then((completed) => {
+          console.log(`[SHARED_LAUNCH_COMPLETED] ${completed.runId} ${completed.outcome?.status ?? completed.state}`);
+        }).catch((error) => {
+          console.error(`[SHARED_LAUNCH_RECOVERY_PENDING] ${operation.runId}: ${redactLogValue(error.message)}`);
+        });
+      });
       return operation;
     },
+    readLaunchOperation: sharedLaunchService.read,
   });
+  const recoveredLaunches = await sharedLaunchService.recover({
+    onError: (error) => console.error(
+      `[SHARED_LAUNCH_RECOVERY_PENDING] ${error.operationId}: ${redactLogValue(error.message)}`,
+    ),
+  }).catch((error) => {
+    console.error(`[SHARED_LAUNCH_RECOVERY_PENDING] Startup recovery retained accepted operations: ${redactLogValue(error.message)}`);
+    return { completed: [], errors: [] };
+  });
+  if (recoveredLaunches.completed.length > 0) {
+    console.log(`[SHARED_LAUNCH_RECOVERED] Materialized ${recoveredLaunches.completed.length} accepted launch operation(s).`);
+  }
 }
 const recoveredSingleSiteAiReviews = await recoverSingleSiteAiReviews(singleSiteAiReview);
 for (const recovery of recoveredSingleSiteAiReviews) {

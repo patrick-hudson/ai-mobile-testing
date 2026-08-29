@@ -3,6 +3,7 @@ import { canonicalDigest, canonicalJson } from '../../shared/canonical-contract.
 import {
   atomicWriteJson,
   containedPath,
+  fsyncDirectory,
   openAtomicStorage,
   readBoundedJson,
   withDirectoryLock,
@@ -15,6 +16,9 @@ const SAFE_PRINCIPAL_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const SAFE_PROJECT_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 const OPERATION_ID = /^[a-f0-9]{64}$/u;
 const MAX_INTENT_BYTES = 64 * 1_024;
+const MAX_COMPILED_PLAN_BYTES = 8 * 1_048_576;
+const MAX_LAUNCH_OPERATIONS = 2_048;
+const COMPLETED_OPERATION_RETRY_WINDOW_MS = 24 * 60 * 60 * 1_000;
 
 export class SharedLaunchOperationError extends Error {
   constructor(code, message, statusCode = 400) {
@@ -59,10 +63,25 @@ function validateIntent(intent) {
   return intent;
 }
 
+function validateCompiledPlan(plan) {
+  if (!plan || typeof plan !== 'object' || Array.isArray(plan)
+    || plan.schemaVersion !== 1 || plan.kind !== 'shared-launch-plan'
+    || typeof plan.digest !== 'string' || !/^sha256:[a-f0-9]{64}$/u.test(plan.digest)
+    || !plan.createParentRunInput || 'runId' in plan.createParentRunInput) {
+    fail('LAUNCH_PLAN_INVALID', 'Server-compiled launch plan is invalid.', 500);
+  }
+  const { digest, ...body } = plan;
+  if (canonicalDigest(body) !== digest) fail('LAUNCH_PLAN_INVALID', 'Server-compiled launch plan digest is invalid.', 500);
+  if (Buffer.byteLength(canonicalJson(plan)) > MAX_COMPILED_PLAN_BYTES) {
+    fail('LAUNCH_PLAN_TOO_LARGE', 'Server-compiled launch plan exceeds the durable operation bound.', 500);
+  }
+  return plan;
+}
+
 function validateOperation(value, expectedOperationId = null) {
   const keys = [
     'schemaVersion', 'kind', 'operationId', 'projectId', 'actor', 'requestId', 'requestDigest',
-    'intent', 'state', 'runId', 'outcome', 'acceptedAt', 'updatedAt',
+    'intent', 'planDigest', 'compiledPlan', 'state', 'runId', 'outcome', 'acceptedAt', 'updatedAt',
   ];
   if (!value || typeof value !== 'object' || Array.isArray(value)
     || Object.keys(value).length !== keys.length || keys.some((key) => !(key in value))
@@ -75,11 +94,27 @@ function validateOperation(value, expectedOperationId = null) {
     || !SAFE_REQUEST_ID.test(value.requestId ?? '')
     || !/^sha256:[a-f0-9]{64}$/u.test(value.requestDigest ?? '')
     || !['accepted', 'running', 'completed'].includes(value.state)
-    || (value.runId !== null && !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(value.runId))
+    || !/^run-[a-f0-9]{32}$/u.test(value.runId ?? '')
     || (value.state === 'completed') !== (value.outcome !== null)) {
     fail('LAUNCH_OPERATION_CORRUPT', 'Stored launch operation is corrupt.', 500);
   }
   validateIntent(value.intent);
+  validateCompiledPlan(value.compiledPlan);
+  const expectedRequestDigest = canonicalDigest(value.intent);
+  const derivedOperationId = canonicalDigest({
+    schemaVersion: 1,
+    kind: 'shared-launch-operation-identity',
+    projectId: value.projectId,
+    actor: value.actor,
+    requestId: value.requestId,
+  }).slice('sha256:'.length);
+  if (value.requestDigest !== expectedRequestDigest
+    || value.operationId !== derivedOperationId
+    || value.runId !== `run-${derivedOperationId.slice(0, 32)}`
+    || value.planDigest !== value.compiledPlan.digest
+    || value.compiledPlan.intentDigest !== expectedRequestDigest) {
+    fail('LAUNCH_OPERATION_CORRUPT', 'Stored launch operation durable bindings are corrupt.', 500);
+  }
   for (const field of ['acceptedAt', 'updatedAt']) {
     if (typeof value[field] !== 'string' || new Date(value[field]).toISOString() !== value[field]) {
       fail('LAUNCH_OPERATION_CORRUPT', 'Stored launch operation timestamp is corrupt.', 500);
@@ -96,7 +131,9 @@ export async function openSharedLaunchOperationStore({ root, clock = Date.now, v
   return Object.freeze({ ...storage, clock });
 }
 
-export async function acceptSharedLaunchOperation(store, { principal, projectId, requestId, intent } = {}) {
+export async function acceptSharedLaunchOperation(store, {
+  principal, projectId, requestId, intent, compiledPlan: rawCompiledPlan,
+} = {}) {
   const actor = validatePrincipal(principal);
   if (typeof projectId !== 'string' || !SAFE_PROJECT_ID.test(projectId)) {
     fail('LAUNCH_PROJECT_INVALID', 'Server launch project is invalid.', 500);
@@ -105,6 +142,7 @@ export async function acceptSharedLaunchOperation(store, { principal, projectId,
     fail('IDEMPOTENCY_KEY_INVALID', 'Launch requires a 16-128 character idempotency key.', 400);
   }
   const durableIntent = structuredClone(validateIntent(intent));
+  const compiledPlan = structuredClone(validateCompiledPlan(rawCompiledPlan));
   const requestDigest = canonicalDigest(durableIntent);
   const operationId = canonicalDigest({
     schemaVersion: 1,
@@ -117,7 +155,9 @@ export async function acceptSharedLaunchOperation(store, { principal, projectId,
     const file = operationFile(store, operationId);
     let existing = null;
     try {
-      existing = validateOperation(await readBoundedJson(store, file, { label: 'launch operation', maximumBytes: 128 * 1_024 }), operationId);
+      existing = validateOperation(await readBoundedJson(store, file, {
+        label: 'launch operation', maximumBytes: MAX_COMPILED_PLAN_BYTES + 256 * 1_024,
+      }), operationId);
     } catch (error) {
       if (error?.code !== 'ATOMIC_NOT_FOUND') throw error;
     }
@@ -126,6 +166,33 @@ export async function acceptSharedLaunchOperation(store, { principal, projectId,
         fail('IDEMPOTENCY_CONFLICT', 'This launch idempotency key is already bound to different intent.', 409);
       }
       return existing;
+    }
+    const operationDirectory = containedPath(store.root, 'operations');
+    let entries = [];
+    try { entries = await store.fs.readdir(operationDirectory); } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+    let liveOperations = 0;
+    let removedCompletedOperation = false;
+    for (const entry of entries.filter((name) => /^[a-f0-9]{64}\.json$/u.test(name))) {
+      const entryId = entry.slice(0, -'.json'.length);
+      let stored;
+      try {
+        stored = await getSharedLaunchOperation(store, entryId);
+      } catch {
+        liveOperations += 1;
+        continue;
+      }
+      if (stored.state !== 'completed') {
+        liveOperations += 1;
+      } else if (store.clock() - Date.parse(stored.updatedAt) > COMPLETED_OPERATION_RETRY_WINDOW_MS) {
+        await store.fs.unlink(operationFile(store, entryId));
+        removedCompletedOperation = true;
+      }
+    }
+    if (removedCompletedOperation) await fsyncDirectory(store.fs, operationDirectory);
+    if (liveOperations >= MAX_LAUNCH_OPERATIONS) {
+      fail('LAUNCH_OPERATION_QUOTA_EXCEEDED', 'Launch operation quota is exhausted.', 429);
     }
     const acceptedAt = timestamp(store);
     const operation = {
@@ -137,8 +204,10 @@ export async function acceptSharedLaunchOperation(store, { principal, projectId,
       requestId,
       requestDigest,
       intent: durableIntent,
+      planDigest: compiledPlan.digest,
+      compiledPlan,
       state: 'accepted',
-      runId: null,
+      runId: `run-${operationId.slice(0, 32)}`,
       outcome: null,
       acceptedAt,
       updatedAt: acceptedAt,
@@ -151,10 +220,86 @@ export async function acceptSharedLaunchOperation(store, { principal, projectId,
 export async function getSharedLaunchOperation(store, operationId) {
   try {
     return validateOperation(await readBoundedJson(store, operationFile(store, operationId), {
-      label: 'launch operation', maximumBytes: 128 * 1_024,
+      label: 'launch operation', maximumBytes: MAX_COMPILED_PLAN_BYTES + 256 * 1_024,
     }), operationId);
   } catch (error) {
     if (error?.code === 'ATOMIC_NOT_FOUND') fail('LAUNCH_OPERATION_NOT_FOUND', 'Launch operation was not found.', 404);
     throw error;
   }
+}
+
+export async function findSharedLaunchOperation(store, { principal, projectId, requestId, intent } = {}) {
+  const actor = validatePrincipal(principal);
+  if (typeof projectId !== 'string' || !SAFE_PROJECT_ID.test(projectId)
+    || typeof requestId !== 'string' || !SAFE_REQUEST_ID.test(requestId)) {
+    fail('IDEMPOTENCY_KEY_INVALID', 'Launch lookup identity is invalid.', 400);
+  }
+  const durableIntent = validateIntent(intent);
+  const operationId = canonicalDigest({
+    schemaVersion: 1, kind: 'shared-launch-operation-identity', projectId, actor, requestId,
+  }).slice('sha256:'.length);
+  let operation;
+  try { operation = await getSharedLaunchOperation(store, operationId); } catch (error) {
+    if (error?.code === 'LAUNCH_OPERATION_NOT_FOUND') return null;
+    throw error;
+  }
+  if (operation.requestDigest !== canonicalDigest(durableIntent)
+    || canonicalJson(operation.intent) !== canonicalJson(durableIntent)) {
+    fail('IDEMPOTENCY_CONFLICT', 'This launch idempotency key is already bound to different intent.', 409);
+  }
+  return operation;
+}
+
+export async function completeSharedLaunchOperation(store, operationId, outcome) {
+  if (!outcome || typeof outcome !== 'object' || Array.isArray(outcome)
+    || !['succeeded', 'failed'].includes(outcome.status)
+    || Buffer.byteLength(canonicalJson(outcome)) > 16 * 1_024) {
+    fail('LAUNCH_OUTCOME_INVALID', 'Launch operation outcome is invalid.', 500);
+  }
+  return withDirectoryLock(store, containedPath(store.root, '.launch-operations.lock'), async () => {
+    const current = await getSharedLaunchOperation(store, operationId);
+    if (current.state === 'completed') {
+      if (canonicalJson(current.outcome) !== canonicalJson(outcome)) {
+        fail('LAUNCH_OPERATION_ALREADY_COMPLETED', 'Launch operation already has a different terminal outcome.', 409);
+      }
+      return current;
+    }
+    const next = {
+      ...structuredClone(current),
+      state: 'completed',
+      outcome: structuredClone(outcome),
+      updatedAt: timestamp(store),
+    };
+    await atomicWriteJson(store, operationFile(store, operationId), next);
+    return validateOperation(next, operationId);
+  });
+}
+
+export async function listRecoverableSharedLaunchOperations(store, { limit = MAX_LAUNCH_OPERATIONS } = {}) {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_LAUNCH_OPERATIONS) {
+    fail('LAUNCH_OPERATION_LIMIT_INVALID', 'Launch operation list limit is invalid.', 400);
+  }
+  let entries = [];
+  try { entries = await store.fs.readdir(containedPath(store.root, 'operations')); } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+  const operations = [];
+  const errors = [];
+  for (const entry of entries.filter((name) => /^[a-f0-9]{64}\.json$/u.test(name)).sort()) {
+    const operationId = entry.slice(0, -'.json'.length);
+    let operation;
+    try {
+      operation = await getSharedLaunchOperation(store, operationId);
+    } catch (error) {
+      errors.push(Object.freeze({
+        operationId,
+        code: typeof error?.code === 'string' ? error.code : 'LAUNCH_OPERATION_RECOVERY_FAILED',
+        message: error instanceof Error ? error.message : String(error),
+      }));
+      continue;
+    }
+    if (operation.state !== 'completed') operations.push(operation);
+    if (operations.length >= limit) break;
+  }
+  return Object.freeze({ operations: Object.freeze(operations), errors: Object.freeze(errors) });
 }
