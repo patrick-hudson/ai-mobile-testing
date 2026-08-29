@@ -445,6 +445,46 @@ try {
   assert.equal(projectedHead.riskRegister.risks.find(({ identity }) => identity === manualRisk.identity).reviewState, 'ACKNOWLEDGED');
   assert.equal(projectedHead.riskRegister.risks.find(({ identity }) => identity === visualRisk.identity).reviewState, 'ACCEPTED');
 
+  const projectionDeliveryIssued = await authority.createPrincipal({
+    id: 'projection-delivery', kind: 'service', roles: ['delivery'], projectIds: ['project-1'], runIds: ['run-projection'],
+  });
+  const projectionApi = createSharedControlApi({
+    authority,
+    service: projectionControl,
+    claimStore: await openPromotionClaimStore({ root: path.join(root, 'projection-claims'), clock }),
+    expectedOrigin: 'https://audit.example.test',
+  });
+  const projectionAssertion = await projectionApi.handle({
+    method: 'POST', url: '/api/control/v1/runs/run-projection/release/assert',
+    headers: {
+      authorization: `Bearer ${projectionDeliveryIssued.credential}`,
+      'content-type': 'application/json',
+      'idempotency-key': 'projection-assertion-0001',
+    },
+    body: {
+      expected: {
+        projectId: 'project-1', subjectDigest: projectedHead.finalSubjectDigest,
+        authority: projectedHead.decision.grantedAuthority,
+        executionSetDigest: projectedHead.decision.executionManifestDigest,
+        runRevision: projectedHead.runRevision, decisionRevision: projectedHead.decisionRevision,
+      },
+      ttlMs: 60_000,
+    },
+  });
+  assert.equal(projectionAssertion.status, 200);
+  assert.equal(projectionAssertion.body.data.result.decisionCode, 'RELEASE_READY');
+  assert.equal(projectionAssertion.body.data.result.ready, true);
+  assert.equal(projectionAssertion.body.data.result.authority, 'FULL');
+  assert.deepEqual(projectionAssertion.body.data.result.certifiedScope, projectedHead.decision.certifiedScope);
+  assert.deepEqual(projectionAssertion.body.data.result.coverageBasis, projectedHead.decision.coverageBasis);
+  assert.deepEqual(projectionAssertion.body.data.result.blockingReasons, []);
+  assert.equal(projectionAssertion.body.data.result.riskSummary.active > 0, true,
+    'active non-blocking risks must remain visible without preventing claim issuance');
+  assert.deepEqual(projectionAssertion.body.data.result.revisions, {
+    run: projectedHead.runRevision, decision: projectedHead.decisionRevision, risk: projectedHead.riskRevision,
+  });
+  assert.equal(projectionAssertion.body.data.result.exitCode, CONTROL_EXIT_CODES.SUCCESS);
+
   const custodianIssued = await authority.createPrincipal({
     id: 'projection-custodian', kind: 'human', roles: ['custodian'], projectIds: ['project-1'], runIds: ['run-projection'],
   });

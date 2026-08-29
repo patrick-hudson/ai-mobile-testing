@@ -1,3 +1,5 @@
+import { projectPublicationView } from './release-projection.mjs';
+
 export const CONTROL_EXIT_CODES = Object.freeze({
   SUCCESS: 0,
   REQUEST_FAILED: 1,
@@ -10,6 +12,27 @@ export const CONTROL_EXIT_CODES = Object.freeze({
   EVIDENCE_UNAVAILABLE: 13,
   TIMEOUT: 14,
 });
+
+export function createReleaseAssertionResult(publication, { projectId } = {}) {
+  const view = projectPublicationView(publication);
+  return Object.freeze({
+    schemaVersion: 1,
+    projectId,
+    runId: publication.runId,
+    subjectDigest: view.subjectDigest,
+    executionSetDigest: view.decision.executionManifestDigest,
+    decisionCode: view.decision.code,
+    ready: view.decision.ready,
+    authority: view.decision.grantedAuthority,
+    certifiedScope: view.decision.certifiedScope,
+    coverageBasis: view.decision.coverageBasis,
+    blockingReasons: view.decision.blockingReasons,
+    riskSummary: view.riskSummary,
+    superseded: view.decision.superseded,
+    revisions: view.revisions,
+    exitCode: CONTROL_EXIT_CODES.SUCCESS,
+  });
+}
 
 export function controlExitCode({ status = 500, code = '' } = {}) {
   const normalized = String(code);

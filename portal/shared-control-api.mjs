@@ -1,4 +1,5 @@
 import { assertPrincipalAuthorized, CONTROL_ACTIONS, ControlPlaneError, validateMutationRequest } from '../shared/control-plane-contract.mjs';
+import { createReleaseAssertionResult } from '../shared/control-client-contract.mjs';
 import { consumePromotionClaim, issuePromotionClaim } from '../scripts/lib/promotion-claim-store.mjs';
 
 export const SHARED_CONTROL_API_PREFIX = '/api/control/v1';
@@ -77,10 +78,14 @@ export function createSharedControlApi({
           if (!body.expected || typeof body.expected !== 'object' || Array.isArray(body.expected)) throw new ControlPlaneError('CONTROL_BODY_INVALID', 'expected is required.', 400);
           if (body.expected.projectId !== service.projectId) throw new ControlPlaneError('PROMOTION_SCOPE_MISMATCH', 'Promotion project does not match this control service.', 409);
           const publication = await service.readPublication(principal, runId);
-          return ok(await issuePromotionClaim(claimStore, {
+          const claim = await issuePromotionClaim(claimStore, {
             principal, publication, expected: { ...body.expected, projectId: service.projectId }, ttlMs: body.ttlMs,
             requestId: request.headers['idempotency-key'] ?? body.requestId,
-          }));
+          });
+          return ok({
+            ...claim,
+            result: createReleaseAssertionResult(publication, { projectId: service.projectId }),
+          });
         }
         if (request.method === 'POST' && suffix === 'promotion/consume') {
           mutation(request, authentication, expectedOrigin);
