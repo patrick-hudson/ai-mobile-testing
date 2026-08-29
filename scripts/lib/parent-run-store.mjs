@@ -39,6 +39,9 @@ export const MAX_ATTEMPT_ARTIFACTS = 64;
 export const MAX_ATTEMPT_ARTIFACT_BYTES = 8 * 1_048_576;
 export const MAX_ATTEMPT_EVIDENCE_BYTES = 16 * 1_048_576;
 const ARTIFACT_MEDIA_TYPE = /^[a-z0-9][a-z0-9.+-]{0,126}\/[a-z0-9][a-z0-9.+-]{0,126}$/i;
+const MAX_OPERATION_RESOURCES = 128;
+const MAX_OPERATION_BODY_BYTES = 16 * 1_024;
+const OPERATION_RETRY_WINDOW_MS = 24 * 60 * 60 * 1_000;
 
 export class ParentRunStoreError extends Error {
   constructor(code, message, details = undefined) {
@@ -144,6 +147,32 @@ function canonicalTimestamp(value, label) {
   } catch (error) {
     if (error instanceof ParentRunStoreError) throw error;
     fail('STORE_CORRUPT', `${label} is invalid.`);
+  }
+  return value;
+}
+
+function validateOperationResource(value, idempotencyKey) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || value.idempotencyKey !== idempotencyKey || !SAFE_ID.test(idempotencyKey)
+    || typeof value.operationId !== 'string' || !/^[a-f0-9]{64}$/.test(value.operationId)
+    || typeof value.kind !== 'string' || value.kind.length < 1 || value.kind.length > 128
+    || !DIGEST_PATTERN.test(value.bodyDigest)
+    || !value.body || typeof value.body !== 'object' || Array.isArray(value.body)
+    || Buffer.byteLength(canonicalJson(value.body)) > MAX_OPERATION_BODY_BYTES
+    || !value.actor || typeof value.actor !== 'object' || Array.isArray(value.actor)
+    || typeof value.actor.id !== 'string' || !value.actor.id
+    || typeof value.actor.kind !== 'string' || !value.actor.kind
+    || !['accepted', 'completed'].includes(value.state)
+    || !canonicalTimestamp(value.acceptedAt, 'operation acceptedAt')) {
+    fail('STORE_CORRUPT', `Operation ${idempotencyKey} is corrupt.`);
+  }
+  if (value.state === 'accepted' && (value.completedAt !== null || value.outcome !== null)) {
+    fail('STORE_CORRUPT', `Accepted operation ${idempotencyKey} has a terminal outcome.`);
+  }
+  if (value.state === 'completed' && (value.completedAt === null || !value.outcome || typeof value.outcome !== 'object'
+    || Array.isArray(value.outcome) || !canonicalTimestamp(value.completedAt, 'operation completedAt')
+    || Date.parse(value.completedAt) < Date.parse(value.acceptedAt))) {
+    fail('STORE_CORRUPT', `Completed operation ${idempotencyKey} has invalid terminal state.`);
   }
   return value;
 }
@@ -323,6 +352,9 @@ async function recoverUnlocked(store, runId, { repairCache = true } = {}) {
       || !Number.isSafeInteger(item.manualRekicks) || item.manualRekicks < 0 || item.manualRekicks > 3) {
       fail('STORE_CORRUPT', `Parent run ${runId} has invalid work-item state.`);
     }
+  }
+  for (const [idempotencyKey, operation] of Object.entries(snapshot.operations)) {
+    validateOperationResource(operation, idempotencyKey);
   }
   if (typeof snapshot.runnerRevision !== 'string' || !snapshot.runnerRevision
     || !snapshot.resourceScheduling || typeof snapshot.resourceScheduling !== 'object'
@@ -1120,7 +1152,12 @@ export async function acceptOperation(store, runId, request) {
   return withDirectoryLock(store.storage, globalLockPath(store), () => withDirectoryLock(store.storage, lockPath(store, runId), async () => {
     const state = await recoverUnlocked(store, runId);
     const digest = operationBodyDigest(request);
-    const existing = state.operations[request.idempotencyKey];
+    const expiredCompletedKeys = Object.entries(state.operations)
+      .filter(([, operation]) => operation.state === 'completed'
+        && Date.parse(operation.completedAt) + OPERATION_RETRY_WINDOW_MS <= store.clock())
+      .map(([idempotencyKey]) => idempotencyKey);
+    const expiredCompleted = new Set(expiredCompletedKeys);
+    const existing = expiredCompleted.has(request.idempotencyKey) ? null : state.operations[request.idempotencyKey];
     if (existing) {
       if (existing.bodyDigest !== digest) fail('IDEMPOTENCY_CONFLICT', 'Idempotency key was reused with a different operation body.');
       return clone(existing);
@@ -1133,7 +1170,9 @@ export async function acceptOperation(store, runId, request) {
     if (request.expectedSubjectDigest !== undefined && request.expectedSubjectDigest !== state.finalSubjectDigest) {
       fail('RELEASE_SUBJECT_MISMATCH', 'Operation does not match the immutable final subject.');
     }
-    if (Object.keys(state.operations).length >= 128) fail('OPERATION_LIMIT_REACHED', 'Run operation retention limit was reached.');
+    if (Object.keys(state.operations).length - expiredCompleted.size >= MAX_OPERATION_RESOURCES) {
+      fail('OPERATION_LIMIT_REACHED', 'Run operation retention limit was reached.');
+    }
     const operation = {
       operationId: createHash('sha256').update(`${runId}\0${request.idempotencyKey}`).digest('hex'),
       idempotencyKey: request.idempotencyKey,
@@ -1147,8 +1186,9 @@ export async function acceptOperation(store, runId, request) {
       outcome: null,
     };
     await appendMutationUnlocked(store, state, 'operation', 'operation-accepted', (next) => {
+      for (const idempotencyKey of expiredCompletedKeys) delete next.operations[idempotencyKey];
       next.operations[request.idempotencyKey] = operation;
-    }, { actor: request.actor, data: { idempotencyKey: request.idempotencyKey } });
+    }, { actor: request.actor, data: { idempotencyKey: request.idempotencyKey, compactedOperationCount: expiredCompletedKeys.length } });
     return clone(operation);
   }));
 }

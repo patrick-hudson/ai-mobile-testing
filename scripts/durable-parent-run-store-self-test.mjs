@@ -382,6 +382,16 @@ await writeFile(decisionEvent, `${JSON.stringify(corrupted)}\n`);
 await expectCode('STORE_CORRUPT', () => recoverParentRun(store, 'run-main'));
 await writeFile(decisionEvent, originalEvent);
 
+// Completed operation resources expire after the retry window without erasing their append-only audit history.
+now += 24 * 60 * 60 * 1_000 + 1;
+await acceptOperation(store, 'run-main', operationRequest('after-retention-window'));
+await expectCode('OPERATION_NOT_FOUND', () => getOperation(store, 'run-main', 'launch-1'));
+assert.equal(
+  (await readRunHistories(store, 'run-main')).operation.filter(({ type }) => type === 'operation-completed').length,
+  1,
+  'compacting completed operation resources must retain their append-only audit history',
+);
+
 const legacyRoot = join(root, 'legacy-fixture');
 await writeFile(join(root, 'legacy.json'), JSON.stringify({ auditId: 'legacy-1', status: 'passed' }));
 const legacy = await readLegacyRun(join(root, 'legacy.json'));
