@@ -93,7 +93,7 @@ function fixture() {
   const run = {
     schemaVersion: 1, kind: 'durable-parent-run', runId: publication.runId, runRevision: 9,
     compilationState: 'sealed', executionManifest, executionManifestDigest: executionManifest.digest,
-    subjectCoreDigest: core.digest,
+    subjectCore: core, subjectCoreDigest: core.digest,
     finalSubject, finalSubjectDigest: finalSubject.digest,
     workItems: { 'work-visual': { id: 'work-visual', state: 'completed_pass' } },
     ledgerSequences: { mutation: 4, decision: 1, risk: 0, operation: 0 },
@@ -566,6 +566,8 @@ try {
   const persistedResult = JSON.parse(resultText);
   assert.equal(persistedResult.stage, 'final');
   assert.equal(persistedResult.runId, happy.run.runId);
+  assert.deepEqual(persistedResult.subjectCore, happy.run.subjectCore,
+    'delivery must retain the certificate policy bound to the immutable release subject core');
   assert.deepEqual(persistedResult.finalSubject, happy.run.finalSubject,
     'delivery must retain the non-secret immutable target and deployment identity contract');
 } finally {

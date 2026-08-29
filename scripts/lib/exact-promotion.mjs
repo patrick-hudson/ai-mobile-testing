@@ -1,6 +1,6 @@
 import { canonicalDigest, exactKeys } from '../../shared/canonical-contract.mjs';
 import { parseAuditedCandidateDeployment, parseReleaseArtifactManifest } from '../../shared/release-artifact-contract.mjs';
-import { parseFinalReleaseSubject } from '../../shared/release-subject.mjs';
+import { parseFinalReleaseSubject, parseReleaseSubjectCore } from '../../shared/release-subject.mjs';
 import { verifyReleaseArtifactManifest } from './release-artifact.mjs';
 
 const DIGEST = /^sha256:[a-f0-9]{64}$/u;
@@ -28,7 +28,7 @@ function parseCiResult(value) {
   if (!record(value)) fail('EXACT_PROMOTION_CI_RESULT_INVALID', 'Shared release CI result is required.');
   exactKeys(value, [
     'schemaVersion', 'kind', 'stage', 'confirmed', 'requestId', 'operationId', 'runId', 'publicationDigest',
-    'subjectDigest', 'executionSetDigest', 'finalSubject', 'decision', 'assertionExpected',
+    'subjectDigest', 'executionSetDigest', 'subjectCore', 'finalSubject', 'decision', 'assertionExpected',
   ], 'Shared release CI result');
   if (value.schemaVersion !== 1 || value.kind !== 'shared-release-ci-result' || value.stage !== 'final'
     || value.confirmed !== true
@@ -36,12 +36,14 @@ function parseCiResult(value) {
     || !RUN_ID.test(value.runId ?? '') || !DIGEST.test(value.publicationDigest ?? '')) {
     fail('EXACT_PROMOTION_CI_RESULT_INVALID', 'Shared release CI result identity is invalid.');
   }
+  const subjectCore = parseReleaseSubjectCore(value.subjectCore);
   const subject = parseFinalReleaseSubject(value.finalSubject);
   exactKeys(value.decision, ['code', 'ready', 'authority', 'runRevision', 'decisionRevision'], 'Shared release CI decision');
   exactKeys(value.assertionExpected, [
     'subjectDigest', 'authority', 'executionSetDigest', 'runRevision', 'decisionRevision',
   ], 'Shared release CI assertion expectation');
-  if (value.subjectDigest !== subject.digest || value.executionSetDigest !== subject.executionManifestDigest
+  if (subject.subjectCoreDigest !== subjectCore.digest
+    || value.subjectDigest !== subject.digest || value.executionSetDigest !== subject.executionManifestDigest
     || value.decision.ready !== true || !['RELEASE_READY', 'FEATURE_READY'].includes(value.decision.code)
     || value.decision.authority !== subject.grantedAuthority.qualifier
     || value.assertionExpected.subjectDigest !== subject.digest
@@ -52,6 +54,9 @@ function parseCiResult(value) {
     || !Number.isSafeInteger(value.decision.runRevision) || value.decision.runRevision < 1
     || !Number.isSafeInteger(value.decision.decisionRevision) || value.decision.decisionRevision < 1) {
     fail('EXACT_PROMOTION_CI_RESULT_INVALID', 'Shared release CI result is internally inconsistent or not ready.');
+  }
+  if (subjectCore.certificatePolicy !== 'strict') {
+    fail('EXACT_PROMOTION_EVIDENCE_NON_AUTHORITATIVE', 'Exact promotion requires authoritative strict-certificate evidence.');
   }
   return { document: structuredClone(value), subject };
 }

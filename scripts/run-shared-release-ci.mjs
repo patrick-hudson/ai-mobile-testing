@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { canonicalDigest } from '../shared/canonical-contract.mjs';
 import { CONTROL_EXIT_CODES, controlExitCode } from '../shared/control-client-contract.mjs';
-import { parseFinalReleaseSubject } from '../shared/release-subject.mjs';
+import { parseFinalReleaseSubject, parseReleaseSubjectCore } from '../shared/release-subject.mjs';
 import { parseRunContract } from '../shared/run-contract.mjs';
 import { readCredentialFile } from './lib/credential-file.mjs';
 import { createSharedReleaseHttpClient, runSharedReleaseCi } from './lib/shared-release-ci.mjs';
@@ -88,7 +88,11 @@ export function formatSharedReleaseCiResult(requestId, result) {
     || coreBound !== (decision.subjectStage === 'core')) {
     throw new TypeError('Shared release CI result stage contradicts its release decision.');
   }
+  const subjectCore = parseReleaseSubjectCore(result.run.subjectCore);
   const finalSubject = coreBound ? null : parseFinalReleaseSubject(result.run.finalSubject);
+  if (!coreBound && finalSubject.subjectCoreDigest !== subjectCore.digest) {
+    throw new TypeError('Shared release CI result subjects do not share one sealed core.');
+  }
   return Object.freeze({
     schemaVersion: 1,
     kind: 'shared-release-ci-result',
@@ -100,6 +104,7 @@ export function formatSharedReleaseCiResult(requestId, result) {
     publicationDigest: result.publication.digest,
     subjectDigest: result.publication.finalSubjectDigest ?? result.publication.subjectCoreDigest,
     executionSetDigest: decision.executionManifestDigest,
+    subjectCore,
     finalSubject,
     decision: Object.freeze({
       code: decision.code,

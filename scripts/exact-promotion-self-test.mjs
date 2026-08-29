@@ -15,7 +15,7 @@ const D1 = `sha256:${'1'.repeat(64)}`;
 const D2 = `sha256:${'2'.repeat(64)}`;
 const root = await mkdtemp(path.join(tmpdir(), 'exact-promotion-'));
 
-function finalSubject(mode = 'single-site') {
+function releaseSubject(mode = 'single-site', certificatePolicy = 'strict') {
   const targets = mode === 'single-site'
     ? [{ role: 'audited', origin: 'https://beta.example.test' }]
     : [
@@ -38,7 +38,7 @@ function finalSubject(mode = 'single-site') {
     },
     revisions: { runner: D1, plugins: D1, targets: D1, configuration: D1 },
     environmentIdentity: D2,
-    certificatePolicy: 'strict',
+    certificatePolicy,
   });
   const executionManifest = sealExecutionManifest({
     schemaVersion: 1,
@@ -47,7 +47,7 @@ function finalSubject(mode = 'single-site') {
     oracleExecutions: [{ id: 'oracle-visual', definitionId: 'VISUAL-001', requiredWorkItemIds: workItems.map(({ id }) => id) }],
     contextWorkItemIds: [],
   });
-  return sealFinalReleaseSubject({
+  const finalSubject = sealFinalReleaseSubject({
     schemaVersion: 1,
     subjectCore: core,
     executionManifest,
@@ -55,17 +55,18 @@ function finalSubject(mode = 'single-site') {
     coverageBasis: { selectedDefinitions: ['VISUAL-001'], selectedTargets: targetIds, excludedAsNotApplicable: [] },
     deploymentIdentityRecheck: core.deploymentIdentity,
   });
+  return { subjectCore: core, finalSubject };
 }
 
-function ciResult(subject = finalSubject()) {
+function ciResult({ subjectCore, finalSubject }) {
   return formatSharedReleaseCiResult('shared-release-ci-request-0001', {
     stage: 'final',
     operationId: 'a'.repeat(64),
     runId: `run-${'a'.repeat(32)}`,
-    run: { finalSubject: subject },
+    run: { subjectCore, finalSubject },
     publication: {
       digest: D1,
-      finalSubjectDigest: subject.digest,
+      finalSubjectDigest: finalSubject.digest,
       decisionRevision: 4,
       runRevision: 9,
       decision: {
@@ -73,13 +74,13 @@ function ciResult(subject = finalSubject()) {
         code: 'RELEASE_READY',
         ready: true,
         grantedAuthority: 'FULL',
-        executionManifestDigest: subject.executionManifestDigest,
+        executionManifestDigest: finalSubject.executionManifestDigest,
       },
     },
     assertionExpected: {
-      subjectDigest: subject.digest,
+      subjectDigest: finalSubject.digest,
       authority: 'FULL',
-      executionSetDigest: subject.executionManifestDigest,
+      executionSetDigest: finalSubject.executionManifestDigest,
       runRevision: 9,
       decisionRevision: 4,
     },
@@ -149,7 +150,7 @@ try {
     createdAt: '2026-08-29T20:00:00.000Z',
   });
   const base = {
-    ciResult: ciResult(), artifactRoot, artifactManifest, candidateDeployment,
+    ciResult: ciResult(releaseSubject()), artifactRoot, artifactManifest, candidateDeployment,
     projectId: 'quitting7oh-release',
     production: { accountId: 'account-123', projectName: 'quitting7oh-org', branch: 'main' },
     sourceRevision: candidateDeployment.sourceRevision,
@@ -175,6 +176,33 @@ try {
   );
   assert.deepEqual(rejectedCoreStage.calls, []);
 
+  const bypassCiResult = ciResult(releaseSubject('single-site', 'preview-bypass'));
+  const bypass = harness();
+  await assert.rejects(
+    executeExactPromotion({
+      ...base,
+      ciResult: bypassCiResult,
+      client: bypass.client,
+      provider: bypass.provider,
+    }),
+    (error) => error?.code === 'EXACT_PROMOTION_EVIDENCE_NON_AUTHORITATIVE',
+    'a ready decision backed by Preview-bypass evidence must never reach promotion',
+  );
+  assert.deepEqual(bypass.calls, []);
+
+  const mismatchedCore = harness();
+  await assert.rejects(
+    executeExactPromotion({
+      ...base,
+      ciResult: { ...bypassCiResult, subjectCore: releaseSubject().subjectCore },
+      client: mismatchedCore.client,
+      provider: mismatchedCore.provider,
+    }),
+    (error) => error?.code === 'EXACT_PROMOTION_CI_RESULT_INVALID',
+    'a strict subject core cannot be substituted for the bypass-bearing core bound to the final subject',
+  );
+  assert.deepEqual(mismatchedCore.calls, []);
+
   const successful = harness();
   const receipt = await executeExactPromotion({ ...base, client: successful.client, provider: successful.provider });
   assert.deepEqual(successful.calls, ['prepare', 'assert', 'consume', 'deploy']);
@@ -186,7 +214,7 @@ try {
 
   const comparative = harness();
   await executeExactPromotion({
-    ...base, ciResult: ciResult(finalSubject('comparative')),
+    ...base, ciResult: ciResult(releaseSubject('comparative')),
     client: comparative.client, provider: comparative.provider,
   });
   assert.deepEqual(comparative.calls, ['prepare', 'assert', 'consume', 'deploy']);
