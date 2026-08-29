@@ -127,6 +127,20 @@ async function countOpenPortalStyleDescriptors(pid: number) {
 }
 
 function acceptedSingleSitePreview(runContract: Record<string, any>, digestCharacter = 'a') {
+  const normalizedRunContract = {
+    schemaVersion: runContract.schemaVersion,
+    mode: runContract.mode,
+    targetIds: [...runContract.targetIds],
+    scope: {
+      qualifier: runContract.scope.qualifier,
+      pluginIds: [...runContract.scope.pluginIds],
+      auditIds: [...runContract.scope.auditIds],
+      areas: [...runContract.scope.areas],
+    },
+    url: runContract.url,
+    deploymentRole: runContract.deploymentRole,
+    certificatePolicy: runContract.certificatePolicy,
+  };
   const coverage = {
     scope: {
       qualifier: runContract.scope.qualifier,
@@ -156,7 +170,7 @@ function acceptedSingleSitePreview(runContract: Record<string, any>, digestChara
     schemaVersion: 1,
     mode: 'single-site',
     accepted: true,
-    runContract,
+    runContract: normalizedRunContract,
     previewDigest: `sha256:${digestCharacter.repeat(64)}`,
     coverage,
     preflight: { evidenceAuthority: { status: 'authoritative', reasons: [] }, issues: [] },
@@ -615,6 +629,57 @@ test('u5: single-site mode previews exact coverage and navigates an accepted job
   expect(runUrl.searchParams.get('run')).toBe(job.id);
   expect(runUrl.searchParams.get('view')).toBe('overview');
   expect(runUrl.searchParams.get('inspector')).toBe('closed');
+});
+
+test('u5: unauthorized new audits stay locked and can be unlocked without leaving the page', async ({ page }) => {
+  const unlockToken = 'portal-browser-unlock-capability';
+  let authorized = false;
+  let preflightRequests = 0;
+  let submittedUnlockToken = '';
+
+  await page.route('**/api/config', async (route) => {
+    const response = await route.fetch();
+    const config = await response.json();
+    return route.fulfill({ response, json: { ...config, operator: { authorized } } });
+  });
+  await page.route('**/api/operator/session', async (route) => {
+    submittedUnlockToken = String(route.request().postDataJSON()?.token ?? '');
+    authorized = submittedUnlockToken === unlockToken;
+    return route.fulfill({
+      status: authorized ? 200 : 403,
+      json: authorized
+        ? { authorized: true }
+        : { error: 'The operator unlock credential is invalid or expired.' },
+    });
+  });
+  await page.route('**/api/single-site/preflight', async (route) => {
+    preflightRequests += 1;
+    const contract = route.request().postDataJSON();
+    return route.fulfill({ status: 200, json: acceptedSingleSitePreview(contract) });
+  });
+
+  await page.goto('/new-audit.html?mode=single-site');
+  await expect(page.locator('#system-status')).toHaveText('Operator authorization required');
+  await expect(page.locator('#operator-access')).toBeVisible();
+  await expect(page.locator('#preview-single-site')).toBeDisabled();
+  await expect(page.locator('#launch-run')).toBeDisabled();
+  expect(preflightRequests).toBe(0);
+
+  await page.locator('#operator-unlock-token').fill(
+    `http://127.0.0.1:4173/operator/bootstrap?token=${unlockToken}`,
+  );
+  await page.locator('#operator-unlock-submit').click();
+
+  expect(submittedUnlockToken).toBe(unlockToken);
+  await expect(page.locator('#operator-unlock-token')).toHaveValue('');
+  await expect(page.locator('#operator-access')).toBeHidden();
+  await expect(page.locator('#system-status')).toHaveText('Operator ready');
+  await expect(page.locator('#preview-single-site')).toBeEnabled();
+
+  await page.getByRole('checkbox', { name: /confirm this is the intended deployment role/i }).check();
+  await page.locator('#preview-single-site').click();
+  await expect(page.locator('#single-site-preflight-status')).toContainText(/identity accepted/i);
+  expect(preflightRequests).toBe(1);
 });
 
 test('u5: single-site URL suggestions require explicit role reconfirmation without changing scope or targets', async ({ page }) => {

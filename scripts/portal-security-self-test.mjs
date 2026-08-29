@@ -725,6 +725,41 @@ async function assertPortalRestartReadsLargeExternalLog(temporary) {
           assert.equal(config.runnerIsolation.reportWorkerActive, false);
           assert.equal(config.runnerIsolation.credentialStorageEnabled, false);
           assert.equal(config.operator.authorized, false);
+          const portalOrigin = `http://127.0.0.1:${port}`;
+          const invalidInlineUnlock = await fetch(`${portalOrigin}/api/operator/session`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Origin: portalOrigin },
+            body: JSON.stringify({ token: 'invalid' }),
+          });
+          assert.equal(invalidInlineUnlock.status, 403);
+          const crossOriginInlineUnlock = await fetch(`${portalOrigin}/api/operator/session`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Origin: 'https://attacker.example.test' },
+            body: JSON.stringify({ token: operatorToken }),
+          });
+          assert.equal(crossOriginInlineUnlock.status, 403,
+            'A valid capability must not bypass the same-origin browser boundary.');
+          const sandboxedInlineUnlock = await fetch(`${portalOrigin}/api/operator/session`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Origin: 'null' },
+            body: JSON.stringify({ token: operatorToken }),
+          });
+          assert.equal(sandboxedInlineUnlock.status, 403,
+            'Sandboxed artifact documents must not establish an operator browser session.');
+          const inlineUnlock = await fetch(`${portalOrigin}/api/operator/session`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Origin: portalOrigin },
+            body: JSON.stringify({ token: operatorToken }),
+          });
+          assert.equal(inlineUnlock.status, 200);
+          assert.deepEqual(await inlineUnlock.json(), { authorized: true });
+          assert.match(inlineUnlock.headers.get('set-cookie') ?? '', /^portal_operator=[^;]+; HttpOnly; SameSite=Strict; Path=\/$/);
+          const operatorCookie = (inlineUnlock.headers.get('set-cookie') ?? '').split(';', 1)[0];
+          const inlineAuthorizedConfig = await (await fetch(`${portalOrigin}/api/config`, {
+            headers: { Cookie: operatorCookie },
+          })).json();
+          assert.equal(inlineAuthorizedConfig.operator.authorized, true,
+            'The in-page exchange must authorize the browser without returning the session token to JavaScript.');
           const invalidBootstrap = await fetch(`http://127.0.0.1:${port}/operator/bootstrap?token=invalid`, {
             redirect: 'manual',
           });
@@ -735,7 +770,6 @@ async function assertPortalRestartReadsLargeExternalLog(temporary) {
           assert.equal(bootstrap.status, 303);
           assert.equal(bootstrap.headers.get('location'), '/');
           assert.match(bootstrap.headers.get('set-cookie') ?? '', /^portal_operator=[^;]+; HttpOnly; SameSite=Strict; Path=\/$/);
-          const operatorCookie = (bootstrap.headers.get('set-cookie') ?? '').split(';', 1)[0];
           const authorizedConfig = await (await fetch(`http://127.0.0.1:${port}/api/config`, {
             headers: { Cookie: operatorCookie },
           })).json();

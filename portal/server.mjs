@@ -1518,12 +1518,27 @@ async function routeRequest(request, response) {
     }
     response.writeHead(303, {
       Location: '/',
-      'Set-Cookie': `portal_operator=${operatorSessionToken}; HttpOnly; SameSite=Strict; Path=/`,
+      'Set-Cookie': operatorSessionCookie(),
       'Cache-Control': 'no-store',
       'Referrer-Policy': 'no-referrer',
       'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'",
     });
     return response.end();
+  }
+  if (request.method === 'POST' && pathname === '/api/operator/session') {
+    assertOperatorSessionRequest(request);
+    const body = await readJsonBody(request);
+    if (!body || typeof body !== 'object' || Array.isArray(body)
+      || typeof body.token !== 'string' || body.token.length === 0 || body.token.length > 4_096) {
+      throw httpError(400, 'Provide the current operator unlock link or token.');
+    }
+    if (!constantTimeTokenMatch(body.token, operatorCapabilityToken)) {
+      throw httpError(403, 'The operator unlock credential is invalid or expired. Copy the current link from the portal service log.');
+    }
+    return sendJson(response, 200, { authorized: true }, {
+      'Set-Cookie': operatorSessionCookie(),
+      'Referrer-Policy': 'no-referrer',
+    });
   }
   if (request.method === 'GET' && pathname === '/api/settings/anthropic-key') {
     return sendJson(response, 200, anthropicCredentialState());
@@ -7763,10 +7778,11 @@ async function readJsonBody(request) {
   }
 }
 
-function sendJson(response, status, value) {
+function sendJson(response, status, value, additionalHeaders = {}) {
   if (response.headersSent || response.destroyed || response.writableEnded) return;
   const body = `${JSON.stringify(value)}\n`;
   response.writeHead(status, {
+    ...additionalHeaders,
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': Buffer.byteLength(body),
     'Cache-Control': 'no-store',
@@ -7816,6 +7832,21 @@ function assertMutationRequest(request) {
     throw httpError(415, 'Mutation requests must use application/json.');
   }
   requireOperatorAuthorization(request);
+}
+
+function assertOperatorSessionRequest(request) {
+  if (request.headers.origin === 'null') {
+    throw httpError(403, 'Sandboxed artifact documents cannot establish an operator session.');
+  }
+  const contentType = request.headers['content-type'] ?? '';
+  if (!contentType.toLowerCase().startsWith('application/json')) {
+    throw httpError(415, 'Operator session requests must use application/json.');
+  }
+  assertSameOrigin(request);
+}
+
+function operatorSessionCookie() {
+  return `portal_operator=${operatorSessionToken}; HttpOnly; SameSite=Strict; Path=/`;
 }
 
 function requireOperatorAuthorization(request) {

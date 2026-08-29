@@ -45,6 +45,10 @@ const state = {
 const elements = {
   form: document.querySelector('#launch-form'),
   launchRun: document.querySelector('#launch-run'),
+  operatorAccess: document.querySelector('#operator-access'),
+  operatorUnlockToken: document.querySelector('#operator-unlock-token'),
+  operatorUnlockSubmit: document.querySelector('#operator-unlock-submit'),
+  operatorUnlockStatus: document.querySelector('#operator-unlock-status'),
   catalogSummary: document.querySelector('#catalog-summary'),
   comparativeDepth: document.querySelector('#comparative-depth'),
   comparativeSites: document.querySelector('#comparative-sites'),
@@ -131,12 +135,18 @@ async function init() {
     onRestoreFocus(key) { focus.focus(key, shell.heading); },
   });
   elements.form.setAttribute('aria-busy', 'false');
-  connection.textContent = state.config.operator?.authorized ? 'Operator ready' : 'Operator authorization required';
+  renderOperatorAuthorization();
   renderInspector();
 }
 
 function bindEvents() {
   elements.form.addEventListener('submit', launchRun);
+  elements.operatorUnlockSubmit.addEventListener('click', () => void unlockOperator());
+  elements.operatorUnlockToken.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    void unlockOperator();
+  });
   elements.previewSingleSite.addEventListener('click', () => void previewSingleSite());
   elements.auditFilter.addEventListener('input', renderAudits);
   elements.clearAreas.addEventListener('click', () => {
@@ -198,6 +208,92 @@ function exactOrigin(value) {
   } catch {
     return null;
   }
+}
+
+function operatorAuthorized() {
+  return state.config?.operator?.authorized === true;
+}
+
+function renderOperatorAuthorization({ message = '', error = false } = {}) {
+  const authorized = operatorAuthorized();
+  connection.textContent = authorized ? 'Operator ready' : 'Operator authorization required';
+  elements.operatorAccess.hidden = authorized;
+  elements.operatorUnlockStatus.classList.toggle('error', error);
+  elements.operatorUnlockStatus.classList.toggle('success', authorized && Boolean(message));
+  elements.operatorUnlockStatus.textContent = message || (authorized
+    ? 'Operator controls are unlocked for this browser session.'
+    : 'Runs, site checks, purge, and credential changes require an operator session.');
+  updateLaunchAvailability();
+}
+
+function operatorTokenFromInput(value) {
+  const trimmed = String(value ?? '').trim();
+  if (!trimmed) return '';
+  try {
+    const parsed = new URL(trimmed, window.location.origin);
+    if (parsed.pathname === '/operator/bootstrap') return parsed.searchParams.get('token') ?? '';
+  } catch {
+    // A raw capability token is also accepted.
+  }
+  return trimmed;
+}
+
+function canonicalJson(value) {
+  const normalize = (entry) => {
+    if (Array.isArray(entry)) return entry.map(normalize);
+    if (entry && typeof entry === 'object') {
+      return Object.fromEntries(Object.keys(entry).sort().map((key) => [key, normalize(entry[key])]));
+    }
+    return entry;
+  };
+  return JSON.stringify(normalize(value));
+}
+
+async function unlockOperator() {
+  if (!beginOperation('operator-unlock')) return;
+  const token = operatorTokenFromInput(elements.operatorUnlockToken.value);
+  elements.operatorUnlockToken.value = '';
+  if (!token) {
+    endOperation('operator-unlock');
+    renderOperatorAuthorization({ message: 'Paste the current operator unlock link or token.', error: true });
+    elements.operatorUnlockToken.focus();
+    return;
+  }
+  setButtonBusy(elements.operatorUnlockSubmit, true, 'Unlocking…');
+  elements.operatorUnlockStatus.classList.remove('error', 'success');
+  elements.operatorUnlockStatus.textContent = 'Exchanging the capability for a private browser session…';
+  announce('Unlocking operator controls.');
+  try {
+    const result = await requestJson('/api/operator/session', {
+      method: 'POST',
+      body: JSON.stringify({ token }),
+    });
+    if (result?.authorized !== true) throw new Error('The portal did not confirm operator authorization.');
+    const config = await requestJson('/api/config');
+    if (config.operator?.authorized !== true) throw new Error('The operator session was not retained by this browser.');
+    state.config = config;
+    renderOperatorAuthorization({ message: 'Operator controls are unlocked for this browser session.' });
+    announce('Operator controls unlocked.');
+    (isSingleSiteMode() ? elements.previewSingleSite : elements.launchRun).focus();
+  } catch (error) {
+    renderOperatorAuthorization({ message: friendlyError(error), error: true });
+    announce(`Operator controls could not be unlocked. ${friendlyError(error)}`);
+    elements.operatorUnlockToken.focus();
+  } finally {
+    setButtonBusy(elements.operatorUnlockSubmit, false);
+    endOperation('operator-unlock');
+    updateLaunchAvailability();
+  }
+}
+
+function handleOperatorAuthorizationFailure(error) {
+  if (error?.status !== 401 || !state.config) return false;
+  state.config = { ...state.config, operator: { authorized: false } };
+  renderOperatorAuthorization({
+    message: 'The operator session ended, usually because the portal restarted. Paste the current unlock link to continue.',
+    error: true,
+  });
+  return true;
 }
 
 function validatedOrigin(input, label) {
@@ -309,9 +405,15 @@ function invalidateSingleSitePreview({ announceChange = true } = {}) {
 }
 
 function updateLaunchAvailability() {
-  if (state.pending.has('launch')) return;
-  elements.launchRun.disabled = !state.config || (isSingleSiteMode() && !state.singleSitePreview?.accepted);
-  elements.launchRun.setAttribute('aria-disabled', String(elements.launchRun.disabled));
+  const authorized = operatorAuthorized();
+  if (!state.pending.has('launch')) {
+    elements.launchRun.disabled = !state.config || !authorized || (isSingleSiteMode() && !state.singleSitePreview?.accepted);
+    elements.launchRun.setAttribute('aria-disabled', String(elements.launchRun.disabled));
+  }
+  if (!state.pending.has('single-site-preview')) {
+    elements.previewSingleSite.disabled = !state.config || !authorized;
+    elements.previewSingleSite.setAttribute('aria-disabled', String(elements.previewSingleSite.disabled));
+  }
 }
 
 function resetDefaultTargets() {
@@ -459,6 +561,11 @@ function currentSingleSiteContract() {
 }
 
 async function previewSingleSite() {
+  if (!operatorAuthorized()) {
+    renderOperatorAuthorization({ message: 'Unlock operator controls before checking the site.', error: true });
+    elements.operatorUnlockToken.focus();
+    return;
+  }
   if (!isSingleSiteMode() || !beginOperation('single-site-preview')) return;
   let contract;
   try {
@@ -470,7 +577,7 @@ async function previewSingleSite() {
   }
   const controller = new AbortController();
   const generation = ++state.singleSitePreflightGeneration;
-  const contractIdentity = JSON.stringify(contract);
+  const contractIdentity = canonicalJson(contract);
   state.singleSitePreflightController = controller;
   setRegionBusy(elements.singleSiteSettings, true);
   setRegionBusy(elements.singleSiteCoverage, true);
@@ -488,7 +595,7 @@ async function previewSingleSite() {
     const value = await response.json().catch(() => ({ error: `Preflight failed (${response.status})` }));
     if (!isCurrentSingleSitePreflight(controller, generation, contractIdentity)) return;
     if (!response.ok && !value?.preflight) throw httpError(response.status, value);
-    if (value?.accepted === true && JSON.stringify(value.runContract) !== contractIdentity) {
+    if (value?.accepted === true && canonicalJson(value.runContract) !== contractIdentity) {
       throw new Error('The preflight response did not match the submitted launch contract. Check the site again.');
     }
     if (!value.accepted) {
@@ -504,6 +611,7 @@ async function previewSingleSite() {
     announce(`Site accepted. ${value.coverage.counts.plannedExecutions} standalone executions are ready to launch.`);
   } catch (error) {
     if (controller.signal.aborted || error?.name === 'AbortError' || generation !== state.singleSitePreflightGeneration) return;
+    handleOperatorAuthorizationFailure(error);
     state.singleSitePreview = null;
     state.singleSitePreviewContract = null;
     invalidateLaunchAttempt();
@@ -524,13 +632,13 @@ async function previewSingleSite() {
 function isCurrentSingleSitePreflight(controller, generation, contractIdentity) {
   if (controller.signal.aborted || state.singleSitePreflightController !== controller
     || generation !== state.singleSitePreflightGeneration || !isSingleSiteMode()) return false;
-  try { return JSON.stringify(currentSingleSiteContract()) === contractIdentity; }
+  try { return canonicalJson(currentSingleSiteContract()) === contractIdentity; }
   catch { return false; }
 }
 
 function acceptSingleSitePreview(value) {
   state.singleSitePreview = value;
-  state.singleSitePreviewContract = JSON.stringify(value.runContract);
+  state.singleSitePreviewContract = canonicalJson(value.runContract);
   invalidateLaunchAttempt();
   renderSingleSiteCoverage(value);
 }
@@ -594,6 +702,11 @@ function renderSingleSiteCoverage(value) {
 async function launchRun(event) {
   event.preventDefault();
   if (!state.config || state.pending.has('launch')) return;
+  if (!operatorAuthorized()) {
+    renderOperatorAuthorization({ message: 'Unlock operator controls before launching an audit.', error: true });
+    elements.operatorUnlockToken.focus();
+    return;
+  }
   if (isSingleSiteMode()) return launchSingleSiteRun();
   if (!elements.form.reportValidity() || !beginOperation('launch')) return;
   let body;
@@ -638,6 +751,7 @@ async function launchRun(event) {
     const run = await requestJson('/api/runs', { method: 'POST', body: JSON.stringify(body), timeoutMs: 45_000 });
     navigateToRun('comparative', run.id);
   } catch (error) {
+    handleOperatorAuthorizationFailure(error);
     const message = friendlyError(error);
     showFormMessage(message, true);
     focusComparativeError(message);
@@ -655,7 +769,7 @@ async function launchSingleSiteRun() {
   let contract;
   try {
     contract = currentSingleSiteContract();
-    if (!state.singleSitePreview?.accepted || state.singleSitePreviewContract !== JSON.stringify(contract)) {
+    if (!state.singleSitePreview?.accepted || state.singleSitePreviewContract !== canonicalJson(contract)) {
       throw focusError('Selections changed after the coverage preview. Check the site again before launching.', elements.previewSingleSite);
     }
   } catch (error) {
@@ -712,6 +826,7 @@ async function launchSingleSiteRun() {
     navigateToRun('single-site', value.job.id);
   } catch (error) {
     if (Number.isInteger(error?.status)) state.singleSiteLaunchAttempt = null;
+    handleOperatorAuthorizationFailure(error);
     const message = friendlyError(error);
     showFormMessage(message, true);
     focusNamedTarget(error?.body?.details?.focusTarget);

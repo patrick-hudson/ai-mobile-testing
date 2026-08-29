@@ -24,6 +24,23 @@
         </div>
 
         <form id="launch-form" aria-busy="true">
+          <section id="operator-access" class="audit-operator-access" aria-labelledby="operator-access-title" hidden>
+            <div class="audit-operator-copy">
+              <p class="audit-kicker">OPERATOR ACCESS</p>
+              <h3 id="operator-access-title">Unlock test controls in this browser</h3>
+              <p>Copy the current operator unlock link from the portal service log, then paste the link or token here. You do not need to leave or reload this page.</p>
+              <p class="audit-muted audit-small">Find it with <code>docker compose logs --tail=50 portal</code>. The credential is exchanged for an HttpOnly browser session and cleared from this form immediately.</p>
+            </div>
+            <div class="audit-operator-form">
+              <label class="audit-field" for="operator-unlock-token"><span>Operator unlock link or token</span></label>
+              <div class="audit-operator-input-row">
+                <input id="operator-unlock-token" type="password" autocomplete="off" spellcheck="false" maxlength="4096" />
+                <button id="operator-unlock-submit" class="console-button console-button-secondary" type="button">Unlock controls</button>
+              </div>
+              <p id="operator-unlock-status" class="audit-message" role="status" aria-live="polite" aria-atomic="true">Runs, site checks, purge, and credential changes require an operator session.</p>
+            </div>
+          </section>
+
           <fieldset>
             <legend>Audit mode</legend>
             <div class="audit-choice-grid audit-two-up">
