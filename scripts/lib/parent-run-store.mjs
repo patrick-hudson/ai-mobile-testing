@@ -28,7 +28,7 @@ import {
 } from './durable-ledger.mjs';
 
 export const PARENT_RUN_STORE_SCHEMA_VERSION = 1;
-export const PARENT_RUN_WRITER_PROTOCOL = 'single-coordinator-fenced-v1';
+export const PARENT_RUN_WRITER_PROTOCOL = 'single-coordinator-global-performance-v2';
 const SAFE_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,127})$/;
 const LOCAL_VOLUME_DRIVERS = new Set(['local']);
 const WORK_OUTCOMES = new Set([
@@ -290,6 +290,10 @@ function globalCoordinatorPath(store) {
   return containedPath(store.root, 'coordinator.json');
 }
 
+function performanceSchedulerPath(store) {
+  return containedPath(store.root, 'performance-scheduler.json');
+}
+
 function clone(value) {
   return JSON.parse(canonicalJson(value));
 }
@@ -324,6 +328,87 @@ function sealCoordinatorLease(value) {
     expiresAt: value.expiresAt,
   };
   return { ...body, digest: canonicalDigest(body) };
+}
+
+function sealPerformanceScheduler(value) {
+  const body = {
+    schemaVersion: 1,
+    kind: 'store-performance-scheduler',
+    revision: value.revision,
+    phase: value.phase,
+    reservation: value.reservation,
+    updatedAt: value.updatedAt,
+  };
+  return { ...body, digest: canonicalDigest(body) };
+}
+
+function validatePerformanceReservation(value, phase) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    fail('STORE_CORRUPT', 'Store performance scheduler reservation is invalid.');
+  }
+  const drainingKeys = [
+    'workerId', 'runId', 'workItemId', 'coordinatorEpoch', 'requestedAt', 'expiresAt',
+  ];
+  const runningKeys = [...drainingKeys, 'attempt', 'leaseToken', 'acquiredAt'];
+  exactKeys(value, phase === 'running' ? runningKeys : drainingKeys, 'store performance reservation');
+  if (!SAFE_ID.test(value.workerId) || !SAFE_ID.test(value.runId) || !SAFE_ID.test(value.workItemId)
+    || !Number.isSafeInteger(value.coordinatorEpoch) || value.coordinatorEpoch < 1
+    || canonicalTimestamp(value.requestedAt, 'performance reservation requestedAt')
+      >= canonicalTimestamp(value.expiresAt, 'performance reservation expiresAt')) {
+    fail('STORE_CORRUPT', 'Store performance scheduler reservation is invalid.');
+  }
+  if (phase === 'running' && (!Number.isSafeInteger(value.attempt) || value.attempt < 1
+    || !SAFE_ID.test(value.leaseToken)
+    || canonicalTimestamp(value.acquiredAt, 'performance reservation acquiredAt') < value.requestedAt)) {
+    fail('STORE_CORRUPT', 'Store running performance reservation is invalid.');
+  }
+  return value;
+}
+
+function validatePerformanceScheduler(value) {
+  exactKeys(value, [
+    'schemaVersion', 'kind', 'revision', 'phase', 'reservation', 'updatedAt', 'digest',
+  ], 'store performance scheduler');
+  const { digest, ...body } = value;
+  if (value.schemaVersion !== 1 || value.kind !== 'store-performance-scheduler'
+    || !Number.isSafeInteger(value.revision) || value.revision < 0
+    || !['idle', 'draining', 'running'].includes(value.phase)
+    || !canonicalTimestamp(value.updatedAt, 'performance scheduler updatedAt')
+    || digest !== canonicalDigest(body)) {
+    fail('STORE_CORRUPT', 'Store performance scheduler is invalid or corrupt.');
+  }
+  if (value.phase === 'idle') {
+    if (value.reservation !== null) fail('STORE_CORRUPT', 'Idle performance scheduler cannot retain a reservation.');
+  } else {
+    validatePerformanceReservation(value.reservation, value.phase);
+  }
+  return value;
+}
+
+async function readPerformanceSchedulerUnlocked(store) {
+  try {
+    return validatePerformanceScheduler(await readBoundedJson(store.storage, performanceSchedulerPath(store), {
+      label: 'store performance scheduler', maximumBytes: 16_384,
+    }));
+  } catch (error) {
+    if (error?.code === 'STORE_CORRUPT') throw error;
+    fail('STORE_CORRUPT', 'Store performance scheduler is unreadable.', { cause: error?.code ?? error?.message });
+  }
+}
+
+async function writePerformanceSchedulerUnlocked(store, previous, phase, reservation = null) {
+  const next = sealPerformanceScheduler({
+    revision: previous.revision + 1,
+    phase,
+    reservation,
+    updatedAt: timestamp(store),
+  });
+  await atomicWriteJson(store.storage, performanceSchedulerPath(store), next);
+  return next;
+}
+
+export async function readStorePerformanceScheduler(store) {
+  return clone(await readPerformanceSchedulerUnlocked(store));
 }
 
 async function validateCoordinator(store, coordinator) {
@@ -505,9 +590,11 @@ export async function openParentRunStore({
   const storage = await openAtomicStorage({ root, filesystem, nonce, verify: verifyStorage });
   await storage.fs.mkdir(containedPath(storage.root, 'runs'), { recursive: true, mode: 0o2770 });
   const manifestPath = containedPath(storage.root, 'store-manifest.json');
+  const schedulerPath = containedPath(storage.root, 'performance-scheduler.json');
   const store = { root: storage.root, storage, clock, manifest: null };
   await withDirectoryLock(storage, containedPath(storage.root, '.store-initialization.lock'), async () => {
-    if (await pathExists(storage.fs, manifestPath)) {
+    const existingStore = await pathExists(storage.fs, manifestPath);
+    if (existingStore) {
       const manifest = validateManifest(await readBoundedJson(storage, manifestPath, { label: 'store manifest' }));
       if ((deploymentIdentity && deploymentIdentity !== manifest.deploymentIdentity)
         || (volumeIdentity && volumeIdentity !== manifest.volumeIdentity)
@@ -515,18 +602,37 @@ export async function openParentRunStore({
         fail('STORE_IDENTITY_MISMATCH', 'Configured deployment, volume, or writer identity does not match the durable store.');
       }
       store.manifest = manifest;
-      return;
+    } else {
+      if (!deploymentIdentity || !volumeIdentity) {
+        fail('STORE_MANIFEST_REQUIRED', 'A new store requires deploymentIdentity and volumeIdentity.');
+      }
+      if (!volumeIdentity.startsWith('named-volume:')) {
+        fail('STORE_VOLUME_UNSUPPORTED', 'Store volumeIdentity must identify a Docker named volume.');
+      }
+      await writeManifest(store, {
+        deploymentIdentity, volumeIdentity, volumeDriver, writerProtocol, authorityEpoch: 0,
+        createdAt: timestamp(store), cutoverRevision, backupMarker,
+      });
     }
-    if (!deploymentIdentity || !volumeIdentity) {
-      fail('STORE_MANIFEST_REQUIRED', 'A new store requires deploymentIdentity and volumeIdentity.');
+    if (!await pathExists(storage.fs, schedulerPath)) {
+      if (existingStore) {
+        const states = await schedulingStatesUnlocked(store);
+        const hadPerformanceState = states.some((state) => state.resourceScheduling.performanceDrain !== null
+          || state.resourceScheduling.exclusiveLease !== null
+          || Object.values(state.workItems).some((item) => item.resourceClass === 'performance'
+            && item.state === 'running'));
+        if (hadPerformanceState) {
+          fail('STORE_CORRUPT', 'Existing store is missing its performance scheduler while performance state is active.');
+        }
+      }
+      await atomicWriteJson(storage, schedulerPath, sealPerformanceScheduler({
+        revision: 0,
+        phase: 'idle',
+        reservation: null,
+        updatedAt: timestamp(store),
+      }), { exclusive: true });
     }
-    if (!volumeIdentity.startsWith('named-volume:')) {
-      fail('STORE_VOLUME_UNSUPPORTED', 'Store volumeIdentity must identify a Docker named volume.');
-    }
-    await writeManifest(store, {
-      deploymentIdentity, volumeIdentity, volumeDriver, writerProtocol, authorityEpoch: 0,
-      createdAt: timestamp(store), cutoverRevision, backupMarker,
-    });
+    await readPerformanceSchedulerUnlocked(store);
   });
   return store;
 }
@@ -810,118 +916,247 @@ function workerCanRun(item, worker) {
       || worker.capabilities.includes(item.capability));
 }
 
-export async function requestPerformanceDrain(store, runId, coordinator, input) {
+async function schedulingStatesUnlocked(store) {
+  const states = [];
+  for (const runId of await listParentRunIds(store)) {
+    const state = await recoverUnlocked(store, runId);
+    states.push(state);
+  }
+  return states;
+}
+
+function liveRunningItems(states, store) {
+  return states.flatMap((state) => Object.values(state.workItems)
+    .filter((item) => item.state === 'running' && item.lease && Date.parse(item.lease.expiresAt) > store.clock())
+    .map((item) => ({ state, item })));
+}
+
+async function reconcilePerformanceSchedulerUnlocked(store, coordinator, states = null) {
+  const current = await readPerformanceSchedulerUnlocked(store);
+  if (current.phase === 'idle') return current;
+  const allStates = states ?? await schedulingStatesUnlocked(store);
+  const reservation = current.reservation;
+  const state = allStates.find(({ runId }) => runId === reservation.runId);
+  const item = state?.workItems?.[reservation.workItemId];
+  if (current.phase === 'draining') {
+    if (reservation.coordinatorEpoch !== coordinator.epoch || Date.parse(reservation.expiresAt) <= store.clock()
+      || !state || state.status !== 'active' || state.authorityTombstone !== null
+      || !item || item.resourceClass !== 'performance'
+      || (!['queued', 'running'].includes(item.state))) {
+      return writePerformanceSchedulerUnlocked(store, current, 'idle');
+    }
+    if (item.state === 'running') {
+      if (!item.lease || item.lease.workerId !== reservation.workerId
+        || item.lease.epoch !== reservation.coordinatorEpoch) {
+        fail('STORE_CORRUPT', 'Draining performance reservation disagrees with its running work lease.');
+      }
+      return writePerformanceSchedulerUnlocked(store, current, 'running', {
+        ...reservation,
+        attempt: item.lease.attempt,
+        leaseToken: item.lease.token,
+        acquiredAt: item.lease.claimedAt,
+      });
+    }
+    return current;
+  }
+  if (!state || state.status !== 'active' || state.authorityTombstone !== null || !item
+    || item.state !== 'running' || !item.lease) {
+    return writePerformanceSchedulerUnlocked(store, current, 'idle');
+  }
+  if (item.resourceClass !== 'performance' || item.lease.workerId !== reservation.workerId
+    || item.lease.attempt !== reservation.attempt || item.lease.epoch !== reservation.coordinatorEpoch
+    || item.lease.token !== reservation.leaseToken) {
+    fail('STORE_CORRUPT', 'Running performance scheduler disagrees with its fenced work lease.');
+  }
+  if (reservation.coordinatorEpoch !== coordinator.epoch) {
+    fail('PERFORMANCE_RECOVERY_PENDING', 'A stale-epoch performance lease must be recovered before scheduling resumes.');
+  }
+  return current;
+}
+
+export async function reconcileStorePerformanceScheduler(store, coordinator) {
+  return withDirectoryLock(store.storage, globalLockPath(store), async () => {
+    await validateCoordinator(store, coordinator);
+    return clone(await reconcilePerformanceSchedulerUnlocked(store, coordinator));
+  });
+}
+
+function normalizedRunIds(value) {
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_DISCOVERED_PARENT_RUNS
+    || value.some((runId) => typeof runId !== 'string' || !SAFE_ID.test(runId))) {
+    fail('STORE_SCHEMA_INVALID', 'Store scheduling requires a bounded non-empty authorized run list.');
+  }
+  return [...new Set(value)];
+}
+
+export async function requestStorePerformanceDrain(store, coordinator, input) {
   const worker = validatedWorkerScheduling({
     workerId: input?.workerId,
-    capabilities: ['performance:lighthouse'],
-    resourceClasses: ['performance'],
+    capabilities: input?.capabilities ?? ['performance:lighthouse'],
+    resourceClasses: input?.resourceClasses ?? ['performance'],
   });
+  if (!worker.resourceClasses.includes('performance') || !worker.capabilities.includes('performance:lighthouse')) {
+    fail('WORKER_CAPABILITY_MISMATCH', 'Only a Lighthouse performance worker can reserve the global performance resource.');
+  }
+  const runIds = normalizedRunIds(input?.runIds);
   const leaseMs = input?.leaseMs ?? 30_000;
   if (!Number.isSafeInteger(leaseMs) || leaseMs < 1_000 || leaseMs > 3_600_000) {
     fail('STORE_SCHEMA_INVALID', 'Performance drain leaseMs must be an integer from 1000 through 3600000.');
   }
-  return withDirectoryLock(store.storage, globalLockPath(store), () => withDirectoryLock(store.storage, lockPath(store, runId), async () => {
-    const state = await recoverUnlocked(store, runId);
+  return withDirectoryLock(store.storage, globalLockPath(store), async () => {
     await validateCoordinator(store, coordinator);
-    const existing = state.resourceScheduling.performanceDrain;
-    if (existing && Date.parse(existing.expiresAt) > store.clock()) {
-      if (existing.workerId !== worker.workerId || existing.coordinatorEpoch !== coordinator.epoch) {
-        fail('PERFORMANCE_DRAIN_HELD', 'Another worker already holds the active performance drain.');
+    const states = await schedulingStatesUnlocked(store);
+    const current = await reconcilePerformanceSchedulerUnlocked(store, coordinator, states);
+    if (current.phase === 'running') fail('PERFORMANCE_LEASE_HELD', 'The store-global performance resource is already running.');
+    if (current.phase === 'draining') {
+      if (current.reservation.workerId !== worker.workerId) {
+        fail('PERFORMANCE_DRAIN_HELD', 'Another worker holds the store-global performance drain.');
       }
-      return clone(existing);
+      return clone(current.reservation);
     }
-    if (state.resourceScheduling.exclusiveLease) fail('PERFORMANCE_LEASE_HELD', 'A performance resource lease is already active.');
-    const eligible = Object.values(state.workItems).some((item) => item.resourceClass === 'performance' && item.state === 'queued');
-    if (!eligible) fail('NO_PERFORMANCE_WORK', 'No queued performance work item is available.');
-    const drain = {
+    const authorized = new Set(runIds);
+    const selected = states
+      .filter((state) => authorized.has(state.runId) && state.status === 'active' && state.authorityTombstone === null)
+      .flatMap((state) => Object.values(state.workItems).map((item) => ({ state, item })))
+      .find(({ item }) => item.state === 'queued' && item.resourceClass === 'performance'
+        && workerCanRun(item, worker));
+    if (!selected) fail('NO_PERFORMANCE_WORK', 'No authorized queued performance work item is available.');
+    const reservation = {
       workerId: worker.workerId,
+      runId: selected.state.runId,
+      workItemId: selected.item.id,
+      coordinatorEpoch: coordinator.epoch,
       requestedAt: timestamp(store),
       expiresAt: new Date(store.clock() + leaseMs).toISOString(),
-      coordinatorEpoch: coordinator.epoch,
     };
-    await appendMutationUnlocked(store, state, 'mutation', 'performance-drain-requested', (next) => {
-      next.resourceScheduling.performanceDrain = drain;
-    }, { data: { workerId: worker.workerId } });
-    return clone(drain);
-  }));
+    await writePerformanceSchedulerUnlocked(store, current, 'draining', reservation);
+    return clone(reservation);
+  });
 }
 
-export async function claimWorkItem(store, runId, coordinator, input) {
+export function requestPerformanceDrain(store, runId, coordinator, input) {
+  return requestStorePerformanceDrain(store, coordinator, {
+    ...input,
+    capabilities: ['performance:lighthouse'],
+    resourceClasses: ['performance'],
+    runIds: [runId],
+  });
+}
+
+function createWorkLease(store, state, requested, worker, coordinator, leaseMs) {
+  const attempt = requested.attempts.length + 1;
+  return {
+    runId: state.runId,
+    workItemId: requested.id,
+    workerId: worker.workerId,
+    attempt,
+    epoch: coordinator.epoch,
+    token: store.storage.nonce(),
+    claimedAt: timestamp(store),
+    expiresAt: new Date(store.clock() + leaseMs).toISOString(),
+    subjectCoreDigest: state.subjectCoreDigest,
+    runnerRevision: state.runnerRevision,
+    capability: requested.capability,
+    resourceClass: requested.resourceClass,
+    targetId: requested.targetId,
+    specAffinity: requested.specAffinity,
+    executionDescriptor: requested.executionDescriptor,
+    executionDescriptorDigest: requested.executionDescriptor?.digest ?? null,
+  };
+}
+
+export async function claimStoreWorkItem(store, coordinator, input) {
   if (!Number.isSafeInteger(input?.leaseMs) || input.leaseMs < 100 || input.leaseMs > 3_600_000) {
     fail('STORE_SCHEMA_INVALID', 'Work-item leaseMs must be an integer from 100 through 3600000.');
   }
   const worker = validatedWorkerScheduling(input);
-  let claimed;
-  await mutate(store, runId, { coordinator, type: 'work-item-claimed', data: { workerId: worker.workerId } }, (state) => {
-    if (state.status === 'cancelled') fail('RUN_CANCELLED', `Parent run ${runId} is cancelled.`);
-    let drain = state.resourceScheduling.performanceDrain;
-    if (drain && Date.parse(drain.expiresAt) <= store.clock()) {
-      state.resourceScheduling.performanceDrain = null;
-      drain = null;
-    }
+  const runIds = normalizedRunIds(input?.runIds);
+  return withDirectoryLock(store.storage, globalLockPath(store), async () => {
+    await validateCoordinator(store, coordinator);
+    const states = await schedulingStatesUnlocked(store);
+    const scheduler = await reconcilePerformanceSchedulerUnlocked(store, coordinator, states);
     const wantsPerformance = worker.resourceClasses.includes('performance');
-    if (drain && !wantsPerformance) fail('PERFORMANCE_DRAINING', 'Ordinary claims are paused for an exclusive performance execution.');
-    if (wantsPerformance && !drain) fail('PERFORMANCE_DRAIN_REQUIRED', 'Performance work requires an active coordinator drain.');
-    if (drain && Object.values(state.workItems).some((item) => item.resourceClass === 'ordinary' && item.state === 'running')) {
-      fail('PERFORMANCE_DRAIN_PENDING', 'Performance work is waiting for active ordinary browser work to drain.');
+    if (!wantsPerformance && scheduler.phase !== 'idle') {
+      fail('PERFORMANCE_DRAINING', 'Ordinary claims are paused for the store-global performance execution.');
     }
-    if (state.resourceScheduling.exclusiveLease) fail('PERFORMANCE_LEASE_HELD', 'A performance resource lease is already active.');
-    const requested = input.workItemId
-      ? state.workItems[input.workItemId]
-      : Object.values(state.workItems).find((item) => item.state === 'queued' && workerCanRun(item, worker));
-    if (!requested) {
-      const queued = Object.values(state.workItems).some(({ state: workState }) => workState === 'queued');
+    if (wantsPerformance && (scheduler.phase !== 'draining'
+      || scheduler.reservation.workerId !== worker.workerId
+      || scheduler.reservation.coordinatorEpoch !== coordinator.epoch)) {
+      fail('PERFORMANCE_DRAIN_REQUIRED', 'Performance work requires its active store-global drain.');
+    }
+    if (wantsPerformance && liveRunningItems(states, store).some(({ item }) => item.resourceClass === 'ordinary')) {
+      fail('PERFORMANCE_DRAIN_PENDING', 'Performance work is waiting for active ordinary work across the store to drain.');
+    }
+    if (wantsPerformance && liveRunningItems(states, store).some(({ item }) => item.resourceClass === 'performance')) {
+      fail('PERFORMANCE_LEASE_HELD', 'The store-global performance resource is already active.');
+    }
+    const authorized = new Set(runIds);
+    const authorizedStates = states.filter((state) => authorized.has(state.runId));
+    if (authorizedStates.length === 1 && authorizedStates[0].status === 'cancelled') {
+      fail('RUN_CANCELLED', `Parent run ${authorizedStates[0].runId} is cancelled.`);
+    }
+    let selected;
+    if (wantsPerformance) {
+      const state = states.find(({ runId }) => runId === scheduler.reservation.runId);
+      const item = state?.workItems?.[scheduler.reservation.workItemId];
+      if (!state || !authorized.has(state.runId) || !item) {
+        fail('PERFORMANCE_DRAIN_REQUIRED', 'The active performance reservation is outside this worker authorization.');
+      }
+      selected = { state, item };
+    } else if (input.workItemId) {
+      const state = states.find((candidate) => authorized.has(candidate.runId)
+        && candidate.workItems[input.workItemId]);
+      const item = state?.workItems?.[input.workItemId];
+      if (!state || !item) fail('NO_WORK_AVAILABLE', `Work item ${input.workItemId} is unavailable.`);
+      if (item.state !== 'queued') {
+        if (['completed_pass', 'completed_product_failure', 'cancelled', 'incomplete'].includes(item.state)) {
+          fail('WORK_ITEM_TERMINAL', `Work item ${item.id} is terminal.`);
+        }
+        fail('WORK_ITEM_LEASE_HELD', `Work item ${item.id} already has an active lease.`);
+      }
+      selected = { state, item };
+    } else {
+      selected = states
+        .filter((state) => authorized.has(state.runId) && state.status === 'active' && state.authorityTombstone === null)
+        .flatMap((state) => Object.values(state.workItems).map((item) => ({ state, item })))
+        .find(({ item }) => item.state === 'queued' && workerCanRun(item, worker));
+    }
+    if (!selected) {
+      const queued = states.some((state) => authorized.has(state.runId)
+        && Object.values(state.workItems).some(({ state: workState }) => workState === 'queued'));
       fail(queued ? 'NO_COMPATIBLE_WORK' : 'NO_WORK_AVAILABLE', queued
         ? 'No queued work item matches this worker capability.'
         : 'No queued work item is available.');
     }
-    if (input.workItemId && requested.state !== 'queued') {
-      if (['completed_pass', 'completed_product_failure', 'cancelled', 'incomplete'].includes(requested.state)) {
-        fail('WORK_ITEM_TERMINAL', `Work item ${requested.id} is terminal.`);
+    const { state: selectedState, item: selectedItem } = selected;
+    if (selectedState.status === 'cancelled') fail('RUN_CANCELLED', `Parent run ${selectedState.runId} is cancelled.`);
+    if (selectedItem.state !== 'queued') fail('WORK_ITEM_LEASE_HELD', `Work item ${selectedItem.id} is not queued.`);
+    if (!workerCanRun(selectedItem, worker)) fail('WORKER_CAPABILITY_MISMATCH', `Worker cannot execute ${selectedItem.id}.`);
+    return withDirectoryLock(store.storage, lockPath(store, selectedState.runId), async () => {
+      const state = await recoverUnlocked(store, selectedState.runId);
+      const requested = state.workItems[selectedItem.id];
+      if (!requested || requested.state !== 'queued') fail('WORK_ITEM_LEASE_HELD', `Work item ${selectedItem.id} is not queued.`);
+      const claimed = createWorkLease(store, state, requested, worker, coordinator, input.leaseMs);
+      await appendMutationUnlocked(store, state, 'mutation', 'work-item-claimed', (next) => {
+        const item = next.workItems[requested.id];
+        item.state = 'running';
+        item.lease = claimed;
+      }, { data: { workerId: worker.workerId, workItemId: requested.id } });
+      if (requested.resourceClass === 'performance') {
+        await writePerformanceSchedulerUnlocked(store, scheduler, 'running', {
+          ...scheduler.reservation,
+          attempt: claimed.attempt,
+          leaseToken: claimed.token,
+          acquiredAt: claimed.claimedAt,
+        });
       }
-      fail('WORK_ITEM_LEASE_HELD', `Work item ${requested.id} already has an active lease.`);
-    }
-    if (!workerCanRun(requested, worker)) fail('WORKER_CAPABILITY_MISMATCH', `Worker cannot execute ${requested.id}.`);
-    if (requested.resourceClass === 'performance' && !drain) {
-      fail('PERFORMANCE_DRAIN_REQUIRED', 'Performance work requires an active coordinator drain.');
-    }
-    if (requested.resourceClass === 'ordinary' && drain) {
-      fail('PERFORMANCE_DRAINING', 'Ordinary claims are paused for an exclusive performance execution.');
-    }
-    const attempt = requested.attempts.length + 1;
-    claimed = {
-      runId,
-      workItemId: requested.id,
-      workerId: worker.workerId,
-      attempt,
-      epoch: coordinator.epoch,
-      token: store.storage.nonce(),
-      claimedAt: timestamp(store),
-      expiresAt: new Date(store.clock() + input.leaseMs).toISOString(),
-      subjectCoreDigest: state.subjectCoreDigest,
-      runnerRevision: state.runnerRevision,
-      capability: requested.capability,
-      resourceClass: requested.resourceClass,
-      targetId: requested.targetId,
-      specAffinity: requested.specAffinity,
-      executionDescriptor: requested.executionDescriptor,
-      executionDescriptorDigest: requested.executionDescriptor?.digest ?? null,
-    };
-    requested.state = 'running';
-    requested.lease = claimed;
-    if (requested.resourceClass === 'performance') {
-      state.resourceScheduling.exclusiveLease = {
-        workItemId: requested.id,
-        workerId: worker.workerId,
-        attempt,
-        leaseToken: claimed.token,
-        coordinatorEpoch: coordinator.epoch,
-        acquiredAt: claimed.claimedAt,
-        expiresAt: claimed.expiresAt,
-      };
-    }
+      return clone(claimed);
+    });
   });
-  return clone(claimed);
+}
+
+export function claimWorkItem(store, runId, coordinator, input) {
+  return claimStoreWorkItem(store, coordinator, { ...input, runIds: [runId] });
 }
 
 function validateWorkLease(state, lease) {
@@ -1005,7 +1240,8 @@ export async function requeueExpiredWork(store, runId, coordinator) {
     const state = await recoverUnlocked(store, runId);
     await validateCoordinator(store, coordinator);
     const expiredIds = Object.values(state.workItems)
-      .filter((item) => item.state === 'running' && Date.parse(item.lease.expiresAt) <= store.clock())
+      .filter((item) => item.state === 'running'
+        && (Date.parse(item.lease.expiresAt) <= store.clock() || item.lease.epoch !== coordinator.epoch))
       .map((item) => item.id);
     const drainExpired = state.resourceScheduling.performanceDrain
       && Date.parse(state.resourceScheduling.performanceDrain.expiresAt) <= store.clock();
@@ -1015,6 +1251,7 @@ export async function requeueExpiredWork(store, runId, coordinator) {
     await appendMutationUnlocked(store, state, 'mutation', 'expired-work-requeued', (next) => {
       for (const id of expiredIds) {
         const item = next.workItems[id];
+        const reason = item.lease.epoch !== coordinator.epoch ? 'coordinator-epoch-fenced' : 'lease-expired';
         item.attempts.push({
           attempt: item.lease.attempt,
           outcome: 'operational_failure',
@@ -1022,7 +1259,7 @@ export async function requeueExpiredWork(store, runId, coordinator) {
           artifacts: [],
           workerId: item.lease.workerId,
           completedAt: timestamp(store),
-          reason: 'lease-expired',
+          reason,
         });
         item.lease = null;
         item.state = item.attempts.length >= item.maxAttempts ? 'incomplete' : 'queued';
@@ -1035,6 +1272,11 @@ export async function requeueExpiredWork(store, runId, coordinator) {
         next.resourceScheduling.performanceDrain = null;
       }
     });
+    const scheduler = await readPerformanceSchedulerUnlocked(store);
+    if (scheduler.phase !== 'idle' && scheduler.reservation.runId === runId
+      && expiredIds.includes(scheduler.reservation.workItemId)) {
+      await writePerformanceSchedulerUnlocked(store, scheduler, 'idle');
+    }
     return expiredIds.length;
   }));
 }
@@ -1259,6 +1501,13 @@ export async function adoptAttemptEvidence(store, runId, coordinator, inbox) {
     }
     adopted = clone(item);
   }, { data: { workItemId: document.workItemId, digest } });
+  const scheduler = await readPerformanceSchedulerUnlocked(store);
+  if (scheduler.phase === 'running' && scheduler.reservation.runId === runId
+    && scheduler.reservation.workItemId === document.workItemId
+    && scheduler.reservation.attempt === document.attempt
+    && scheduler.reservation.leaseToken === document.leaseToken) {
+    await writePerformanceSchedulerUnlocked(store, scheduler, 'idle');
+  }
   return adopted;
   }));
 }
@@ -1304,7 +1553,7 @@ export async function cancelParentRun(store, runId, coordinator, input) {
       delete state.clockNow;
       return state;
     }
-    return appendMutationUnlocked(store, state, 'mutation', 'parent-run-cancelled', (next) => {
+    const cancelled = await appendMutationUnlocked(store, state, 'mutation', 'parent-run-cancelled', (next) => {
       next.status = 'cancelled';
       for (const item of Object.values(next.workItems)) {
         if (!['completed_pass', 'completed_product_failure'].includes(item.state)) {
@@ -1315,6 +1564,11 @@ export async function cancelParentRun(store, runId, coordinator, input) {
       next.resourceScheduling.performanceDrain = null;
       next.resourceScheduling.exclusiveLease = null;
     }, { actor: input.actor, data: { reason: input.reason } });
+    const scheduler = await readPerformanceSchedulerUnlocked(store);
+    if (scheduler.phase !== 'idle' && scheduler.reservation.runId === runId) {
+      await writePerformanceSchedulerUnlocked(store, scheduler, 'idle');
+    }
+    return cancelled;
   }));
 }
 
@@ -1483,6 +1737,10 @@ export async function tombstoneParentRunAuthority(store, runId, coordinator, inp
       next.resourceScheduling.performanceDrain = null;
       next.resourceScheduling.exclusiveLease = null;
     }, { actor: input?.actor ?? null, data: { reason: tombstone.reason, lastPublicationDigest: tombstone.lastPublicationDigest } });
+    const scheduler = await readPerformanceSchedulerUnlocked(store);
+    if (scheduler.phase !== 'idle' && scheduler.reservation.runId === runId) {
+      await writePerformanceSchedulerUnlocked(store, scheduler, 'idle');
+    }
     return clone(tombstone);
   }));
 }

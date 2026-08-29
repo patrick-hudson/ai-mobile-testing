@@ -34,7 +34,8 @@ try {
     targetRegistry,
   });
   assert.deepEqual(await supervisor.maintain(), {
-    state: 'ready', epoch: 1, runCount: 0, requeued: 0, completedOperations: 0, sealedGraphs: 0, errors: [],
+    state: 'ready', epoch: 1, runCount: 0, requeued: 0, completedOperations: 0, sealedGraphs: 0,
+    performanceScheduler: { phase: 'idle', runId: null, workItemId: null }, errors: [],
   }, 'the store-wide coordinator must acquire before the first run exists');
   for (const [runId, suffix] of [['run-a', 'a'], ['run-b', 'b']]) {
     await createParentRun(store, {
@@ -66,7 +67,7 @@ try {
   } }, { capabilities: ['browser:chromium'], resourceClasses: ['ordinary'] }), /server-issued execution grant/i);
   await assert.rejects(supervisor.claim({ ...worker, id: 'worker-performance', workerGrant: {
     capabilities: ['performance:lighthouse'], resourceClasses: ['performance'],
-  } }), (error) => error?.code === 'GLOBAL_PERFORMANCE_SCHEDULER_PENDING');
+  } }), (error) => error?.code === 'PERFORMANCE_DRAIN_REQUIRED');
 
   const deploymentIdentity = { kind: 'target-preflight-set', value: digest('9') };
   const launch = compileSharedLaunchPlan({

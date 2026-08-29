@@ -103,11 +103,7 @@ const server = http.createServer(async (request, response) => {
       ...(['/v1/performance-drain', '/v1/claim'].includes(request.url) ? {} : { runId: leaseRunId }),
     });
     if (request.url === '/v1/performance-drain') {
-      supervisor.schedulingFor(principal, body);
-      return json(response, 409, {
-        code: 'GLOBAL_PERFORMANCE_SCHEDULER_PENDING',
-        error: 'Performance work remains fenced until the store-global exclusive resource scheduler is active.',
-      });
+      return json(response, 202, await supervisor.requestPerformanceDrain(principal, body));
     }
     if (request.url === '/v1/claim') {
       const lease = await supervisor.claim(principal, body);
@@ -143,7 +139,11 @@ const server = http.createServer(async (request, response) => {
     }
     return json(response, 404, { error: 'Not found.' });
   } catch (error) {
-    const unavailable = ['NO_WORK_AVAILABLE', 'NO_COMPATIBLE_WORK', 'PERFORMANCE_DRAIN_PENDING', 'PERFORMANCE_DRAIN_REQUIRED', 'PERFORMANCE_DRAINING'].includes(error?.code);
+    const unavailable = [
+      'NO_WORK_AVAILABLE', 'NO_COMPATIBLE_WORK', 'NO_PERFORMANCE_WORK',
+      'PERFORMANCE_DRAIN_PENDING', 'PERFORMANCE_DRAIN_REQUIRED', 'PERFORMANCE_DRAINING',
+      'PERFORMANCE_DRAIN_HELD', 'PERFORMANCE_LEASE_HELD', 'PERFORMANCE_RECOVERY_PENDING',
+    ].includes(error?.code);
     json(response, error?.status ?? (unavailable ? 409 : 400), { code: error?.code ?? 'SHARED_COORDINATOR_REQUEST_INVALID', error: error?.message ?? 'Request failed.' });
   }
 });

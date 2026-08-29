@@ -314,6 +314,10 @@ try {
     (error) => error?.code === 'ARTIFACT_DIGEST_MISMATCH',
   );
 
+  now += 10_001;
+  await requeueExpiredWork(store, 'recovery-run', recoveryCoordinator);
+  await requeueExpiredWork(store, 'evidence-boundary-run', recoveryCoordinator);
+
   await createParentRun(store, {
     runId: 'maintenance-run', subjectCoreDigest: digest('5'), runnerRevision: 'runner-u4',
     workItems: [{

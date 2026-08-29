@@ -122,7 +122,7 @@ const store = await openParentRunStore({
   deploymentIdentity: 'compose-project:test',
   volumeIdentity: 'named-volume:test-store',
   volumeDriver: 'local',
-  writerProtocol: 'single-coordinator-fenced-v1',
+  writerProtocol: 'single-coordinator-global-performance-v2',
   clock,
   verifyStorage: false,
 });

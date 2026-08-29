@@ -369,6 +369,10 @@ try {
       leaseMs: 10_000,
     });
     assert.equal(lease.capability, plan.capability);
+    const inbox = await publishAttemptEvidence(store, 'browser-matrix-run', lease, {
+      outcome: 'completed_pass', reason: null, artifacts: [],
+    });
+    await adoptAttemptEvidence(store, 'browser-matrix-run', coordinator, inbox);
   }
   await sealParentRunGraph(store, 'comparative-context-run', coordinator, {
     executionManifest: comparative.executionManifest,
