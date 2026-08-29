@@ -13,7 +13,13 @@ export function openParentRunStore(options: any): Promise<ParentRunStore>;
 export function createParentRun(store: ParentRunStore, input: any): Promise<any>;
 export function recoverParentRun(store: ParentRunStore, runId: string): Promise<any>;
 export function readParentRun(store: ParentRunStore, runId: string): Promise<any>;
-export function sealParentRunGraph(store: ParentRunStore, runId: string, coordinator: CoordinatorFence, input: any): Promise<any>;
+export function sealParentRunGraph(store: ParentRunStore, runId: string, coordinator: CoordinatorFence, input: {
+  subjectCore?: unknown;
+  executionManifest: unknown;
+  finalSubject: unknown;
+  inventoryWorkItemId?: string;
+  workItems?: Array<{ id: string; maxAttempts: number; capability?: string; resourceClass?: 'ordinary' | 'performance'; targetId?: string; specAffinity?: string | null }>;
+}): Promise<any>;
 export function acquireCoordinator(store: ParentRunStore, runId: string, input: { ownerId: string; leaseMs: number }): Promise<CoordinatorFence>;
 export function takeOverCoordinator(store: ParentRunStore, runId: string, input: { ownerId: string; leaseMs: number }): Promise<CoordinatorFence>;
 export function heartbeatCoordinator(store: ParentRunStore, coordinator: CoordinatorFence, input: { leaseMs: number }): Promise<CoordinatorFence>;

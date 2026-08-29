@@ -20,6 +20,7 @@ import {
   createParentRun,
   openParentRunStore,
   publishAttemptEvidence,
+  readParentRun,
   requestPerformanceDrain,
   sealParentRunGraph,
 } from './lib/parent-run-store.mjs';
@@ -304,18 +305,17 @@ try {
     'A sealed run cannot omit scheduled contextual work from its durable queue.',
   );
   await createParentRun(store, {
-    runId: 'inventory-run',
-    subjectCore: singleCore,
+    runId: 'browser-matrix-run',
+    subjectCore: browserMatrixCore,
     compilationState: 'pending',
     runnerRevision: 'runner-fixture',
     workItems: [{
-      ...singleBarrier.workItem,
-      maxAttempts: singleBarrier.maxAttempts,
+      ...browserMatrixBarrier.workItem,
+      maxAttempts: browserMatrixBarrier.maxAttempts,
       specAffinity: 'scripts/probe-single-site.mjs',
     }],
   });
   for (const [runId, graph, subjectCore] of [
-    ['browser-matrix-run', browserMatrix, browserMatrixCore],
     ['comparative-context-run', comparative, comparativeCore],
     ['performance-run', performanceGraph, performanceCore],
   ]) {
@@ -329,11 +329,36 @@ try {
       workItems: durableWorkItems(graph),
     });
   }
-  const coordinator = await acquireCoordinator(store, 'inventory-run', { ownerId: 'compiler-test', leaseMs: 60_000 });
-  const inventoryLease = await claimWorkItem(store, 'inventory-run', coordinator, {
+  const coordinator = await acquireCoordinator(store, 'browser-matrix-run', { ownerId: 'compiler-test', leaseMs: 60_000 });
+  await assert.rejects(
+    () => sealParentRunGraph(store, 'browser-matrix-run', coordinator, {
+      executionManifest: browserMatrix.executionManifest,
+      finalSubject: browserMatrix.finalSubject,
+      inventoryWorkItemId: browserMatrixBarrier.workItem.id,
+      workItems: durableWorkItems(browserMatrix),
+    }),
+    (error) => error?.code === 'INVENTORY_BARRIER_INCOMPLETE',
+    'The final graph must not seal before its inventory barrier succeeds.',
+  );
+  const inventoryLease = await claimWorkItem(store, 'browser-matrix-run', coordinator, {
     workerId: 'inventory-worker', capabilities: ['inventory:http'], resourceClasses: ['ordinary'], leaseMs: 10_000,
   });
-  assert.equal(inventoryLease.workItemId, singleBarrier.workItem.id);
+  assert.equal(inventoryLease.workItemId, browserMatrixBarrier.workItem.id);
+  const inventoryInbox = await publishAttemptEvidence(store, 'browser-matrix-run', inventoryLease, {
+    outcome: 'completed_pass', reason: null, artifacts: [],
+  });
+  await adoptAttemptEvidence(store, 'browser-matrix-run', coordinator, inventoryInbox);
+  const expanded = await sealParentRunGraph(store, 'browser-matrix-run', coordinator, {
+    executionManifest: browserMatrix.executionManifest,
+    finalSubject: browserMatrix.finalSubject,
+    inventoryWorkItemId: browserMatrixBarrier.workItem.id,
+    workItems: durableWorkItems(browserMatrix),
+  });
+  assert.equal(expanded.compilationState, 'sealed');
+  assert.equal(expanded.compilationBarrier.id, browserMatrixBarrier.workItem.id);
+  assert.deepEqual(Object.keys(expanded.workItems).sort(), browserMatrix.executionManifest.workItems.map(({ id }) => id));
+  assert.equal((await readParentRun(store, 'browser-matrix-run')).compilationBarrier.canonicalResult.outcome, 'completed_pass',
+    'Restart recovery must retain the completed inventory attempt after graph expansion.');
 
   for (const plan of browserMatrix.workItemPlans) {
     const lease = await claimWorkItem(store, 'browser-matrix-run', coordinator, {

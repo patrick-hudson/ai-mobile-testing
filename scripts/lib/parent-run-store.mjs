@@ -76,6 +76,35 @@ function schedulingString(value, label, { nullable = false, maximum = 512 } = {}
   return value;
 }
 
+function normalizeScheduledWorkItems(value) {
+  if (!Array.isArray(value) || value.length === 0) fail('STORE_SCHEMA_INVALID', 'A parent run requires work items.');
+  const workItems = {};
+  for (const item of value) {
+    const id = safeId(item.id, 'workItem.id');
+    if (workItems[id]) fail('STORE_SCHEMA_INVALID', `Duplicate work item ${id}.`);
+    if (!Number.isSafeInteger(item.maxAttempts) || item.maxAttempts < 1 || item.maxAttempts > 16) {
+      fail('STORE_SCHEMA_INVALID', `Work item ${id} maxAttempts must be from 1 through 16.`);
+    }
+    const capability = schedulingCapability(item.capability ?? 'browser:any', `Work item ${id} capability`);
+    const resourceClass = item.resourceClass ?? 'ordinary';
+    if (!RESOURCE_CLASSES.has(resourceClass)) fail('STORE_SCHEMA_INVALID', `Work item ${id} resourceClass is invalid.`);
+    workItems[id] = {
+      id,
+      capability,
+      resourceClass,
+      targetId: schedulingString(item.targetId ?? 'unspecified-target', `Work item ${id} targetId`, { maximum: 128 }),
+      specAffinity: schedulingString(item.specAffinity ?? null, `Work item ${id} specAffinity`, { nullable: true, maximum: 512 }),
+      state: 'queued',
+      maxAttempts: item.maxAttempts,
+      lease: null,
+      attempts: [],
+      manualRekicks: 0,
+      canonicalResult: null,
+    };
+  }
+  return workItems;
+}
+
 function artifactName(value) {
   if (typeof value !== 'string' || value.length === 0 || value.length > 240 || value.includes('\\') || value.includes('\0')) {
     fail('STORE_SCHEMA_INVALID', 'Artifact name is invalid.');
@@ -321,6 +350,7 @@ async function recoverUnlocked(store, runId, { repairCache = true } = {}) {
   const latest = events.at(-1);
   const snapshot = latest.stateSnapshot;
   snapshot.authorityTombstone ??= null;
+  snapshot.compilationBarrier ??= null;
   if (snapshot?.schemaVersion !== 1 || snapshot.kind !== 'durable-parent-run'
     || snapshot.runId !== runId || !Number.isSafeInteger(snapshot.runRevision)
     || !['active', 'cancelled'].includes(snapshot.status)
@@ -351,6 +381,20 @@ async function recoverUnlocked(store, runId, { repairCache = true } = {}) {
       || (item.specAffinity !== null && typeof item.specAffinity !== 'string')
       || !Number.isSafeInteger(item.manualRekicks) || item.manualRekicks < 0 || item.manualRekicks > 3) {
       fail('STORE_CORRUPT', `Parent run ${runId} has invalid work-item state.`);
+    }
+  }
+  if (snapshot.compilationBarrier !== null) {
+    const item = snapshot.compilationBarrier;
+    item.manualRekicks ??= 0;
+    if (snapshot.compilationState !== 'sealed' || item?.id === undefined || snapshot.workItems[item.id]
+      || !SAFE_ID.test(item.id) || item.state !== 'completed_pass'
+      || !Number.isSafeInteger(item.maxAttempts) || item.maxAttempts < 1
+      || !Array.isArray(item.attempts) || item.attempts.length < 1
+      || !CAPABILITY_PATTERN.test(item.capability) || !RESOURCE_CLASSES.has(item.resourceClass)
+      || typeof item.targetId !== 'string' || (item.specAffinity !== null && typeof item.specAffinity !== 'string')
+      || !Number.isSafeInteger(item.manualRekicks) || item.manualRekicks < 0 || item.manualRekicks > 3
+      || item.lease !== null || item.canonicalResult?.outcome !== 'completed_pass') {
+      fail('STORE_CORRUPT', `Parent run ${runId} has an invalid completed compilation barrier.`);
     }
   }
   for (const [idempotencyKey, operation] of Object.entries(snapshot.operations)) {
@@ -458,7 +502,7 @@ export async function openParentRunStore({
 
 export async function createParentRun(store, input) {
   const runId = safeId(input?.runId, 'runId');
-  if (!Array.isArray(input.workItems) || input.workItems.length === 0) fail('STORE_SCHEMA_INVALID', 'A parent run requires work items.');
+  const scheduledWorkItems = normalizeScheduledWorkItems(input.workItems);
   const compilationState = input.compilationState ?? 'pending';
   if (!['pending', 'sealed'].includes(compilationState)) fail('STORE_SCHEMA_INVALID', 'Parent-run compilationState is invalid.');
   const subjectCore = input.subjectCore ? parseReleaseSubjectCore(input.subjectCore) : null;
@@ -492,30 +536,7 @@ export async function createParentRun(store, input) {
     await store.storage.fs.mkdir(path.join(temporaryDirectory, 'inboxes'), { recursive: true, mode: 0o2770 });
     await store.storage.fs.mkdir(path.join(temporaryDirectory, 'publications'), { recursive: true, mode: 0o2770 });
     const createdAt = timestamp(store);
-    const workItems = {};
-    for (const item of input.workItems) {
-      const id = safeId(item.id, 'workItem.id');
-      if (workItems[id]) fail('STORE_SCHEMA_INVALID', `Duplicate work item ${id}.`);
-      if (!Number.isSafeInteger(item.maxAttempts) || item.maxAttempts < 1 || item.maxAttempts > 16) {
-        fail('STORE_SCHEMA_INVALID', `Work item ${id} maxAttempts must be from 1 through 16.`);
-      }
-      const capability = schedulingCapability(item.capability ?? 'browser:any', `Work item ${id} capability`);
-      const resourceClass = item.resourceClass ?? 'ordinary';
-      if (!RESOURCE_CLASSES.has(resourceClass)) fail('STORE_SCHEMA_INVALID', `Work item ${id} resourceClass is invalid.`);
-      workItems[id] = {
-        id,
-        capability,
-        resourceClass,
-        targetId: schedulingString(item.targetId ?? 'unspecified-target', `Work item ${id} targetId`, { maximum: 128 }),
-        specAffinity: schedulingString(item.specAffinity ?? null, `Work item ${id} specAffinity`, { nullable: true, maximum: 512 }),
-        state: 'queued',
-        maxAttempts: item.maxAttempts,
-        lease: null,
-        attempts: [],
-        manualRekicks: 0,
-        canonicalResult: null,
-      };
-    }
+    const workItems = clone(scheduledWorkItems);
     if (compilationState === 'sealed' && executionManifest) {
       const storedIds = Object.keys(workItems).sort();
       const manifestIds = executionManifest.workItems.map(({ id }) => id).sort();
@@ -536,6 +557,7 @@ export async function createParentRun(store, input) {
       finalSubject,
       finalSubjectDigest,
       compilationState,
+      compilationBarrier: null,
       runnerRevision,
       createdAt,
       updatedAt: createdAt,
@@ -593,15 +615,34 @@ export async function sealParentRunGraph(store, runId, coordinator, input) {
     }
     const storedIds = Object.keys(state.workItems).sort();
     const manifestIds = executionManifest.workItems.map(({ id }) => id).sort();
-    if (canonicalJson(storedIds) !== canonicalJson(manifestIds)) {
-      fail('SEALED_MANIFEST_MISMATCH', 'Sealed execution manifest does not match the durable work-item queue.');
-    }
     if (state.compilationState === 'sealed') {
+      if (canonicalJson(storedIds) !== canonicalJson(manifestIds)) {
+        fail('SEALED_MANIFEST_MISMATCH', 'Sealed execution manifest does not match the durable work-item queue.');
+      }
       if (state.executionManifestDigest !== executionManifest.digest || state.finalSubjectDigest !== finalSubject.digest) {
         fail('SEALED_MANIFEST_IMMUTABLE', 'A sealed parent-run graph cannot be rewritten.');
       }
       delete state.clockNow;
       return state;
+    }
+    let expandedWorkItems = null;
+    let completedBarrier = null;
+    if (canonicalJson(storedIds) !== canonicalJson(manifestIds)) {
+      const inventoryWorkItemId = safeId(input.inventoryWorkItemId, 'inventoryWorkItemId');
+      if (storedIds.length !== 1 || storedIds[0] !== inventoryWorkItemId) {
+        fail('SEALED_MANIFEST_MISMATCH', 'Pending parent run does not contain the declared inventory barrier.');
+      }
+      const barrier = state.workItems[inventoryWorkItemId];
+      if (barrier.capability !== 'inventory:http' || barrier.resourceClass !== 'ordinary'
+        || barrier.state !== 'completed_pass' || barrier.lease !== null
+        || barrier.canonicalResult?.outcome !== 'completed_pass') {
+        fail('INVENTORY_BARRIER_INCOMPLETE', 'Inventory must complete successfully before the parent graph can expand and seal.');
+      }
+      expandedWorkItems = normalizeScheduledWorkItems(input.workItems);
+      if (canonicalJson(Object.keys(expandedWorkItems).sort()) !== canonicalJson(manifestIds)) {
+        fail('SEALED_MANIFEST_MISMATCH', 'Expanded durable work items do not match the sealed execution manifest.');
+      }
+      completedBarrier = clone(barrier);
     }
     return appendMutationUnlocked(store, state, 'mutation', 'parent-run-graph-sealed', (next) => {
       next.subjectCore = subjectCore ?? next.subjectCore;
@@ -609,8 +650,12 @@ export async function sealParentRunGraph(store, runId, coordinator, input) {
       next.executionManifestDigest = executionManifest.digest;
       next.finalSubject = finalSubject;
       next.finalSubjectDigest = finalSubject.digest;
+      if (expandedWorkItems) {
+        next.compilationBarrier = completedBarrier;
+        next.workItems = expandedWorkItems;
+      }
       next.compilationState = 'sealed';
-    });
+    }, { data: { inventoryWorkItemId: completedBarrier?.id ?? null, workItemIds: manifestIds } });
   }));
 }
 
