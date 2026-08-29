@@ -264,6 +264,10 @@ export function projectPublicationView(value) {
   });
   return freezeContract({
     schemaVersion: 1,
+    publication: {
+      runId: envelope.runId,
+      envelopeDigest: envelope.digest,
+    },
     subjectDigest: envelope.finalSubjectDigest,
     decision: envelope.decision,
     riskRegister: envelope.riskRegister,

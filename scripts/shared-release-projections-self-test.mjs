@@ -15,6 +15,10 @@ import { projectConsoleReleasePublication } from '../portal/console-risk.mjs';
 import { projectReportReleasePublication } from '../portal/report-publication.mjs';
 import { projectSiteHealthRelease } from './lib/site-health.mjs';
 import { projectArchiveReleasePublication } from '../reporters/archive-bundle.ts';
+import {
+  sharedParentRunToConsoleIndexRecord,
+  sharedPublicationToConsoleIndexRecord,
+} from '../portal/console-index-records.mjs';
 
 const D1 = `sha256:${'1'.repeat(64)}`;
 const D2 = `sha256:${'2'.repeat(64)}`;
@@ -275,11 +279,87 @@ const envelope = appendPublicationEnvelope(null, {
   riskRegister: accepted.riskRegister,
 });
 const golden = projectPublicationView(envelope);
+assert.deepEqual(golden.publication, {
+  runId: envelope.runId,
+  envelopeDigest: envelope.digest,
+}, 'Every report projection must retain the exact selected publication binding.');
 assert.deepEqual(projectSharedReleasePublication(envelope), golden);
 assert.deepEqual(projectConsoleReleasePublication(envelope), golden);
 assert.deepEqual(projectReportReleasePublication(envelope), golden);
 assert.deepEqual(projectSiteHealthRelease(envelope), golden);
 assert.deepEqual(projectArchiveReleasePublication(envelope), golden);
+const globalRunRecord = sharedPublicationToConsoleIndexRecord({
+  publication: envelope,
+  parentRun: {
+    runId: envelope.runId,
+    status: 'active',
+    workItems: {
+      'work-terminal-pass': { id: 'work-terminal-pass', state: 'completed_pass' },
+      'work-terminal-failure': { id: 'work-terminal-failure', state: 'completed_product_failure' },
+    },
+    createdAt: '2026-08-28T19:59:00.000Z',
+    updatedAt: '2026-08-28T20:04:00.000Z',
+  },
+});
+assert.equal(globalRunRecord.mode, 'single-site');
+assert.equal(globalRunRecord.runId, envelope.runId);
+assert.equal(globalRunRecord.sourceRevision, `shared-${envelope.runRevision}`);
+assert.equal(globalRunRecord.fields.outcome, envelope.decision.code);
+assert.equal(globalRunRecord.fields.authority, envelope.decision.grantedAuthority);
+assert.equal(globalRunRecord.fields.findingCount, envelope.riskSummary.active);
+assert.equal(globalRunRecord.fields.publicationRevision, envelope.digest);
+assert.equal(globalRunRecord.fields.terminal, true,
+  'Execution terminality must derive from canonical work items, not the mutable parent-run control status.');
+assert.equal(globalRunRecord.fields.progressTotal, 2);
+assert.equal(globalRunRecord.fields.progressCompleted, 2);
+assert.equal(globalRunRecord.fields.finishedAt, '2026-08-28T20:04:00.000Z');
+assert.deepEqual(globalRunRecord.fields.destinations, [
+  `/run.html?mode=single-site&run=${envelope.runId}`,
+  `/report.html?mode=single-site&run=${envelope.runId}`,
+]);
+const partialEnvelope = appendPublicationEnvelope(null, {
+  schemaVersion: 1,
+  runId: envelope.runId,
+  runRevision: envelope.runRevision,
+  decisionRevision: envelope.decisionRevision,
+  riskRevision: envelope.riskRevision,
+  ledgerSequences: envelope.ledgerSequences,
+  finalSubjectDigest: envelope.finalSubjectDigest,
+  decision: envelope.decision,
+  riskRegister: { ...envelope.riskRegister, availability: 'PARTIAL' },
+});
+const partialRunRecord = sharedPublicationToConsoleIndexRecord({
+  publication: partialEnvelope,
+  parentRun: {
+    runId: partialEnvelope.runId,
+    status: 'active',
+    workItems: { 'work-pass': { id: 'work-pass', state: 'completed_pass' } },
+    createdAt: '2026-08-28T19:59:00.000Z',
+    updatedAt: '2026-08-28T20:04:00.000Z',
+  },
+});
+assert.equal(partialRunRecord.complete, false,
+  'A partial Risk Register must keep the aggregate Runs source explicitly incomplete.');
+assert.deepEqual(partialRunRecord.fields.limitations, ['risk-register-partial']);
+const provisionalRunRecord = sharedParentRunToConsoleIndexRecord({
+  publication: null,
+  parentRun: {
+    runId: 'run-comparative-provisional',
+    runRevision: 3,
+    status: 'active',
+    compilationState: 'sealed',
+    subjectCore: comparative.core,
+    subjectCoreDigest: comparative.core.digest,
+    createdAt: '2026-08-28T20:00:00.000Z',
+    updatedAt: '2026-08-28T20:01:00.000Z',
+  },
+});
+assert.equal(provisionalRunRecord.mode, 'comparative');
+assert.equal(provisionalRunRecord.complete, false);
+assert.equal(provisionalRunRecord.fields.finalizationStatus, 'publication-unavailable');
+assert.deepEqual(provisionalRunRecord.fields.reasonCodes, ['release-publication-unavailable']);
+assert.doesNotMatch(provisionalRunRecord.fields.title, /no risks/iu,
+  'An unpublished or unavailable risk projection must never masquerade as an empty register.');
 assert.deepEqual(parseChecklistRelease(envelope, 'release/publication/current.json'), golden.releaseTruth);
 const manifest = applySharedReleaseEligibility({}, envelope, 'Shared finalization');
 assert.deepEqual(manifest.sharedRelease, golden);

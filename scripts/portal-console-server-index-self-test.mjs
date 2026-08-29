@@ -67,6 +67,16 @@ assert.match(refresh, /readSingleSiteFinalizationStatus/u);
 assert.doesNotMatch(refresh, /listSingleSiteJobs|readSingleSiteJobInput|input\.json/u);
 
 assert.match(source, /normalizedRunToConsoleIndexRecord\(normalized/u);
+assert.match(source, /listParentRunIds/u, 'Global Runs discovery must enumerate durable shared parent runs.');
+assert.match(source, /readCurrentEnvelope/u, 'Shared Runs discovery must read the single current publication head.');
+assert.match(source, /sharedPublicationToConsoleIndexRecord/u,
+  'Shared parent runs must enter the global index through the canonical publication projection.');
+assert.match(source, /backfillSharedParentRunConsoleIndexSlice/u,
+  'Shared parent-run discovery must remain bounded maintenance work.');
+assert.match(source, /source-unavailable/u,
+  'A failed shared-store listing must remain visible as an incomplete aggregate source.');
+assert.match(source, /source-limit/u,
+  'A capped shared parent-run listing must not claim complete global discovery.');
 assert.match(source, /normalizeComparativeConsoleRecord/u);
 assert.match(source, /normalizeSingleSiteConsoleRecord/u);
 assert.match(source, /await persistManifest\(run\);[\s\S]{0,200}upsertComparativeConsoleRun|persistManifest[\s\S]*upsertComparativeConsoleRun/u);

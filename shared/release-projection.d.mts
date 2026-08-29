@@ -16,7 +16,8 @@ export interface SharedReleaseView {
   decisionRevision: number; riskRevision: number; visualDispositionRevision: number;
 }
 export interface PublicationView {
-  schemaVersion: 1; subjectDigest: string; decision: ReleaseDecision; riskRegister: RiskRegister;
+  schemaVersion: 1; publication: { runId: string; envelopeDigest: string };
+  subjectDigest: string; decision: ReleaseDecision; riskRegister: RiskRegister;
   riskSummary: PublicationEnvelope['riskSummary']; revisions: { run: number; decision: number; risk: number };
   releaseTruth: Record<string, unknown>;
 }

@@ -1,7 +1,11 @@
 import { createHash } from 'node:crypto';
 import { createProductRiskRecord } from './console-risk.mjs';
+import { parsePublicationEnvelope } from '../shared/publication-envelope.mjs';
 
 const MAX_DATE_MS = 9_999_999_999_999_999;
+const TERMINAL_SHARED_WORK_ITEM_STATES = new Set([
+  'completed_pass', 'completed_product_failure', 'incomplete', 'cancelled',
+]);
 
 function record(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value) ? value : null;
@@ -94,6 +98,165 @@ function scopeLabel(run) {
     ? `${new URL(deployment.productionOrigin).host} → ${new URL(deployment.candidateOrigin).host}`
     : 'Comparative scope unavailable';
   return deployment?.origin ? new URL(deployment.origin).host : 'Single-site scope unavailable';
+}
+
+function sharedScopeLabel(decision) {
+  const scope = record(decision?.certifiedScope) ?? {};
+  const features = safeList(scope.features);
+  const definitions = safeList(scope.definitions);
+  const targets = safeList(scope.targets);
+  return `${decision.grantedAuthority} · ${features.length} feature${features.length === 1 ? '' : 's'} · ${definitions.length} definition${definitions.length === 1 ? '' : 's'} · ${targets.length} target${targets.length === 1 ? '' : 's'}`;
+}
+
+function sharedExecutionSummary(parentRun) {
+  const workItems = Object.values(record(parentRun?.workItems) ?? {}).filter((item) => record(item));
+  const completed = workItems.filter(({ state }) => TERMINAL_SHARED_WORK_ITEM_STATES.has(state)).length;
+  return Object.freeze({
+    total: workItems.length,
+    completed,
+    terminal: workItems.length > 0 && completed === workItems.length,
+  });
+}
+
+export function sharedParentRunToConsoleIndexRecord(input) {
+  const source = record(input);
+  const parentRun = record(source?.parentRun);
+  if (!parentRun || typeof parentRun.runId !== 'string') {
+    throw new TypeError('A durable shared parent run is required.');
+  }
+  if (source.publication === null || source.publication === undefined) {
+    const mode = parentRun.subjectCore?.mode;
+    const createdAt = timestamp(parentRun.createdAt);
+    const updatedAt = timestamp(parentRun.updatedAt);
+    if (!['single-site', 'comparative'].includes(mode) || !createdAt || !updatedAt
+      || !Number.isSafeInteger(parentRun.runRevision) || parentRun.runRevision < 1) {
+      throw new TypeError('Unpublished shared parent-run discovery requires canonical subject identity and timestamps.');
+    }
+    const requested = record(parentRun.subjectCore?.requestedAuthority) ?? {};
+    const requestedScope = record(requested.scope) ?? {};
+    const execution = sharedExecutionSummary(parentRun);
+    const encodedRunId = encodeURIComponent(parentRun.runId);
+    return Object.freeze({
+      schemaVersion: 1,
+      mode,
+      runId: parentRun.runId,
+      recordId: 'run',
+      recordType: 'run',
+      scopeKey: indexedScopeKey(parentRun.subjectCoreDigest),
+      sourceId: 'shared-parent-runs',
+      sourceRevision: `shared-state-${parentRun.runRevision}`,
+      sourceUpdatedAt: updatedAt,
+      complete: false,
+      sortKey: `recent:${String(Math.max(0, MAX_DATE_MS - Date.parse(updatedAt))).padStart(16, '0')}:${mode}:${parentRun.runId}`,
+      fields: Object.freeze(compactFields({
+        title: `Shared ${mode} run · ${parentRun.runId}`,
+        status: boundedString(parentRun.status, 120) ?? 'active',
+        phase: boundedString(parentRun.compilationState, 120) ?? 'shared-execution',
+        qualifier: boundedString(requested.qualifier, 120),
+        createdAt,
+        updatedAt,
+        sourceKind: 'shared-parent-run',
+        sourceTimestamp: updatedAt,
+        executionState: execution.terminal ? 'incomplete' : 'active',
+        activityState: execution.terminal ? 'idle' : 'active',
+        finalizationStatus: 'publication-unavailable',
+        evidenceAuthorityStatus: 'unavailable',
+        pipelineIntegrityStatus: 'provisional',
+        progressTotal: execution.total,
+        progressCompleted: execution.completed,
+        terminal: execution.terminal,
+        targetIds: safeList(requestedScope.targets),
+        auditIds: safeList(requestedScope.definitions),
+        areas: safeList(requestedScope.features),
+        reasonCodes: ['release-publication-unavailable'],
+        destinations: [
+          `/run.html?mode=${mode}&run=${encodedRunId}`,
+          `/report.html?mode=${mode}&run=${encodedRunId}`,
+        ],
+        limitations: ['release-publication-unavailable'],
+      })),
+    });
+  }
+  const publication = parsePublicationEnvelope(source.publication);
+  if (publication.runId !== parentRun.runId) {
+    throw new TypeError('Shared publication identity does not match its durable parent run.');
+  }
+  const decision = publication.decision;
+  const mode = decision.mode;
+  const updatedAt = timestamp(parentRun.updatedAt);
+  const createdAt = timestamp(parentRun.createdAt);
+  if (!updatedAt || !createdAt) throw new TypeError('Shared parent-run timestamps are invalid.');
+  const blockingFailures = decision.blockingReasons
+    .filter(({ class: reasonClass }) => reasonClass === 'product-failure').length;
+  const blockingIncomplete = decision.blockingReasons.length - blockingFailures;
+  const risksComplete = ['AVAILABLE', 'EMPTY'].includes(publication.riskRegister.availability);
+  const execution = sharedExecutionSummary(parentRun);
+  const terminal = execution.terminal;
+  const encodedRunId = encodeURIComponent(publication.runId);
+  return Object.freeze({
+    schemaVersion: 1,
+    mode,
+    runId: publication.runId,
+    recordId: 'run',
+    recordType: 'run',
+    scopeKey: indexedScopeKey(publication.finalSubjectDigest),
+    sourceId: 'shared-parent-runs',
+    sourceRevision: `shared-${publication.runRevision}`,
+    sourceUpdatedAt: updatedAt,
+    complete: risksComplete,
+    sortKey: `recent:${String(Math.max(0, MAX_DATE_MS - Date.parse(updatedAt))).padStart(16, '0')}:${mode}:${publication.runId}`,
+    fields: Object.freeze(compactFields({
+      title: `${decision.label} · ${publication.runId}`,
+      status: boundedString(parentRun.status, 120) ?? 'published',
+      phase: terminal ? 'release-published' : 'shared-execution',
+      outcome: decision.code,
+      authority: decision.grantedAuthority,
+      qualifier: decision.grantedAuthority,
+      scopeLabel: sharedScopeLabel(decision),
+      createdAt,
+      finishedAt: terminal ? updatedAt : undefined,
+      updatedAt,
+      sourceKind: 'shared-release-publication',
+      sourceTimestamp: updatedAt,
+      publicationRevision: publication.digest,
+      executionState: terminal
+        ? decision.ready ? 'completed_pass' : decision.code === 'NOT_READY_TEST_FAILURE'
+          ? 'completed_product_failure' : 'incomplete'
+        : 'active',
+      activityState: terminal ? 'idle' : 'active',
+      finalizationStatus: 'shared-publication',
+      coverageStatus: decision.grantedAuthority,
+      evidenceAuthorityStatus: 'authoritative',
+      pipelineIntegrityStatus: blockingIncomplete > 0 ? 'incomplete' : 'available',
+      progressTotal: execution.total,
+      progressCompleted: execution.completed,
+      findingCount: publication.riskSummary.active,
+      blockingFailures,
+      blockingIncomplete,
+      terminal,
+      targetIds: safeList(decision.certifiedScope.targets),
+      auditIds: safeList(decision.certifiedScope.definitions),
+      areas: safeList(decision.certifiedScope.features),
+      reasonCodes: [
+        decision.code,
+        `risk-register-${publication.riskRegister.availability.toLowerCase()}`,
+        ...(decision.superseded ? ['superseded'] : []),
+      ],
+      destinations: [
+        `/run.html?mode=${mode}&run=${encodedRunId}`,
+        `/report.html?mode=${mode}&run=${encodedRunId}`,
+      ],
+      limitations: risksComplete ? undefined
+        : [`risk-register-${publication.riskRegister.availability.toLowerCase()}`],
+    })),
+  });
+}
+
+export function sharedPublicationToConsoleIndexRecord(input) {
+  if (!record(input) || input.publication === null || input.publication === undefined) {
+    throw new TypeError('A shared release publication is required.');
+  }
+  return sharedParentRunToConsoleIndexRecord(input);
 }
 
 export function normalizedRunToConsoleIndexRecord(run, options = {}) {

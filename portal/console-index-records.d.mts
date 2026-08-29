@@ -1,6 +1,14 @@
 import type { ConsoleIndexRecord } from './console-index.mjs';
 
 export function normalizedRunToConsoleIndexRecord(run: unknown, options?: { sourceId?: string }): ConsoleIndexRecord;
+export function sharedPublicationToConsoleIndexRecord(input: {
+  publication: unknown;
+  parentRun: Record<string, unknown>;
+}): ConsoleIndexRecord;
+export function sharedParentRunToConsoleIndexRecord(input: {
+  publication?: unknown | null;
+  parentRun: Record<string, unknown>;
+}): ConsoleIndexRecord;
 export function timelineToConsoleIndexRecord(timeline: unknown, options: {
   sourceId: string;
   scopeKey: string;

@@ -27,9 +27,12 @@ import { assertSharedListScope, classifySharedReadRequest } from './shared-read-
 import {
   ARTIFACT_READ_LEASE_MS,
   listAdoptedAttemptArtifacts,
+  listParentRunIds,
   openAdoptedAttemptArtifact,
   openParentRunStore,
   parentRunExists,
+  readCurrentEnvelope,
+  readParentRun,
 } from '../scripts/lib/parent-run-store.mjs';
 import { createSharedControlService } from '../scripts/lib/shared-control-service.mjs';
 import { openPromotionClaimStore } from '../scripts/lib/promotion-claim-store.mjs';
@@ -51,6 +54,8 @@ import {
 } from './console-index.mjs';
 import {
   normalizedRunToConsoleIndexRecord,
+  sharedParentRunToConsoleIndexRecord,
+  sharedPublicationToConsoleIndexRecord,
   timelineToConsoleIndexRecord,
 } from './console-index-records.mjs';
 import {
@@ -297,6 +302,7 @@ const MEDIA_VALIDATION_TIMEOUT_MS = 20_000;
 const MAX_MEDIA_VALIDATION_OUTPUT_BYTES = 64 * 1024;
 const COMPARATIVE_CONSOLE_SOURCE_ID = 'comparative-runs';
 const SINGLE_SITE_CONSOLE_SOURCE_ID = 'single-site-jobs';
+const SHARED_PARENT_RUN_CONSOLE_SOURCE_ID = 'shared-parent-runs';
 const MAX_SINGLE_SITE_CONSOLE_STATE_BYTES = 1024 * 1024;
 const MAX_SINGLE_SITE_CONSOLE_FINALIZATION_BYTES = 64 * 1024;
 const MAX_COMPARATIVE_CONSOLE_MANIFEST_BYTES = 1024 * 1024;
@@ -461,6 +467,11 @@ let consoleMaintenanceTimer = null;
 let consoleComparativeBackfillIterator = null;
 let consoleSingleSiteBackfillIterator = null;
 let consoleSingleSitePendingEntry = null;
+let consoleSharedParentRunIds = [];
+let consoleSharedParentRunCursor = 0;
+let consoleSharedParentRunBackfillRevision = null;
+let consoleSharedParentRunBackfillDone = true;
+let consoleSharedParentRunBackfillLimitation = null;
 let consoleComparativeBackfillRevision = null;
 let consoleSingleSiteBackfillRevision = null;
 let consoleComparativeSourceRevision = 0;
@@ -664,13 +675,14 @@ const consoleApi = createConsoleApi({
   resolveCapabilities: resolveConsoleCapabilities,
 });
 consoleMaintenanceAbortController = new AbortController();
-beginConsoleIndexBackfill();
+await beginConsoleIndexBackfill();
 await runConsoleIndexMaintenanceSlice();
 scheduleConsoleIndexMaintenance();
 consoleMaintenanceTimer = setInterval(() => {
-  void refreshKnownSingleSiteConsoleIndexSlice().catch((error) => {
-    console.error(`[PORTAL_CONSOLE_REFRESH_FAILED] ${redactLogValue(error.message)}`);
-  });
+  void Promise.all([
+    refreshKnownSingleSiteConsoleIndexSlice(),
+    refreshSharedParentRunConsoleIndexSlice(),
+  ]).catch((error) => console.error(`[PORTAL_CONSOLE_REFRESH_FAILED] ${redactLogValue(error.message)}`));
 }, SINGLE_SITE_AI_REVIEW_SYNC_MS);
 consoleMaintenanceTimer.unref();
 const externalRunSyncTimer = setInterval(() => {
@@ -1221,7 +1233,7 @@ async function refreshSingleSiteConsoleRunBestEffort(jobId, reason) {
   }
 }
 
-function beginConsoleIndexBackfill() {
+async function beginConsoleIndexBackfill() {
   const now = new Date().toISOString();
   consoleComparativeBackfillRevision = nextConsoleSourceRevision('comparative');
   consoleSingleSiteBackfillRevision = nextConsoleSourceRevision('single-site');
@@ -1234,6 +1246,11 @@ function beginConsoleIndexBackfill() {
   consoleSingleSiteBackfillLimited = false;
   consoleComparativeBackfillRecords = 0;
   consoleSingleSiteBackfillRecords = 0;
+  consoleSharedParentRunIds = [];
+  consoleSharedParentRunCursor = 0;
+  consoleSharedParentRunBackfillRevision = null;
+  consoleSharedParentRunBackfillDone = !sharedParentRunStore;
+  consoleSharedParentRunBackfillLimitation = null;
   consoleIndex.beginBackfill(COMPARATIVE_CONSOLE_SOURCE_ID, {
     revision: consoleComparativeBackfillRevision,
     updatedAt: now,
@@ -1246,6 +1263,35 @@ function beginConsoleIndexBackfill() {
     cursor: null,
     budget: DEFAULT_CONSOLE_INDEX_BUDGET,
   });
+  if (sharedParentRunStore) {
+    consoleSharedParentRunBackfillRevision = `shared-parent-runs-${Date.now()}`;
+    consoleIndex.beginBackfill(SHARED_PARENT_RUN_CONSOLE_SOURCE_ID, {
+      revision: consoleSharedParentRunBackfillRevision,
+      updatedAt: now,
+      cursor: null,
+      budget: DEFAULT_CONSOLE_INDEX_BUDGET,
+    });
+    try {
+      consoleSharedParentRunIds = await listParentRunIds(sharedParentRunStore, {
+        limit: MAX_CONSOLE_KNOWN_SINGLE_SITE_JOBS,
+      });
+      if (consoleSharedParentRunIds.length >= MAX_CONSOLE_KNOWN_SINGLE_SITE_JOBS) {
+        consoleSharedParentRunBackfillLimitation = 'source-limit';
+      }
+    } catch (error) {
+      consoleSharedParentRunBackfillDone = true;
+      consoleSharedParentRunBackfillLimitation = 'source-unavailable';
+      consoleIndex.updateBackfill(SHARED_PARENT_RUN_CONSOLE_SOURCE_ID, {
+        revision: consoleSharedParentRunBackfillRevision,
+        updatedAt: new Date().toISOString(),
+        cursor: null,
+        complete: false,
+        limitation: consoleSharedParentRunBackfillLimitation,
+        work: createConsoleReadWork(),
+      });
+      console.error(`[PORTAL_CONSOLE_BACKFILL_UNAVAILABLE] Shared parent runs: ${redactLogValue(error.message)}`);
+    }
+  }
 }
 
 function boundedConsoleBackfillWork(work, startedAt, budgetExhausted = false) {
@@ -1378,6 +1424,58 @@ async function backfillSingleSiteConsoleIndexSlice() {
   });
 }
 
+async function sharedParentRunConsoleIndexRecord(runId) {
+  const parentRun = await readParentRun(sharedParentRunStore, runId);
+  if (!parentRun.currentPublicationDigest) {
+    return sharedParentRunToConsoleIndexRecord({ parentRun, publication: null });
+  }
+  const publication = await readCurrentEnvelope(sharedParentRunStore, runId);
+  return sharedPublicationToConsoleIndexRecord({ parentRun, publication });
+}
+
+async function backfillSharedParentRunConsoleIndexSlice() {
+  if (!sharedParentRunStore || consoleSharedParentRunBackfillDone) return;
+  const startedAt = performance.now();
+  let work = createConsoleReadWork();
+  let budgetExhausted = false;
+  while (consoleSharedParentRunCursor < consoleSharedParentRunIds.length) {
+    if (work.recordsRead >= DEFAULT_CONSOLE_INDEX_BUDGET.maxRecords
+      || work.sourceFilesRead + 2 > DEFAULT_CONSOLE_INDEX_BUDGET.maxSourceFiles
+      || performance.now() - startedAt >= DEFAULT_CONSOLE_INDEX_BUDGET.maxElapsedMs) {
+      budgetExhausted = true;
+      break;
+    }
+    const runId = consoleSharedParentRunIds[consoleSharedParentRunCursor];
+    const consumed = consumeConsoleReadWork(work, DEFAULT_CONSOLE_INDEX_BUDGET, {
+      recordsRead: 1,
+      sourceFilesRead: 2,
+    });
+    if (!consumed.accepted) {
+      budgetExhausted = true;
+      break;
+    }
+    work = consumed.work;
+    consoleSharedParentRunCursor += 1;
+    try {
+      upsertConsoleRecordSet(await sharedParentRunConsoleIndexRecord(runId), []);
+    } catch (error) {
+      consoleSharedParentRunBackfillLimitation ??= 'source-malformed';
+      console.error(`[PORTAL_CONSOLE_BACKFILL_REJECTED] shared parent run ${runId}: ${redactLogValue(error.message)}`);
+    }
+  }
+  consoleSharedParentRunBackfillDone = consoleSharedParentRunCursor >= consoleSharedParentRunIds.length;
+  const complete = consoleSharedParentRunBackfillDone && consoleSharedParentRunBackfillLimitation === null;
+  consoleIndex.updateBackfill(SHARED_PARENT_RUN_CONSOLE_SOURCE_ID, {
+    revision: consoleSharedParentRunBackfillRevision,
+    updatedAt: new Date().toISOString(),
+    cursor: complete ? null : `shared-runs-${consoleSharedParentRunCursor}`,
+    complete,
+    limitation: complete ? null
+      : consoleSharedParentRunBackfillDone ? consoleSharedParentRunBackfillLimitation : 'budget-exhausted',
+    work: boundedConsoleBackfillWork(work, startedAt, budgetExhausted),
+  });
+}
+
 async function runConsoleIndexMaintenanceSlice() {
   if (consoleMaintenanceRunning || consoleMaintenanceAbortController?.signal.aborted) return;
   consoleMaintenanceRunning = true;
@@ -1386,11 +1484,50 @@ async function runConsoleIndexMaintenanceSlice() {
     if (!consoleMaintenanceAbortController.signal.aborted && !consoleSingleSiteBackfillDone) {
       await backfillSingleSiteConsoleIndexSlice();
     }
+    if (!consoleMaintenanceAbortController.signal.aborted && !consoleSharedParentRunBackfillDone) {
+      await backfillSharedParentRunConsoleIndexSlice();
+    }
     if (!consoleMaintenanceAbortController.signal.aborted && consoleReportProjectionTasks.size > 0) {
       await runConsoleReportProjectionSlice();
     }
   } finally {
     consoleMaintenanceRunning = false;
+  }
+}
+
+async function refreshSharedParentRunConsoleIndexSlice() {
+  if (!sharedParentRunStore || !consoleSharedParentRunBackfillDone
+    || consoleMaintenanceAbortController?.signal.aborted) return;
+  const startedAt = performance.now();
+  let work = createConsoleReadWork();
+  let visited = 0;
+  while (visited < consoleSharedParentRunIds.length
+    && work.recordsRead < DEFAULT_CONSOLE_INDEX_BUDGET.maxRecords
+    && work.sourceFilesRead + 2 <= DEFAULT_CONSOLE_INDEX_BUDGET.maxSourceFiles
+    && performance.now() - startedAt < DEFAULT_CONSOLE_INDEX_BUDGET.maxElapsedMs) {
+    const slot = consoleSharedParentRunCursor % Math.max(1, consoleSharedParentRunIds.length);
+    const runId = consoleSharedParentRunIds[slot];
+    consoleSharedParentRunCursor = (slot + 1) % Math.max(1, consoleSharedParentRunIds.length);
+    visited += 1;
+    const consumed = consumeConsoleReadWork(work, DEFAULT_CONSOLE_INDEX_BUDGET, {
+      recordsRead: 1,
+      sourceFilesRead: 2,
+    });
+    if (!consumed.accepted) break;
+    work = consumed.work;
+    try {
+      upsertConsoleRecordSet(await sharedParentRunConsoleIndexRecord(runId), []);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') {
+        console.error(`[PORTAL_CONSOLE_REFRESH_REJECTED] shared parent run ${runId}: ${redactLogValue(error.message)}`);
+      }
+    }
+  }
+  if (consoleSharedParentRunIds.length === 0 || visited >= consoleSharedParentRunIds.length) {
+    consoleSharedParentRunIds = await listParentRunIds(sharedParentRunStore, {
+      limit: MAX_CONSOLE_KNOWN_SINGLE_SITE_JOBS,
+    });
+    consoleSharedParentRunCursor = 0;
   }
 }
 
@@ -1487,7 +1624,7 @@ async function refreshKnownSingleSiteConsoleIndexSlice() {
 
 function scheduleConsoleIndexMaintenance() {
   if (consoleMaintenanceAbortController?.signal.aborted || consoleMaintenanceImmediate
-    || (consoleComparativeBackfillDone && consoleSingleSiteBackfillDone
+    || (consoleComparativeBackfillDone && consoleSingleSiteBackfillDone && consoleSharedParentRunBackfillDone
       && consoleReportProjectionTasks.size === 0)) return;
   consoleMaintenanceImmediate = setImmediate(() => {
     consoleMaintenanceImmediate = null;
@@ -1512,6 +1649,8 @@ async function closeConsoleIndexMaintenance() {
   consoleKnownSingleSiteRevisions.clear();
   consoleKnownSingleSiteFinalizations.clear();
   consoleKnownSingleSiteAiOptIn.clear();
+  consoleSharedParentRunIds = [];
+  consoleSharedParentRunCursor = 0;
   for (const { task } of consoleReportProjectionTasks.values()) {
     cancelConsoleReportProjectionTask(task);
   }
