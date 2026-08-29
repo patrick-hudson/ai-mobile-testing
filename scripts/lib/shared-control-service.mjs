@@ -15,6 +15,7 @@ import {
   cancelParentRun,
   completeOperation,
   getOperation,
+  getOperationById,
   listAcceptedOperations,
   readBoundedAttemptLogs,
   readCurrentEnvelope,
@@ -151,6 +152,14 @@ export function createSharedControlService({ store, projectId = 'default' } = {}
       if (!action) fail('OPERATION_KIND_INVALID', 'Operation kind is unsupported.');
       assertPrincipalAuthorized(principal, action, object(runId));
       return getOperation(store, runId, namespacedKey(principal, kind, runId, requestId));
+    },
+    async readOperationById(principal, runId, operationId) {
+      assertPrincipalAuthorized(principal, CONTROL_ACTIONS.OPERATION_READ, object(runId));
+      const operation = await getOperationById(store, runId, operationId);
+      const action = CONTROL_OPERATION_KINDS[operation.kind];
+      if (!action) fail('OPERATION_KIND_INVALID', 'Stored operation kind is unsupported.');
+      assertPrincipalAuthorized(principal, action, object(runId));
+      return operation;
     },
     async applyAcceptedOperations(coordinator, runId, handlers = {}) {
       const applied = [];

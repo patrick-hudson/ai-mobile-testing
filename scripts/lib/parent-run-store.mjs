@@ -1200,6 +1200,14 @@ export async function getOperation(store, runId, idempotencyKey) {
   return clone(operation);
 }
 
+export async function getOperationById(store, runId, operationId) {
+  safeId(operationId, 'operationId');
+  const state = await recoverUnlocked(store, runId);
+  const operation = Object.values(state.operations).find((candidate) => candidate.operationId === operationId);
+  if (!operation) fail('OPERATION_NOT_FOUND', `Operation ${operationId} was not found.`);
+  return clone(operation);
+}
+
 export async function listAcceptedOperations(store, runId, { limit = 32 } = {}) {
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 128) fail('STORE_SCHEMA_INVALID', 'Operation list limit is invalid.');
   const state = await recoverUnlocked(store, runId);

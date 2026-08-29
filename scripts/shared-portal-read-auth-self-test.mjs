@@ -203,17 +203,25 @@ try {
   assert.equal(accepted.code, 0, accepted.stderr);
   assert.equal(accepted.document.data.state, 'accepted');
   const acceptedOperationId = accepted.document.data.operationId;
+  assert.equal(accepted.document.data.statusUrl,
+    `/api/control/v1/runs/${sharedRunId}/operations/${acceptedOperationId}`);
 
   await stopPortal(portal);
   portal = null;
   portal = await startPortal({ environment, origin });
   const persisted = await runAuditControl([
     'operation', '--server', origin, '--token-file', operatorTokenFile, '--run', sharedRunId,
-    '--kind', 'cancel', '--request-id', requestId,
+    '--operation-id', acceptedOperationId,
   ]);
   assert.equal(persisted.code, 0, persisted.stderr);
   assert.equal(persisted.document.data.operationId, acceptedOperationId);
   assert.equal(persisted.document.data.state, 'accepted');
+  const boundedWait = await runAuditControl([
+    'wait-operation', '--server', origin, '--token-file', operatorTokenFile, '--run', sharedRunId,
+    '--operation-id', acceptedOperationId, '--max-polls', '1', '--poll-ms', '100',
+  ]);
+  assert.equal(boundedWait.code, 14, boundedWait.stderr);
+  assert.match(boundedWait.stderr, /did not reach a terminal state within the polling bound/u);
 
   const coordinatorPort = await availablePort();
   coordinator = await startCoordinator({
@@ -228,21 +236,13 @@ try {
       AUDIT_SHARED_COORDINATOR_LEASE_MS: '5000',
     },
   });
-  let completed = null;
-  for (let attempt = 0; attempt < 40; attempt += 1) {
-    const result = await runAuditControl([
-      'operation', '--server', origin, '--token-file', operatorTokenFile, '--run', sharedRunId,
-      '--kind', 'cancel', '--request-id', requestId,
-    ]);
-    assert.equal(result.code, 0, result.stderr);
-    if (result.document.data.state === 'completed') {
-      completed = result.document.data;
-      break;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-  assert.equal(completed?.operationId, acceptedOperationId);
-  assert.equal(completed?.outcome?.status, 'succeeded');
+  const completed = await runAuditControl([
+    'wait-operation', '--server', origin, '--token-file', operatorTokenFile, '--run', sharedRunId,
+    '--operation-id', acceptedOperationId, '--max-polls', '40', '--poll-ms', '100',
+  ]);
+  assert.equal(completed.code, 0, completed.stderr);
+  assert.equal(completed.document.data.operationId, acceptedOperationId);
+  assert.equal(completed.document.data.outcome.status, 'succeeded');
 
   console.log('Shared portal read-auth self-test passed: authorized reads, CLI mutation persistence, coordinator completion, revocation, active-content isolation, and portal restart fail closed.');
 } finally {

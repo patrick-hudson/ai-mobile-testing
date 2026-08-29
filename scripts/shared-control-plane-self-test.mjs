@@ -462,6 +462,31 @@ try {
   const apiCookie = login.headers['set-cookie'].split(';')[0];
   const currentSession = await api.handle({ method: 'GET', url: '/api/control/v1/session', headers: { cookie: apiCookie } });
   assert.equal(currentSession.status, 200);
+  const duplicateCancel = await api.handle({
+    method: 'POST', url: '/api/control/v1/runs/run-1/cancel',
+    headers: {
+      authorization: `Bearer ${operatorIssued.credential}`,
+      'content-type': 'application/json',
+      'idempotency-key': 'same-request-0001',
+    },
+    body: { expectedRunRevision: 1, reason: 'Operator requested stop.' },
+  });
+  assert.equal(duplicateCancel.status, 202);
+  assert.equal(duplicateCancel.body.data.operationId, firstOperation.operationId);
+  assert.equal(duplicateCancel.body.data.statusUrl,
+    `/api/control/v1/runs/run-1/operations/${firstOperation.operationId}`);
+  assert.equal(duplicateCancel.headers.location, duplicateCancel.body.data.statusUrl);
+  const directOperation = await api.handle({
+    method: 'GET', url: duplicateCancel.body.data.statusUrl,
+    headers: { authorization: `Bearer ${operatorIssued.credential}` },
+  });
+  assert.equal(directOperation.status, 200);
+  assert.equal(directOperation.body.data.operationId, firstOperation.operationId);
+  const viewerOperation = await api.handle({
+    method: 'GET', url: duplicateCancel.body.data.statusUrl,
+    headers: { authorization: `Bearer ${viewerIssued.credential}` },
+  });
+  assert.equal(viewerOperation.status, 403, 'view-only principals must not inspect mutation operation resources');
   const logout = await api.handle({
     method: 'DELETE', url: '/api/control/v1/session',
     headers: { cookie: apiCookie, origin: 'https://audit.example.test', 'sec-fetch-site': 'same-origin', 'content-type': 'application/json', 'x-audit-csrf': login.body.data.csrfToken },

@@ -11,9 +11,11 @@ const run = options.run ? encodeURIComponent(options.run) : null;
 const routes = {
   launch: ['POST', '/api/control/v1/runs'],
   watch: ['GET', `/api/control/v1/runs/${run}`],
+  publication: ['GET', `/api/control/v1/runs/${run}/publication`],
   executions: ['GET', `/api/control/v1/runs/${run}/executions`],
   logs: ['GET', `/api/control/v1/runs/${run}/logs?limit=${encodeURIComponent(options.limit ?? '200')}`],
-  operation: ['GET', `/api/control/v1/runs/${run}/operations?kind=${encodeURIComponent(options.kind ?? '')}&requestId=${encodeURIComponent(options.requestId ?? '')}`],
+  operation: ['GET', operationPath(run, options)],
+  'wait-operation': ['GET', operationPath(run, options)],
   cancel: ['POST', `/api/control/v1/runs/${run}/cancel`],
   rekick: ['POST', `/api/control/v1/runs/${run}/rekick`],
   'risk-acknowledge': ['POST', `/api/control/v1/runs/${run}/risks/acknowledge`],
@@ -29,7 +31,9 @@ const [method, pathname] = routes[command];
 const body = options.body ? JSON.parse(await readFile(options.body, 'utf8')) : {};
 const maximumPolls = integer(options.maxPolls ?? '600', 1, 10_000, '--max-polls');
 const pollMs = integer(options.pollMs ?? '1000', 100, 60_000, '--poll-ms');
-for (let poll = 1; poll <= (['watch'].includes(command) || (command === 'logs' && options.follow === 'true') ? maximumPolls : 1); poll += 1) {
+const polling = command === 'watch' || command === 'wait-operation' || (command === 'logs' && options.follow === 'true');
+let reachedTerminal = false;
+for (let poll = 1; poll <= (polling ? maximumPolls : 1); poll += 1) {
   const { response, document } = await request(method, pathname, body);
   process.stdout.write(`${JSON.stringify(document)}\n`);
   if (!response.ok) {
@@ -37,8 +41,20 @@ for (let poll = 1; poll <= (['watch'].includes(command) || (command === 'logs' &
     process.exitCode = exitClass(response.status, document.error?.code);
     break;
   }
-  if (command === 'watch' && terminal(document.data)) break;
-  if (poll < maximumPolls && (command === 'watch' || (command === 'logs' && options.follow === 'true'))) await new Promise((resolve) => setTimeout(resolve, pollMs));
+  if (command === 'watch' && terminal(document.data)) { reachedTerminal = true; break; }
+  if (command === 'wait-operation' && document.data?.state === 'completed') {
+    reachedTerminal = true;
+    if (document.data.outcome?.status !== 'succeeded') {
+      process.stderr.write(`[audit-control] operation failed: ${document.data.outcome?.code ?? 'CONTROL_OPERATION_FAILED'}\n`);
+      process.exitCode = exitClass(409, document.data.outcome?.code);
+    }
+    break;
+  }
+  if (poll < maximumPolls && polling) await new Promise((resolve) => setTimeout(resolve, pollMs));
+}
+if (polling && !reachedTerminal && !process.exitCode) {
+  process.stderr.write(`[audit-control] ${command} did not reach a terminal state within the polling bound.\n`);
+  process.exitCode = 14;
 }
 async function request(method, pathname, body) {
   const response = await fetch(new URL(pathname, base), {
@@ -50,6 +66,10 @@ async function request(method, pathname, body) {
   return { response, document };
 }
 function terminal(data) { return data?.status === 'cancelled' || (data?.workItems && Object.values(data.workItems).every((item) => ['completed_pass', 'completed_product_failure', 'cancelled', 'incomplete'].includes(item.state))); }
+function operationPath(runId, values) {
+  if (values.operationId) return `/api/control/v1/runs/${runId}/operations/${encodeURIComponent(values.operationId)}`;
+  return `/api/control/v1/runs/${runId}/operations?kind=${encodeURIComponent(values.kind ?? '')}&requestId=${encodeURIComponent(values.requestId ?? '')}`;
+}
 function exitClass(status, code = '') {
   if (/NOT_READY|PROMOTION_NOT_READY/.test(code)) return 10;
   if (/STALE|SUPERSEDED|REPLAYED|EXPIRED/.test(code)) return 11;

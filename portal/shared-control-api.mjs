@@ -67,6 +67,10 @@ export function createSharedControlApi({
         if (request.method === 'GET' && suffix === 'operations') return ok(await service.readOperation(principal, runId, {
           kind: url.searchParams.get('kind'), requestId: url.searchParams.get('requestId'),
         }));
+        const operationMatch = /^operations\/([a-f0-9]{64})$/u.exec(suffix);
+        if (request.method === 'GET' && operationMatch) {
+          return ok(await service.readOperationById(principal, runId, operationMatch[1]));
+        }
         if (request.method === 'POST' && suffix === 'release/assert') {
           mutation(request, authentication, expectedOrigin);
           const body = recordBody(request.body);
@@ -90,10 +94,12 @@ export function createSharedControlApi({
         if (request.method === 'POST' && kind) {
           mutation(request, authentication, expectedOrigin);
           const body = recordBody(request.body);
-          return accepted(await service.acceptMutation(principal, runId, {
+          const operation = await service.acceptMutation(principal, runId, {
             kind, requestId: request.headers['idempotency-key'] ?? body.requestId,
             expectedRunRevision: body.expectedRunRevision, body,
-          }));
+          });
+          const statusUrl = `${SHARED_CONTROL_API_PREFIX}/runs/${encodeURIComponent(runId)}/operations/${operation.operationId}`;
+          return accepted({ ...operation, statusUrl }, { location: statusUrl });
         }
         return error('CONTROL_ROUTE_NOT_FOUND', 'Control route was not found.', 404);
       } catch (caught) {
@@ -140,6 +146,6 @@ function mutationKind(suffix) {
 function numberQuery(url, name, fallback) { const value = Number(url.searchParams.get(name) ?? fallback); return value; }
 function response(status, body, extraHeaders = {}) { return Object.freeze({ handled: true, status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', ...extraHeaders }, body }); }
 function ok(body) { return response(200, { schemaVersion: 1, data: body }); }
-function accepted(body) { return response(202, { schemaVersion: 1, data: body }); }
+function accepted(body, headers = {}) { return response(202, { schemaVersion: 1, data: body }, headers); }
 function error(code, message, status) { return response(status, { schemaVersion: 1, error: { code, message } }); }
 function unhandled() { return Object.freeze({ handled: false, status: 0, headers: {}, body: null }); }

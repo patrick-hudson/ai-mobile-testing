@@ -10,6 +10,7 @@ export interface SharedControlService {
   readLogs(principal: ControlPrincipal, runId: string, options?: { limit?: number }): Promise<any>;
   acceptMutation(principal: ControlPrincipal, runId: string, input: any): Promise<any>;
   readOperation(principal: ControlPrincipal, runId: string, input: any): Promise<any>;
+  readOperationById(principal: ControlPrincipal, runId: string, operationId: string): Promise<any>;
   applyAcceptedOperations(coordinator: any, runId: string, handlers?: Record<string, Function>): Promise<any[]>;
   publishCurrentProjection(coordinator: any, runId: string): Promise<any>;
 }

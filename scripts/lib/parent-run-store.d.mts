@@ -28,6 +28,7 @@ export function adoptAttemptEvidence(store: ParentRunStore, runId: string, coord
 export function cancelParentRun(store: ParentRunStore, runId: string, coordinator: CoordinatorFence, input: any): Promise<any>;
 export function acceptOperation(store: ParentRunStore, runId: string, request: any): Promise<any>;
 export function getOperation(store: ParentRunStore, runId: string, idempotencyKey: string): Promise<any>;
+export function getOperationById(store: ParentRunStore, runId: string, operationId: string): Promise<any>;
 export function listAcceptedOperations(store: ParentRunStore, runId: string, options?: { limit?: number }): Promise<any[]>;
 export function rekickIncompleteWork(store: ParentRunStore, runId: string, coordinator: CoordinatorFence, input: any): Promise<any>;
 export function completeOperation(store: ParentRunStore, runId: string, coordinator: CoordinatorFence, operationId: string, outcome: any): Promise<any>;
