@@ -138,7 +138,7 @@ export function buildPreRegisteredShadowMatrix() {
       grantedScope: 'NONE', outcomeCode: 'REJECTED_SUBJECT_MISMATCH',
     }),
     pair('AE12', 'Risk data is unavailable', ['R26'], {
-      riskAvailability: 'UNAVAILABLE', riskCategories: ['PIPELINE_LIMITATION'],
+      riskAvailability: 'UNAVAILABLE',
     }),
     pair('AE13', 'Unauthorized or duplicate mutation is bounded', ['R16', 'R24'], {
       grantedScope: 'NONE', outcomeCode: 'REJECTED_UNAUTHORIZED',
@@ -193,7 +193,7 @@ export function buildPreRegisteredShadowMatrix() {
       outcomeCode: 'NOT_READY_TEST_FAILURE',
     }),
     pair('CR12_RISK_UNAVAILABLE', 'Unavailable risk projection remains explicit', ['R9', 'R20', 'R26'], {
-      riskAvailability: 'UNAVAILABLE', riskCategories: ['PIPELINE_LIMITATION'],
+      riskAvailability: 'UNAVAILABLE',
     }),
     pair('CR13_STALE_REVISION', 'Stale publication revision is rejected', ['R20', 'R25'], {}, {
       grantedScope: 'NONE', outcomeCode: 'REJECTED_STALE_REVISION',

@@ -4,6 +4,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { applySharedReleaseEligibility } from '../portal/release-eligibility.mjs';
+import { buildProductionDerivedShadowMatrix } from './lib/shadow-validation-adapters.mjs';
 import { assertConsumableReleaseDecision } from '../shared/release-decision.mjs';
 import { parsePublicationEnvelope } from '../shared/publication-envelope.mjs';
 import {
@@ -20,7 +21,39 @@ import { parseChecklistRelease } from './lib/release-truth.mjs';
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const generatedAt = '2026-08-29T12:00:00.000Z';
-const matrix = buildPreRegisteredShadowMatrix();
+const derivations = [];
+const matrix = await buildProductionDerivedShadowMatrix({
+  observe: (receipt) => derivations.push(receipt),
+});
+const registeredMatrix = buildPreRegisteredShadowMatrix();
+
+assert.deepEqual(
+  matrix,
+  registeredMatrix,
+  'production adapters must reproduce the pre-registered semantic matrix exactly',
+);
+for (const caseId of [...SHADOW_ACCEPTANCE_CASE_IDS, ...SHADOW_CORRUPTION_CASE_IDS]) {
+  const receipts = derivations.filter((receipt) => receipt.caseId === caseId);
+  assert(receipts.some(({ side }) => side === 'legacy'), `${caseId} must invoke a legacy production adapter`);
+  assert(receipts.some(({ side }) => side === 'shared'), `${caseId} must invoke a shared production adapter`);
+  assert(
+    receipts.some(({ side, productionFunction }) => side === 'shared'
+      && ['compileCanonicalExecutionGraph', 'projectSharedReleaseView', 'production-rejection-validator'].includes(productionFunction)),
+    `${caseId} must exercise shared production derivation`,
+  );
+}
+assert(
+  derivations.some(({ productionFunction }) => productionFunction === 'compileDefinitionCoverageManifest'),
+  'the legacy Single-site adapter must invoke the production coverage compiler',
+);
+assert(
+  derivations.some(({ productionFunction }) => productionFunction === 'parseChecklistRelease'),
+  'legacy authority must pass through the production checklist parser',
+);
+assert(
+  derivations.some(({ productionFunction }) => productionFunction === 'projectSharedReleaseView'),
+  'shared authority and risks must be projected by production code',
+);
 
 assert.deepEqual(
   SHADOW_ACCEPTANCE_CASE_IDS,
@@ -93,6 +126,8 @@ assert.throws(() => assertConsumableReleaseDecision(report, {
 }), /unsupported|invalid/iu);
 
 const cliSource = await readFile(join(repositoryRoot, 'scripts/run-shadow-validation.mjs'), 'utf8');
+assert.match(cliSource, /buildProductionDerivedShadowMatrix/u);
+assert.doesNotMatch(cliSource, /buildPreRegisteredShadowMatrix/u);
 assert.match(cliSource, /artifacts\/shadow-validation/u);
 assert.match(cliSource, /realpath\(root\)/u);
 assert.match(cliSource, /pathFromRoot\.startsWith/u);

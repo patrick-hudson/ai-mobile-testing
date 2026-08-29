@@ -2,7 +2,7 @@
 import { mkdir, realpath, rename, writeFile } from 'node:fs/promises';
 import { dirname, relative, resolve, sep } from 'node:path';
 
-import { buildPreRegisteredShadowMatrix } from '../shared/shadow-validation-fixtures.mjs';
+import { buildProductionDerivedShadowMatrix } from './lib/shadow-validation-adapters.mjs';
 import { runShadowValidation } from '../shared/shadow-validation.mjs';
 
 function outputArgument(argv) {
@@ -34,7 +34,7 @@ async function validatedOutputPath(argument) {
 try {
   const output = await validatedOutputPath(outputArgument(process.argv.slice(2)));
   const report = runShadowValidation({
-    ...buildPreRegisteredShadowMatrix(),
+    ...await buildProductionDerivedShadowMatrix(),
     generatedAt: new Date().toISOString(),
   });
   const temporary = `${output}.tmp-${process.pid}`;
