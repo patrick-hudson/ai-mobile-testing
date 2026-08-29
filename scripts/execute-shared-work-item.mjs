@@ -8,7 +8,7 @@ import { buildLiveRouteInventory } from '../shared/live-route-inventory.mjs';
 import { preflightQuitting7ohSite } from '../shared/site-preflight.mjs';
 import { parseWorkExecutionDescriptor } from '../shared/work-execution-descriptor.mjs';
 import { startBrowserEgressProxy } from './lib/browser-egress-proxy.mjs';
-import { validateSharedPlaywrightRows } from './lib/shared-playwright-work-item.mjs';
+import { collectSharedPlaywrightArtifacts } from './lib/shared-playwright-work-item.mjs';
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const MAX_JSON_BYTES = 16 * 1_048_576;
@@ -128,7 +128,12 @@ async function spawnPlaywright(descriptor, artifactRoot, signal) {
     }
     const resultsPath = path.join(artifactRoot, 'results.json');
     const document = await boundedJson(resultsPath, 'Playwright results');
-    const validated = validateSharedPlaywrightRows(document, descriptor);
+    const validated = await collectSharedPlaywrightArtifacts({
+      document,
+      descriptor,
+      artifactRoot,
+      evidenceRoot: path.dirname(artifactRoot),
+    });
     if ((completion.code === 0) !== (validated.outcome === 'completed_pass')) {
       throw new Error('Playwright exit status disagrees with the exact structured work-item rows.');
     }
@@ -143,7 +148,10 @@ async function spawnPlaywright(descriptor, artifactRoot, signal) {
     return {
       outcome: validated.outcome,
       reason: validated.outcome === 'completed_pass' ? null : 'playwright-product-failure',
-      artifacts: [{ path: 'playwright/work-item-rows.json', mediaType: 'application/json' }],
+      artifacts: [
+        { path: 'playwright/work-item-rows.json', mediaType: 'application/json' },
+        ...validated.artifacts,
+      ],
     };
   } finally {
     await egressProxy?.close();
