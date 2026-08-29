@@ -1,15 +1,34 @@
+#!/usr/bin/env node
 import { resolve } from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { pipelineOnlyOutcome, readChecklistRelease, releaseOutcome } from './lib/release-truth.mjs';
 import { readCredentialFile } from './lib/credential-file.mjs';
+import { CONTROL_EXIT_CODES, controlExitCode } from '../shared/control-client-contract.mjs';
 
-const options = parseArguments(process.argv.slice(2));
-if (options.server) {
-  if (!options.tokenFile) throw new Error('--token-file is required for API release assertion.');
+await main().catch((error) => {
+  const code = typeof error?.code === 'string' ? error.code : 'ASSERT_RELEASE_FAILED';
+  const message = safeMessage(error?.message ?? error);
+  writeJson({ schemaVersion: 1, error: { code, message } });
+  process.stderr.write(`[assert-release] ${code}: ${message}\n`);
+  process.exitCode = Number.isSafeInteger(error?.exitCode) ? error.exitCode : CONTROL_EXIT_CODES.REQUEST_FAILED;
+});
+
+async function main() {
+  const options = parseArguments(process.argv.slice(2));
+  if (options.server) return assertLiveRelease(options);
+  return assertStaticEvidence(options);
+}
+
+async function assertLiveRelease(options) {
+  if (!options.tokenFile) throw usage('--token-file is required for API release assertion.');
   const token = await readCredentialFile(options.tokenFile, { label: 'Delivery credential' });
   const response = await fetch(new URL(`/api/control/v1/runs/${encodeURIComponent(options.run)}/release/assert`, options.server), {
     method: 'POST',
-    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', 'idempotency-key': options.requestId },
+    headers: {
+      authorization: `Bearer ${token}`,
+      'content-type': 'application/json',
+      'idempotency-key': options.requestId,
+    },
     body: JSON.stringify({
       expected: {
         projectId: options.project,
@@ -22,41 +41,53 @@ if (options.server) {
       ttlMs: options.ttlMs,
     }),
   });
-  const document = await response.json();
-  console.log(JSON.stringify(document));
-  if (!response.ok) {
-    console.error(`[assert-release] ${response.status} ${document.error?.code ?? 'REQUEST_FAILED'}: ${document.error?.message ?? response.statusText}`);
-    process.exitCode = decisionExit(document.error?.code, response.status);
+  let document;
+  let validJson = true;
+  try { document = await response.json(); } catch {
+    validJson = false;
+    document = {
+      schemaVersion: 1,
+      error: { code: 'INVALID_RESPONSE', message: 'Shared control API did not return JSON.' },
+    };
   }
-} else {
-let pipelineStatus = 'completed';
-if (options.pipelineManifest) {
-  const lifecycle = JSON.parse(await readFile(options.pipelineManifest, 'utf8'));
-  pipelineStatus = lifecycle.pipeline?.status ?? lifecycle.pipelineStatus ?? 'unavailable';
+  writeJson(document);
+  if (!response.ok || !validJson) {
+    process.stderr.write(`[assert-release] ${response.status} ${document.error?.code ?? 'REQUEST_FAILED'}: ${safeMessage(document.error?.message ?? response.statusText)}\n`);
+    process.exitCode = validJson
+      ? controlExitCode({ status: response.status, code: document.error?.code })
+      : CONTROL_EXIT_CODES.REQUEST_FAILED;
+  }
 }
-const release = await readChecklistRelease(options.manifest);
-const outcome = options.pipelineOnly
-  ? pipelineOnlyOutcome(pipelineStatus, release)
-  : releaseOutcome(pipelineStatus, release);
-console.log(JSON.stringify({
-  policy: options.pipelineOnly ? 'PIPELINE_ONLY' : 'LEGACY_EVIDENCE_ONLY',
-  policyReason: options.pipelineOnly
-    ? 'Pipeline-only validation requires complete evidence, no executed blocking failures, and no run-integrity failure; it does not certify release readiness.'
-    : 'A completed evidence pipeline and authoritative READY decision are both required.',
-  pipelineStatus,
-  releaseDecision: release.decision,
-  releaseReason: release.reason,
-  outcome: outcome.status,
-  authoritativePromotion: false,
-  promotionReason: 'Static manifests are diagnostic evidence only; authoritative delivery requires a live single-use promotion claim.',
-  manifest: options.manifest,
-}));
-if (options.pipelineOnly) {
-  if (outcome.exitCode !== 0) process.exitCode = outcome.exitCode;
-} else {
-  console.error('[assert-release] Static manifest assertion cannot authorize promotion; use --server with the live shared control API.');
-  process.exitCode = 13;
-}
+
+async function assertStaticEvidence(options) {
+  let pipelineStatus = 'completed';
+  if (options.pipelineManifest) {
+    const lifecycle = JSON.parse(await readFile(options.pipelineManifest, 'utf8'));
+    pipelineStatus = lifecycle.pipeline?.status ?? lifecycle.pipelineStatus ?? 'unavailable';
+  }
+  const release = await readChecklistRelease(options.manifest);
+  const outcome = options.pipelineOnly
+    ? pipelineOnlyOutcome(pipelineStatus, release)
+    : releaseOutcome(pipelineStatus, release);
+  writeJson({
+    policy: options.pipelineOnly ? 'PIPELINE_ONLY' : 'LEGACY_EVIDENCE_ONLY',
+    policyReason: options.pipelineOnly
+      ? 'Pipeline-only validation requires complete evidence, no executed blocking failures, and no run-integrity failure; it does not certify release readiness.'
+      : 'A completed evidence pipeline and authoritative READY decision are both required.',
+    pipelineStatus,
+    releaseDecision: release.decision,
+    releaseReason: release.reason,
+    outcome: outcome.status,
+    authoritativePromotion: false,
+    promotionReason: 'Static manifests are diagnostic evidence only; authoritative delivery requires a live single-use promotion claim.',
+    manifest: options.manifest,
+  });
+  if (options.pipelineOnly) {
+    if (outcome.exitCode !== 0) process.exitCode = outcome.exitCode;
+  } else {
+    process.stderr.write('[assert-release] Static manifest assertion cannot authorize promotion; use --server with the live shared control API.\n');
+    process.exitCode = CONTROL_EXIT_CODES.EVIDENCE_UNAVAILABLE;
+  }
 }
 
 function parseArguments(argv) {
@@ -66,16 +97,24 @@ function parseArguments(argv) {
   const values = {};
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
-    if (argument === '--manifest') manifest = argv[++index];
-    else if (argument === '--pipeline-manifest') pipelineManifest = argv[++index];
+    if (argument === '--manifest') manifest = requiredValue(argv, ++index, argument);
+    else if (argument === '--pipeline-manifest') pipelineManifest = requiredValue(argv, ++index, argument);
     else if (argument === '--pipeline-only') pipelineOnly = true;
-    else if (['--server', '--token-file', '--run', '--project', '--subject', '--authority', '--execution-set-digest', '--request-id'].includes(argument)) values[argument.slice(2)] = argv[++index];
-    else if (argument === '--run-revision' || argument === '--decision-revision' || argument === '--ttl-ms') values[argument.slice(2)] = Number(argv[++index]);
-    else throw new Error(`Unknown argument: ${argument}`);
+    else if (['--server', '--token-file', '--run', '--project', '--subject', '--authority', '--execution-set-digest', '--request-id'].includes(argument)) {
+      values[argument.slice(2)] = requiredValue(argv, ++index, argument);
+    } else if (argument === '--run-revision' || argument === '--decision-revision' || argument === '--ttl-ms') {
+      values[argument.slice(2)] = Number(requiredValue(argv, ++index, argument));
+    } else throw usage(`Unknown argument: ${argument}`);
   }
-  if (!manifest && !values.server) throw new Error('--manifest is required.');
+  if (!manifest && !values.server) throw usage('--manifest is required.');
   if (values.server && ['run', 'project', 'subject', 'authority', 'execution-set-digest', 'run-revision', 'decision-revision', 'request-id'].some((key) => !values[key])) {
-    throw new Error('API assertion requires --run, --project, --subject, --authority, --execution-set-digest, --run-revision, --decision-revision, and --request-id.');
+    throw usage('API assertion requires --run, --project, --subject, --authority, --execution-set-digest, --run-revision, --decision-revision, and --request-id.');
+  }
+  for (const key of ['run-revision', 'decision-revision']) {
+    if (values.server && (!Number.isSafeInteger(values[key]) || values[key] < 1)) throw usage(`--${key} must be a positive integer.`);
+  }
+  if (values['ttl-ms'] !== undefined && (!Number.isSafeInteger(values['ttl-ms']) || values['ttl-ms'] < 1 || values['ttl-ms'] > 300_000)) {
+    throw usage('--ttl-ms must be an integer from 1 through 300000.');
   }
   return {
     manifest: manifest ? resolve(manifest) : null,
@@ -95,10 +134,20 @@ function parseArguments(argv) {
   };
 }
 
-function decisionExit(code = '', status = 500) {
-  if (/NOT_READY/.test(code)) return 10;
-  if (/STALE|SUPERSEDED|EXPIRED/.test(code)) return 11;
-  if (/SCOPE|SUBJECT|AUTHORITY|EXECUTION_SET/.test(code)) return 12;
-  if (/EMPTY|UNAVAILABLE/.test(code)) return 13;
-  return status === 401 || status === 403 ? 3 : 1;
+function requiredValue(argv, index, flag) {
+  const value = argv[index];
+  if (value === undefined || value.startsWith('--')) throw usage(`${flag} requires a value.`);
+  return value;
+}
+
+function usage(message) {
+  return Object.assign(new Error(message), { code: 'ASSERT_RELEASE_USAGE', exitCode: CONTROL_EXIT_CODES.USAGE });
+}
+
+function writeJson(value) {
+  process.stdout.write(`${JSON.stringify(value)}\n`);
+}
+
+function safeMessage(value) {
+  return String(value).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu, '').slice(0, 1_024);
 }

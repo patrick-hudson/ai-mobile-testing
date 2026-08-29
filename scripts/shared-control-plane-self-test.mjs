@@ -35,6 +35,7 @@ import { sealExecutionManifest, sealOracleResult, sealWorkItemResult } from '../
 import { appendPublicationEnvelope } from '../shared/publication-envelope.mjs';
 import { projectSharedReleaseView } from '../shared/release-projection.mjs';
 import { sealFinalReleaseSubject, sealReleaseSubjectCore } from '../shared/release-subject.mjs';
+import { CONTROL_EXIT_CODES, controlExitCode } from '../shared/control-client-contract.mjs';
 
 const root = await mkdtemp(path.join(tmpdir(), 'shared-control-plane-'));
 let now = Date.parse('2026-08-28T20:00:00.000Z');
@@ -61,6 +62,11 @@ try {
   assert.doesNotMatch(workerSource, /console\.(?:log|error).*workerCredential/u, 'worker credentials must never enter logs');
   assert.doesNotMatch(controlCliSource, /AUDIT_CONTROL_TOKEN/u, 'control CLI credentials must not be accepted from the process environment');
   assert.doesNotMatch(releaseCliSource, /AUDIT_CONTROL_TOKEN/u, 'release assertion credentials must not be accepted from the process environment');
+  assert.equal(controlExitCode({ status: 409, code: 'NOT_READY_TEST_FAILURE' }), CONTROL_EXIT_CODES.NOT_READY);
+  assert.equal(controlExitCode({ status: 409, code: 'PROMOTION_STALE_REVISION' }), CONTROL_EXIT_CODES.STALE);
+  assert.equal(controlExitCode({ status: 409, code: 'PROMOTION_SCOPE_MISMATCH' }), CONTROL_EXIT_CODES.IDENTITY_MISMATCH);
+  assert.equal(controlExitCode({ status: 503, code: 'PROMOTION_EMPTY_EVIDENCE' }), CONTROL_EXIT_CODES.EVIDENCE_UNAVAILABLE);
+  assert.equal(controlExitCode({ status: 403, code: 'AUTHORIZATION_DENIED' }), CONTROL_EXIT_CODES.AUTHORIZATION);
 
   const credentialOutput = path.join(root, 'principal-output', 'worker.token');
   await mkdir(path.dirname(credentialOutput), { mode: 0o700 });
@@ -76,6 +82,19 @@ try {
   assert.equal(principalCliDocument.principal.id, 'cli-worker');
   assert.match(await readFile(credentialOutput, 'utf8'), /^amt\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{32,}\n$/u);
   assert.equal((await stat(credentialOutput)).mode & 0o077, 0, 'principal credential output must be mode 0600');
+  const releaseUsage = await runCommand(process.execPath, [
+    new URL('./assert-release-decision.mjs', import.meta.url).pathname, '--unsupported', 'value',
+  ], path.join(root, 'release-usage'));
+  assert.equal(releaseUsage.code, CONTROL_EXIT_CODES.USAGE);
+  assert.equal(JSON.parse(releaseUsage.stdout).error.code, 'ASSERT_RELEASE_USAGE');
+  assert.doesNotMatch(releaseUsage.stderr, /\n\s+at\s/u, 'release CLI usage failures must not emit runtime stacks');
+  const controlNetworkFailure = await runCommand(process.execPath, [
+    new URL('./audit-control.mjs', import.meta.url).pathname,
+    'publication', '--server', 'http://127.0.0.1:1', '--token-file', credentialOutput, '--run', 'run-1',
+  ], path.join(root, 'control-network-failure'));
+  assert.equal(controlNetworkFailure.code, CONTROL_EXIT_CODES.REQUEST_FAILED);
+  assert.equal(JSON.parse(controlNetworkFailure.stdout).error.code, 'AUDIT_CONTROL_REQUEST_FAILED');
+  assert.doesNotMatch(controlNetworkFailure.stderr, /\n\s+at\s/u, 'control CLI request failures must not emit runtime stacks');
 
   const provisionRoot = path.join(root, 'compose-provision');
   const workerCredentialFiles = {
