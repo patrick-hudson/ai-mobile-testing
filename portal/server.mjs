@@ -37,6 +37,7 @@ import {
   readParentRun,
 } from '../scripts/lib/parent-run-store.mjs';
 import { createSharedControlService } from '../scripts/lib/shared-control-service.mjs';
+import { maybeCrashAtSharedResilienceBoundary } from '../scripts/lib/shared-resilience-failpoint.mjs';
 import {
   createCutoverAdmissionPolicy,
   openCutoverAdmissionGate,
@@ -648,6 +649,7 @@ if (process.env.PORTAL_SHARED_CONTROL === '1') {
     expectedOrigin: deployment.publishedOrigin,
     sessionCookiePath: '/',
     admissionPolicy,
+    afterMutationAccepted: () => maybeCrashAtSharedResilienceBoundary('mutation-acceptance'),
     launch: async (principal, request) => {
       const operation = await sharedLaunchService.accept(principal, request);
       setImmediate(() => {

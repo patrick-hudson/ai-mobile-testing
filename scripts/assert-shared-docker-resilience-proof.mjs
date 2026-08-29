@@ -3,13 +3,29 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { SHARED_DOCKER_RESILIENCE_WORKLOAD_DIGEST } from '../shared/shared-docker-resilience-contract.mjs';
+import { canonicalDigest } from '../shared/canonical-contract.mjs';
 import { deriveRunnerRevision, runnerRevisionDigest } from '../shared/runner-revision.mjs';
+import { SHARED_RESILIENCE_CRASH_BOUNDARIES } from './lib/shared-resilience-failpoint.mjs';
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const DIGEST = /^sha256:[a-f0-9]{64}$/u;
 const WORK_ITEM_ID = /^proof-\d{3}$/u;
 const AUTHORITATIVE_NANO_CPUS = 1_000_000_000;
 const AUTHORITATIVE_MEMORY_BYTES = 2_147_483_648;
+const CRASH_BOUNDARY_SERVICE = Object.freeze({
+  'inventory-seal': 'shared-coordinator',
+  'work-item-adoption': 'shared-coordinator',
+  'oracle-seal': 'shared-coordinator',
+  'envelope-fsync': 'shared-coordinator',
+  'head-swap': 'shared-coordinator',
+  'mutation-acceptance': 'portal',
+});
+const CRASH_RECEIPT_KEYS = Object.freeze([
+  'schemaVersion', 'kind', 'boundary', 'service', 'signal', 'injectedAt',
+  'restartCountBefore', 'restartCountAfter', 'recoveryMs', 'recoveryBoundMs',
+  'expectedStateDigest', 'recoveredStateDigest', 'staleFenceOutcome',
+  'operationOutcome', 'duplicateEvidenceCount', 'digest',
+].sort());
 
 function finite(value, label, { positive = false } = {}) {
   assert(Number.isFinite(value) && (positive ? value > 0 : value >= 0),
@@ -139,6 +155,41 @@ export function validateSharedDockerResilienceProof(report, { expectedWorkspaceR
   assert(Number.isSafeInteger(performanceSample.pids) && performanceSample.pids >= 0);
   assert.equal(performanceSample.nanoCpus, 2_000_000_000);
   assert.equal(performanceSample.memoryBytes, 4_294_967_296);
+
+  assert.equal(report?.crashBoundaries?.length, SHARED_RESILIENCE_CRASH_BOUNDARIES.length,
+    'the authoritative proof must contain all six named crash-boundary receipts');
+  assert.deepEqual(report.crashBoundaries.map(({ boundary }) => boundary), SHARED_RESILIENCE_CRASH_BOUNDARIES,
+    'crash-boundary receipts must be complete, unique, and in canonical order');
+  for (const receipt of report.crashBoundaries) {
+    assert.deepEqual(Object.keys(receipt ?? {}).sort(), CRASH_RECEIPT_KEYS,
+      `the ${receipt?.boundary ?? 'unknown'} crash receipt has an unexpected shape`);
+    const { digest, ...body } = receipt;
+    assert.equal(receipt.schemaVersion, 1);
+    assert.equal(receipt.kind, 'shared-docker-crash-boundary-receipt');
+    assert.equal(receipt.service, CRASH_BOUNDARY_SERVICE[receipt.boundary]);
+    assert.equal(receipt.signal, 'SIGKILL');
+    const injectedAtMs = Date.parse(receipt.injectedAt);
+    assert(Number.isFinite(injectedAtMs));
+    assert.equal(new Date(injectedAtMs).toISOString(), receipt.injectedAt);
+    assert(Number.isSafeInteger(receipt.restartCountBefore) && receipt.restartCountBefore >= 0);
+    assert(Number.isSafeInteger(receipt.restartCountAfter)
+      && receipt.restartCountAfter > receipt.restartCountBefore,
+    `${receipt.boundary} must prove that its killed container restarted`);
+    assert(Number.isSafeInteger(receipt.recoveryBoundMs)
+      && receipt.recoveryBoundMs >= 1_000 && receipt.recoveryBoundMs <= 300_000);
+    assert(Number.isFinite(receipt.recoveryMs)
+      && receipt.recoveryMs >= 0 && receipt.recoveryMs <= receipt.recoveryBoundMs,
+    `${receipt.boundary} exceeded its registered recovery bound`);
+    assert.match(receipt.expectedStateDigest ?? '', DIGEST);
+    assert.equal(receipt.recoveredStateDigest, receipt.expectedStateDigest,
+      `${receipt.boundary} recovered the wrong canonical state`);
+    assert.equal(receipt.staleFenceOutcome,
+      receipt.boundary === 'mutation-acceptance' ? 'not-applicable' : 'rejected');
+    assert.equal(receipt.operationOutcome,
+      receipt.boundary === 'mutation-acceptance' ? 'persisted-terminal' : 'not-applicable');
+    assert.equal(receipt.duplicateEvidenceCount, 0);
+    assert.equal(digest, canonicalDigest(body), `${receipt.boundary} receipt digest is invalid`);
+  }
   return report;
 }
 

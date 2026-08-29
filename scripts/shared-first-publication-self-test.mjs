@@ -163,6 +163,7 @@ const [pluginRegistry, targetRegistry] = await Promise.all([
 const root = await mkdtemp(path.join(tmpdir(), 'shared-first-publication-'));
 const storeMarker = 'ab'.repeat(32);
 let now = Date.parse(observedAt);
+const resilienceHookEvents = [];
 try {
   const store = await openParentRunStore({
     root,
@@ -177,6 +178,17 @@ try {
     store,
     projectId: 'project-first-publication',
     reprobeTargetIdentity: async ({ subjectCore: currentSubjectCore }) => currentSubjectCore.deploymentIdentity,
+    afterOracleSeal: ({ runId, oracleResultsDigest }) => {
+      resilienceHookEvents.push({ boundary: 'oracle-seal', runId, digest: oracleResultsDigest });
+    },
+    publicationHooks: {
+      afterEnvelopePersist: (envelope) => resilienceHookEvents.push({
+        boundary: 'envelope-fsync', runId: envelope.runId, digest: envelope.digest,
+      }),
+      afterDecisionPersist: (envelope) => resilienceHookEvents.push({
+        boundary: 'head-swap', runId: envelope.runId, digest: envelope.digest,
+      }),
+    },
   });
   const supervisor = createSharedCoordinatorSupervisor({
     store,
@@ -275,6 +287,11 @@ try {
   const finalMaintenance = await supervisor.maintain();
   assert.deepEqual(finalMaintenance.errors, [], JSON.stringify(finalMaintenance.errors));
   const ready = await readCurrentEnvelope(store, 'run-first-comparative');
+  for (const boundary of ['oracle-seal', 'envelope-fsync', 'head-swap']) {
+    assert(resilienceHookEvents.some((event) => event.boundary === boundary
+      && event.runId === 'run-first-comparative' && /^sha256:[a-f0-9]{64}$/u.test(event.digest)),
+    `${boundary} hook must observe a digest-bound production publication boundary`);
+  }
   const state = await readParentRun(store, 'run-first-comparative');
   assert.equal(ready.decision.code, 'FEATURE_READY', JSON.stringify(Object.fromEntries(
     Object.entries(state.workItems).map(([id, item]) => [id, item.state]),

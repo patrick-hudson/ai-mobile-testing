@@ -28,4 +28,5 @@ export function createSharedCoordinatorSupervisor(input: {
   pluginRegistry?: unknown;
   targetRegistry?: unknown;
   onEvent?: (event: any) => void;
+  afterInventorySeal?: (input: { runId: string; graph: any; workItems: any[] }) => Promise<void> | void;
 }): SharedCoordinatorSupervisor;

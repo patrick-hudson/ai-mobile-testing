@@ -1,12 +1,39 @@
 import assert from 'node:assert/strict';
 import { validateSharedDockerResilienceProof } from './assert-shared-docker-resilience-proof.mjs';
+import { canonicalDigest } from '../shared/canonical-contract.mjs';
 import { SHARED_DOCKER_RESILIENCE_WORKLOAD_DIGEST } from '../shared/shared-docker-resilience-contract.mjs';
+import { SHARED_RESILIENCE_CRASH_BOUNDARIES } from './lib/shared-resilience-failpoint.mjs';
 
 const digest = (character) => `sha256:${character.repeat(64)}`;
 const sample = (container) => ({
   container, cpuPercent: 50, memoryPercent: 10, memoryUsage: '200MiB / 2GiB', pids: 30,
   nanoCpus: 1_000_000_000, memoryBytes: 2_147_483_648,
 });
+const boundaryReceipt = (boundary, index) => {
+  const service = boundary === 'mutation-acceptance' ? 'portal' : 'shared-coordinator';
+  const body = {
+    schemaVersion: 1,
+    kind: 'shared-docker-crash-boundary-receipt',
+    boundary,
+    service,
+    signal: 'SIGKILL',
+    injectedAt: `2026-08-29T23:30:0${index}.000Z`,
+    restartCountBefore: index,
+    restartCountAfter: index + 1,
+    recoveryMs: 1_000 + index,
+    recoveryBoundMs: 60_000,
+    expectedStateDigest: digest(String(index + 1)),
+    recoveredStateDigest: digest(String(index + 1)),
+    staleFenceOutcome: boundary === 'mutation-acceptance' ? 'not-applicable' : 'rejected',
+    operationOutcome: boundary === 'mutation-acceptance' ? 'persisted-terminal' : 'not-applicable',
+    duplicateEvidenceCount: 0,
+  };
+  return { ...body, digest: canonicalDigest(body) };
+};
+const resealReceipt = (report, index) => {
+  const { digest: _digest, ...body } = report.crashBoundaries[index];
+  report.crashBoundaries[index] = { ...body, digest: canonicalDigest(body) };
+};
 const valid = {
   schemaVersion: 1,
   kind: 'shared-docker-resilience-proof',
@@ -50,7 +77,14 @@ const valid = {
       }],
     },
   },
+  crashBoundaries: SHARED_RESILIENCE_CRASH_BOUNDARIES.map(boundaryReceipt),
 };
+
+const legacyReport = structuredClone(valid);
+delete legacyReport.crashBoundaries;
+assert.throws(() => validateSharedDockerResilienceProof(legacyReport),
+  /six named crash-boundary receipts/,
+  'a pre-boundary authoritative report must fail closed');
 
 assert.equal(validateSharedDockerResilienceProof(valid, {
   expectedWorkspaceRevision: valid.source.workspaceRevision,
@@ -81,6 +115,13 @@ const rejected = [
   (report) => { report.invariants.performanceIsolation.attempts = 2; },
   (report) => { delete report.invariants.performanceIsolation.invariantDigest; },
   (report) => { report.invariants.performanceIsolation.utilization[0].nanoCpus = 1_000_000_000; },
+  (report) => { report.crashBoundaries.pop(); },
+  (report) => { report.crashBoundaries[0].boundary = 'generic-coordinator-kill'; resealReceipt(report, 0); },
+  (report) => { report.crashBoundaries[0].restartCountAfter = report.crashBoundaries[0].restartCountBefore; resealReceipt(report, 0); },
+  (report) => { report.crashBoundaries[0].recoveredStateDigest = digest('f'); resealReceipt(report, 0); },
+  (report) => { report.crashBoundaries[0].duplicateEvidenceCount = 1; resealReceipt(report, 0); },
+  (report) => { report.crashBoundaries.at(-1).operationOutcome = 'not-applicable'; resealReceipt(report, report.crashBoundaries.length - 1); },
+  (report) => { report.crashBoundaries[0].digest = digest('f'); },
   (report) => { report.authority = 'DIAGNOSTIC'; },
 ];
 for (const mutate of rejected) {

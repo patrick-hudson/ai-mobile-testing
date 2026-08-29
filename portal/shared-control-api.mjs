@@ -20,10 +20,11 @@ export function createSharedRequestAuthorizer({ authority } = {}) {
 export function createSharedControlApi({
   authority, service, claimStore, expectedOrigin, launch = null, readLaunchOperation = null,
   admissionPolicy = null,
+  afterMutationAccepted = async () => {},
   requestAuthorizer = createSharedRequestAuthorizer({ authority }),
   sessionCookiePath = SHARED_CONTROL_API_PREFIX,
 } = {}) {
-  if (!authority || !service || !claimStore || !expectedOrigin) throw new TypeError('Shared control API dependencies are required.');
+  if (!authority || !service || !claimStore || !expectedOrigin || typeof afterMutationAccepted !== 'function') throw new TypeError('Shared control API dependencies are required.');
   if (!/^\/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]*)$/u.test(sessionCookiePath)) throw new TypeError('Shared session cookie path is invalid.');
   return Object.freeze({
     async handle(request) {
@@ -132,6 +133,7 @@ export function createSharedControlApi({
             kind, requestId: request.headers['idempotency-key'] ?? body.requestId,
             expectedRunRevision: body.expectedRunRevision, body,
           });
+          await afterMutationAccepted({ runId, kind, operation });
           const statusUrl = `${SHARED_CONTROL_API_PREFIX}/runs/${encodeURIComponent(runId)}/operations/${operation.operationId}`;
           return accepted({ ...operation, statusUrl }, { location: statusUrl });
         }

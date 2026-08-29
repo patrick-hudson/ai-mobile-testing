@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { canonicalJson } from '../../shared/canonical-contract.mjs';
+import { canonicalDigest, canonicalJson } from '../../shared/canonical-contract.mjs';
 import { sealOracleResult, sealWorkItemResult } from '../../shared/execution-contract.mjs';
 import { appendPublicationEnvelope } from '../../shared/publication-envelope.mjs';
 import { sealPublicationText } from '../../shared/publication-text-policy.mjs';
@@ -60,10 +60,17 @@ function namespacedKey(principal, kind, runId, requestId) {
 
 export function createSharedControlService({
   store, projectId = 'default', admissionPolicy = null, reprobeTargetIdentity = null,
+  afterOracleSeal = async () => {}, publicationHooks = {},
 } = {}) {
   if (!store) throw new TypeError('Shared control service requires the durable parent-run store.');
   if (reprobeTargetIdentity !== null && typeof reprobeTargetIdentity !== 'function') {
     throw new TypeError('Shared control target identity reprobe must be a function.');
+  }
+  if (typeof afterOracleSeal !== 'function' || !publicationHooks || typeof publicationHooks !== 'object'
+    || Array.isArray(publicationHooks)
+    || Object.keys(publicationHooks).some((key) => !['afterEnvelopePersist', 'afterDecisionPersist'].includes(key))
+    || Object.values(publicationHooks).some((hook) => typeof hook !== 'function')) {
+    throw new TypeError('Shared control resilience hooks are invalid.');
   }
   const object = (runId) => ({ projectId, runId });
   const reprobeIdentity = async (runId) => {
@@ -277,7 +284,9 @@ export function createSharedControlService({
             await purgeParentRunEvidence(store, runId);
             await handlers.purgeEvidence?.(operation);
           }
-          if (operation.kind !== 'purge') await publishProjection(store, runId, coordinator);
+          if (operation.kind !== 'purge') await publishProjection(store, runId, coordinator, {
+            afterOracleSeal, publicationHooks,
+          });
           const completed = await completeOperation(store, runId, coordinator, operation.operationId, { status: 'succeeded' });
           applied.push(completed);
         } catch (error) {
@@ -296,12 +305,12 @@ export function createSharedControlService({
       return applied;
     },
     async publishCurrentProjection(coordinator, runId) {
-      return publishProjection(store, runId, coordinator);
+      return publishProjection(store, runId, coordinator, { afterOracleSeal, publicationHooks });
     },
   });
 }
 
-async function publishProjection(store, runId, coordinator) {
+async function publishProjection(store, runId, coordinator, { afterOracleSeal, publicationHooks }) {
   const state = await readParentRun(store, runId);
   if (state.authorityTombstone || !['failed', 'sealed'].includes(state.compilationState)) return null;
   let current = null;
@@ -342,11 +351,12 @@ async function publishProjection(store, runId, coordinator) {
       decision: projection.decision,
       riskRegister: projection.riskRegister,
     });
-    return publishCurrentEnvelope(store, runId, coordinator, next);
+    return publishCurrentEnvelope(store, runId, coordinator, next, publicationHooks);
   }
   if (!state.finalSubject || !state.executionManifest) return null;
   const histories = await readRunHistories(store, runId);
   const assembled = assembleReleaseProjectionInputs({ state, histories });
+  await afterOracleSeal({ runId, oracleResultsDigest: canonicalDigest(assembled.oracleResults) });
   const project = (baseDecisionRevision, baseRiskRevision) => projectSharedReleaseView({
     schemaVersion: 1, runId, baseDecisionRevision, baseRiskRevision,
     finalSubject: state.finalSubject, executionManifest: state.executionManifest,
@@ -389,7 +399,7 @@ async function publishProjection(store, runId, coordinator) {
       : {}),
     finalSubjectDigest: state.finalSubject.digest, decision: projection.decision, riskRegister: projection.riskRegister,
   });
-  return publishCurrentEnvelope(store, runId, coordinator, next);
+  return publishCurrentEnvelope(store, runId, coordinator, next, publicationHooks);
 }
 
 function derivedRisk(state, input) {

@@ -62,9 +62,11 @@ export function createSharedCoordinatorSupervisor({
   pluginRegistry = null,
   targetRegistry = null,
   onEvent = () => {},
+  afterInventorySeal = async () => {},
 } = {}) {
   if (!store || !controlService || typeof ownerId !== 'string' || !ownerId
     || typeof projectId !== 'string' || !projectId || typeof onEvent !== 'function'
+    || typeof afterInventorySeal !== 'function'
     || !Number.isSafeInteger(coordinatorLeaseMs) || coordinatorLeaseMs < 5_000 || coordinatorLeaseMs > 3_600_000
     || !Number.isSafeInteger(workLeaseMs) || workLeaseMs < 1_000 || workLeaseMs > 3_600_000
     || !Number.isSafeInteger(runLimit) || runLimit < 1 || runLimit > 10_000) {
@@ -132,6 +134,7 @@ export function createSharedCoordinatorSupervisor({
       inventoryWorkItemId: barrier.id,
       workItems,
     });
+    await afterInventorySeal({ runId, graph, workItems });
     onEvent({ event: 'single-site-graph-sealed', runId, workItemCount: workItems.length, graphDigest: graph.digest });
     return true;
   }

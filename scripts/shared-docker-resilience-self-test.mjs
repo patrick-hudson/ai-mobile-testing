@@ -10,6 +10,8 @@ import {
   SHARED_DOCKER_RESILIENCE_WORK_ITEM_COUNT,
 } from '../shared/shared-docker-resilience-contract.mjs';
 import { deriveRunnerRevision, runnerRevisionDigest } from '../shared/runner-revision.mjs';
+import { canonicalDigest } from '../shared/canonical-contract.mjs';
+import { SHARED_RESILIENCE_CRASH_BOUNDARIES } from './lib/shared-resilience-failpoint.mjs';
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const mode = process.argv[2] ?? '--authoritative';
@@ -233,14 +235,34 @@ function claimedButUnpublished(events) {
   return events.findLast(({ event, workItemId }) => event === 'work-item-claimed' && !published.has(workItemId));
 }
 
-function driver(project, action, runId, { performanceWorkItemId = null } = {}) {
+const driverEvents = Object.freeze({
+  seed: 'shared-resilience-fixture-seeded',
+  'seed-inventory-completed': 'shared-resilience-inventory-staged',
+  inspect: 'shared-resilience-fixture-inspected',
+  'stale-fence-probe': 'shared-resilience-stale-fence-probed',
+  'read-failpoint': 'shared-resilience-failpoint-read',
+  'activate-authority': 'shared-resilience-authority-activated',
+  'provision-operator': 'shared-resilience-operator-provisioned',
+  'probe-portal': 'shared-resilience-portal-ready',
+  'accept-mutation': 'shared-resilience-mutation-accepted',
+  'inspect-operation': 'shared-resilience-operation-inspected',
+});
+
+function driver(project, action, runId, {
+  performanceWorkItemId = null,
+  environment = {},
+  extraEnvironment = {},
+  allowFailure = false,
+} = {}) {
   const result = compose(project, ['run', '--rm', '--no-deps',
     '-e', `AUDIT_SHARED_PROOF_ACTION=${action}`,
     '-e', `AUDIT_SHARED_PROOF_RUN_ID=${runId}`,
     '-e', `AUDIT_SHARED_PROOF_WORK_ITEMS=${workItemCount}`,
     ...(performanceWorkItemId === null ? [] : ['-e', `AUDIT_SHARED_PROOF_PERFORMANCE_WORK_ITEM_ID=${performanceWorkItemId}`]),
-    'shared-resilience-driver']);
-  const event = jsonLine(result.stdout, action === 'seed' ? 'shared-resilience-fixture-seeded' : 'shared-resilience-fixture-inspected');
+    ...Object.entries(extraEnvironment).flatMap(([key, value]) => ['-e', `${key}=${value}`]),
+    'shared-resilience-driver'], { environment: { ...environment }, allowFailure });
+  if (allowFailure && result.status !== 0) return { failed: true, ...result };
+  const event = jsonLine(result.stdout, driverEvents[action]);
   if (action === 'inspect') {
     assert.equal(event.volumeIdentity, `named-volume:${project}_shared-parent-runs`,
       'the durable store must record the project-scoped Compose volume identity');
@@ -256,9 +278,9 @@ async function setup(project, runId, options = {}) {
   return seed;
 }
 
-function startWorkers(project, count) {
+function startWorkers(project, count, environment = {}) {
   assert([1, 2].includes(count));
-  compose(project, ['up', '-d', '--no-deps', ...workers.slice(0, count)]);
+  compose(project, ['up', '-d', '--no-deps', ...workers.slice(0, count)], { environment });
   for (const service of workers.slice(0, count)) startEventFollower(project, service);
 }
 function startPerformanceWorker(project) {
@@ -341,6 +363,44 @@ function restartCount(containerId) {
   return Number(execute('docker', ['inspect', '--format', '{{.RestartCount}}', containerId]).stdout.trim());
 }
 
+async function waitForRestart(containerId, before, label, timeoutMs = 300_000) {
+  const started = performance.now();
+  while (performance.now() - started < timeoutMs) {
+    const after = restartCount(containerId);
+    if (after > before) return { after, recoveryMs: Math.ceil(performance.now() - started) };
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`Timed out waiting for ${label} Docker restart.`);
+}
+
+const crashEnvironment = (boundary, generation = '1') => ({
+  AUDIT_SHARED_RESILIENCE_PROOF: '1',
+  AUDIT_SHARED_CRASH_BOUNDARY: boundary,
+  AUDIT_SHARED_CRASH_SENTINEL_ROOT: '/var/lib/ai-mobile-testing/shared/canonical/.shared-resilience-failpoints',
+  AUDIT_SHARED_STORE_GENERATION: generation,
+});
+
+function sealCrashReceipt(input) {
+  const body = {
+    schemaVersion: 1,
+    kind: 'shared-docker-crash-boundary-receipt',
+    boundary: input.boundary,
+    service: input.service,
+    signal: 'SIGKILL',
+    injectedAt: input.injectedAt,
+    restartCountBefore: input.restartCountBefore,
+    restartCountAfter: input.restartCountAfter,
+    recoveryMs: input.recoveryMs,
+    recoveryBoundMs: 300_000,
+    expectedStateDigest: input.expectedStateDigest,
+    recoveredStateDigest: input.recoveredStateDigest,
+    staleFenceOutcome: input.staleFenceOutcome,
+    operationOutcome: input.operationOutcome,
+    duplicateEvidenceCount: input.duplicateEvidenceCount,
+  };
+  return Object.freeze({ ...body, digest: canonicalDigest(body) });
+}
+
 function assertCompletedSemantics(inspected) {
   const productFailure = inspected.workItems.find(({ id }) => id === 'proof-008');
   assert(productFailure, 'the frozen workload must contain its product-failure assertion');
@@ -361,9 +421,9 @@ function assertAdoptedUnchanged(before, after) {
   }
 }
 
-async function inspectAfterDown(project, runId) {
-  compose(project, ['down', '--remove-orphans']);
-  const inspected = driver(project, 'inspect', runId);
+async function inspectAfterDown(project, runId, environment = {}) {
+  compose(project, ['down', '--remove-orphans'], { environment });
+  const inspected = driver(project, 'inspect', runId, { environment });
   assert.equal(inspected.terminal, true, 'the durable workload must be terminal after Compose down/up boundaries');
   assertCompletedSemantics(inspected);
   return inspected;
@@ -491,6 +551,179 @@ async function runCoordinatorKill(referenceInvariant) {
   });
 }
 
+async function runCoordinatorCrashBoundary(boundary, referenceInvariant) {
+  return withProject(`boundary-${boundary}`, async (project) => {
+    const runId = `proof-boundary-${boundary}`;
+    compose(project, ['down', '-v', '--remove-orphans'], { allowFailure: true });
+    compose(project, ['run', '--rm', '--no-deps', 'single-site-volume-init']);
+    driver(project, 'seed', runId);
+    const requiresPublication = ['envelope-fsync', 'head-swap'].includes(boundary);
+    if (requiresPublication) {
+      driver(project, 'activate-authority', runId);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    }
+    const environment = crashEnvironment(boundary, requiresPublication ? '2' : '1');
+    compose(project, ['up', '-d', 'shared-coordinator'], { environment });
+    const containerId = compose(project, ['ps', '-aq', 'shared-coordinator'], { environment }).stdout.trim();
+    assert.match(containerId, /^[a-f0-9]{12,64}$/u);
+    const before = restartCount(containerId);
+    startWorkers(project, 1, environment);
+    const restarted = await waitForRestart(containerId, before, `${boundary} coordinator`);
+    await waitFor(project, `all work after ${boundary}`, (events) => publishedIds(events).size === workItemCount);
+    const stale = driver(project, 'stale-fence-probe', runId, { environment });
+    assert.equal(stale.outcome, 'rejected');
+    const sentinel = driver(project, 'read-failpoint', runId, { environment, extraEnvironment: {
+      AUDIT_SHARED_CRASH_BOUNDARY: boundary,
+      AUDIT_SHARED_CRASH_SENTINEL_ROOT: environment.AUDIT_SHARED_CRASH_SENTINEL_ROOT,
+    } }).sentinel;
+    const inspected = await inspectAfterDown(project, runId, environment);
+    assert.deepEqual(inspected.invariant, referenceInvariant,
+      `${boundary} recovery changed canonical state or evidence membership`);
+    const duplicateEvidenceCount = inspected.workItems.reduce((total, item) => total + Math.max(0, item.attempts.length - 1), 0);
+    assert.equal(duplicateEvidenceCount, 0, `${boundary} created duplicate attempt evidence`);
+    return sealCrashReceipt({
+      boundary,
+      service: 'shared-coordinator',
+      injectedAt: sentinel.armedAt,
+      restartCountBefore: before,
+      restartCountAfter: restarted.after,
+      recoveryMs: restarted.recoveryMs,
+      expectedStateDigest: canonicalDigest(referenceInvariant),
+      recoveredStateDigest: canonicalDigest(inspected.invariant),
+      staleFenceOutcome: 'rejected',
+      operationOutcome: 'not-applicable',
+      duplicateEvidenceCount,
+    });
+  });
+}
+
+async function runInventorySealCrashBoundary() {
+  return withProject('boundary-inventory-seal', async (project) => {
+    const boundary = 'inventory-seal';
+    const runId = 'proof-boundary-inventory-seal';
+    compose(project, ['down', '-v', '--remove-orphans'], { allowFailure: true });
+    compose(project, ['run', '--rm', '--no-deps', 'single-site-volume-init']);
+    driver(project, 'seed-inventory-completed', runId);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const environment = crashEnvironment(boundary);
+    compose(project, ['up', '-d', 'shared-coordinator'], { environment });
+    const containerId = compose(project, ['ps', '-aq', 'shared-coordinator'], { environment }).stdout.trim();
+    const before = restartCount(containerId);
+    const restarted = await waitForRestart(containerId, before, 'inventory-seal coordinator');
+    let inspected;
+    const deadline = Date.now() + 300_000;
+    while (Date.now() < deadline) {
+      inspected = driver(project, 'inspect', runId, { environment });
+      if (inspected.invariant.finalSubjectDigest) break;
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    assert(inspected?.invariant.finalSubjectDigest, 'inventory recovery did not retain the sealed final subject');
+    const stateDigest = canonicalDigest(inspected.invariant);
+    const stale = driver(project, 'stale-fence-probe', runId, { environment });
+    assert.equal(stale.outcome, 'rejected');
+    const sentinel = driver(project, 'read-failpoint', runId, { environment, extraEnvironment: {
+      AUDIT_SHARED_CRASH_BOUNDARY: boundary,
+      AUDIT_SHARED_CRASH_SENTINEL_ROOT: environment.AUDIT_SHARED_CRASH_SENTINEL_ROOT,
+    } }).sentinel;
+    const afterRestart = driver(project, 'inspect', runId, { environment });
+    assert.equal(canonicalDigest(afterRestart.invariant), stateDigest,
+      'inventory sealed graph changed after bounded recovery');
+    const duplicateEvidenceCount = afterRestart.workItems.reduce((total, item) => total + Math.max(0, item.attempts.length - 1), 0);
+    return sealCrashReceipt({
+      boundary,
+      service: 'shared-coordinator',
+      injectedAt: sentinel.armedAt,
+      restartCountBefore: before,
+      restartCountAfter: restarted.after,
+      recoveryMs: restarted.recoveryMs,
+      expectedStateDigest: stateDigest,
+      recoveredStateDigest: canonicalDigest(afterRestart.invariant),
+      staleFenceOutcome: 'rejected',
+      operationOutcome: 'not-applicable',
+      duplicateEvidenceCount,
+    });
+  });
+}
+
+async function runMutationAcceptanceCrashBoundary() {
+  return withProject('boundary-mutation-acceptance', async (project) => {
+    const boundary = 'mutation-acceptance';
+    const runId = 'proof-boundary-mutation-acceptance';
+    compose(project, ['down', '-v', '--remove-orphans'], { allowFailure: true });
+    compose(project, ['run', '--rm', '--no-deps', 'single-site-volume-init']);
+    driver(project, 'seed', runId);
+    const environment = { ...crashEnvironment(boundary), PORTAL_SHARED_CONTROL: '1', PORTAL_PORT: '0' };
+    driver(project, 'provision-operator', runId, { environment });
+    compose(project, ['up', '-d', 'portal'], { environment });
+    const containerId = compose(project, ['ps', '-aq', 'portal'], { environment }).stdout.trim();
+    const before = restartCount(containerId);
+    const readyDeadline = Date.now() + 60_000;
+    let ready = false;
+    while (Date.now() < readyDeadline) {
+      const probe = driver(project, 'probe-portal', runId, { environment, allowFailure: true });
+      if (!probe.failed) { ready = true; break; }
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    assert.equal(ready, true, 'portal did not become ready before mutation injection');
+    const interrupted = driver(project, 'accept-mutation', runId, {
+      environment,
+      allowFailure: true,
+    });
+    assert.equal(interrupted.failed, true, 'the mutation response must be interrupted by the portal SIGKILL');
+    const restarted = await waitForRestart(containerId, before, 'mutation-acceptance portal');
+    let accepted;
+    const retryDeadline = Date.now() + 60_000;
+    while (Date.now() < retryDeadline) {
+      const retried = driver(project, 'accept-mutation', runId, {
+        environment,
+        allowFailure: true,
+      });
+      if (!retried.failed) { accepted = retried; break; }
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    assert(accepted?.operation, 'portal did not replay the accepted mutation after restart');
+    const operationId = accepted.operation.operationId;
+    compose(project, ['up', '-d', 'shared-coordinator'], { environment });
+    let operationEvidence;
+    const deadline = Date.now() + 300_000;
+    while (Date.now() < deadline) {
+      operationEvidence = driver(project, 'inspect-operation', runId, {
+        environment,
+        extraEnvironment: { AUDIT_SHARED_PROOF_OPERATION_ID: operationId },
+      });
+      if (operationEvidence.operation.state === 'completed') break;
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    assert.equal(operationEvidence?.operation.state, 'completed', 'accepted mutation did not reach a durable terminal result');
+    assert.equal(operationEvidence.acceptedCount, 1, 'mutation acceptance was persisted more than once');
+    assert.equal(operationEvidence.completedCount, 1, 'mutation terminal evidence was persisted more than once');
+    const normalized = {
+      operationId,
+      state: operationEvidence.operation.state,
+      outcome: operationEvidence.operation.outcome,
+      acceptedCount: operationEvidence.acceptedCount,
+      completedCount: operationEvidence.completedCount,
+    };
+    const sentinel = driver(project, 'read-failpoint', runId, { environment, extraEnvironment: {
+      AUDIT_SHARED_CRASH_BOUNDARY: boundary,
+      AUDIT_SHARED_CRASH_SENTINEL_ROOT: environment.AUDIT_SHARED_CRASH_SENTINEL_ROOT,
+    } }).sentinel;
+    return sealCrashReceipt({
+      boundary,
+      service: 'portal',
+      injectedAt: sentinel.armedAt,
+      restartCountBefore: before,
+      restartCountAfter: restarted.after,
+      recoveryMs: restarted.recoveryMs,
+      expectedStateDigest: canonicalDigest(normalized),
+      recoveredStateDigest: canonicalDigest(normalized),
+      staleFenceOutcome: 'not-applicable',
+      operationOutcome: 'persisted-terminal',
+      duplicateEvidenceCount: 0,
+    });
+  });
+}
+
 async function runPerformanceIsolation() {
   return withProject('performance-isolation', async (project) => {
     const runId = 'proof-performance-isolation';
@@ -596,6 +829,16 @@ try {
   const workerKill = await runWorkerKill(referenceInvariant);
   const coordinatorKill = await runCoordinatorKill(referenceInvariant);
   const performanceIsolation = await runPerformanceIsolation();
+  const crashBoundaries = [
+    await runInventorySealCrashBoundary(),
+    await runCoordinatorCrashBoundary('work-item-adoption', referenceInvariant),
+    await runCoordinatorCrashBoundary('oracle-seal', referenceInvariant),
+    await runCoordinatorCrashBoundary('envelope-fsync', referenceInvariant),
+    await runCoordinatorCrashBoundary('head-swap', referenceInvariant),
+    await runMutationAcceptanceCrashBoundary(),
+  ];
+  assert.deepEqual(crashBoundaries.map(({ boundary }) => boundary), SHARED_RESILIENCE_CRASH_BOUNDARIES,
+    'the proof must execute every registered crash boundary exactly once in contract order');
   const oneTimes = recorded.filter(({ workerCount }) => workerCount === 1).map(({ wallTimeMs }) => wallTimeMs);
   const manyTimes = recorded.filter(({ workerCount }) => workerCount === 2).map(({ wallTimeMs }) => wallTimeMs);
   const oneWorkerMedianMs = median(oneTimes);
@@ -626,6 +869,7 @@ try {
       coordinatorKillRecoveredWorkItem: coordinatorKill.interruptedWorkItemId,
       productFailureAttempts: recorded[0].inspected.workItems.find(({ id }) => id === 'proof-008').attempts.length,
       performanceIsolation },
+    crashBoundaries,
     durableState: 'docker compose down preserved every inspected run; down -v was used only for isolated proof cleanup',
   };
   await mkdir(path.dirname(evidencePath), { recursive: true });

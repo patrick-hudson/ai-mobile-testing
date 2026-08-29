@@ -23,4 +23,9 @@ export declare function createSharedControlService(options: {
     withMutationAdmission<T>(kind: string, requestId: string, operation: () => Promise<T>): Promise<T>;
   } | null;
   reprobeTargetIdentity?: ((input: { runId: string; subjectCore: any; finalSubject: any }) => Promise<any>) | null;
+  afterOracleSeal?: (input: { runId: string; oracleResultsDigest: string }) => Promise<void> | void;
+  publicationHooks?: {
+    afterEnvelopePersist?: (envelope: any) => Promise<void> | void;
+    afterDecisionPersist?: (envelope: any) => Promise<void> | void;
+  };
 }): SharedControlService;

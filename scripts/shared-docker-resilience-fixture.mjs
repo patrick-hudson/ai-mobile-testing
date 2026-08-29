@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { canonicalDigest } from '../shared/canonical-contract.mjs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -5,6 +7,8 @@ import { sealExecutionManifest } from '../shared/execution-contract.mjs';
 import { sealFinalReleaseSubject, sealReleaseSubjectCore } from '../shared/release-subject.mjs';
 import { resolveRunnerRevision, runnerRevisionDigest } from '../shared/runner-revision.mjs';
 import { sealWorkExecutionDescriptor } from '../shared/work-execution-descriptor.mjs';
+import { compileSharedLaunchPlan } from '../shared/launch-plan-compiler.mjs';
+import { openScopedCredentialAuthority } from '../portal/scoped-credential-authority.mjs';
 import {
   SHARED_DOCKER_RESILIENCE_CASES,
   SHARED_DOCKER_RESILIENCE_ORIGIN,
@@ -14,10 +18,21 @@ import {
 } from '../shared/shared-docker-resilience-contract.mjs';
 import {
   createParentRun,
+  acquireStoreCoordinator,
+  adoptAttemptEvidence,
+  claimWorkItem,
+  getOperationById,
+  heartbeatCoordinator,
   openParentRunStore,
+  publishAttemptEvidence,
   readAdoptedAttemptArtifactJson,
   readParentRun,
+  readReleaseAuthoritySelector,
+  readRunHistories,
+  readStoreCoordinator,
+  transitionReleaseAuthority,
 } from './lib/parent-run-store.mjs';
+import { readSharedResilienceCrashSentinel } from './lib/shared-resilience-failpoint.mjs';
 import { readTrustedStoreMarker, sharedStoreBuildIdentity, sharedStoreGeneration, sharedStoreRollbackBuilds } from './lib/shared-store-runtime.mjs';
 
 const required = (name) => {
@@ -27,6 +42,7 @@ const required = (name) => {
 };
 const action = required('AUDIT_SHARED_PROOF_ACTION');
 const runId = required('AUDIT_SHARED_PROOF_RUN_ID');
+if (!/^[A-Za-z0-9._-]{1,128}$/u.test(runId)) throw new Error('AUDIT_SHARED_PROOF_RUN_ID is invalid.');
 const workItemCount = Number(process.env.AUDIT_SHARED_PROOF_WORK_ITEMS ?? 6);
 const performanceWorkItemId = process.env.AUDIT_SHARED_PROOF_PERFORMANCE_WORK_ITEM_ID ?? null;
 if (!Number.isSafeInteger(workItemCount) || workItemCount < 2 || workItemCount > 8) {
@@ -157,6 +173,129 @@ if (action === 'seed') {
     executionManifestDigest: executionManifest.digest,
     finalSubjectDigest: finalSubject.digest,
   })}\n`);
+} else if (action === 'seed-inventory-completed') {
+  const [pluginRegistry, targetRegistry] = await Promise.all([
+    readFile(new URL('../audit/plugins.generated.json', import.meta.url), 'utf8').then(JSON.parse),
+    readFile(new URL('../audit/targets.generated.json', import.meta.url), 'utf8').then(JSON.parse),
+  ]);
+  const fixtureDigest = SHARED_DOCKER_RESILIENCE_WORKLOAD_DIGEST;
+  const deploymentIdentity = { kind: 'target-preflight-set', value: fixtureDigest };
+  const launch = compileSharedLaunchPlan({
+    intent: { schemaVersion: 1, runContract: {
+      schemaVersion: 1,
+      mode: 'single-site',
+      url: SHARED_DOCKER_RESILIENCE_ORIGIN,
+      deploymentRole: 'preview',
+      certificatePolicy: 'strict',
+      targetIds: [SHARED_DOCKER_RESILIENCE_TARGET_ID],
+      scope: { qualifier: 'TARGETED', pluginIds: [], auditIds: ['A11Y-001'], areas: [] },
+    } },
+    pluginRegistry,
+    targetRegistry,
+    runnerRevision: fixtureDigest,
+    configurationRevision: fixtureDigest,
+    environmentRevision: fixtureDigest,
+    deploymentIdentity,
+  });
+  await createParentRun(store, { runId, ...launch.createParentRunInput });
+  const coordinator = await acquireStoreCoordinator(store, { ownerId: 'proof-inventory-seeder', leaseMs: 100 });
+  // The proof driver owns the only coordinator fence while staging the
+  // completed inventory barrier. Use the normal claim API so the adoption is
+  // indistinguishable from a real inventory worker publication.
+  const claimed = await claimWorkItem(store, runId, coordinator, {
+    workerId: 'proof-inventory-seeder', capabilities: ['inventory:http'], resourceClasses: ['ordinary'], leaseMs: 10_000,
+  });
+  const inventoryDocument = {
+    schemaVersion: 1,
+    kind: 'shared-single-site-inventory-result',
+    workItemId: claimed.workItemId,
+    executionDescriptorDigest: claimed.executionDescriptorDigest,
+    deploymentIdentityRecheck: deploymentIdentity,
+    preflight: { accepted: true },
+    diagnostic: { inventory: {
+      schemaVersion: 1,
+      origin: SHARED_DOCKER_RESILIENCE_ORIGIN,
+      routes: [{
+        url: `${SHARED_DOCKER_RESILIENCE_ORIGIN}/`, path: '/', query: '', disposition: 'included',
+        sources: [{ source: 'catalog', from: null, depth: 0 }],
+      }],
+      limitations: [], failures: [],
+    } },
+  };
+  const inventoryBytes = Buffer.from(`${JSON.stringify(inventoryDocument)}\n`);
+  const inbox = await publishAttemptEvidence(store, runId, claimed, {
+    outcome: 'completed_pass',
+    executionDescriptorDigest: claimed.executionDescriptorDigest,
+    artifacts: [{
+      name: 'inventory/live-route-inventory.json', mediaType: 'application/json', sizeBytes: inventoryBytes.length,
+      digest: `sha256:${createHash('sha256').update(inventoryBytes).digest('hex')}`,
+      contentBase64: inventoryBytes.toString('base64'),
+    }],
+  });
+  await adoptAttemptEvidence(store, runId, coordinator, inbox);
+  process.stdout.write(`${JSON.stringify({ event: 'shared-resilience-inventory-staged', runId })}\n`);
+} else if (action === 'stale-fence-probe') {
+  const current = await readStoreCoordinator(store);
+  if (current === null || current.epoch < 2) throw new Error('Recovered coordinator did not advance its fence.');
+  let outcome = 'accepted';
+  try {
+    await heartbeatCoordinator(store, { ...current, epoch: current.epoch - 1 }, { leaseMs: 100 });
+  } catch (error) {
+    if (error?.code !== 'STALE_COORDINATOR') throw error;
+    outcome = 'rejected';
+  }
+  process.stdout.write(`${JSON.stringify({ event: 'shared-resilience-stale-fence-probed', runId, outcome, currentEpoch: current.epoch })}\n`);
+} else if (action === 'activate-authority') {
+  const coordinator = await acquireStoreCoordinator(store, { ownerId: 'proof-authority-activator', leaseMs: 100 });
+  const shadow = await readReleaseAuthoritySelector(store);
+  const draining = await transitionReleaseAuthority(store, coordinator, {
+    expectedSelectorDigest: shadow.digest, phase: 'DRAINING', buildIdentity,
+  });
+  const active = await transitionReleaseAuthority(store, coordinator, {
+    expectedSelectorDigest: draining.digest, phase: 'ACTIVE', activationRevision: 1, buildIdentity,
+  });
+  process.stdout.write(`${JSON.stringify({ event: 'shared-resilience-authority-activated', runId, selector: active })}\n`);
+} else if (action === 'read-failpoint') {
+  const boundary = required('AUDIT_SHARED_CRASH_BOUNDARY');
+  const sentinel = await readSharedResilienceCrashSentinel(boundary, {
+    root: required('AUDIT_SHARED_CRASH_SENTINEL_ROOT'),
+  });
+  process.stdout.write(`${JSON.stringify({ event: 'shared-resilience-failpoint-read', runId, sentinel })}\n`);
+} else if (action === 'provision-operator') {
+  const credentialRoot = required('AUDIT_SHARED_CREDENTIAL_ROOT');
+  const authority = await openScopedCredentialAuthority({ root: credentialRoot });
+  const issued = await authority.createPrincipal({
+    id: `proof-operator-${runId}`, kind: 'human', roles: ['operator'],
+    projectIds: [process.env.AUDIT_SHARED_PROJECT_ID ?? 'default'], runIds: [runId],
+  });
+  const proofRoot = path.join(credentialRoot, '.resilience-proof');
+  await mkdir(proofRoot, { recursive: true, mode: 0o700 });
+  await writeFile(path.join(proofRoot, `${runId}.credential`), issued.credential, { mode: 0o600, flag: 'wx' });
+  process.stdout.write(`${JSON.stringify({ event: 'shared-resilience-operator-provisioned', runId })}\n`);
+} else if (action === 'probe-portal') {
+  const response = await fetch('http://portal:4173/healthz');
+  if (response.status !== 200) throw new Error(`Portal health returned ${response.status}.`);
+  process.stdout.write(`${JSON.stringify({ event: 'shared-resilience-portal-ready', runId })}\n`);
+} else if (action === 'accept-mutation') {
+  const credential = await readFile(path.join(
+    required('AUDIT_SHARED_CREDENTIAL_ROOT'), '.resilience-proof', `${runId}.credential`,
+  ), 'utf8');
+  const response = await fetch(`http://portal:4173/api/control/v1/runs/${encodeURIComponent(runId)}/cancel`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${credential}`, 'content-type': 'application/json', 'idempotency-key': 'resilience-cancel-0001' },
+    body: JSON.stringify({ expectedRunRevision: 1, reason: 'Resilience proof mutation.' }),
+  });
+  const body = await response.json();
+  if (response.status !== 202) throw new Error(`Mutation returned ${response.status}: ${JSON.stringify(body)}`);
+  process.stdout.write(`${JSON.stringify({ event: 'shared-resilience-mutation-accepted', runId, operation: body.data })}\n`);
+} else if (action === 'inspect-operation') {
+  const operation = await getOperationById(store, runId, required('AUDIT_SHARED_PROOF_OPERATION_ID'));
+  const histories = await readRunHistories(store, runId);
+  process.stdout.write(`${JSON.stringify({
+    event: 'shared-resilience-operation-inspected', runId, operation,
+    acceptedCount: histories.operation.filter(({ type }) => type === 'operation-accepted').length,
+    completedCount: histories.operation.filter(({ type, data }) => type === 'operation-completed' && data?.operationId === operation.operationId).length,
+  })}\n`);
 } else if (action === 'inspect') {
   const state = await readParentRun(store, runId);
   const workItems = [];
@@ -170,7 +309,7 @@ if (action === 'seed') {
       ? null
       : item.attempts.find((attempt) => attempt.attempt === item.canonicalResult.attempt);
     let evidence = null;
-    if (canonicalAttempt) {
+    if (canonicalAttempt?.artifacts.some(({ logicalName }) => logicalName === 'playwright/work-item-evidence-index.json')) {
       const index = await readAdoptedAttemptArtifactJson(store, runId, {
         workItemId: item.id,
         name: 'playwright/work-item-evidence-index.json',
@@ -248,5 +387,5 @@ if (action === 'seed') {
     workItems,
   })}\n`);
 } else {
-  throw new Error('AUDIT_SHARED_PROOF_ACTION must be seed or inspect.');
+  throw new Error('AUDIT_SHARED_PROOF_ACTION is unsupported.');
 }

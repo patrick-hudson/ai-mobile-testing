@@ -22,6 +22,7 @@ import {
   targetPreflightInputsForSubject,
 } from '../shared/target-preflight-set.mjs';
 import { readTrustedStoreMarker, sharedStoreBuildIdentity, sharedStoreGeneration, sharedStoreRollbackBuilds } from './lib/shared-store-runtime.mjs';
+import { maybeCrashAtSharedResilienceBoundary } from './lib/shared-resilience-failpoint.mjs';
 
 const required = (name) => {
   const value = process.env[name];
@@ -95,6 +96,11 @@ const controlService = createSharedControlService({
       : {};
     return (await probeTargetPreflightSet(inputs, { preflightOptions })).identity;
   },
+  afterOracleSeal: () => maybeCrashAtSharedResilienceBoundary('oracle-seal'),
+  publicationHooks: {
+    afterEnvelopePersist: () => maybeCrashAtSharedResilienceBoundary('envelope-fsync'),
+    afterDecisionPersist: () => maybeCrashAtSharedResilienceBoundary('head-swap'),
+  },
 });
 const credentialAuthority = await openScopedCredentialAuthority({ root: required('AUDIT_SHARED_CREDENTIAL_ROOT') });
 const projectId = process.env.AUDIT_SHARED_PROJECT_ID ?? 'default';
@@ -111,6 +117,7 @@ const supervisor = createSharedCoordinatorSupervisor({
   workLeaseMs: leaseMs,
   pluginRegistry,
   targetRegistry,
+  afterInventorySeal: () => maybeCrashAtSharedResilienceBoundary('inventory-seal'),
   onEvent: (event) => process.stdout.write(`${JSON.stringify(event)}\n`),
 });
 let maintenance = Promise.resolve();
@@ -223,6 +230,7 @@ const server = http.createServer(async (request, response) => {
         artifacts: [],
       });
       const adopted = await adoptAttemptEvidence(store, leaseRunId, coordinator, inbox);
+      await maybeCrashAtSharedResilienceBoundary('work-item-adoption');
       return json(response, 202, { workItemId: adopted.id, state: adopted.state, canonicalResult: adopted.canonicalResult });
     }
     if (requestUrl.pathname === '/v1/result-finalize') {
@@ -235,6 +243,7 @@ const server = http.createServer(async (request, response) => {
         intentDigest: body.intentDigest,
       });
       const adopted = await adoptAttemptEvidence(store, leaseRunId, coordinator, inbox);
+      await maybeCrashAtSharedResilienceBoundary('work-item-adoption');
       return json(response, 202, { workItemId: adopted.id, state: adopted.state, canonicalResult: adopted.canonicalResult });
     }
     if (requestUrl.pathname === '/v1/log') {

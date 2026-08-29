@@ -13,6 +13,7 @@ import { compileSharedLaunchPlan } from '../shared/launch-plan-compiler.mjs';
 const root = await mkdtemp(path.join(tmpdir(), 'shared-coordinator-supervisor-'));
 const digest = (character) => `sha256:${character.repeat(64)}`;
 let now = Date.parse('2026-08-29T12:00:00.000Z');
+const inventorySealHooks = [];
 try {
   const [pluginRegistry, targetRegistry] = await Promise.all([
     readFile(new URL('../audit/plugins.generated.json', import.meta.url), 'utf8').then(JSON.parse),
@@ -34,6 +35,7 @@ try {
     workLeaseMs: 1_000,
     pluginRegistry,
     targetRegistry,
+    afterInventorySeal: (input) => { inventorySealHooks.push(input); },
   });
   assert.deepEqual(await supervisor.maintain(), {
     state: 'ready', epoch: 1, runCount: 0, requeued: 0, completedOperations: 0, sealedGraphs: 0,
@@ -131,6 +133,8 @@ try {
   await adoptAttemptEvidence(store, 'run-inventory', supervisor.coordinator(), inbox);
   const sealed = await supervisor.maintain();
   assert.equal(sealed.sealedGraphs, 1);
+  assert.equal(inventorySealHooks.length, 1);
+  assert.equal(inventorySealHooks[0].runId, 'run-inventory');
   const sealedState = await readParentRun(store, 'run-inventory');
   assert.equal(sealedState.compilationState, 'sealed');
   assert(sealedState.finalSubjectDigest);

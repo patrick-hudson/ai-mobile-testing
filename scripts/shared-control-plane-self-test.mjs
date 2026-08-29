@@ -553,11 +553,13 @@ try {
   }), (error) => error?.code === 'VISUAL_REVIEW_INVALID');
   const publicationBeforeRejectedText = await readCurrentEnvelope(reopenedStore, 'run-projection');
   const revisionBeforeRejectedText = projectionState.runRevision;
+  const mutationAcceptanceHooks = [];
   const projectionMutationApi = createSharedControlApi({
     authority,
     service: projectionControl,
     claimStore: await openPromotionClaimStore({ root: path.join(root, 'projection-mutation-claims'), clock }),
     expectedOrigin: 'https://audit.example.test',
+    afterMutationAccepted: (input) => { mutationAcceptanceHooks.push(input); },
   });
   const rejectedApiMutation = await projectionMutationApi.handle({
     method: 'POST', url: '/api/control/v1/runs/run-projection/visual/disposition',
@@ -606,6 +608,8 @@ try {
     'rejected publication text must not advance the run or its ledgers');
   assert.equal((await readCurrentEnvelope(reopenedStore, 'run-projection')).digest, publicationBeforeRejectedText.digest,
     'rejected publication text must not advance the canonical publication head');
+  assert.equal(mutationAcceptanceHooks.length, 0,
+    'rejected mutations must never reach the post-acceptance crash boundary');
 
   const defectOperation = await projectionControl.acceptMutation(projectionReviewer, 'run-projection', {
     kind: 'visual-disposition', requestId: 'visual-defect-0001', expectedRunRevision: projectionState.runRevision,
@@ -637,10 +641,24 @@ try {
   const decisionRevisionBeforeRisk = projectedHead.decisionRevision;
   const riskRevisionBefore = projectedHead.riskRevision;
   projectionState = await recoverParentRun(reopenedStore, 'run-projection');
-  await projectionControl.acceptMutation(projectionReviewer, 'run-projection', {
-    kind: 'risk-acknowledge', requestId: 'risk-acknowledge-0003', expectedRunRevision: projectionState.runRevision,
-    body: { expectedSubjectDigest: projection.finalSubject.digest, riskIdentity: manualRisk.identity },
+  const acceptedRiskMutation = await projectionMutationApi.handle({
+    method: 'POST', url: '/api/control/v1/runs/run-projection/risks/acknowledge',
+    headers: {
+      authorization: `Bearer ${projectionReviewerIssued.credential}`,
+      'content-type': 'application/json',
+      'idempotency-key': 'risk-acknowledge-0003',
+    },
+    body: {
+      expectedRunRevision: projectionState.runRevision,
+      expectedSubjectDigest: projection.finalSubject.digest,
+      riskIdentity: manualRisk.identity,
+    },
   });
+  assert.equal(acceptedRiskMutation.status, 202, JSON.stringify(acceptedRiskMutation.body));
+  assert.equal(mutationAcceptanceHooks.length, 1);
+  assert.equal(mutationAcceptanceHooks[0].runId, 'run-projection');
+  assert.equal(mutationAcceptanceHooks[0].kind, 'risk-acknowledge');
+  assert.equal(mutationAcceptanceHooks[0].operation.state, 'accepted');
   const riskApplyResults = await projectionControl.applyAcceptedOperations(coordinator, 'run-projection');
   assert.equal(riskApplyResults[0].outcome.status, 'succeeded', JSON.stringify(riskApplyResults[0].outcome));
   projectedHead = await readCurrentEnvelope(reopenedStore, 'run-projection');
