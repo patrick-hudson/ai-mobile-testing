@@ -191,6 +191,30 @@ services:
     volumes:
       - shared-parent-runs:/var/lib/ai-mobile-testing/shared/canonical
 
+  shadow-validation:
+    build:
+      context: .
+      target: audit-source
+      args:
+        PLAYWRIGHT_VERSION: ${PLAYWRIGHT_VERSION:-1.62.1}
+        INSTALL_MSEDGE: "0"
+    image: quitting7oh-shadow-validation:${AUDIT_IMAGE_TAG:-local}
+    profiles: [shadow-validation]
+    init: true
+    user: "${AUDIT_HOST_UID:-1000}:${AUDIT_HOST_GID:-1000}"
+    healthcheck:
+      disable: true
+    command: ["npm", "run", "shadow-validation:container"]
+    restart: "no"
+    read_only: true
+    network_mode: "none"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    volumes:
+      - ./artifacts/shadow-validation:/work/artifacts/shadow-validation
+
   shared-worker-ordinary-a:
     <<: *audit-base
     profiles: [shared-runner]
