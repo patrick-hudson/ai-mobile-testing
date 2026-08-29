@@ -16,6 +16,7 @@ import { createSharedControlService } from './lib/shared-control-service.mjs';
 import { createSharedCoordinatorSupervisor } from './lib/shared-coordinator-supervisor.mjs';
 import { openScopedCredentialAuthority } from '../portal/scoped-credential-authority.mjs';
 import { assertPrincipalAuthorized, CONTROL_ACTIONS } from '../shared/control-plane-contract.mjs';
+import { readTrustedStoreMarker, sharedStoreBuildIdentity, sharedStoreGeneration, sharedStoreRollbackBuilds } from './lib/shared-store-runtime.mjs';
 
 const required = (name) => {
   const value = process.env[name];
@@ -53,10 +54,19 @@ const leaseMs = boundedInteger('AUDIT_SHARED_LEASE_MS', 30_000, 1_000, 3_600_000
 const coordinatorLeaseMs = boundedInteger('AUDIT_SHARED_COORDINATOR_LEASE_MS', 60_000, 5_000, 3_600_000);
 const uploadTimeoutMs = boundedInteger('AUDIT_SHARED_UPLOAD_TIMEOUT_MS', 20 * 60_000, 30_000, 3_600_000);
 const port = boundedInteger('AUDIT_SHARED_COORDINATOR_PORT', 4_180, 1_024, 65_535);
+const storeMarker = await readTrustedStoreMarker(required('AUDIT_SHARED_STORE_MARKER_FILE'));
+const backupMarker = await readTrustedStoreMarker(required('AUDIT_SHARED_BACKUP_MARKER_FILE'), 'shared backup marker');
+const buildIdentity = sharedStoreBuildIdentity();
 const store = await openParentRunStore({
   root: required('AUDIT_SHARED_STORE_ROOT'),
   deploymentIdentity: required('AUDIT_SHARED_DEPLOYMENT_IDENTITY'),
   volumeIdentity: required('AUDIT_SHARED_VOLUME_IDENTITY'),
+  storeMarker,
+  storeGeneration: sharedStoreGeneration(),
+  expectedStoreGeneration: sharedStoreGeneration(),
+  buildIdentity,
+  backupMarker,
+  prequalifiedRollbackBuilds: sharedStoreRollbackBuilds(process.env, buildIdentity),
 });
 const controlService = createSharedControlService({ store, projectId: process.env.AUDIT_SHARED_PROJECT_ID ?? 'default' });
 const credentialAuthority = await openScopedCredentialAuthority({ root: required('AUDIT_SHARED_CREDENTIAL_ROOT') });

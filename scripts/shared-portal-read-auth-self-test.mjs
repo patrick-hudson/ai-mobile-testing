@@ -33,8 +33,14 @@ try {
   const queue = path.join(root, 'queue');
   const finalizations = path.join(root, 'finalizations');
   const baselines = path.join(root, 'baselines');
+  const sharedStoreMarker = '12'.repeat(32);
+  const sharedBackupMarker = '34'.repeat(32);
+  const sharedStoreMarkerFile = path.join(store, '.trusted-store-marker');
+  const sharedBackupMarkerFile = path.join(store, '.trusted-backup-marker');
   const timestamp = '2026-08-29T12:00:00.000Z';
-  await Promise.all([artifacts, sharded, secrets, queue, finalizations, baselines].map((directory) => mkdir(directory, { recursive: true })));
+  await Promise.all([artifacts, sharded, secrets, queue, finalizations, baselines, store].map((directory) => mkdir(directory, { recursive: true })));
+  await writeFile(sharedStoreMarkerFile, `${sharedStoreMarker}\n`, { mode: 0o600 });
+  await writeFile(sharedBackupMarkerFile, `${sharedBackupMarker}\n`, { mode: 0o600 });
   for (const runId of ['run-a-0001', 'run-b-0002']) {
     const directory = path.join(artifacts, runId);
     await mkdir(path.join(directory, 'logs'), { recursive: true });
@@ -58,6 +64,8 @@ try {
     root: store,
     deploymentIdentity: 'self-test:shared-portal',
     volumeIdentity: 'named-volume:self-test-shared-portal',
+    storeMarker: sharedStoreMarker,
+    backupMarker: sharedBackupMarker,
     verifyStorage: false,
   });
   const sharedRunId = 'shared-op-0001';
@@ -165,6 +173,8 @@ try {
     PORTAL_VISUAL_BASELINE_ROOT: baselines,
     PORTAL_SHARED_CREDENTIAL_ROOT: credentials,
     AUDIT_SHARED_STORE_ROOT: store,
+    AUDIT_SHARED_STORE_MARKER_FILE: sharedStoreMarkerFile,
+    AUDIT_SHARED_BACKUP_MARKER_FILE: sharedBackupMarkerFile,
     AUDIT_SHARED_DEPLOYMENT_IDENTITY: 'self-test:shared-portal',
     AUDIT_SHARED_VOLUME_IDENTITY: 'named-volume:self-test-shared-portal',
     AUDIT_SHARED_PROJECT_ID: 'project-1',

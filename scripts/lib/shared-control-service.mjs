@@ -67,6 +67,10 @@ export function createSharedControlService({ store, projectId = 'default' } = {}
       assertPrincipalAuthorized(principal, CONTROL_ACTIONS.PROMOTION_CONSUME, object(runId));
       return withCurrentEnvelopeFence(store, runId, callback);
     },
+    async withReleaseAssertionFence(principal, runId, callback) {
+      assertPrincipalAuthorized(principal, CONTROL_ACTIONS.RELEASE_ASSERT, object(runId));
+      return withCurrentEnvelopeFence(store, runId, callback);
+    },
     async readExecutions(principal, runId) {
       assertPrincipalAuthorized(principal, CONTROL_ACTIONS.RUN_VIEW, object(runId));
       const state = await readParentRun(store, runId);

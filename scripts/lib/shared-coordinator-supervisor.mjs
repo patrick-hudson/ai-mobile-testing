@@ -17,7 +17,7 @@ import {
 } from '../../shared/execution-graph-compiler.mjs';
 import { scheduleCanonicalWorkItems } from '../../shared/launch-plan-compiler.mjs';
 
-const PROJECTION_PENDING_CODES = new Set(['PUBLICATION_UNAVAILABLE', 'SEALED_MANIFEST_MISSING']);
+const PROJECTION_PENDING_CODES = new Set(['PUBLICATION_UNAVAILABLE', 'SEALED_MANIFEST_MISSING', 'RELEASE_AUTHORITY_INACTIVE']);
 
 function fail(code, message, statusCode = 503) {
   throw new ControlPlaneError(code, message, statusCode);

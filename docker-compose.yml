@@ -28,6 +28,7 @@ services:
     volumes:
       - single-site-jobs:/var/lib/ai-mobile-testing/jobs
       - shared-parent-runs:/var/lib/ai-mobile-testing/shared/canonical
+      - shared-store-trust:/var/lib/ai-mobile-testing/shared/trust
       - shared-worker-exchange:/var/lib/ai-mobile-testing/shared/exchange
       - shared-control-identities:/var/lib/ai-mobile-testing/shared/credentials
       - shared-worker-ordinary-a-secret:/var/lib/ai-mobile-testing/shared/secrets/ordinary-a
@@ -62,8 +63,13 @@ services:
       PORTAL_VISUAL_BASELINE_ROOT: /var/lib/ai-mobile-testing/baselines
       PORTAL_SHARED_CREDENTIAL_ROOT: /var/lib/ai-mobile-testing/shared/credentials
       AUDIT_SHARED_STORE_ROOT: /var/lib/ai-mobile-testing/shared/canonical
+      AUDIT_SHARED_STORE_MARKER_FILE: /var/lib/ai-mobile-testing/shared/trust/store-marker
+      AUDIT_SHARED_BACKUP_MARKER_FILE: /var/lib/ai-mobile-testing/shared/trust/backup-marker
       AUDIT_SHARED_DEPLOYMENT_IDENTITY: ${AUDIT_SHARED_DEPLOYMENT_IDENTITY:-compose:ai-mobile-testing}
       AUDIT_SHARED_VOLUME_IDENTITY: named-volume:shared-parent-runs
+      AUDIT_SHARED_BUILD_IDENTITY: ${AUDIT_SHARED_BUILD_IDENTITY:-build:quitting7oh-release-audit-local}
+      AUDIT_SHARED_PREQUALIFIED_ROLLBACK_BUILDS: ${AUDIT_SHARED_PREQUALIFIED_ROLLBACK_BUILDS:-build:quitting7oh-release-audit-local}
+      AUDIT_SHARED_STORE_GENERATION: ${AUDIT_SHARED_STORE_GENERATION:-1}
       AUDIT_SHARED_PROJECT_ID: ${AUDIT_SHARED_PROJECT_ID:-default}
       AUDIT_PREVIEW_TLS_BYPASS_ALLOWLIST: ${AUDIT_PREVIEW_TLS_BYPASS_ALLOWLIST:-}
       ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-5}
@@ -77,6 +83,7 @@ services:
       - single-site-finalizations:/var/lib/ai-mobile-testing/finalizations
       - single-site-baselines:/var/lib/ai-mobile-testing/baselines
       - shared-parent-runs:/var/lib/ai-mobile-testing/shared/canonical
+      - shared-store-trust:/var/lib/ai-mobile-testing/shared/trust:ro
       - shared-control-identities:/var/lib/ai-mobile-testing/shared/credentials
 
   single-site-worker:
@@ -138,9 +145,14 @@ services:
         condition: service_completed_successfully
     environment:
       AUDIT_SHARED_STORE_ROOT: /var/lib/ai-mobile-testing/shared/canonical
+      AUDIT_SHARED_STORE_MARKER_FILE: /var/lib/ai-mobile-testing/shared/trust/store-marker
+      AUDIT_SHARED_BACKUP_MARKER_FILE: /var/lib/ai-mobile-testing/shared/trust/backup-marker
       AUDIT_SHARED_EXCHANGE_ROOT: /var/lib/ai-mobile-testing/shared/exchange
       AUDIT_SHARED_DEPLOYMENT_IDENTITY: ${AUDIT_SHARED_DEPLOYMENT_IDENTITY:-compose:ai-mobile-testing}
       AUDIT_SHARED_VOLUME_IDENTITY: ${AUDIT_SHARED_VOLUME_IDENTITY:-named-volume:shared-parent-runs}
+      AUDIT_SHARED_BUILD_IDENTITY: ${AUDIT_SHARED_BUILD_IDENTITY:-build:quitting7oh-release-audit-local}
+      AUDIT_SHARED_PREQUALIFIED_ROLLBACK_BUILDS: ${AUDIT_SHARED_PREQUALIFIED_ROLLBACK_BUILDS:-build:quitting7oh-release-audit-local}
+      AUDIT_SHARED_STORE_GENERATION: ${AUDIT_SHARED_STORE_GENERATION:-1}
       AUDIT_SHARED_COORDINATOR_PORT: "4180"
       AUDIT_SHARED_LEASE_MS: ${AUDIT_SHARED_LEASE_MS:-30000}
       AUDIT_SHARED_COORDINATOR_LEASE_MS: ${AUDIT_SHARED_COORDINATOR_LEASE_MS:-60000}
@@ -149,6 +161,7 @@ services:
       AUDIT_SHARED_PROJECT_ID: ${AUDIT_SHARED_PROJECT_ID:-default}
     volumes:
       - shared-parent-runs:/var/lib/ai-mobile-testing/shared/canonical
+      - shared-store-trust:/var/lib/ai-mobile-testing/shared/trust:ro
       - shared-worker-exchange:/var/lib/ai-mobile-testing/shared/exchange
       - shared-control-identities:/var/lib/ai-mobile-testing/shared/credentials
 
@@ -186,10 +199,16 @@ services:
     restart: "no"
     environment:
       AUDIT_SHARED_STORE_ROOT: /var/lib/ai-mobile-testing/shared/canonical
+      AUDIT_SHARED_STORE_MARKER_FILE: /var/lib/ai-mobile-testing/shared/trust/store-marker
+      AUDIT_SHARED_BACKUP_MARKER_FILE: /var/lib/ai-mobile-testing/shared/trust/backup-marker
       AUDIT_SHARED_DEPLOYMENT_IDENTITY: ${AUDIT_SHARED_DEPLOYMENT_IDENTITY:-compose:ai-mobile-testing}
       AUDIT_SHARED_VOLUME_IDENTITY: ${AUDIT_SHARED_VOLUME_IDENTITY:-named-volume:shared-parent-runs}
+      AUDIT_SHARED_BUILD_IDENTITY: ${AUDIT_SHARED_BUILD_IDENTITY:-build:quitting7oh-release-audit-local}
+      AUDIT_SHARED_PREQUALIFIED_ROLLBACK_BUILDS: ${AUDIT_SHARED_PREQUALIFIED_ROLLBACK_BUILDS:-build:quitting7oh-release-audit-local}
+      AUDIT_SHARED_STORE_GENERATION: ${AUDIT_SHARED_STORE_GENERATION:-1}
     volumes:
       - shared-parent-runs:/var/lib/ai-mobile-testing/shared/canonical
+      - shared-store-trust:/var/lib/ai-mobile-testing/shared/trust:ro
 
   shadow-validation:
     build:
@@ -453,6 +472,7 @@ volumes:
   single-site-finalizations:
   single-site-baselines:
   shared-parent-runs:
+  shared-store-trust:
   shared-worker-exchange:
   shared-control-identities:
   shared-worker-ordinary-a-secret:

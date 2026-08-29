@@ -36,6 +36,7 @@ import {
 } from '../scripts/lib/parent-run-store.mjs';
 import { createSharedControlService } from '../scripts/lib/shared-control-service.mjs';
 import { openPromotionClaimStore } from '../scripts/lib/promotion-claim-store.mjs';
+import { readTrustedStoreMarker, sharedStoreBuildIdentity, sharedStoreGeneration, sharedStoreRollbackBuilds } from '../scripts/lib/shared-store-runtime.mjs';
 import {
   openSharedLaunchOperationStore,
 } from '../scripts/lib/shared-launch-operation-store.mjs';
@@ -541,10 +542,19 @@ if (process.env.PORTAL_SHARED_CONTROL === '1') {
     sessionSecure: process.env.PORTAL_SESSION_SECURE === '1',
   });
   legacyOperatorEnabled = deployment.local;
+  const storeMarker = await readTrustedStoreMarker(process.env.AUDIT_SHARED_STORE_MARKER_FILE);
+  const backupMarker = await readTrustedStoreMarker(process.env.AUDIT_SHARED_BACKUP_MARKER_FILE, 'shared backup marker');
+  const buildIdentity = sharedStoreBuildIdentity();
   const controlStore = await openParentRunStore({
     root: process.env.AUDIT_SHARED_STORE_ROOT,
     deploymentIdentity: process.env.AUDIT_SHARED_DEPLOYMENT_IDENTITY,
     volumeIdentity: process.env.AUDIT_SHARED_VOLUME_IDENTITY,
+    storeMarker,
+    storeGeneration: sharedStoreGeneration(),
+    expectedStoreGeneration: sharedStoreGeneration(),
+    buildIdentity,
+    backupMarker,
+    prequalifiedRollbackBuilds: sharedStoreRollbackBuilds(process.env, buildIdentity),
   });
   sharedParentRunStore = controlStore;
   const credentialAuthority = await openScopedCredentialAuthority({
@@ -605,7 +615,7 @@ if (process.env.PORTAL_SHARED_CONTROL === '1') {
           schemaVersion: 1,
           deploymentIdentity: controlStore.manifest.deploymentIdentity,
           volumeIdentity: controlStore.manifest.volumeIdentity,
-          writerProtocol: controlStore.manifest.writerProtocol,
+          writerProtocol: controlStore.manifest.currentWriterProtocol,
           runnerRevision: singleSiteRunnerRevision,
         }),
         deploymentIdentity,

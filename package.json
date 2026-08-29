@@ -104,6 +104,7 @@
     "shared-work-dispatcher:self-test": "node scripts/shared-work-dispatcher-self-test.mjs",
     "shared-coordinator-supervisor:self-test": "node scripts/shared-coordinator-supervisor-self-test.mjs",
     "shared-first-publication:self-test": "node scripts/shared-first-publication-self-test.mjs",
+    "shared-authority-selector:self-test": "node scripts/shared-authority-selector-self-test.mjs",
     "shadow-validation": "node scripts/run-shadow-validation.mjs",
     "shadow-validation:container": "node scripts/run-shadow-validation.mjs --output shadow-validation.json",
     "shadow-validation:self-test": "node scripts/shadow-validation-self-test.mjs",

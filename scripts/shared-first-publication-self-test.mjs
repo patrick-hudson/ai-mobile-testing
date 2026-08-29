@@ -18,6 +18,8 @@ import {
   publishAttemptEvidence,
   readCurrentEnvelope,
   readParentRun,
+  readReleaseAuthoritySelector,
+  transitionReleaseAuthority,
 } from './lib/parent-run-store.mjs';
 
 const digest = (character) => `sha256:${character.repeat(64)}`;
@@ -92,6 +94,7 @@ try {
     root,
     deploymentIdentity: 'shared-first-publication-test',
     volumeIdentity: 'named-volume:shared-first-publication-test',
+    backupMarker: 'backup:shared-first-publication-test',
     verifyStorage: false,
     clock: () => now,
   });
@@ -106,6 +109,18 @@ try {
   });
   const startupMaintenance = await supervisor.maintain();
   assert.deepEqual(startupMaintenance.errors, [], JSON.stringify(startupMaintenance.errors));
+  const shadowSelector = await readReleaseAuthoritySelector(store);
+  const drainingSelector = await transitionReleaseAuthority(store, supervisor.coordinator(), {
+    expectedSelectorDigest: shadowSelector.digest,
+    phase: 'DRAINING',
+    buildIdentity: store.buildIdentity,
+  });
+  await transitionReleaseAuthority(store, supervisor.coordinator(), {
+    expectedSelectorDigest: drainingSelector.digest,
+    phase: 'ACTIVE',
+    activationRevision: 1,
+    buildIdentity: store.buildIdentity,
+  });
 
   const launch = compileSharedLaunchPlan({
     intent: { schemaVersion: 1, runContract: {

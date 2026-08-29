@@ -26,12 +26,12 @@ export interface ReportPublicationReadOptions {
 export function loadSharedReleasePublication(
   storeRoot: string,
   runId: string,
-  options?: { filesystem?: typeof import('node:fs/promises'); verifyStorage?: boolean },
+  options?: { filesystem?: typeof import('node:fs/promises'); verifyStorage?: boolean; storeMarker?: string; expectedStoreGeneration?: number; writerProtocol?: string; buildIdentity?: string },
 ): Promise<import('../shared/publication-envelope.mjs').PublicationEnvelope>;
 export function loadSharedReleaseProjection(
   storeRoot: string,
   runId: string,
-  options?: { filesystem?: typeof import('node:fs/promises'); verifyStorage?: boolean },
+  options?: { filesystem?: typeof import('node:fs/promises'); verifyStorage?: boolean; storeMarker?: string; expectedStoreGeneration?: number; writerProtocol?: string; buildIdentity?: string },
 ): Promise<import('../shared/release-projection.mjs').PublicationView>;
 
 export function loadReportPublication(

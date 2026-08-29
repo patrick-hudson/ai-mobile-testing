@@ -36,9 +36,11 @@ import {
   readAllLedgers,
 } from './durable-ledger.mjs';
 
-export const PARENT_RUN_STORE_SCHEMA_VERSION = 1;
+export const PARENT_RUN_STORE_SCHEMA_VERSION = 2;
 export const PARENT_RUN_WRITER_PROTOCOL = 'single-coordinator-global-performance-v2';
+export const RELEASE_AUTHORITY_PHASES = Object.freeze(['SHADOW', 'DRAINING', 'ACTIVE', 'PROMOTION_DISABLED']);
 const SAFE_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,127})$/;
+const STORE_MARKER = /^[a-f0-9]{64}$/;
 const LOCAL_VOLUME_DRIVERS = new Set(['local']);
 const WORK_OUTCOMES = new Set([
   'completed_pass', 'completed_product_failure', 'operational_failure', 'cancelled', 'incomplete_unknown',
@@ -353,29 +355,55 @@ function nextTimestamp(store, previous) {
 
 function manifestBody(value) {
   return {
-    schemaVersion: 1,
+    schemaVersion: PARENT_RUN_STORE_SCHEMA_VERSION,
     kind: 'durable-parent-run-store',
     deploymentIdentity: value.deploymentIdentity,
     volumeIdentity: value.volumeIdentity,
     volumeDriver: value.volumeDriver,
-    authorityEpoch: value.authorityEpoch,
-    writerProtocol: value.writerProtocol,
+    storeMarkerDigest: value.storeMarkerDigest,
+    storeGeneration: value.storeGeneration,
+    schemaFloor: value.schemaFloor,
+    currentWriterProtocol: value.currentWriterProtocol,
+    minimumWriterProtocol: value.minimumWriterProtocol,
+    coordinatorEpoch: value.coordinatorEpoch,
+    activationEpoch: value.activationEpoch,
+    activationRevision: value.activationRevision,
     createdAt: value.createdAt,
     cutoverRevision: value.cutoverRevision,
     backupMarker: value.backupMarker,
+    prequalifiedRollbackBuilds: value.prequalifiedRollbackBuilds,
   };
 }
 
-function validateManifest(value) {
-  if (value?.schemaVersion !== 1 || value.kind !== 'durable-parent-run-store'
+function validateManifest(value, { supportedSchemaVersion, writerProtocol } = {}) {
+  if (value?.schemaVersion !== PARENT_RUN_STORE_SCHEMA_VERSION || value.kind !== 'durable-parent-run-store'
     || typeof value.deploymentIdentity !== 'string' || !value.deploymentIdentity
     || typeof value.volumeIdentity !== 'string' || !value.volumeIdentity
     || !LOCAL_VOLUME_DRIVERS.has(value.volumeDriver)
-    || value.writerProtocol !== PARENT_RUN_WRITER_PROTOCOL
-    || !Number.isSafeInteger(value.authorityEpoch) || value.authorityEpoch < 0
+    || !DIGEST_PATTERN.test(value.storeMarkerDigest)
+    || !Number.isSafeInteger(value.storeGeneration) || value.storeGeneration < 1
+    || !Number.isSafeInteger(value.schemaFloor) || value.schemaFloor < 1
+    || typeof value.currentWriterProtocol !== 'string' || !value.currentWriterProtocol
+    || typeof value.minimumWriterProtocol !== 'string' || !value.minimumWriterProtocol
+    || !Number.isSafeInteger(value.coordinatorEpoch) || value.coordinatorEpoch < 0
+    || !Number.isSafeInteger(value.activationEpoch) || ![0, 1].includes(value.activationEpoch)
+    || (value.activationRevision !== null && (!Number.isSafeInteger(value.activationRevision) || value.activationRevision < 1))
+    || (value.activationEpoch === 0 && value.activationRevision !== null)
+    || (value.activationEpoch === 1 && value.activationRevision === null)
     || !Number.isSafeInteger(value.cutoverRevision) || value.cutoverRevision < 0
+    || (value.backupMarker !== null && (typeof value.backupMarker !== 'string' || !value.backupMarker))
+    || !Array.isArray(value.prequalifiedRollbackBuilds)
+    || value.prequalifiedRollbackBuilds.length < 1
+    || value.prequalifiedRollbackBuilds.some((entry) => typeof entry !== 'string' || !entry)
+    || new Set(value.prequalifiedRollbackBuilds).size !== value.prequalifiedRollbackBuilds.length
     || canonicalDigest(manifestBody(value)) !== value.digest) {
     fail('STORE_MANIFEST_INVALID', 'Parent-run store manifest is invalid or corrupt.');
+  }
+  if (value.schemaFloor > supportedSchemaVersion) {
+    fail('STORE_SCHEMA_FLOOR_UNSUPPORTED', 'This build cannot open the durable store schema floor.');
+  }
+  if (writerProtocol !== value.currentWriterProtocol || writerProtocol !== value.minimumWriterProtocol) {
+    fail('STORE_WRITER_INCOMPATIBLE', 'This build writer protocol is incompatible with the durable store.');
   }
   return value;
 }
@@ -409,6 +437,132 @@ function globalLockPath(store) {
 
 function globalCoordinatorPath(store) {
   return containedPath(store.root, 'coordinator.json');
+}
+
+function authoritySelectorPath(store) {
+  return containedPath(store.root, 'release-authority-selector.json');
+}
+
+function authorityActivationIntentPath(store) {
+  return containedPath(store.root, 'release-authority-activation-intent.json');
+}
+
+function selectorBody(value) {
+  return {
+    schemaVersion: 1,
+    kind: 'release-authority-selector',
+    storeMarkerDigest: value.storeMarkerDigest,
+    storeGeneration: value.storeGeneration,
+    phase: value.phase,
+    activationEpoch: value.activationEpoch,
+    activationRevision: value.activationRevision,
+    activatedAt: value.activatedAt,
+    activeWriterProtocol: value.activeWriterProtocol,
+    minimumWriterProtocol: value.minimumWriterProtocol,
+    activeBuildIdentity: value.activeBuildIdentity,
+    backupMarker: value.backupMarker,
+    prequalifiedRollbackBuilds: value.prequalifiedRollbackBuilds,
+    revision: value.revision,
+    previousDigest: value.previousDigest,
+    updatedAt: value.updatedAt,
+  };
+}
+
+function sealAuthoritySelector(value) {
+  const body = selectorBody(value);
+  return { ...body, digest: canonicalDigest(body) };
+}
+
+function validateAuthoritySelector(store, value) {
+  const body = selectorBody(value ?? {});
+  if (value?.schemaVersion !== 1 || value.kind !== 'release-authority-selector'
+    || value.storeMarkerDigest !== store.manifest.storeMarkerDigest
+    || value.storeGeneration !== store.manifest.storeGeneration
+    || !RELEASE_AUTHORITY_PHASES.includes(value.phase)
+    || value.activationEpoch !== store.manifest.activationEpoch
+    || value.activationRevision !== store.manifest.activationRevision
+    || (value.activationRevision !== null && (!Number.isSafeInteger(value.activationRevision) || value.activationRevision < 1))
+    || (value.activatedAt !== null && typeof value.activatedAt !== 'string')
+    || (value.activeWriterProtocol !== null && typeof value.activeWriterProtocol !== 'string')
+    || value.minimumWriterProtocol !== store.manifest.minimumWriterProtocol
+    || (value.activeBuildIdentity !== null && typeof value.activeBuildIdentity !== 'string')
+    || value.backupMarker !== store.manifest.backupMarker
+    || canonicalJson(value.prequalifiedRollbackBuilds) !== canonicalJson(store.manifest.prequalifiedRollbackBuilds)
+    || !Number.isSafeInteger(value.revision) || value.revision < 1
+    || (value.previousDigest !== null && !DIGEST_PATTERN.test(value.previousDigest))
+    || typeof value.updatedAt !== 'string'
+    || canonicalDigest(body) !== value.digest) {
+    fail('AUTHORITY_SELECTOR_INVALID', 'Release-authority selector is invalid, stale, or corrupt.');
+  }
+  const activated = ['ACTIVE', 'PROMOTION_DISABLED'].includes(value.phase);
+  if ((activated && (value.activationEpoch !== 1 || value.activationRevision === null
+    || value.activatedAt === null || value.activeWriterProtocol !== store.manifest.currentWriterProtocol
+    || value.activeBuildIdentity === null))
+    || (!activated && (value.activationEpoch !== 0 || value.activationRevision !== null
+      || value.activatedAt !== null || value.activeWriterProtocol !== null || value.activeBuildIdentity !== null))) {
+    fail('AUTHORITY_SELECTOR_INVALID', 'Release-authority selector activation fields disagree with its phase.');
+  }
+  return value;
+}
+
+async function readAuthoritySelectorUnlocked(store) {
+  let selector;
+  try {
+    selector = await readBoundedJson(store.storage, authoritySelectorPath(store), { label: 'release-authority selector' });
+  } catch (error) {
+    if (error?.code === 'ATOMIC_NOT_FOUND') fail('AUTHORITY_SELECTOR_INVALID', 'Release-authority selector is missing.');
+    throw error;
+  }
+  try {
+    return validateAuthoritySelector(store, selector);
+  } catch (error) {
+    if (error?.code !== 'AUTHORITY_SELECTOR_INVALID' || store.manifest.activationEpoch !== 1) throw error;
+    let intent;
+    try {
+      intent = await readBoundedJson(store.storage, authorityActivationIntentPath(store), { label: 'release-authority activation intent' });
+    } catch (intentError) {
+      if (intentError?.code === 'ATOMIC_NOT_FOUND') throw error;
+      throw intentError;
+    }
+    const { digest, ...body } = intent ?? {};
+    if (intent?.schemaVersion !== 1 || intent.kind !== 'release-authority-activation-intent'
+      || !DIGEST_PATTERN.test(intent.fromSelectorDigest)
+      || intent.storeGeneration !== store.manifest.storeGeneration
+      || intent.activationRevision !== store.manifest.activationRevision
+      || intent.selector?.digest !== intent.toSelectorDigest
+      || digest !== canonicalDigest(body)) {
+      fail('AUTHORITY_SELECTOR_INVALID', 'Interrupted release-authority activation intent is corrupt.');
+    }
+    const recovered = validateAuthoritySelector(store, intent.selector);
+    if (recovered.phase !== 'ACTIVE' || recovered.previousDigest !== intent.fromSelectorDigest) {
+      fail('AUTHORITY_SELECTOR_INVALID', 'Interrupted release-authority activation cannot recover a non-active selector.');
+    }
+    await atomicWriteJson(store.storage, authoritySelectorPath(store), recovered);
+    await store.storage.fs.rm(authorityActivationIntentPath(store), { force: true });
+    return recovered;
+  }
+}
+
+function authorityBinding(store, selector) {
+  const body = {
+    storeMarkerDigest: store.manifest.storeMarkerDigest,
+    storeGeneration: store.manifest.storeGeneration,
+    activationEpoch: selector.activationEpoch,
+    writerProtocol: store.manifest.currentWriterProtocol,
+  };
+  return Object.freeze({ ...body, digest: canonicalDigest(body) });
+}
+
+async function requireActiveAuthority(store) {
+  const selector = await readAuthoritySelectorUnlocked(store);
+  if (selector.phase !== 'ACTIVE') {
+    fail('RELEASE_AUTHORITY_INACTIVE', `Direct release authority requires ACTIVE; current phase is ${selector.phase}.`);
+  }
+  if (!selector.prequalifiedRollbackBuilds.includes(store.buildIdentity)
+    || selector.activeWriterProtocol !== store.manifest.currentWriterProtocol) {
+    fail('STORE_WRITER_INCOMPATIBLE', 'The active selector does not authorize this build and writer protocol.');
+  }
+  return { selector, binding: authorityBinding(store, selector) };
 }
 
 function performanceSchedulerPath(store) {
@@ -457,7 +611,7 @@ async function readGlobalCoordinator(store) {
   if (value.schemaVersion !== 1 || value.kind !== 'global-coordinator-lease'
     || !SAFE_ID.test(value.ownerId) || !SAFE_ID.test(value.token)
     || !Number.isSafeInteger(value.epoch) || value.epoch < 1
-    || value.epoch > store.manifest.authorityEpoch + 1
+    || value.epoch > store.manifest.coordinatorEpoch
     || canonicalTimestamp(value.acquiredAt, 'coordinator acquiredAt') >= canonicalTimestamp(value.expiresAt, 'coordinator expiresAt')
     || digest !== canonicalDigest(body)) {
     fail('STORE_CORRUPT', 'Global coordinator lease is invalid or corrupt.');
@@ -601,6 +755,7 @@ async function recoverUnlocked(store, runId, { repairCache = true } = {}) {
   const latest = events.at(-1);
   const snapshot = latest.stateSnapshot;
   snapshot.authorityTombstone ??= null;
+  snapshot.currentPublicationAuthorityBinding ??= null;
   snapshot.compilationBarrier ??= null;
   snapshot.inventoryBarrierPlan ??= null;
   snapshot.sealedCompileRiskInputs ??= null;
@@ -747,7 +902,15 @@ export async function openParentRunStore({
   deploymentIdentity,
   volumeIdentity,
   volumeDriver = 'local',
+  storeMarker = null,
+  storeGeneration = 1,
+  expectedStoreGeneration = null,
+  schemaFloor = PARENT_RUN_STORE_SCHEMA_VERSION,
+  supportedSchemaVersion = PARENT_RUN_STORE_SCHEMA_VERSION,
   writerProtocol = PARENT_RUN_WRITER_PROTOCOL,
+  minimumWriterProtocol = PARENT_RUN_WRITER_PROTOCOL,
+  buildIdentity = `build:${PARENT_RUN_WRITER_PROTOCOL}`,
+  prequalifiedRollbackBuilds = [buildIdentity],
   backupMarker = null,
   cutoverRevision = 0,
   verifyStorage = true,
@@ -756,20 +919,50 @@ export async function openParentRunStore({
   if (!LOCAL_VOLUME_DRIVERS.has(volumeDriver)) {
     fail('STORE_VOLUME_UNSUPPORTED', 'Only a Docker Engine local named volume is supported.');
   }
+  if (storeMarker !== null && !STORE_MARKER.test(storeMarker)) {
+    fail('STORE_MARKER_INVALID', 'Configured store marker must be 32 random bytes encoded as lowercase hex.');
+  }
+  if (!Number.isSafeInteger(storeGeneration) || storeGeneration < 1
+    || (expectedStoreGeneration !== null && (!Number.isSafeInteger(expectedStoreGeneration) || expectedStoreGeneration < 1))) {
+    fail('STORE_SCHEMA_INVALID', 'Store generation is invalid.');
+  }
+  if (!Number.isSafeInteger(schemaFloor) || schemaFloor < 1
+    || !Number.isSafeInteger(supportedSchemaVersion) || supportedSchemaVersion < 1) {
+    fail('STORE_SCHEMA_INVALID', 'Store schema floor or supported schema version is invalid.');
+  }
+  if (schemaFloor > supportedSchemaVersion) {
+    fail('STORE_SCHEMA_FLOOR_UNSUPPORTED', 'This build cannot initialize a durable store above its supported schema floor.');
+  }
+  if (writerProtocol !== minimumWriterProtocol) {
+    fail('STORE_WRITER_INCOMPATIBLE', 'The initializing writer protocol must satisfy the durable store minimum.');
+  }
+  if (typeof buildIdentity !== 'string' || !buildIdentity
+    || !Array.isArray(prequalifiedRollbackBuilds) || prequalifiedRollbackBuilds.length < 1
+    || prequalifiedRollbackBuilds.some((entry) => typeof entry !== 'string' || !entry)) {
+    fail('STORE_SCHEMA_INVALID', 'Build identity and prequalified rollback builds are required.');
+  }
   const storage = await openAtomicStorage({ root, filesystem, nonce, verify: verifyStorage });
   await storage.fs.mkdir(containedPath(storage.root, 'runs'), { recursive: true, mode: 0o2770 });
   const manifestPath = containedPath(storage.root, 'store-manifest.json');
   const schedulerPath = containedPath(storage.root, 'performance-scheduler.json');
-  const store = { root: storage.root, storage, clock, manifest: null };
+  const store = { root: storage.root, storage, clock, manifest: null, buildIdentity };
   ARTIFACT_INTEGRITY_CACHES.set(store, new Map());
   await withDirectoryLock(storage, containedPath(storage.root, '.store-initialization.lock'), async () => {
     const existingStore = await pathExists(storage.fs, manifestPath);
     if (existingStore) {
-      const manifest = validateManifest(await readBoundedJson(storage, manifestPath, { label: 'store manifest' }));
+      const manifest = validateManifest(await readBoundedJson(storage, manifestPath, { label: 'store manifest' }), {
+        supportedSchemaVersion, writerProtocol,
+      });
       if ((deploymentIdentity && deploymentIdentity !== manifest.deploymentIdentity)
         || (volumeIdentity && volumeIdentity !== manifest.volumeIdentity)
-        || volumeDriver !== manifest.volumeDriver || writerProtocol !== manifest.writerProtocol) {
-        fail('STORE_IDENTITY_MISMATCH', 'Configured deployment, volume, or writer identity does not match the durable store.');
+        || volumeDriver !== manifest.volumeDriver) {
+        fail('STORE_IDENTITY_MISMATCH', 'Configured deployment or volume identity does not match the durable store.');
+      }
+      if (storeMarker !== null && canonicalDigest({ storeMarker }) !== manifest.storeMarkerDigest) {
+        fail('STORE_MARKER_MISMATCH', 'Configured trusted marker does not match the durable store.');
+      }
+      if (expectedStoreGeneration !== null && expectedStoreGeneration !== manifest.storeGeneration) {
+        fail('STORE_GENERATION_MISMATCH', 'Configured store generation does not match the durable store.');
       }
       store.manifest = manifest;
     } else {
@@ -779,10 +972,40 @@ export async function openParentRunStore({
       if (!volumeIdentity.startsWith('named-volume:')) {
         fail('STORE_VOLUME_UNSUPPORTED', 'Store volumeIdentity must identify a Docker named volume.');
       }
+      const trustedMarker = storeMarker ?? randomBytes(32).toString('hex');
       await writeManifest(store, {
-        deploymentIdentity, volumeIdentity, volumeDriver, writerProtocol, authorityEpoch: 0,
+        deploymentIdentity, volumeIdentity, volumeDriver,
+        storeMarkerDigest: canonicalDigest({ storeMarker: trustedMarker }), storeGeneration,
+        schemaFloor, currentWriterProtocol: writerProtocol, minimumWriterProtocol,
+        coordinatorEpoch: 0, activationEpoch: 0, activationRevision: null,
         createdAt: timestamp(store), cutoverRevision, backupMarker,
+        prequalifiedRollbackBuilds: [...new Set(prequalifiedRollbackBuilds)].sort(),
       });
+    }
+    const selectorPath = authoritySelectorPath(store);
+    if (!await pathExists(storage.fs, selectorPath)) {
+      if (existingStore) fail('AUTHORITY_SELECTOR_INVALID', 'Existing durable store is missing its release-authority selector.');
+      const initial = sealAuthoritySelector({
+        storeMarkerDigest: store.manifest.storeMarkerDigest,
+        storeGeneration: store.manifest.storeGeneration,
+        phase: 'SHADOW', activationEpoch: 0, activationRevision: null, activatedAt: null,
+        activeWriterProtocol: null, minimumWriterProtocol: store.manifest.minimumWriterProtocol,
+        activeBuildIdentity: null, backupMarker: store.manifest.backupMarker,
+        prequalifiedRollbackBuilds: store.manifest.prequalifiedRollbackBuilds,
+        revision: 1, previousDigest: null, updatedAt: timestamp(store),
+      });
+      await atomicWriteJson(storage, selectorPath, initial, { exclusive: true });
+    }
+    const openedSelector = await readAuthoritySelectorUnlocked(store);
+    if (['ACTIVE', 'PROMOTION_DISABLED'].includes(openedSelector.phase) && storeMarker === null) {
+      fail('STORE_MARKER_REQUIRED', 'Activated release authority requires the trusted external store marker.');
+    }
+    if (['ACTIVE', 'PROMOTION_DISABLED'].includes(openedSelector.phase) && expectedStoreGeneration === null) {
+      fail('STORE_GENERATION_REQUIRED', 'Activated release authority requires the configured store generation.');
+    }
+    if (['ACTIVE', 'PROMOTION_DISABLED'].includes(openedSelector.phase)
+      && !openedSelector.prequalifiedRollbackBuilds.includes(buildIdentity)) {
+      fail('STORE_BUILD_INCOMPATIBLE', 'This build is not prequalified to open the activated release-authority store.');
     }
     if (!await pathExists(storage.fs, schedulerPath)) {
       if (existingStore) {
@@ -892,6 +1115,7 @@ export async function createParentRun(store, input) {
       operations: {},
       authorityTombstone: null,
       currentPublicationDigest: null,
+      currentPublicationAuthorityBinding: null,
       ledgerSequences: { decision: 0, risk: 0, mutation: 1, operation: 0 },
       ledgerHeads: { decision: null, risk: null, mutation: null, operation: null },
     };
@@ -1020,7 +1244,7 @@ async function acquireStoreCoordinatorUnlocked(store, input, takeoverOnly) {
   const active = previous && Date.parse(previous.expiresAt) > store.clock();
   if (active) fail('COORDINATOR_LEASE_HELD', `Coordinator epoch ${previous.epoch} is still active.`);
   if (takeoverOnly && previous === null) fail('COORDINATOR_TAKEOVER_INVALID', 'No prior coordinator exists to take over.');
-  const epoch = Math.max(previous?.epoch ?? 0, store.manifest.authorityEpoch) + 1;
+  const epoch = Math.max(previous?.epoch ?? 0, store.manifest.coordinatorEpoch) + 1;
   const coordinator = {
     ownerId: input.ownerId,
     epoch,
@@ -1028,10 +1252,10 @@ async function acquireStoreCoordinatorUnlocked(store, input, takeoverOnly) {
     acquiredAt: timestamp(store),
     expiresAt: new Date(store.clock() + input.leaseMs).toISOString(),
   };
-  // Advance the manifest fence before publishing the lease. A crash may skip
-  // an epoch, but can never expose a lease newer than the durable authority
-  // epoch or allow a later coordinator to reuse the same epoch.
-  await writeManifest(store, { ...store.manifest, authorityEpoch: epoch });
+  // Advance the coordinator fence before publishing the lease. This sequence
+  // is deliberately independent from the one-time release activation epoch.
+  // A crash may skip a coordinator epoch but can never activate release truth.
+  await writeManifest(store, { ...store.manifest, coordinatorEpoch: epoch });
   await atomicWriteJson(store.storage, globalCoordinatorPath(store), sealCoordinatorLease(coordinator));
   return coordinator;
 }
@@ -1059,6 +1283,123 @@ export function takeOverStoreCoordinator(store, input) {
   return withDirectoryLock(store.storage, globalLockPath(store), async () => (
     clone(await acquireStoreCoordinatorUnlocked(store, input, true))
   ));
+}
+
+export async function readReleaseAuthoritySelector(store) {
+  return clone(await readAuthoritySelectorUnlocked(store));
+}
+
+export async function readReleaseAuthorityContext(store, { requireActive = false } = {}) {
+  const selector = await readAuthoritySelectorUnlocked(store);
+  if (requireActive && selector.phase !== 'ACTIVE') {
+    fail('RELEASE_AUTHORITY_INACTIVE', `Release authority requires ACTIVE; current phase is ${selector.phase}.`);
+  }
+  return Object.freeze({ selector: clone(selector), binding: authorityBinding(store, selector) });
+}
+
+export function transitionReleaseAuthority(store, coordinator, input = {}) {
+  return withDirectoryLock(store.storage, globalLockPath(store), async () => {
+    await validateCoordinator(store, coordinator);
+    const current = await readAuthoritySelectorUnlocked(store);
+    if (input.expectedSelectorDigest !== current.digest) {
+      fail('AUTHORITY_SELECTOR_CONFLICT', 'Release-authority selector changed before the requested transition.');
+    }
+    if (!RELEASE_AUTHORITY_PHASES.includes(input.phase)) {
+      fail('AUTHORITY_TRANSITION_INVALID', 'Requested release-authority phase is invalid.');
+    }
+    if (typeof input.buildIdentity !== 'string' || !input.buildIdentity) {
+      fail('AUTHORITY_TRANSITION_INVALID', 'Authority transition requires the exact build identity.');
+    }
+    if (input.buildIdentity !== store.buildIdentity) {
+      fail('STORE_WRITER_INCOMPATIBLE', 'Authority transition build identity does not match the opener.');
+    }
+    if (input.phase === current.phase) {
+      if (input.phase === 'ACTIVE'
+        && (input.activationRevision !== current.activationRevision
+          || input.buildIdentity !== current.activeBuildIdentity)) {
+        fail('AUTHORITY_TRANSITION_INVALID', 'Repeated activation does not match the durable activation.');
+      }
+      return clone(current);
+    }
+    const wasActivated = current.activationEpoch === 1;
+    const allowed = wasActivated
+      ? (current.phase === 'ACTIVE' && input.phase === 'PROMOTION_DISABLED')
+        || (current.phase === 'PROMOTION_DISABLED' && input.phase === 'ACTIVE')
+      : (current.phase === 'SHADOW' && input.phase === 'DRAINING')
+        || (current.phase === 'DRAINING' && ['SHADOW', 'ACTIVE'].includes(input.phase));
+    if (!allowed) {
+      fail('AUTHORITY_TRANSITION_INVALID', `Release authority cannot transition from ${current.phase} to ${input.phase}.`);
+    }
+    const activating = input.phase === 'ACTIVE';
+    const firstActivation = activating && !wasActivated;
+    const requestedActivationRevision = current.activationRevision ?? input.activationRevision;
+    if (activating && (!current.prequalifiedRollbackBuilds.includes(input.buildIdentity)
+      || current.backupMarker === null
+      || !Number.isSafeInteger(requestedActivationRevision) || requestedActivationRevision < 1)) {
+      fail('AUTHORITY_ACTIVATION_NOT_QUALIFIED', 'Activation requires a backup marker, activation revision, and prequalified shared-compatible build.');
+    }
+    const nextStoreGeneration = firstActivation ? store.manifest.storeGeneration + 1 : store.manifest.storeGeneration;
+    const next = sealAuthoritySelector({
+      ...current,
+      storeGeneration: nextStoreGeneration,
+      phase: input.phase,
+      activationEpoch: activating || wasActivated ? 1 : 0,
+      activationRevision: activating ? requestedActivationRevision : wasActivated ? current.activationRevision : null,
+      activatedAt: activating ? (current.activatedAt ?? timestamp(store)) : wasActivated ? current.activatedAt : null,
+      activeWriterProtocol: activating || wasActivated ? store.manifest.currentWriterProtocol : null,
+      activeBuildIdentity: activating ? input.buildIdentity : wasActivated ? current.activeBuildIdentity : null,
+      revision: current.revision + 1,
+      previousDigest: current.digest,
+      updatedAt: nextTimestamp(store, current.updatedAt),
+    });
+    await input.hooks?.beforeCommit?.(clone(next));
+    if (firstActivation) {
+      const intentBody = {
+        schemaVersion: 1,
+        kind: 'release-authority-activation-intent',
+        fromSelectorDigest: current.digest,
+        toSelectorDigest: next.digest,
+        storeGeneration: nextStoreGeneration,
+        activationRevision: requestedActivationRevision,
+        selector: next,
+        createdAt: timestamp(store),
+      };
+      const intentPath = authorityActivationIntentPath(store);
+      if (await pathExists(store.storage.fs, intentPath)) {
+        const staleIntent = await readBoundedJson(store.storage, intentPath, {
+          label: 'release-authority activation intent',
+        });
+        const { digest: staleIntentDigest, ...staleIntentBody } = staleIntent ?? {};
+        if (staleIntent?.schemaVersion !== 1 || staleIntent.kind !== 'release-authority-activation-intent'
+          || staleIntent.fromSelectorDigest !== current.digest
+          || staleIntent.toSelectorDigest !== staleIntent.selector?.digest
+          || staleIntent.storeGeneration !== nextStoreGeneration
+          || staleIntent.activationRevision !== requestedActivationRevision
+          || staleIntentDigest !== canonicalDigest(staleIntentBody)) {
+          fail('AUTHORITY_SELECTOR_INVALID', 'Interrupted pre-fence activation intent is corrupt or stale.');
+        }
+        // The manifest still carries activationEpoch=0, so this intent never
+        // crossed the durable activation fence. Under the singleton global
+        // lock it is safe to discard and retry from the unchanged selector.
+        await store.storage.fs.rm(intentPath);
+      }
+      await atomicWriteJson(store.storage, authorityActivationIntentPath(store), {
+        ...intentBody, digest: canonicalDigest(intentBody),
+      }, { exclusive: true });
+      await input.hooks?.afterActivationIntent?.(clone(next));
+      await writeManifest(store, {
+        ...store.manifest,
+        storeGeneration: nextStoreGeneration,
+        activationEpoch: 1,
+        activationRevision: requestedActivationRevision,
+      });
+      await input.hooks?.afterActivationFence?.(clone(next));
+    }
+    await atomicWriteJson(store.storage, authoritySelectorPath(store), next);
+    if (firstActivation) await store.storage.fs.rm(authorityActivationIntentPath(store), { force: true });
+    await input.hooks?.afterCommit?.(clone(next));
+    return clone(next);
+  });
 }
 
 export function acquireCoordinator(store, runId, input) {
@@ -2674,12 +3015,32 @@ async function readPublicationChain(store, runId, digest) {
   }
 }
 
+function publicationHeadDocument(runId, envelopeDigest, binding) {
+  const body = {
+    schemaVersion: 2,
+    kind: 'publication-head',
+    runId,
+    envelopeDigest,
+    authorityBinding: binding,
+  };
+  return { ...body, digest: canonicalDigest(body) };
+}
+
+function validatePublicationAuthorityBinding(store, selector, value) {
+  const expected = authorityBinding(store, selector);
+  if (canonicalJson(value) !== canonicalJson(expected)) {
+    fail('PUBLICATION_AUTHORITY_STALE', 'Publication head is bound to a stale store generation or activation epoch.');
+  }
+  return expected;
+}
+
 export async function publishCurrentEnvelope(store, runId, coordinator, envelopeValue, hooks = {}) {
   const envelope = parsePublicationEnvelope(envelopeValue);
   if (envelope.runId !== runId) fail('STORE_SCHEMA_INVALID', 'Publication envelope belongs to a different run.');
   return withDirectoryLock(store.storage, globalLockPath(store), () => withDirectoryLock(store.storage, lockPath(store, runId), async () => {
     const state = await recoverUnlocked(store, runId);
     await validateCoordinator(store, coordinator);
+    const { selector, binding } = await requireActiveAuthority(store);
     if (state.compilationState !== 'sealed' || !state.executionManifestDigest || !state.finalSubjectDigest) {
       fail('SEALED_MANIFEST_MISSING', 'Release authority is unavailable until the parent-run graph is sealed.');
     }
@@ -2702,9 +3063,9 @@ export async function publishCurrentEnvelope(store, runId, coordinator, envelope
     }
     if (state.currentPublicationDigest !== null && envelope.previousEnvelopeDigest !== state.currentPublicationDigest) {
       if (state.currentPublicationDigest === envelope.digest) {
-        await atomicWriteJson(store.storage, path.join(runDirectory(store, runId), 'publication-head.json'), {
-          schemaVersion: 1, kind: 'publication-head', runId, envelopeDigest: envelope.digest,
-        });
+        validatePublicationAuthorityBinding(store, selector, state.currentPublicationAuthorityBinding);
+        await atomicWriteJson(store.storage, path.join(runDirectory(store, runId), 'publication-head.json'),
+          publicationHeadDocument(runId, envelope.digest, binding));
         return envelope;
       }
       fail('PUBLICATION_HEAD_CONFLICT', 'Publication does not extend the current immutable envelope.');
@@ -2719,16 +3080,17 @@ export async function publishCurrentEnvelope(store, runId, coordinator, envelope
     await hooks.afterEnvelopePersist?.(envelope);
     const next = await appendMutationUnlocked(store, state, 'decision', 'publication-head-advanced', (candidate) => {
       candidate.currentPublicationDigest = envelope.digest;
-    }, { data: { envelopeDigest: envelope.digest, decisionRevision: envelope.decisionRevision } });
+      candidate.currentPublicationAuthorityBinding = binding;
+    }, { data: { envelopeDigest: envelope.digest, decisionRevision: envelope.decisionRevision, authorityBindingDigest: binding.digest } });
     await hooks.afterDecisionPersist?.(envelope);
-    await atomicWriteJson(store.storage, path.join(runDirectory(store, runId), 'publication-head.json'), {
-      schemaVersion: 1, kind: 'publication-head', runId, envelopeDigest: envelope.digest,
-    });
+    await atomicWriteJson(store.storage, path.join(runDirectory(store, runId), 'publication-head.json'),
+      publicationHeadDocument(runId, envelope.digest, binding));
     return parsePublicationEnvelope(await readPublicationByDigest(store, runId, next.currentPublicationDigest));
   }));
 }
 
 export async function readCurrentEnvelope(store, runId) {
+  const selector = await readAuthoritySelectorUnlocked(store);
   const state = await recoverUnlocked(store, runId);
   if (state.authorityTombstone !== null) {
     fail('RELEASE_AUTHORITY_TOMBSTONED', 'Parent run release authority was irreversibly tombstoned before purge.', state.authorityTombstone);
@@ -2741,7 +3103,18 @@ export async function readCurrentEnvelope(store, runId) {
     if (error?.code === 'ATOMIC_NOT_FOUND') head = null;
     else throw error;
   }
-  if (head !== null && (head?.schemaVersion !== 1 || head.kind !== 'publication-head' || head.runId !== runId)) {
+  if (head !== null) {
+    const { digest, ...body } = head ?? {};
+    if (head?.schemaVersion !== 2 || head.kind !== 'publication-head' || head.runId !== runId
+      || !DIGEST_PATTERN.test(head.envelopeDigest) || digest !== canonicalDigest(body)) {
+      fail('STORE_CORRUPT', 'Publication head is invalid.');
+    }
+  }
+  if (state.currentPublicationAuthorityBinding === null) {
+    fail('PUBLICATION_AUTHORITY_STALE', 'Publication has no durable release-authority binding.');
+  }
+  const binding = validatePublicationAuthorityBinding(store, selector, state.currentPublicationAuthorityBinding);
+  if (head !== null && canonicalJson(head.authorityBinding) !== canonicalJson(binding)) {
     fail('STORE_CORRUPT', 'Publication head is invalid.');
   }
   if (head?.envelopeDigest !== state.currentPublicationDigest) {
@@ -2749,9 +3122,7 @@ export async function readCurrentEnvelope(store, runId) {
     // that fsync but before the pointer rename, recovery completes only the
     // pointer swap after validating the entire immutable envelope chain.
     await readPublicationChain(store, runId, state.currentPublicationDigest);
-    head = {
-      schemaVersion: 1, kind: 'publication-head', runId, envelopeDigest: state.currentPublicationDigest,
-    };
+    head = publicationHeadDocument(runId, state.currentPublicationDigest, binding);
     await atomicWriteJson(store.storage, path.join(runDirectory(store, runId), 'publication-head.json'), head);
   }
   const current = (await readPublicationChain(store, runId, head.envelopeDigest)).at(-1);
@@ -2767,7 +3138,12 @@ export async function withCurrentEnvelopeFence(store, runId, callback) {
     const state = await recoverUnlocked(store, runId);
     if (state.authorityTombstone !== null) fail('RELEASE_AUTHORITY_TOMBSTONED', 'Parent run release authority is tombstoned.');
     if (state.currentPublicationDigest === null) fail('PUBLICATION_UNAVAILABLE', 'Parent run has no current publication.');
+    const selector = await readAuthoritySelectorUnlocked(store);
+    if (selector.phase !== 'ACTIVE') {
+      fail('RELEASE_AUTHORITY_INACTIVE', `Promotion consumption requires ACTIVE; current phase is ${selector.phase}.`);
+    }
+    validatePublicationAuthorityBinding(store, selector, state.currentPublicationAuthorityBinding);
     const current = (await readPublicationChain(store, runId, state.currentPublicationDigest)).at(-1);
-    return callback(current);
+    return callback(current, { selector: clone(selector), binding: authorityBinding(store, selector) });
   }));
 }

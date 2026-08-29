@@ -23,12 +23,14 @@ import {
   publishCurrentEnvelope,
   readCurrentEnvelope,
   readParentRun,
+  readReleaseAuthoritySelector,
   readRunHistories,
   recoverParentRun,
   requeueExpiredWork,
   sealParentRunGraph,
   takeOverCoordinator,
   takeOverStoreCoordinator,
+  transitionReleaseAuthority,
 } from './lib/parent-run-store.mjs';
 import { readLegacyRun } from './lib/legacy-run-adapter.mjs';
 import { loadSharedReleasePublication } from '../portal/report-publication.mjs';
@@ -39,6 +41,7 @@ import { sealFinalReleaseSubject, sealReleaseSubjectCore } from '../shared/relea
 import { atomicWriteJson, openAtomicStorage, withDirectoryLock } from './lib/atomic-filesystem.mjs';
 
 const DIGEST = canonicalDigest({ fixture: 'durable-parent-run' });
+const STORE_MARKER = '9a'.repeat(32);
 const root = await mkdtemp(join(tmpdir(), 'durable-parent-run-'));
 let now = Date.parse('2026-08-28T12:00:00.000Z');
 const clock = () => now;
@@ -121,8 +124,10 @@ const store = await openParentRunStore({
   root,
   deploymentIdentity: 'compose-project:test',
   volumeIdentity: 'named-volume:test-store',
+  storeMarker: STORE_MARKER,
   volumeDriver: 'local',
   writerProtocol: 'single-coordinator-global-performance-v2',
+  backupMarker: 'backup:durable-parent-run-test',
   clock,
   verifyStorage: false,
 });
@@ -365,6 +370,18 @@ now += 1_001;
 const coordinatorB = await takeOverStoreCoordinator(store, { ownerId: 'coordinator-b', leaseMs: 1_000 });
 assert.equal(coordinatorB.epoch, coordinatorA.epoch + 1);
 await expectCode('STALE_COORDINATOR', () => publishCurrentEnvelope(store, 'run-main', coordinatorA, envelope(1)));
+const shadowSelector = await readReleaseAuthoritySelector(store);
+const drainingSelector = await transitionReleaseAuthority(store, coordinatorB, {
+  expectedSelectorDigest: shadowSelector.digest,
+  phase: 'DRAINING',
+  buildIdentity: store.buildIdentity,
+});
+await transitionReleaseAuthority(store, coordinatorB, {
+  expectedSelectorDigest: drainingSelector.digest,
+  phase: 'ACTIVE',
+  activationRevision: 1,
+  buildIdentity: store.buildIdentity,
+});
 await expectCode('STALE_WORK_LEASE', () => adoptWorkHeartbeat(
   store, 'run-stale-worker-epoch', coordinatorB, staleEpochHeartbeat,
 ));
@@ -415,7 +432,10 @@ await assert.rejects(
   /synthetic crash/,
 );
 assert.equal((await readCurrentEnvelope(store, 'run-main')).digest, thirdEnvelope.digest);
-assert.equal((await loadSharedReleasePublication(root, 'run-main')).digest, thirdEnvelope.digest);
+assert.equal((await loadSharedReleasePublication(root, 'run-main', {
+  storeMarker: STORE_MARKER,
+  expectedStoreGeneration: 2,
+})).digest, thirdEnvelope.digest);
 
 const coordinatorPath = join(root, 'coordinator.json');
 const coordinatorDocument = await readFile(coordinatorPath, 'utf8');

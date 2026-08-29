@@ -90,11 +90,15 @@ export function createSharedControlApi({
           const body = recordBody(request.body);
           if (!body.expected || typeof body.expected !== 'object' || Array.isArray(body.expected)) throw new ControlPlaneError('CONTROL_BODY_INVALID', 'expected is required.', 400);
           if (body.expected.projectId !== service.projectId) throw new ControlPlaneError('PROMOTION_SCOPE_MISMATCH', 'Promotion project does not match this control service.', 409);
-          const publication = await service.readPublication(principal, runId);
-          const claim = await issuePromotionClaim(claimStore, {
-            principal, publication, expected: { ...body.expected, projectId: service.projectId }, ttlMs: body.ttlMs,
-            requestId: request.headers['idempotency-key'] ?? body.requestId,
-          });
+          const { publication, claim } = await service.withReleaseAssertionFence(principal, runId,
+            async (current, authorityContext) => ({
+              publication: current,
+              claim: await issuePromotionClaim(claimStore, {
+                principal, publication: current, authorityContext,
+                expected: { ...body.expected, projectId: service.projectId }, ttlMs: body.ttlMs,
+                requestId: request.headers['idempotency-key'] ?? body.requestId,
+              }),
+            }));
           return ok({
             ...claim,
             result: createReleaseAssertionResult(publication, { projectId: service.projectId }),

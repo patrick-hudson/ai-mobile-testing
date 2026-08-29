@@ -22,6 +22,10 @@ export async function loadSharedReleasePublication(storeRoot, runId, options = {
     root: storeRoot,
     filesystem: options.filesystem,
     verifyStorage: options.verifyStorage ?? false,
+    storeMarker: options.storeMarker,
+    expectedStoreGeneration: options.expectedStoreGeneration,
+    writerProtocol: options.writerProtocol,
+    buildIdentity: options.buildIdentity,
   });
   return readCurrentEnvelope(store, runId);
 }

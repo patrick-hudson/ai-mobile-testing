@@ -11,8 +11,8 @@ import {
 } from '../shared/control-plane-contract.mjs';
 import { openScopedCredentialAuthority } from '../portal/scoped-credential-authority.mjs';
 import {
-  consumePromotionClaim,
-  issuePromotionClaim,
+  consumePromotionClaim as consumePromotionClaimRaw,
+  issuePromotionClaim as issuePromotionClaimRaw,
   openPromotionClaimStore,
 } from './lib/promotion-claim-store.mjs';
 import {
@@ -24,9 +24,11 @@ import {
   publishAttemptEvidence,
   publishCurrentEnvelope,
   readCurrentEnvelope,
+  readReleaseAuthoritySelector,
   rekickIncompleteWork,
   recoverParentRun,
   tombstoneParentRunAuthority,
+  transitionReleaseAuthority,
 } from './lib/parent-run-store.mjs';
 import { createSharedControlService } from './lib/shared-control-service.mjs';
 import { createSharedControlApi, createSharedRequestAuthorizer } from '../portal/shared-control-api.mjs';
@@ -38,6 +40,26 @@ import { projectSharedReleaseView } from '../shared/release-projection.mjs';
 import { sealFinalReleaseSubject, sealReleaseSubjectCore } from '../shared/release-subject.mjs';
 import { CONTROL_EXIT_CODES, controlExitCode } from '../shared/control-client-contract.mjs';
 import { canonicalDigest } from '../shared/canonical-contract.mjs';
+
+const claimAuthorityContext = () => {
+  const body = {
+    storeMarkerDigest: canonicalDigest({ storeMarker: 'control-plane-test' }),
+    storeGeneration: 1,
+    activationEpoch: 1,
+    writerProtocol: 'single-coordinator-global-performance-v2',
+  };
+  return { selector: { phase: 'ACTIVE', activationEpoch: 1 }, binding: { ...body, digest: canonicalDigest(body) } };
+};
+const issuePromotionClaim = (store, input) => issuePromotionClaimRaw(store, {
+  authorityContext: claimAuthorityContext(),
+  ...input,
+});
+const consumePromotionClaim = (store, token, input) => consumePromotionClaimRaw(store, token, {
+  ...input,
+  withCurrentPublication: input.withCurrentPublication
+    ? (callback) => input.withCurrentPublication((current) => callback(current, claimAuthorityContext()))
+    : (callback) => Promise.resolve(input.readCurrentPublication()).then((current) => callback(current, claimAuthorityContext())),
+});
 import { sealCompileRiskInputs, sealRiskSourceObservationSet } from '../shared/risk-source-observation.mjs';
 import {
   openSharedLaunchOperationStore,
@@ -45,6 +67,7 @@ import {
 import { createSharedLaunchService } from './lib/shared-launch-service.mjs';
 
 const root = await mkdtemp(path.join(tmpdir(), 'shared-control-plane-'));
+const parentStoreMarker = 'bc'.repeat(32);
 let now = Date.parse('2026-08-28T20:00:00.000Z');
 const clock = () => now;
 
@@ -367,7 +390,8 @@ try {
   const parentStoreRoot = path.join(root, 'parent-store');
   const parentStore = await openParentRunStore({
     root: parentStoreRoot, deploymentIdentity: 'test-deployment', volumeIdentity: 'named-volume:test',
-    verifyStorage: false, clock,
+    storeMarker: parentStoreMarker,
+    backupMarker: 'backup:shared-control-plane-test', verifyStorage: false, clock,
   });
   await createParentRun(parentStore, {
     runId: 'run-1', subjectCoreDigest: `sha256:${'a'.repeat(64)}`,
@@ -391,7 +415,10 @@ try {
   await assert.rejects(() => control.acceptMutation(operator, 'run-1', {
     kind: 'cancel', requestId: 'same-request-0001', expectedRunRevision: 1, body: { reason: 'Different request body.' },
   }), (error) => error?.code === 'IDEMPOTENCY_CONFLICT');
-  const reopenedStore = await openParentRunStore({ root: parentStoreRoot, verifyStorage: false, clock });
+  const reopenedStore = await openParentRunStore({
+    root: parentStoreRoot, storeMarker: parentStoreMarker, expectedStoreGeneration: 1,
+    verifyStorage: false, clock,
+  });
   const reopenedControl = createSharedControlService({ store: reopenedStore, projectId: 'project-1' });
   assert.deepEqual(await reopenedControl.readOperation(operator, 'run-1', { kind: 'cancel', requestId: 'same-request-0001' }), firstOperation,
     'operation must remain retrievable after a portal/service restart');
@@ -402,6 +429,18 @@ try {
     kind: 'cancel', requestId: 'large-request-0003', expectedRunRevision: 2, body: { reason: 'x'.repeat(70_000) },
   }), (error) => error?.code === 'OPERATION_BODY_TOO_LARGE');
   const coordinator = await acquireCoordinator(reopenedStore, 'run-1', { ownerId: 'control-coordinator', leaseMs: 60_000 });
+  const shadowSelector = await readReleaseAuthoritySelector(reopenedStore);
+  const drainingSelector = await transitionReleaseAuthority(reopenedStore, coordinator, {
+    expectedSelectorDigest: shadowSelector.digest,
+    phase: 'DRAINING',
+    buildIdentity: reopenedStore.buildIdentity,
+  });
+  await transitionReleaseAuthority(reopenedStore, coordinator, {
+    expectedSelectorDigest: drainingSelector.digest,
+    phase: 'ACTIVE',
+    activationRevision: 1,
+    buildIdentity: reopenedStore.buildIdentity,
+  });
   const applied = await reopenedControl.applyAcceptedOperations(coordinator, 'run-1');
   assert.equal(applied[0].outcome.status, 'succeeded');
   assert.equal((await recoverParentRun(reopenedStore, 'run-1')).status, 'cancelled');
@@ -598,7 +637,10 @@ try {
   await tombstoneParentRunAuthority(reopenedStore, 'run-projection', coordinator, {
     actor: { id: custodian.id, kind: custodian.kind }, reason: 'Synthetic crash after tombstone and before evidence removal.',
   });
-  const purgeRecoveryStore = await openParentRunStore({ root: parentStoreRoot, verifyStorage: false, clock });
+  const purgeRecoveryStore = await openParentRunStore({
+    root: parentStoreRoot, storeMarker: parentStoreMarker, expectedStoreGeneration: 2,
+    verifyStorage: false, clock,
+  });
   const purgeRecoveryControl = createSharedControlService({ store: purgeRecoveryStore, projectId: 'project-1' });
   const purgeResults = await purgeRecoveryControl.applyAcceptedOperations(coordinator, 'run-projection');
   assert.equal(purgeResults[0].outcome.status, 'succeeded', 'restart must resume evidence cleanup from an existing authority tombstone');
@@ -818,6 +860,10 @@ try {
     executionSetDigest: head.decision.executionManifestDigest,
     runRevision: head.runRevision, decisionRevision: head.decisionRevision,
   };
+  await assert.rejects(() => issuePromotionClaimRaw(claimStore, {
+    principal: delivery, publication: head, expected: expectedHead, ttlMs: 60_000,
+  }), (error) => error?.code === 'PROMOTION_AUTHORITY_INACTIVE',
+  'claim issue without a current ACTIVE store binding must fail closed');
   await assert.rejects(() => issuePromotionClaim(claimStore, {
     principal: delivery, publication: null, expected: expectedHead, ttlMs: 60_000,
   }), (error) => error?.code === 'PROMOTION_EMPTY_EVIDENCE');

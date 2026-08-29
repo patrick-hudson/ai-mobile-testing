@@ -17,10 +17,19 @@ try {
   const credentialRoot = path.join(root, 'credentials');
   const runId = 'stream-http-run';
   const projectId = 'stream-http-project';
+  const storeMarker = '56'.repeat(32);
+  const backupMarker = '78'.repeat(32);
+  await fs.mkdir(storeRoot, { recursive: true });
+  const storeMarkerFile = path.join(storeRoot, '.trusted-store-marker');
+  const backupMarkerFile = path.join(storeRoot, '.trusted-backup-marker');
+  await fs.writeFile(storeMarkerFile, `${storeMarker}\n`, { mode: 0o600 });
+  await fs.writeFile(backupMarkerFile, `${backupMarker}\n`, { mode: 0o600 });
   const store = await openParentRunStore({
     root: storeRoot,
     deploymentIdentity: 'self-test:streaming-http',
     volumeIdentity: 'named-volume:self-test-streaming-http',
+    storeMarker,
+    backupMarker,
     verifyStorage: false,
   });
   await createParentRun(store, {
@@ -45,6 +54,8 @@ try {
       ...process.env,
       AUDIT_SHARED_COORDINATOR_PORT: String(port),
       AUDIT_SHARED_STORE_ROOT: storeRoot,
+      AUDIT_SHARED_STORE_MARKER_FILE: storeMarkerFile,
+      AUDIT_SHARED_BACKUP_MARKER_FILE: backupMarkerFile,
       AUDIT_SHARED_CREDENTIAL_ROOT: credentialRoot,
       AUDIT_SHARED_DEPLOYMENT_IDENTITY: 'self-test:streaming-http',
       AUDIT_SHARED_VOLUME_IDENTITY: 'named-volume:self-test-streaming-http',

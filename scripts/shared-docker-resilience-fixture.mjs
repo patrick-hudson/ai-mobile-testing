@@ -18,6 +18,7 @@ import {
   readAdoptedAttemptArtifactJson,
   readParentRun,
 } from './lib/parent-run-store.mjs';
+import { readTrustedStoreMarker, sharedStoreBuildIdentity, sharedStoreGeneration, sharedStoreRollbackBuilds } from './lib/shared-store-runtime.mjs';
 
 const required = (name) => {
   const value = process.env[name];
@@ -30,10 +31,19 @@ const workItemCount = Number(process.env.AUDIT_SHARED_PROOF_WORK_ITEMS ?? 6);
 if (!Number.isSafeInteger(workItemCount) || workItemCount < 2 || workItemCount > 8) {
   throw new Error('AUDIT_SHARED_PROOF_WORK_ITEMS must be an integer from 2 through 8.');
 }
+const storeMarker = await readTrustedStoreMarker(required('AUDIT_SHARED_STORE_MARKER_FILE'));
+const backupMarker = await readTrustedStoreMarker(required('AUDIT_SHARED_BACKUP_MARKER_FILE'), 'shared backup marker');
+const buildIdentity = sharedStoreBuildIdentity();
 const store = await openParentRunStore({
   root: required('AUDIT_SHARED_STORE_ROOT'),
   deploymentIdentity: required('AUDIT_SHARED_DEPLOYMENT_IDENTITY'),
   volumeIdentity: required('AUDIT_SHARED_VOLUME_IDENTITY'),
+  storeMarker,
+  storeGeneration: sharedStoreGeneration(),
+  expectedStoreGeneration: sharedStoreGeneration(),
+  buildIdentity,
+  backupMarker,
+  prequalifiedRollbackBuilds: sharedStoreRollbackBuilds(process.env, buildIdentity),
 });
 
 if (action === 'seed') {

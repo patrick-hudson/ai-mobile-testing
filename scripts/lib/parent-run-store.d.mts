@@ -1,14 +1,17 @@
 import type { PublicationEnvelope } from '../../shared/publication-envelope.mjs';
 import type { WorkExecutionDescriptor } from '../../shared/work-execution-descriptor.mjs';
 export class ParentRunStoreError extends Error { code: string; details?: unknown }
-export const PARENT_RUN_STORE_SCHEMA_VERSION: 1;
+export const PARENT_RUN_STORE_SCHEMA_VERSION: 2;
 export const PARENT_RUN_WRITER_PROTOCOL: 'single-coordinator-global-performance-v2';
+export const RELEASE_AUTHORITY_PHASES: readonly ['SHADOW', 'DRAINING', 'ACTIVE', 'PROMOTION_DISABLED'];
 export const MAX_ATTEMPT_ARTIFACTS: 64;
 export const MAX_ATTEMPT_ARTIFACT_BYTES: number;
 export const MAX_ATTEMPT_EVIDENCE_BYTES: number;
 export const ARTIFACT_READ_LEASE_MS: number;
-export interface ParentRunStore { root: string; clock(): number; manifest: any }
+export interface ParentRunStore { root: string; clock(): number; manifest: any; buildIdentity: string }
 export interface CoordinatorFence { ownerId: string; epoch: number; token: string; acquiredAt: string; expiresAt: string }
+export interface ReleaseAuthorityBinding { storeMarkerDigest: string; storeGeneration: number; activationEpoch: 0 | 1; writerProtocol: string; digest: string }
+export interface ReleaseAuthorityContext { selector: any; binding: ReleaseAuthorityBinding }
 export interface WorkLease { runId: string; workItemId: string; workerId: string; attempt: number; epoch: number; token: string; claimedAt: string; expiresAt: string; subjectCoreDigest: string; runnerRevision: string; capability: string; resourceClass: 'ordinary' | 'performance'; targetId: string; specAffinity: string | null; executionDescriptor: WorkExecutionDescriptor | null; executionDescriptorDigest: string | null }
 export interface WorkHeartbeatReceipt { relativePath: string; digest: string; workItemId: string; leaseToken: string }
 export interface StorePerformanceReservation { workerId: string; runId: string; workItemId: string; coordinatorEpoch: number; requestedAt: string; expiresAt: string; attempt?: number; leaseToken?: string; acquiredAt?: string }
@@ -30,6 +33,13 @@ export function acquireCoordinator(store: ParentRunStore, runId: string, input: 
 export function takeOverCoordinator(store: ParentRunStore, runId: string, input: { ownerId: string; leaseMs: number }): Promise<CoordinatorFence>;
 export function acquireStoreCoordinator(store: ParentRunStore, input: { ownerId: string; leaseMs: number }): Promise<CoordinatorFence>;
 export function takeOverStoreCoordinator(store: ParentRunStore, input: { ownerId: string; leaseMs: number }): Promise<CoordinatorFence>;
+export function readReleaseAuthoritySelector(store: ParentRunStore): Promise<any>;
+export function readReleaseAuthorityContext(store: ParentRunStore, options?: { requireActive?: boolean }): Promise<any>;
+export function transitionReleaseAuthority(store: ParentRunStore, coordinator: CoordinatorFence, input: {
+  expectedSelectorDigest: string; phase: 'SHADOW' | 'DRAINING' | 'ACTIVE' | 'PROMOTION_DISABLED';
+  buildIdentity: string; activationRevision?: number;
+  hooks?: { beforeCommit?(selector: any): void | Promise<void>; afterActivationIntent?(selector: any): void | Promise<void>; afterActivationFence?(selector: any): void | Promise<void>; afterCommit?(selector: any): void | Promise<void> };
+}): Promise<any>;
 export function heartbeatCoordinator(store: ParentRunStore, coordinator: CoordinatorFence, input: { leaseMs: number }): Promise<CoordinatorFence>;
 export function requestPerformanceDrain(store: ParentRunStore, runId: string, coordinator: CoordinatorFence, input: { workerId: string; leaseMs?: number }): Promise<StorePerformanceReservation>;
 export function requestStorePerformanceDrain(store: ParentRunStore, coordinator: CoordinatorFence, input: { workerId: string; capabilities: string[]; resourceClasses: Array<'performance'>; runIds: string[]; leaseMs?: number }): Promise<StorePerformanceReservation>;
@@ -80,4 +90,4 @@ export function readRunHistories(store: ParentRunStore, runId: string): Promise<
 export function readBoundedAttemptLogs(store: ParentRunStore, runId: string, options?: { limit?: number }): Promise<{ entries: any[]; truncated: boolean }>;
 export function publishCurrentEnvelope(store: ParentRunStore, runId: string, coordinator: CoordinatorFence, envelope: PublicationEnvelope, hooks?: { afterEnvelopePersist?(envelope: PublicationEnvelope): void | Promise<void>; afterDecisionPersist?(envelope: PublicationEnvelope): void | Promise<void> }): Promise<PublicationEnvelope>;
 export function readCurrentEnvelope(store: ParentRunStore, runId: string): Promise<PublicationEnvelope>;
-export function withCurrentEnvelopeFence<T>(store: ParentRunStore, runId: string, callback: (envelope: PublicationEnvelope) => T | Promise<T>): Promise<T>;
+export function withCurrentEnvelopeFence<T>(store: ParentRunStore, runId: string, callback: (envelope: PublicationEnvelope, authority: ReleaseAuthorityContext) => T | Promise<T>): Promise<T>;

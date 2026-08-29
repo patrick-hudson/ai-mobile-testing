@@ -41,16 +41,38 @@ function parseStoredClaim(value, expectedId) {
   return value;
 }
 
+function validateAuthorityContext(value) {
+  const selector = value?.selector;
+  const binding = value?.binding;
+  const { digest, ...body } = binding ?? {};
+  if (selector?.phase !== 'ACTIVE' || selector.activationEpoch !== 1
+    || !DIGEST.test(binding?.storeMarkerDigest)
+    || !Number.isSafeInteger(binding?.storeGeneration) || binding.storeGeneration < 1
+    || binding.activationEpoch !== selector.activationEpoch
+    || typeof binding.writerProtocol !== 'string' || !binding.writerProtocol
+    || digest !== canonicalDigest(body)) {
+    fail('PROMOTION_AUTHORITY_INACTIVE', 'Promotion requires the current ACTIVE durable store binding.');
+  }
+  return binding;
+}
+
 function claimResult(claim, secret) {
   return Object.freeze({
     token: `amtp.${claim.id}.${secret}`, expiresAt: claim.expiresAt, runId: claim.runId,
     subjectDigest: claim.subjectDigest, authority: claim.authority, runRevision: claim.runRevision,
     decisionRevision: claim.decisionRevision,
+    authorityBinding: {
+      storeMarkerDigest: claim.storeMarkerDigest,
+      storeGeneration: claim.storeGeneration,
+      activationEpoch: claim.activationEpoch,
+      writerProtocol: claim.writerProtocol,
+    },
   });
 }
 
 function assertIdempotentClaim(existing, intended, ttlMs) {
-  for (const field of ['requestId', 'principalId', 'projectId', 'runId', 'subjectDigest', 'authority', 'executionSetDigest', 'runRevision', 'decisionRevision']) {
+  for (const field of ['requestId', 'principalId', 'projectId', 'runId', 'subjectDigest', 'authority', 'executionSetDigest', 'runRevision', 'decisionRevision',
+    'storeMarkerDigest', 'storeGeneration', 'activationEpoch', 'writerProtocol']) {
     if (existing[field] !== intended[field]) fail('IDEMPOTENCY_CONFLICT', 'Promotion assertion request id was reused with different content.');
   }
   if (Date.parse(existing.expiresAt) - Date.parse(existing.issuedAt) !== ttlMs) {
@@ -77,9 +99,10 @@ function validateHead(publication, principal, expected) {
   }
 }
 
-export async function issuePromotionClaim(store, { principal, publication, expected, ttlMs = 60_000, requestId = null }) {
+export async function issuePromotionClaim(store, { principal, publication, authorityContext, expected, ttlMs = 60_000, requestId = null }) {
   if (!Number.isSafeInteger(ttlMs) || ttlMs < 1 || ttlMs > 5 * 60_000) fail('PROMOTION_CLAIM_INVALID', 'Promotion claim TTL is outside bounds.', 400);
   if (requestId !== null && (typeof requestId !== 'string' || requestId.length < 8 || requestId.length > 256)) fail('IDEMPOTENCY_KEY_INVALID', 'Promotion assertion request id is invalid.', 400);
+  const authorityBinding = validateAuthorityContext(authorityContext);
   if (typeof publication?.runId !== 'string' || !publication.runId) validateHead(publication, principal, expected);
   const effectiveRequestId = requestId ?? `direct-${randomBytes(16).toString('hex')}`;
   const id = createHash('sha256').update(`${principal.id}\0${publication.runId}\0${effectiveRequestId}`).digest('hex').slice(0, 32);
@@ -90,6 +113,8 @@ export async function issuePromotionClaim(store, { principal, publication, expec
     runId: publication?.runId, subjectDigest: expected?.subjectDigest, authority: expected?.authority,
     executionSetDigest: expected?.executionSetDigest, publicationDigest: publication?.digest,
     runRevision: expected?.runRevision, decisionRevision: expected?.decisionRevision,
+    storeMarkerDigest: authorityBinding.storeMarkerDigest, storeGeneration: authorityBinding.storeGeneration,
+    activationEpoch: authorityBinding.activationEpoch, writerProtocol: authorityBinding.writerProtocol,
   };
   const claimPath = path.join(store.root, `${id}.json`);
   const existing = await fs.readFile(claimPath, 'utf8').then(JSON.parse).catch((error) => error?.code === 'ENOENT' ? null : Promise.reject(error));
@@ -106,6 +131,8 @@ export async function issuePromotionClaim(store, { principal, publication, expec
     executionSetDigest: publication.decision.executionManifestDigest,
     publicationDigest: publication.digest, runRevision: publication.runRevision,
     decisionRevision: publication.decisionRevision, issuedAt: new Date(store.clock()).toISOString(),
+    storeMarkerDigest: authorityBinding.storeMarkerDigest, storeGeneration: authorityBinding.storeGeneration,
+    activationEpoch: authorityBinding.activationEpoch, writerProtocol: authorityBinding.writerProtocol,
     expiresAt: new Date(store.clock() + ttlMs).toISOString(), tokenHash, consumedAt: null,
     digest: null,
   };
@@ -122,7 +149,10 @@ export async function issuePromotionClaim(store, { principal, publication, expec
   return claimResult(body, secret);
 }
 
-export async function consumePromotionClaim(store, token, { principal, expectedSubjectDigest, readCurrentPublication, withCurrentPublication = null }) {
+export async function consumePromotionClaim(store, token, { principal, expectedSubjectDigest, withCurrentPublication = null }) {
+  if (typeof withCurrentPublication !== 'function') {
+    fail('PROMOTION_FENCE_REQUIRED', 'Promotion claim consumption requires the live publication and authority fence.', 500);
+  }
   const parsed = /^amtp\.([a-f0-9]{32})\.([A-Za-z0-9_-]{32,})$/.exec(String(token));
   if (!parsed) fail('PROMOTION_CLAIM_INVALID', 'Promotion claim is invalid.', 401);
   return (async () => {
@@ -138,12 +168,17 @@ export async function consumePromotionClaim(store, token, { principal, expectedS
     if (await fs.stat(receiptPath).catch(() => null)) fail('PROMOTION_CLAIM_REPLAYED', 'Promotion claim was already consumed.');
     if (Date.parse(claim.expiresAt) <= store.clock()) fail('PROMOTION_CLAIM_EXPIRED', 'Promotion claim expired.');
     if (claim.subjectDigest !== expectedSubjectDigest) fail('PROMOTION_SUBJECT_MISMATCH', 'Promotion claim subject does not match delivery subject.');
-    const consumeAgainst = async (current) => {
+    const consumeAgainst = async (current, authorityContext) => {
+      const authorityBinding = validateAuthorityContext(authorityContext);
       if (current?.digest !== claim.publicationDigest || current?.runRevision !== claim.runRevision
         || current?.decisionRevision !== claim.decisionRevision || current?.finalSubjectDigest !== claim.subjectDigest
         || current?.decision?.superseded || current?.decision?.ready !== true
         || current?.decision?.grantedAuthority !== claim.authority
-        || current?.decision?.executionManifestDigest !== claim.executionSetDigest) {
+        || current?.decision?.executionManifestDigest !== claim.executionSetDigest
+        || authorityBinding.storeMarkerDigest !== claim.storeMarkerDigest
+        || authorityBinding.storeGeneration !== claim.storeGeneration
+        || authorityBinding.activationEpoch !== claim.activationEpoch
+        || authorityBinding.writerProtocol !== claim.writerProtocol) {
         fail('PROMOTION_CLAIM_STALE', 'Release head changed after assertion; delivery is refused.');
       }
       const receipt = {
@@ -160,9 +195,7 @@ export async function consumePromotionClaim(store, token, { principal, expectedS
       }
       return receipt;
     };
-    const receipt = withCurrentPublication
-      ? await withCurrentPublication(consumeAgainst)
-      : await consumeAgainst(await readCurrentPublication(claim.runId));
+    const receipt = await withCurrentPublication(consumeAgainst);
     return Object.freeze({ consumed: true, claimId: claim.id, runId: claim.runId, subjectDigest: claim.subjectDigest, consumedAt: receipt.consumedAt });
   })();
 }
