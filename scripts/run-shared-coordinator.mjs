@@ -1,19 +1,15 @@
 import http from 'node:http';
 import {
-  acquireCoordinator,
   adoptAttemptEvidence,
   adoptWorkHeartbeat,
   appendAttemptLog,
-  claimWorkItem,
-  heartbeatCoordinator,
   heartbeatWorkItem,
   MAX_ATTEMPT_EVIDENCE_BYTES,
   openParentRunStore,
   publishAttemptEvidence,
-  requeueExpiredWork,
-  requestPerformanceDrain,
 } from './lib/parent-run-store.mjs';
 import { createSharedControlService } from './lib/shared-control-service.mjs';
+import { createSharedCoordinatorSupervisor } from './lib/shared-coordinator-supervisor.mjs';
 import { openScopedCredentialAuthority } from '../portal/scoped-credential-authority.mjs';
 import { assertPrincipalAuthorized, CONTROL_ACTIONS } from '../shared/control-plane-contract.mjs';
 
@@ -49,7 +45,6 @@ async function readJson(request) {
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
 
-const runId = required('AUDIT_SHARED_RUN_ID');
 const leaseMs = boundedInteger('AUDIT_SHARED_LEASE_MS', 30_000, 1_000, 3_600_000);
 const coordinatorLeaseMs = boundedInteger('AUDIT_SHARED_COORDINATOR_LEASE_MS', 60_000, 5_000, 3_600_000);
 const port = boundedInteger('AUDIT_SHARED_COORDINATOR_PORT', 4_180, 1_024, 65_535);
@@ -60,28 +55,21 @@ const store = await openParentRunStore({
 });
 const controlService = createSharedControlService({ store, projectId: process.env.AUDIT_SHARED_PROJECT_ID ?? 'default' });
 const credentialAuthority = await openScopedCredentialAuthority({ root: required('AUDIT_SHARED_CREDENTIAL_ROOT') });
-let coordinator = await acquireCoordinator(store, runId, {
+const projectId = process.env.AUDIT_SHARED_PROJECT_ID ?? 'default';
+const supervisor = createSharedCoordinatorSupervisor({
+  store,
+  controlService,
+  projectId,
   ownerId: `coordinator-${process.pid}`,
-  leaseMs: coordinatorLeaseMs,
+  coordinatorLeaseMs,
+  workLeaseMs: leaseMs,
+  onEvent: (event) => process.stdout.write(`${JSON.stringify(event)}\n`),
 });
 let maintenance = Promise.resolve();
 const maintain = () => {
-  maintenance = maintenance.then(async () => {
-    coordinator = await heartbeatCoordinator(store, coordinator, { leaseMs: coordinatorLeaseMs });
-    const requeued = await requeueExpiredWork(store, runId, coordinator);
-    if (requeued > 0) {
-      process.stdout.write(`${JSON.stringify({ event: 'expired-work-requeued', runId, count: requeued })}\n`);
-    }
-    const operations = await controlService.applyAcceptedOperations(coordinator, runId);
-    for (const operation of operations) {
-      process.stdout.write(`${JSON.stringify({ event: 'control-operation-completed', runId, operationId: operation.operationId, outcome: operation.outcome })}\n`);
-    }
-    await controlService.publishCurrentProjection(coordinator, runId);
-  }).catch((error) => {
+  maintenance = maintenance.then(() => supervisor.maintain()).catch((error) => {
     process.stderr.write(`${JSON.stringify({ event: 'coordinator-maintenance-failed', code: error?.code, message: error?.message })}\n`);
-    process.exitCode = 1;
-    clearInterval(heartbeat);
-    server.close();
+    return supervisor.status();
   });
   return maintenance;
 };
@@ -92,43 +80,54 @@ heartbeat.unref();
 
 const server = http.createServer(async (request, response) => {
   try {
-    if (request.method === 'GET' && request.url === '/healthz') return json(response, 200, { status: 'ok' });
+    if (request.method === 'GET' && request.url === '/healthz') {
+      const status = supervisor.status();
+      return json(response, status.state === 'ready' ? 200 : 503, status);
+    }
     if (request.method !== 'POST') return json(response, 404, { error: 'Not found.' });
     const authorization = String(request.headers.authorization ?? '');
     if (!authorization.startsWith('Bearer ')) throw Object.assign(new Error('Worker authentication is required.'), { status: 401 });
     const principal = await credentialAuthority.authenticateCredential(authorization.slice(7));
     const action = ['/v1/performance-drain', '/v1/claim'].includes(request.url) ? CONTROL_ACTIONS.WORK_CLAIM : CONTROL_ACTIONS.WORK_PUBLISH;
-    assertPrincipalAuthorized(principal, action, { projectId: process.env.AUDIT_SHARED_PROJECT_ID ?? 'default', runId });
     const body = await readJson(request);
+    const leaseRunId = body?.lease?.runId;
+    assertPrincipalAuthorized(principal, action, {
+      projectId,
+      ...(['/v1/performance-drain', '/v1/claim'].includes(request.url) ? {} : { runId: leaseRunId }),
+    });
     if (request.url === '/v1/performance-drain') {
-      return json(response, 202, await requestPerformanceDrain(store, runId, coordinator, { workerId: principal.id }));
+      supervisor.schedulingFor(principal, body);
+      return json(response, 409, {
+        code: 'GLOBAL_PERFORMANCE_SCHEDULER_PENDING',
+        error: 'Performance work remains fenced until the store-global exclusive resource scheduler is active.',
+      });
     }
     if (request.url === '/v1/claim') {
-      const lease = await claimWorkItem(store, runId, coordinator, {
-        workerId: principal.id,
-        capabilities: body.capabilities,
-        resourceClasses: body.resourceClasses,
-        leaseMs,
-      });
+      const lease = await supervisor.claim(principal, body);
       return json(response, 200, lease);
     }
+    if (typeof leaseRunId !== 'string' || !leaseRunId) {
+      return json(response, 400, { code: 'WORK_RESULT_BINDING_MISMATCH', error: 'Worker request lacks its server-issued run binding.' });
+    }
+    const coordinator = supervisor.coordinator();
+    if (coordinator === null) return json(response, 503, { code: 'COORDINATOR_UNAVAILABLE', error: 'No active coordinator lease.' });
     if (request.url === '/v1/heartbeat') {
       if (body.lease?.workerId !== principal.id) throw Object.assign(new Error('Worker lease belongs to another principal.'), { status: 403 });
-      const receipt = await heartbeatWorkItem(store, runId, body.lease, { leaseMs });
-      return json(response, 202, await adoptWorkHeartbeat(store, runId, coordinator, receipt));
+      const receipt = await heartbeatWorkItem(store, leaseRunId, body.lease, { leaseMs });
+      return json(response, 202, await adoptWorkHeartbeat(store, leaseRunId, coordinator, receipt));
     }
     if (request.url === '/v1/result') {
       if (body.lease?.workerId !== principal.id) throw Object.assign(new Error('Worker lease belongs to another principal.'), { status: 403 });
       if (!['completed_pass', 'completed_product_failure'].includes(body?.result?.outcome)) {
         return json(response, 422, { error: 'Workers may publish only completed product outcomes; operational recovery requires coordinator-trusted evidence.' });
       }
-      const inbox = await publishAttemptEvidence(store, runId, body.lease, body.result);
-      const adopted = await adoptAttemptEvidence(store, runId, coordinator, inbox);
+      const inbox = await publishAttemptEvidence(store, leaseRunId, body.lease, body.result);
+      const adopted = await adoptAttemptEvidence(store, leaseRunId, coordinator, inbox);
       return json(response, 202, { workItemId: adopted.id, state: adopted.state, canonicalResult: adopted.canonicalResult });
     }
     if (request.url === '/v1/log') {
       if (body.lease?.workerId !== principal.id) throw Object.assign(new Error('Worker lease belongs to another principal.'), { status: 403 });
-      const receipt = await appendAttemptLog(store, runId, body.lease, {
+      const receipt = await appendAttemptLog(store, leaseRunId, body.lease, {
         sequence: body.sequence,
         level: body.level,
         message: body.message,
@@ -141,7 +140,10 @@ const server = http.createServer(async (request, response) => {
     json(response, error?.status ?? (unavailable ? 409 : 400), { code: error?.code ?? 'SHARED_COORDINATOR_REQUEST_INVALID', error: error?.message ?? 'Request failed.' });
   }
 });
-server.listen(port, '0.0.0.0', () => process.stdout.write(`${JSON.stringify({ event: 'shared-coordinator-listening', runId, port, epoch: coordinator.epoch })}\n`));
+await maintain();
+server.listen(port, '0.0.0.0', () => process.stdout.write(`${JSON.stringify({
+  event: 'shared-coordinator-listening', port, state: supervisor.status().state, epoch: supervisor.status().epoch,
+})}\n`));
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.once(signal, () => {

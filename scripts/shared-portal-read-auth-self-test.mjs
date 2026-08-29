@@ -257,7 +257,6 @@ try {
     port: coordinatorPort,
     environment: {
       ...environment,
-      AUDIT_SHARED_RUN_ID: sharedRunId,
       AUDIT_SHARED_COORDINATOR_PORT: String(coordinatorPort),
       AUDIT_SHARED_CREDENTIAL_ROOT: credentials,
       AUDIT_SHARED_EXCHANGE_ROOT: path.join(root, 'exchange'),

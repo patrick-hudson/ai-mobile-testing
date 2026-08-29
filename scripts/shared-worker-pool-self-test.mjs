@@ -37,23 +37,80 @@ let now = Date.parse('2026-08-28T21:00:00.000Z');
 
 try {
   const executorEvidenceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'shared-worker-executor-evidence-'));
+  const executorLease = {
+    runId: 'executor-run', workItemId: 'executor-work', workerId: 'executor-worker', attempt: 1,
+    epoch: 2, token: 'executor-token', subjectCoreDigest: digest('f'), runnerRevision: 'runner-u4',
+  };
+  const executorResult = (overrides = {}) => ({
+    schemaVersion: 1,
+    kind: 'shared-worker-result',
+    runId: executorLease.runId,
+    workItemId: executorLease.workItemId,
+    attempt: executorLease.attempt,
+    subjectCoreDigest: executorLease.subjectCoreDigest,
+    runnerRevision: executorLease.runnerRevision,
+    outcome: 'completed_pass',
+    reason: null,
+    artifacts: [],
+    ...overrides,
+  });
   await fs.mkdir(path.join(executorEvidenceRoot, 'screens'));
   await fs.writeFile(path.join(executorEvidenceRoot, 'screens', 'home.png'), 'executor-screen');
-  await fs.writeFile(path.join(executorEvidenceRoot, 'result.json'), JSON.stringify({
-    outcome: 'completed_pass', reason: null, artifacts: [{ path: 'screens/home.png', mediaType: 'image/png' }],
-  }));
-  const collected = await collectSharedWorkerEvidence(executorEvidenceRoot, { code: 0, signal: null });
+  await assert.rejects(
+    collectSharedWorkerEvidence(executorEvidenceRoot, { code: 0, signal: null }, executorLease),
+    /result manifest is required/,
+    'zero-exit execution without a result manifest must never pass',
+  );
+  await fs.writeFile(path.join(executorEvidenceRoot, 'result.json'), JSON.stringify(executorResult({
+    artifacts: [{ path: 'screens/home.png', mediaType: 'image/png' }],
+  })));
+  const collected = await collectSharedWorkerEvidence(executorEvidenceRoot, { code: 0, signal: null }, executorLease);
   assert.equal(collected.artifacts[0].name, 'screens/home.png');
   assert.equal(collected.artifacts[0].contentBase64, Buffer.from('executor-screen').toString('base64'));
-  await fs.writeFile(path.join(executorEvidenceRoot, 'result.json'), JSON.stringify({
-    outcome: 'completed_pass', reason: null, artifacts: [],
-  }));
-  assert.deepEqual((await collectSharedWorkerEvidence(executorEvidenceRoot, { code: 0, signal: null })).artifacts, [],
+  await assert.rejects(
+    collectSharedWorkerEvidence(executorEvidenceRoot, { code: null, signal: null }, executorLease),
+    /terminated abnormally/,
+  );
+  await assert.rejects(
+    collectSharedWorkerEvidence(executorEvidenceRoot, { code: 2, signal: null }, executorLease),
+    /terminated abnormally/,
+  );
+  await assert.rejects(
+    collectSharedWorkerEvidence(executorEvidenceRoot, { code: null, signal: 'SIGKILL' }, executorLease),
+    /terminated abnormally/,
+  );
+  await assert.rejects(
+    collectSharedWorkerEvidence(executorEvidenceRoot, { code: 1, signal: null }, executorLease),
+    /exit 1 requires a completed product failure/,
+    'Playwright finding exit cannot disagree with the identity-bound result outcome',
+  );
+  await fs.writeFile(path.join(executorEvidenceRoot, 'result.json'), JSON.stringify(executorResult({
+    outcome: 'completed_product_failure', reason: 'assertion-failed',
+  })));
+  assert.deepEqual(await collectSharedWorkerEvidence(executorEvidenceRoot, { code: 1, signal: null }, executorLease), {
+    outcome: 'completed_product_failure', reason: 'assertion-failed', artifacts: [],
+  });
+  await fs.writeFile(path.join(executorEvidenceRoot, 'result.json'), JSON.stringify(executorResult()));
+  assert.deepEqual((await collectSharedWorkerEvidence(executorEvidenceRoot, { code: 0, signal: null }, executorLease)).artifacts, [],
     'files not declared by the executor manifest are never uploaded');
-  await fs.writeFile(path.join(executorEvidenceRoot, 'result.json'), JSON.stringify({
-    outcome: 'completed_pass', reason: null, artifacts: [{ path: '../another-run/secret.png', mediaType: 'image/png' }],
-  }));
-  await assert.rejects(collectSharedWorkerEvidence(executorEvidenceRoot, { code: 0, signal: null }), /normalized and relative/);
+  for (const [field, value] of [
+    ['runId', 'another-run'],
+    ['workItemId', 'another-work'],
+    ['attempt', 2],
+    ['subjectCoreDigest', digest('e')],
+    ['runnerRevision', 'another-runner'],
+  ]) {
+    await fs.writeFile(path.join(executorEvidenceRoot, 'result.json'), JSON.stringify(executorResult({ [field]: value })));
+    await assert.rejects(
+      collectSharedWorkerEvidence(executorEvidenceRoot, { code: 0, signal: null }, executorLease),
+      /does not match the active work lease/,
+      `executor result ${field} must be bound to the active lease`,
+    );
+  }
+  await fs.writeFile(path.join(executorEvidenceRoot, 'result.json'), JSON.stringify(executorResult({
+    artifacts: [{ path: '../another-run/secret.png', mediaType: 'image/png' }],
+  })));
+  await assert.rejects(collectSharedWorkerEvidence(executorEvidenceRoot, { code: 0, signal: null }, executorLease), /normalized and relative/);
   await fs.rm(executorEvidenceRoot, { recursive: true, force: true });
 
   const store = await openParentRunStore({
@@ -413,8 +470,8 @@ try {
   assert.match(sharedWorkerSource, /AUDIT_SHARED_EVIDENCE_DIR/);
   assert.match(sharedWorkerSource, /\/v1\/heartbeat/);
   assert.match(sharedCoordinatorSource, /request\.url === '\/v1\/heartbeat'/);
-  assert.match(sharedCoordinatorSource, /heartbeatWorkItem\(store, runId, body\.lease/);
-  assert.match(sharedCoordinatorSource, /adoptWorkHeartbeat\(store, runId, coordinator, receipt\)/,
+  assert.match(sharedCoordinatorSource, /heartbeatWorkItem\(store, leaseRunId, body\.lease/);
+  assert.match(sharedCoordinatorSource, /adoptWorkHeartbeat\(store, leaseRunId, coordinator, receipt\)/,
     'worker heartbeats must remain inbox writes adopted by the sole canonical coordinator');
   assert.match(sharedEvidenceSource, /result\.json/);
   assert.match(sharedEvidenceSource, /contentBase64/);

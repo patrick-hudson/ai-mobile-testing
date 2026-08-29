@@ -130,8 +130,46 @@ try {
   }));
   assert.equal(new Set(provisionedCredentials).size, 3, 'each Compose worker slot must receive a distinct credential');
   const provisionedAuthority = await openScopedCredentialAuthority({ root: provisionEnvironment.AUDIT_SHARED_CREDENTIAL_ROOT });
-  assert.deepEqual((await Promise.all(provisionedCredentials.map((credential) => provisionedAuthority.authenticateCredential(credential))))
-    .map((principal) => principal.id), ['compose-worker-ordinary-a', 'compose-worker-ordinary-b', 'compose-worker-performance']);
+  const provisionedPrincipals = await Promise.all(provisionedCredentials.map((credential) => provisionedAuthority.authenticateCredential(credential)));
+  assert.deepEqual(provisionedPrincipals.map((principal) => principal.id),
+    ['compose-worker-ordinary-a', 'compose-worker-ordinary-b', 'compose-worker-performance']);
+  assert.deepEqual(provisionedPrincipals.map((principal) => principal.workerGrant), [
+    { capabilities: ['browser:chromium', 'browser:firefox', 'browser:webkit', 'inventory:http'], resourceClasses: ['ordinary'] },
+    { capabilities: ['browser:chromium', 'browser:firefox', 'browser:webkit', 'inventory:http'], resourceClasses: ['ordinary'] },
+    { capabilities: ['performance:lighthouse'], resourceClasses: ['performance'] },
+  ]);
+  await provisionedAuthority.setWorkerGrant('compose-worker-ordinary-a', {
+    capabilities: ['performance:lighthouse'], resourceClasses: ['performance'],
+  });
+  const repairedProvision = await runCommand(process.execPath, [
+    new URL('./provision-shared-worker-identities.mjs', import.meta.url).pathname,
+  ], path.join(root, 'compose-provision-repair'), { env: provisionEnvironment });
+  assert.equal(repairedProvision.code, 0, repairedProvision.stderr);
+  assert.deepEqual(JSON.parse(repairedProvision.stdout).provisioned.map((entry) => entry.status), ['updated', 'reused', 'reused']);
+  assert.deepEqual((await provisionedAuthority.authenticateCredential(provisionedCredentials[0])).workerGrant,
+    { capabilities: ['browser:chromium', 'browser:firefox', 'browser:webkit', 'inventory:http'], resourceClasses: ['ordinary'] });
+  await rm(workerCredentialFiles.AUDIT_SHARED_WORKER_B_CREDENTIAL_FILE);
+  await provisionedAuthority.setWorkerGrant('compose-worker-ordinary-b', {
+    capabilities: ['performance:lighthouse'], resourceClasses: ['performance'],
+  });
+  const recoveredCredentialProvision = await runCommand(process.execPath, [
+    new URL('./provision-shared-worker-identities.mjs', import.meta.url).pathname,
+  ], path.join(root, 'compose-provision-missing-credential'), { env: provisionEnvironment });
+  assert.equal(recoveredCredentialProvision.code, 0, recoveredCredentialProvision.stderr);
+  assert.deepEqual(JSON.parse(recoveredCredentialProvision.stdout).provisioned.map((entry) => entry.status), ['reused', 'issued', 'reused']);
+  const recoveredCredential = (await readFile(workerCredentialFiles.AUDIT_SHARED_WORKER_B_CREDENTIAL_FILE, 'utf8')).trim();
+  assert.deepEqual((await provisionedAuthority.authenticateCredential(recoveredCredential)).workerGrant,
+    { capabilities: ['browser:chromium', 'browser:firefox', 'browser:webkit', 'inventory:http'], resourceClasses: ['ordinary'] },
+    'credential recovery also repairs an existing principal grant before rotating the secret');
+  const overriddenProvision = await runCommand(process.execPath, [
+    new URL('./provision-shared-worker-identities.mjs', import.meta.url).pathname,
+  ], path.join(root, 'compose-provision-override'), {
+    env: { ...provisionEnvironment, AUDIT_SHARED_ORDINARY_CAPABILITIES: 'inventory:http,browser:chromium' },
+  });
+  assert.equal(overriddenProvision.code, 0, overriddenProvision.stderr);
+  assert.deepEqual((await provisionedAuthority.authenticateCredential(provisionedCredentials[0])).workerGrant,
+    { capabilities: ['browser:chromium', 'inventory:http'], resourceClasses: ['ordinary'] },
+    'provisioned grants must use the same ordinary capability override advertised by Compose workers');
   assert.throws(() => validateMutationDeployment({
     bindHost: '0.0.0.0',
     publishedOrigin: 'http://audit.example.test',
@@ -172,6 +210,7 @@ try {
   });
   const workerIssued = await authority.createPrincipal({
     id: 'worker-1', kind: 'worker', roles: ['worker'], projectIds: ['project-1'], runIds: ['run-1'],
+    workerGrant: { capabilities: ['browser:firefox', 'inventory:http'], resourceClasses: ['ordinary'] },
   });
   const deliveryIssued = await authority.createPrincipal({
     id: 'delivery-1', kind: 'service', roles: ['delivery'], projectIds: ['project-1'], runIds: ['run-1'],
@@ -182,6 +221,7 @@ try {
   const viewer = await authority.authenticateCredential(viewerIssued.credential);
   const reviewer = await authority.authenticateCredential(reviewerIssued.credential);
   const worker = await authority.authenticateCredential(workerIssued.credential);
+  assert.deepEqual(worker.workerGrant, { capabilities: ['browser:firefox', 'inventory:http'], resourceClasses: ['ordinary'] });
   const delivery = await authority.authenticateCredential(deliveryIssued.credential);
   const administrator = await authority.authenticateCredential(administratorIssued.credential);
   const reopenedAuthority = await openScopedCredentialAuthority({ root: path.join(root, 'credentials'), clock });
@@ -192,6 +232,29 @@ try {
   await assert.rejects(() => authority.createPrincipal({
     id: 'confused-worker', kind: 'worker', roles: ['administrator'], projectIds: ['*'], runIds: ['*'],
   }), (error) => error?.code === 'CREDENTIAL_SCHEMA_INVALID');
+  await assert.rejects(() => authority.createPrincipal({
+    id: 'bad-worker-grant', kind: 'worker', roles: ['worker'], projectIds: ['*'], runIds: ['*'],
+    workerGrant: { capabilities: ['not a capability'], resourceClasses: ['ordinary'] },
+  }), (error) => error?.code === 'CREDENTIAL_SCHEMA_INVALID');
+  await assert.rejects(() => authority.createPrincipal({
+    id: 'multi-class-worker', kind: 'worker', roles: ['worker'], projectIds: ['*'], runIds: ['*'],
+    workerGrant: { capabilities: ['browser:chromium'], resourceClasses: ['ordinary', 'performance'] },
+  }), (error) => error?.code === 'CREDENTIAL_SCHEMA_INVALID');
+  await assert.rejects(() => authority.createPrincipal({
+    id: 'human-worker-grant', kind: 'human', roles: ['viewer'], projectIds: ['*'], runIds: ['*'],
+    workerGrant: { capabilities: ['browser:chromium'], resourceClasses: ['ordinary'] },
+  }), (error) => error?.code === 'CREDENTIAL_SCHEMA_INVALID');
+  const legacyWorkerIssued = await authority.createPrincipal({
+    id: 'legacy-worker', kind: 'worker', roles: ['worker'], projectIds: ['project-1'], runIds: ['run-1'],
+  });
+  assert.equal((await authority.authenticateCredential(legacyWorkerIssued.credential)).workerGrant, null,
+    'legacy ungranted worker records remain readable but fail closed for scheduling');
+  await authority.setWorkerGrant('legacy-worker', {
+    capabilities: ['browser:chromium'], resourceClasses: ['ordinary'],
+  });
+  assert.deepEqual((await reopenedAuthority.authenticateCredential(legacyWorkerIssued.credential)).workerGrant,
+    { capabilities: ['browser:chromium'], resourceClasses: ['ordinary'] },
+    'an existing credential can receive a persisted grant without rotation');
 
   assert.doesNotThrow(() => assertPrincipalAuthorized(viewer, CONTROL_ACTIONS.RUN_VIEW, { projectId: 'project-1', runId: 'run-1' }));
   assert.throws(() => assertPrincipalAuthorized(viewer, CONTROL_ACTIONS.RUN_REKICK, { projectId: 'project-1', runId: 'run-1' }),

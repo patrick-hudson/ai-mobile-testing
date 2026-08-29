@@ -5,7 +5,9 @@ import { ControlPlaneError } from '../shared/control-plane-contract.mjs';
 import { atomicWriteJson, withDirectoryLock } from '../scripts/lib/atomic-filesystem.mjs';
 
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const CAPABILITY = /^[a-z][a-z0-9.-]*:[a-z][a-z0-9.-]*$/;
 const KINDS = new Set(['human', 'service', 'worker']);
+const WORKER_RESOURCE_CLASSES = new Set(['ordinary', 'performance']);
 const KIND_ROLES = Object.freeze({
   human: new Set(['viewer', 'operator', 'reviewer', 'custodian', 'administrator']),
   service: new Set(['viewer', 'operator', 'custodian', 'delivery']),
@@ -31,6 +33,29 @@ function validateScope(values, label) {
   if (scoped.some((value) => value !== '*' && !SAFE_ID.test(value))) fail('CREDENTIAL_SCHEMA_INVALID', `${label} contains an invalid scope id.`);
   return scoped;
 }
+function workerGrant(value, kind, { stored = false } = {}) {
+  const invalid = (message) => fail(stored ? 'CREDENTIAL_STORE_CORRUPT' : 'CREDENTIAL_SCHEMA_INVALID', message, stored ? 500 : 400);
+  if (kind !== 'worker') {
+    if (value !== undefined && value !== null) invalid('Only worker principals may carry a worker grant.');
+    return null;
+  }
+  if (value === undefined || value === null) return null;
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || Object.keys(value).some((key) => !['capabilities', 'resourceClasses'].includes(key))
+    || !('capabilities' in value) || !('resourceClasses' in value)) {
+    invalid('Worker grant must contain capabilities and exactly one resource class.');
+  }
+  if (!Array.isArray(value.capabilities) || value.capabilities.length === 0 || value.capabilities.length > 32
+    || value.capabilities.some((capability) => typeof capability !== 'string' || !CAPABILITY.test(capability))) {
+    invalid('Worker grant capabilities must be a bounded non-empty capability array.');
+  }
+  if (!Array.isArray(value.resourceClasses) || value.resourceClasses.length !== 1
+    || !WORKER_RESOURCE_CLASSES.has(value.resourceClasses[0])) invalid('Worker grant must contain exactly one valid resource class.');
+  return Object.freeze({
+    capabilities: Object.freeze([...new Set(value.capabilities)].sort()),
+    resourceClasses: Object.freeze([...value.resourceClasses]),
+  });
+}
 function derive(secret, salt) { return scryptSync(secret, Buffer.from(salt, 'base64url'), 32).toString('base64url'); }
 function constantMatch(value, expected) {
   const left = Buffer.from(String(value)); const right = Buffer.from(String(expected));
@@ -43,6 +68,7 @@ function publicPrincipal(record) {
   return Object.freeze({
     id: record.id, kind: record.kind, roles: [...record.roles], projectIds: [...record.projectIds],
     runIds: [...record.runIds], authVersion: record.authVersion,
+    workerGrant: record.workerGrant,
   });
 }
 
@@ -68,6 +94,9 @@ export async function openScopedCredentialAuthority({ root, clock = () => Date.n
     revokePrincipal: (id) => serialize(authority, () => mutatePrincipal(authority, id, (record) => ({ ...record, revokedAt: nowIso(authority), authVersion: record.authVersion + 1 }))),
     setRoles: (id, roles) => serialize(authority, () => mutatePrincipal(authority, id, (record) => ({
       ...record, roles: unique(roles, 'roles', KIND_ROLES[record.kind]), authVersion: record.authVersion + 1,
+    }))),
+    setWorkerGrant: (id, grant) => serialize(authority, () => mutatePrincipal(authority, id, (record) => ({
+      ...record, workerGrant: workerGrant(grant, record.kind), authVersion: record.authVersion + 1,
     }))),
     rotateCredential: (id) => serialize(authority, () => rotateCredential(authority, id)),
     createBrowserSession: (principal, options) => serialize(authority, () => createBrowserSession(authority, principal, options)),
@@ -99,6 +128,7 @@ async function createPrincipal(authority, input) {
     roles: unique(input.roles, 'roles', KIND_ROLES[input.kind]),
     projectIds: validateScope(input.projectIds, 'projectIds'),
     runIds: validateScope(input.runIds, 'runIds'),
+    workerGrant: workerGrant(input.workerGrant, input.kind),
     salt, verifier: derive(secret, salt), authVersion: 1, createdAt: nowIso(authority),
     expiresAt: input.expiresAt ?? null, revokedAt: null,
   };
@@ -123,7 +153,7 @@ async function readPrincipal(authority, id) {
     || !canonicalTime(value.revokedAt, { nullable: true })) {
     fail('CREDENTIAL_STORE_CORRUPT', 'Credential principal record is corrupt.', 500);
   }
-  return value;
+  return { ...value, workerGrant: workerGrant(value.workerGrant, value.kind, { stored: true }) };
 }
 
 async function authenticateCredential(authority, credential) {

@@ -13,6 +13,7 @@ export function openParentRunStore(options: any): Promise<ParentRunStore>;
 export function createParentRun(store: ParentRunStore, input: any): Promise<any>;
 export function recoverParentRun(store: ParentRunStore, runId: string): Promise<any>;
 export function readParentRun(store: ParentRunStore, runId: string): Promise<any>;
+export function listParentRunIds(store: ParentRunStore, options?: { limit?: number }): Promise<string[]>;
 export function sealParentRunGraph(store: ParentRunStore, runId: string, coordinator: CoordinatorFence, input: {
   subjectCore?: unknown;
   executionManifest: unknown;
@@ -22,6 +23,8 @@ export function sealParentRunGraph(store: ParentRunStore, runId: string, coordin
 }): Promise<any>;
 export function acquireCoordinator(store: ParentRunStore, runId: string, input: { ownerId: string; leaseMs: number }): Promise<CoordinatorFence>;
 export function takeOverCoordinator(store: ParentRunStore, runId: string, input: { ownerId: string; leaseMs: number }): Promise<CoordinatorFence>;
+export function acquireStoreCoordinator(store: ParentRunStore, input: { ownerId: string; leaseMs: number }): Promise<CoordinatorFence>;
+export function takeOverStoreCoordinator(store: ParentRunStore, input: { ownerId: string; leaseMs: number }): Promise<CoordinatorFence>;
 export function heartbeatCoordinator(store: ParentRunStore, coordinator: CoordinatorFence, input: { leaseMs: number }): Promise<CoordinatorFence>;
 export function requestPerformanceDrain(store: ParentRunStore, runId: string, coordinator: CoordinatorFence, input: { workerId: string; leaseMs?: number }): Promise<{ workerId: string; requestedAt: string; expiresAt: string; coordinatorEpoch: number }>;
 export function claimWorkItem(store: ParentRunStore, runId: string, coordinator: CoordinatorFence, input: { workerId: string; workItemId?: string; capabilities?: string[]; resourceClasses?: Array<'ordinary' | 'performance'>; leaseMs: number }): Promise<WorkLease>;

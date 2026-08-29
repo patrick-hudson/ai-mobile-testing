@@ -141,7 +141,6 @@ services:
       AUDIT_SHARED_EXCHANGE_ROOT: /var/lib/ai-mobile-testing/shared/exchange
       AUDIT_SHARED_DEPLOYMENT_IDENTITY: ${AUDIT_SHARED_DEPLOYMENT_IDENTITY:-compose:ai-mobile-testing}
       AUDIT_SHARED_VOLUME_IDENTITY: named-volume:shared-parent-runs
-      AUDIT_SHARED_RUN_ID: ${AUDIT_SHARED_RUN_ID:-}
       AUDIT_SHARED_COORDINATOR_PORT: "4180"
       AUDIT_SHARED_CREDENTIAL_ROOT: /var/lib/ai-mobile-testing/shared/credentials
       AUDIT_SHARED_PROJECT_ID: ${AUDIT_SHARED_PROJECT_ID:-default}
@@ -164,6 +163,7 @@ services:
     environment:
       AUDIT_SHARED_CREDENTIAL_ROOT: /var/lib/ai-mobile-testing/shared/credentials
       AUDIT_SHARED_PROJECT_ID: ${AUDIT_SHARED_PROJECT_ID:-default}
+      AUDIT_SHARED_ORDINARY_CAPABILITIES: ${AUDIT_SHARED_ORDINARY_CAPABILITIES:-inventory:http,browser:chromium,browser:firefox,browser:webkit}
       AUDIT_SHARED_WORKER_A_CREDENTIAL_FILE: /var/lib/ai-mobile-testing/shared/secrets/ordinary-a/token
       AUDIT_SHARED_WORKER_B_CREDENTIAL_FILE: /var/lib/ai-mobile-testing/shared/secrets/ordinary-b/token
       AUDIT_SHARED_PERFORMANCE_CREDENTIAL_FILE: /var/lib/ai-mobile-testing/shared/secrets/performance/token

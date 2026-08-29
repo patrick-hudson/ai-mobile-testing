@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import * as fs from 'node:fs/promises';
-import os from 'node:os';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { collectSharedWorkerEvidence } from './lib/shared-worker-evidence.mjs';
 import { maintainSharedWorkerLease } from './lib/shared-worker-heartbeat.mjs';
@@ -23,7 +23,6 @@ if (coordinatorUrl.protocol !== 'http:' || coordinatorUrl.username || coordinato
 const resourceClass = required('AUDIT_SHARED_RESOURCE_CLASS');
 if (!['ordinary', 'performance'].includes(resourceClass)) throw new Error('AUDIT_SHARED_RESOURCE_CLASS is invalid.');
 const capabilities = required('AUDIT_SHARED_WORKER_CAPABILITIES').split(',').map((value) => value.trim()).filter(Boolean);
-const workerId = `worker-${os.hostname().replace(/[^A-Za-z0-9._-]/g, '-')}-${process.pid}`;
 const pollMs = Number(process.env.AUDIT_SHARED_POLL_MS ?? 1_000);
 if (!Number.isSafeInteger(pollMs) || pollMs < 100 || pollMs > 60_000) throw new Error('AUDIT_SHARED_POLL_MS is invalid.');
 
@@ -46,7 +45,7 @@ const post = async (pathname, body) => {
 };
 const wait = () => new Promise((resolve) => setTimeout(resolve, pollMs));
 const execute = async ({ lease, signal: abortSignal }) => {
-  const evidenceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'audit-shared-evidence-'));
+  const evidenceRoot = await fs.mkdtemp(path.join(tmpdir(), 'audit-shared-evidence-'));
   try {
     const completion = await new Promise((resolve, reject) => {
       const child = spawn(executor[0], executor.slice(1), {
@@ -77,7 +76,7 @@ const execute = async ({ lease, signal: abortSignal }) => {
       child.stdin.on('error', reject);
       child.stdin.end(`${JSON.stringify(lease)}\n`);
     });
-    return await collectSharedWorkerEvidence(evidenceRoot, completion);
+    return await collectSharedWorkerEvidence(evidenceRoot, completion, lease);
   } finally {
     await fs.rm(evidenceRoot, { recursive: true, force: true });
   }
@@ -87,10 +86,10 @@ let stopping = false;
 for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => { stopping = true; });
 while (!stopping) {
   if (resourceClass === 'performance') {
-    const drain = await post('/v1/performance-drain', { workerId }).catch(() => null);
+    const drain = await post('/v1/performance-drain', {}).catch(() => null);
     if (!drain || !drain.response.ok) { await wait(); continue; }
   }
-  const claimed = await post('/v1/claim', { workerId, capabilities, resourceClasses: [resourceClass] }).catch(() => null);
+  const claimed = await post('/v1/claim', { capabilities, resourceClasses: [resourceClass] }).catch(() => null);
   if (!claimed || !claimed.response.ok) { await wait(); continue; }
   process.stdout.write(`${JSON.stringify({ event: 'work-item-claimed', workItemId: claimed.value.workItemId, attempt: claimed.value.attempt })}\n`);
   const commandLog = await post('/v1/log', {

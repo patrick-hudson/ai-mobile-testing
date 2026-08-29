@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import {
   acceptOperation,
   acquireCoordinator,
+  acquireStoreCoordinator,
   appendAttemptLog,
   adoptWorkHeartbeat,
   adoptAttemptEvidence,
@@ -16,6 +17,7 @@ import {
   getOperation,
   heartbeatCoordinator,
   heartbeatWorkItem,
+  listParentRunIds,
   openParentRunStore,
   publishAttemptEvidence,
   publishCurrentEnvelope,
@@ -26,6 +28,7 @@ import {
   requeueExpiredWork,
   sealParentRunGraph,
   takeOverCoordinator,
+  takeOverStoreCoordinator,
 } from './lib/parent-run-store.mjs';
 import { readLegacyRun } from './lib/legacy-run-adapter.mjs';
 import { loadSharedReleasePublication } from '../portal/report-publication.mjs';
@@ -123,6 +126,39 @@ const store = await openParentRunStore({
   clock,
   verifyStorage: false,
 });
+
+// The singleton coordinator owns the store, so it can acquire its fence before
+// the portal has materialized any parent run.
+const preRunCoordinator = await acquireStoreCoordinator(store, {
+  ownerId: 'coordinator-before-runs', leaseMs: 100,
+});
+assert.equal(preRunCoordinator.epoch, 1);
+assert.deepEqual(await listParentRunIds(store), []);
+now += 101;
+
+const discoveryRoot = await mkdtemp(join(tmpdir(), 'durable-parent-run-discovery-'));
+try {
+  const discoveryStore = await openParentRunStore({
+    root: discoveryRoot,
+    deploymentIdentity: 'compose-project:discovery',
+    volumeIdentity: 'named-volume:discovery-store',
+    volumeDriver: 'local',
+    clock,
+    verifyStorage: false,
+  });
+  for (const runId of ['run-zeta', 'run-alpha']) {
+    await createParentRun(discoveryStore, {
+      runId,
+      subjectCoreDigest: DIGEST,
+      workItems: [{ id: `work-${runId}`, maxAttempts: 1 }],
+    });
+  }
+  assert.deepEqual(await listParentRunIds(discoveryStore), ['run-alpha', 'run-zeta']);
+  assert.deepEqual(await listParentRunIds(discoveryStore, { limit: 1 }), ['run-alpha']);
+  await expectCode('STORE_SCHEMA_INVALID', () => listParentRunIds(discoveryStore, { limit: 0 }));
+} finally {
+  await rm(discoveryRoot, { recursive: true, force: true });
+}
 await expectCode('SEALED_MANIFEST_MISSING', () => createParentRun(store, {
   runId: 'run-missing-manifest',
   subjectCoreDigest: DIGEST,
@@ -165,6 +201,14 @@ await createParentRun(store, {
   executionManifestDigest: DIGEST,
   compilationState: 'sealed',
   workItems: [{ id: 'work-other', maxAttempts: 1 }],
+});
+await createParentRun(store, {
+  runId: 'run-stale-worker-epoch',
+  subjectCoreDigest: DIGEST,
+  workItems: [
+    { id: 'work-stale-heartbeat', maxAttempts: 2 },
+    { id: 'work-stale-result', maxAttempts: 2 },
+  ],
 });
 const graphCore = sealReleaseSubjectCore({
   schemaVersion: 1,
@@ -305,10 +349,28 @@ await appendRiskLifecycleEvent(store, 'run-main', coordinatorA, {
 assert.equal((await readRunHistories(store, 'run-main')).risk.length, 1);
 
 // Takeover advances the epoch and prevents the stale coordinator from publishing.
+const staleEpochHeartbeatLease = await claimWorkItem(store, 'run-stale-worker-epoch', coordinatorA, {
+  workerId: 'worker-stale-heartbeat', workItemId: 'work-stale-heartbeat', leaseMs: 10_000,
+});
+const staleEpochHeartbeat = await heartbeatWorkItem(store, 'run-stale-worker-epoch', staleEpochHeartbeatLease, {
+  leaseMs: 10_000,
+});
+const staleEpochResultLease = await claimWorkItem(store, 'run-stale-worker-epoch', coordinatorA, {
+  workerId: 'worker-stale-result', workItemId: 'work-stale-result', leaseMs: 10_000,
+});
+const staleEpochResult = await publishAttemptEvidence(store, 'run-stale-worker-epoch', staleEpochResultLease, {
+  outcome: 'completed_pass', artifacts: [],
+});
 now += 1_001;
-const coordinatorB = await takeOverCoordinator(store, 'run-main', { ownerId: 'coordinator-b', leaseMs: 1_000 });
+const coordinatorB = await takeOverStoreCoordinator(store, { ownerId: 'coordinator-b', leaseMs: 1_000 });
 assert.equal(coordinatorB.epoch, coordinatorA.epoch + 1);
 await expectCode('STALE_COORDINATOR', () => publishCurrentEnvelope(store, 'run-main', coordinatorA, envelope(1)));
+await expectCode('STALE_WORK_LEASE', () => adoptWorkHeartbeat(
+  store, 'run-stale-worker-epoch', coordinatorB, staleEpochHeartbeat,
+));
+await expectCode('STALE_WORK_LEASE', () => adoptAttemptEvidence(
+  store, 'run-stale-worker-epoch', coordinatorB, staleEpochResult,
+));
 
 // Envelope durability precedes the single head swap: a crash exposes the old head or the new complete head.
 let histories = await readRunHistories(store, 'run-main');

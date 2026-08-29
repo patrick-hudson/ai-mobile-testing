@@ -21,9 +21,17 @@ function artifactPath(root, value) {
   return candidate;
 }
 
-export async function collectSharedWorkerEvidence(evidenceRoot, { code, signal = null }) {
+export async function collectSharedWorkerEvidence(evidenceRoot, { code, signal = null }, lease) {
+  if (!lease || typeof lease !== 'object' || Array.isArray(lease)
+    || typeof lease.runId !== 'string' || !lease.runId
+    || typeof lease.workItemId !== 'string' || !lease.workItemId
+    || !Number.isSafeInteger(lease.attempt) || lease.attempt < 1
+    || typeof lease.subjectCoreDigest !== 'string' || !lease.subjectCoreDigest
+    || typeof lease.runnerRevision !== 'string' || !lease.runnerRevision) {
+    throw new Error('A valid active work lease is required to collect executor evidence.');
+  }
   const manifestPath = path.join(evidenceRoot, 'result.json');
-  let manifest = null;
+  let manifest;
   let manifestHandle;
   try {
     manifestHandle = await fs.open(manifestPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
@@ -31,17 +39,34 @@ export async function collectSharedWorkerEvidence(evidenceRoot, { code, signal =
     if (!stat.isFile() || stat.size > 65_536) throw new Error('Executor result manifest is not a bounded regular file.');
     manifest = JSON.parse(await manifestHandle.readFile('utf8'));
   } catch (error) {
-    if (error?.code !== 'ENOENT') throw error;
+    if (error?.code === 'ENOENT') throw new Error('Executor result manifest is required.');
+    throw error;
   } finally {
     await manifestHandle?.close();
   }
-  if (manifest !== null && (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)
-    || Object.keys(manifest).some((key) => !['outcome', 'reason', 'artifacts'].includes(key))
+  const resultKeys = [
+    'schemaVersion', 'kind', 'runId', 'workItemId', 'attempt', 'subjectCoreDigest', 'runnerRevision',
+    'outcome', 'reason', 'artifacts',
+  ];
+  if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)
+    || Object.keys(manifest).length !== resultKeys.length || resultKeys.some((key) => !(key in manifest))
+    || manifest.schemaVersion !== 1 || manifest.kind !== 'shared-worker-result'
     || !['completed_pass', 'completed_product_failure'].includes(manifest.outcome)
-    || !Array.isArray(manifest.artifacts) || manifest.artifacts.length > MAX_WORKER_ARTIFACTS)) {
+    || (manifest.reason !== null && (typeof manifest.reason !== 'string' || !manifest.reason || manifest.reason.length > 256))
+    || !Array.isArray(manifest.artifacts) || manifest.artifacts.length > MAX_WORKER_ARTIFACTS) {
     throw new Error('Executor result manifest has an invalid schema.');
   }
-  const declarations = manifest?.artifacts ?? [];
+  if (manifest.runId !== lease.runId || manifest.workItemId !== lease.workItemId || manifest.attempt !== lease.attempt
+    || manifest.subjectCoreDigest !== lease.subjectCoreDigest || manifest.runnerRevision !== lease.runnerRevision) {
+    throw new Error('Executor result identity does not match the active work lease.');
+  }
+  if (signal !== null || !Number.isSafeInteger(code) || code < 0 || code > 1) {
+    throw new Error('Executor terminated abnormally; the lease must expire for operational recovery.');
+  }
+  if (code === 1 && manifest.outcome !== 'completed_product_failure') {
+    throw new Error('Executor exit 1 requires a completed product failure result.');
+  }
+  const declarations = manifest.artifacts;
   const uploads = [];
   const names = new Set();
   const digests = new Set();
@@ -85,10 +110,9 @@ export async function collectSharedWorkerEvidence(evidenceRoot, { code, signal =
       digest, contentBase64: bytes.toString('base64'),
     });
   }
-  const failed = code !== 0;
   return {
-    outcome: failed ? 'completed_product_failure' : (manifest?.outcome ?? 'completed_pass'),
-    reason: failed ? (signal ? `executor-signal-${signal}` : `executor-exit-${code}`) : (manifest?.reason ?? null),
+    outcome: manifest.outcome,
+    reason: manifest.reason,
     artifacts: uploads,
   };
 }

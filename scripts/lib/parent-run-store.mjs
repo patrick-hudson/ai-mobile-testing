@@ -42,6 +42,7 @@ const ARTIFACT_MEDIA_TYPE = /^[a-z0-9][a-z0-9.+-]{0,126}\/[a-z0-9][a-z0-9.+-]{0,
 const MAX_OPERATION_RESOURCES = 128;
 const MAX_OPERATION_BODY_BYTES = 16 * 1_024;
 const OPERATION_RETRY_WINDOW_MS = 24 * 60 * 60 * 1_000;
+const MAX_DISCOVERED_PARENT_RUNS = 2_048;
 
 export class ParentRunStoreError extends Error {
   constructor(code, message, details = undefined) {
@@ -600,6 +601,21 @@ export async function recoverParentRun(store, runId) {
 
 export const readParentRun = recoverParentRun;
 
+export async function listParentRunIds(store, { limit = MAX_DISCOVERED_PARENT_RUNS } = {}) {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_DISCOVERED_PARENT_RUNS) {
+    fail('STORE_SCHEMA_INVALID', `Parent-run discovery limit must be from 1 through ${MAX_DISCOVERED_PARENT_RUNS}.`);
+  }
+  const entries = await store.storage.fs.readdir(containedPath(store.root, 'runs'));
+  const runIds = [];
+  for (const entry of entries.filter((name) => SAFE_ID.test(name)).sort()) {
+    const metadata = await store.storage.fs.lstat(containedPath(store.root, 'runs', entry));
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) continue;
+    runIds.push(entry);
+    if (runIds.length >= limit) break;
+  }
+  return runIds;
+}
+
 export async function sealParentRunGraph(store, runId, coordinator, input) {
   const subjectCore = input.subjectCore ? parseReleaseSubjectCore(input.subjectCore) : null;
   const executionManifest = parseExecutionManifest(input.executionManifest);
@@ -659,40 +675,60 @@ export async function sealParentRunGraph(store, runId, coordinator, input) {
   }));
 }
 
-async function acquire(store, runId, input, takeoverOnly) {
+async function acquireStoreCoordinatorUnlocked(store, input, takeoverOnly) {
   safeId(input?.ownerId, 'coordinator ownerId');
   if (!Number.isSafeInteger(input.leaseMs) || input.leaseMs < 100) fail('STORE_SCHEMA_INVALID', 'Coordinator leaseMs is invalid.');
+  const previous = await readGlobalCoordinator(store);
+  const active = previous && Date.parse(previous.expiresAt) > store.clock();
+  if (active) fail('COORDINATOR_LEASE_HELD', `Coordinator epoch ${previous.epoch} is still active.`);
+  if (takeoverOnly && previous === null) fail('COORDINATOR_TAKEOVER_INVALID', 'No prior coordinator exists to take over.');
+  const epoch = Math.max(previous?.epoch ?? 0, store.manifest.authorityEpoch) + 1;
+  const coordinator = {
+    ownerId: input.ownerId,
+    epoch,
+    token: store.storage.nonce(),
+    acquiredAt: timestamp(store),
+    expiresAt: new Date(store.clock() + input.leaseMs).toISOString(),
+  };
+  // Advance the manifest fence before publishing the lease. A crash may skip
+  // an epoch, but can never expose a lease newer than the durable authority
+  // epoch or allow a later coordinator to reuse the same epoch.
+  await writeManifest(store, { ...store.manifest, authorityEpoch: epoch });
+  await atomicWriteJson(store.storage, globalCoordinatorPath(store), sealCoordinatorLease(coordinator));
+  return coordinator;
+}
+
+async function acquireWithRunAudit(store, runId, input, takeoverOnly) {
   return withDirectoryLock(store.storage, globalLockPath(store), () => (
     withDirectoryLock(store.storage, lockPath(store, runId), async () => {
-    const state = await recoverUnlocked(store, runId);
-    const previous = await readGlobalCoordinator(store);
-    const active = previous && Date.parse(previous.expiresAt) > store.clock();
-    if (active) fail('COORDINATOR_LEASE_HELD', `Coordinator epoch ${previous.epoch} is still active.`);
-    if (takeoverOnly && previous === null) fail('COORDINATOR_TAKEOVER_INVALID', 'No prior coordinator exists to take over.');
-    const epoch = (previous?.epoch ?? store.manifest.authorityEpoch) + 1;
-    const coordinator = {
-      ownerId: input.ownerId,
-      epoch,
-      token: store.storage.nonce(),
-      acquiredAt: timestamp(store),
-      expiresAt: new Date(store.clock() + input.leaseMs).toISOString(),
-    };
-    await atomicWriteJson(store.storage, globalCoordinatorPath(store), sealCoordinatorLease(coordinator));
-    await appendMutationUnlocked(store, state, 'mutation', takeoverOnly ? 'coordinator-taken-over' : 'coordinator-acquired', (next) => {
-      next.coordinator = coordinator;
-    }, { actor: { id: input.ownerId, kind: 'service' }, data: { epoch } });
-    await writeManifest(store, { ...store.manifest, authorityEpoch: Math.max(store.manifest.authorityEpoch, epoch) });
-    return clone(coordinator);
+      const state = await recoverUnlocked(store, runId);
+      const coordinator = await acquireStoreCoordinatorUnlocked(store, input, takeoverOnly);
+      await appendMutationUnlocked(store, state, 'mutation', takeoverOnly ? 'coordinator-taken-over' : 'coordinator-acquired', (next) => {
+        next.coordinator = coordinator;
+      }, { actor: { id: input.ownerId, kind: 'service' }, data: { epoch: coordinator.epoch } });
+      return clone(coordinator);
     })
   ));
 }
 
+export function acquireStoreCoordinator(store, input) {
+  return withDirectoryLock(store.storage, globalLockPath(store), async () => (
+    clone(await acquireStoreCoordinatorUnlocked(store, input, false))
+  ));
+}
+
+export function takeOverStoreCoordinator(store, input) {
+  return withDirectoryLock(store.storage, globalLockPath(store), async () => (
+    clone(await acquireStoreCoordinatorUnlocked(store, input, true))
+  ));
+}
+
 export function acquireCoordinator(store, runId, input) {
-  return acquire(store, runId, input, false);
+  return acquireWithRunAudit(store, runId, input, false);
 }
 
 export function takeOverCoordinator(store, runId, input) {
-  return acquire(store, runId, input, true);
+  return acquireWithRunAudit(store, runId, input, true);
 }
 
 export async function heartbeatCoordinator(store, coordinator, { leaseMs }) {
@@ -903,6 +939,9 @@ export async function adoptWorkHeartbeat(store, runId, coordinator, receipt) {
     || Date.parse(requestedExpiresAt) <= Date.parse(publishedAt)
     || Date.parse(requestedExpiresAt) - Date.parse(publishedAt) > 3_600_000
     || digest !== receipt.digest || digest !== canonicalDigest(body)) fail('STORE_CORRUPT', 'Attempt heartbeat inbox is corrupt.');
+  if (document.coordinatorEpoch !== coordinator?.epoch) {
+    fail('STALE_WORK_LEASE', 'Heartbeat belongs to a stale coordinator epoch.');
+  }
   let renewed;
   await mutate(store, runId, { coordinator, type: 'work-item-heartbeat-adopted', data: { workItemId: document.workItemId } }, (state) => {
     const item = state.workItems[document.workItemId];
@@ -1092,6 +1131,9 @@ export async function adoptAttemptEvidence(store, runId, coordinator, inbox) {
     || new Set(document.evidenceDigests).size !== document.evidenceDigests.length
     || document.evidenceDigests.some((entry) => !DIGEST_PATTERN.test(entry))
     || digest !== canonicalDigest(body) || digest !== inbox.digest) fail('STORE_CORRUPT', 'Attempt evidence inbox is corrupt.');
+  if (document.coordinatorEpoch !== coordinator?.epoch) {
+    fail('STALE_WORK_LEASE', 'Attempt evidence belongs to a stale coordinator epoch.');
+  }
   validateWorkLease(state, {
     runId,
     workItemId: document.workItemId,
