@@ -1,0 +1,120 @@
+name: Exact audited promotion
+
+on:
+  workflow_call:
+    inputs:
+      artifact_id:
+        description: Immutable artifact ID containing site/, release-artifact-manifest.json, candidate-deployment.json, and the shared result
+        required: true
+        type: string
+      control_server:
+        required: true
+        type: string
+      project_id:
+        required: true
+        type: string
+      production_account_id:
+        required: true
+        type: string
+      production_project:
+        required: true
+        type: string
+      production_branch:
+        required: true
+        type: string
+      source_revision:
+        required: true
+        type: string
+      shared_result_name:
+        required: false
+        default: shared-release-result.json
+        type: string
+    secrets:
+      shared_delivery_token:
+        required: true
+      cloudflare_api_token:
+        required: true
+    outputs:
+      receipt_artifact_name:
+        value: ${{ jobs.promote.outputs.receipt_artifact_name }}
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: exact-production-promotion-${{ inputs.production_account_id }}-${{ inputs.production_project }}
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: production
+    outputs:
+      receipt_artifact_name: exact-promotion-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Check out audit implementation
+        uses: actions/checkout@v4
+
+      - name: Download the immutable caller artifact by ID
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ inputs.artifact_id }}
+          path: artifacts/promotion-bundle
+          merge-multiple: true
+
+      - name: Build and validate the pinned delivery image
+        run: docker compose build --pull portal
+
+      - name: Materialize file-only delivery credentials
+        env:
+          SHARED_DELIVERY_TOKEN: ${{ secrets.shared_delivery_token }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.cloudflare_api_token }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/promotion-private artifacts/promotion-result
+          printf '%s\n' "$SHARED_DELIVERY_TOKEN" > artifacts/promotion-private/delivery.token
+          printf '%s\n' "$CLOUDFLARE_API_TOKEN" > artifacts/promotion-private/cloudflare.token
+          chmod 0600 artifacts/promotion-private/delivery.token artifacts/promotion-private/cloudflare.token
+
+      - name: Consume current-head claim and deploy exact audited bytes
+        env:
+          CONTROL_SERVER: ${{ inputs.control_server }}
+          SHARED_RESULT_NAME: ${{ inputs.shared_result_name }}
+          PROJECT_ID: ${{ inputs.project_id }}
+          PRODUCTION_ACCOUNT_ID: ${{ inputs.production_account_id }}
+          PRODUCTION_PROJECT: ${{ inputs.production_project }}
+          PRODUCTION_BRANCH: ${{ inputs.production_branch }}
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          REQUEST_ID: exact-promotion-${{ github.run_id }}-${{ github.run_attempt }}
+        run: >-
+          docker compose run --rm --no-deps portal
+          node scripts/run-exact-promotion.mjs
+          --server "$CONTROL_SERVER"
+          --delivery-token-file /work/artifacts/promotion-private/delivery.token
+          --cloudflare-token-file /work/artifacts/promotion-private/cloudflare.token
+          --ci-result-file "/work/artifacts/promotion-bundle/$SHARED_RESULT_NAME"
+          --artifact-root /work/artifacts/promotion-bundle/site
+          --artifact-manifest-file /work/artifacts/promotion-bundle/release-artifact-manifest.json
+          --candidate-file /work/artifacts/promotion-bundle/candidate-deployment.json
+          --project-id "$PROJECT_ID"
+          --production-account-id "$PRODUCTION_ACCOUNT_ID"
+          --production-project "$PRODUCTION_PROJECT"
+          --production-branch "$PRODUCTION_BRANCH"
+          --source-revision "$SOURCE_REVISION"
+          --request-id "$REQUEST_ID"
+          --result-file /work/artifacts/promotion-result/exact-promotion-receipt.json
+
+      - name: Remove delivery credentials
+        if: always()
+        run: rm -rf artifacts/promotion-private
+
+      - name: Upload non-secret promotion receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exact-promotion-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/promotion-result
+          if-no-files-found: error
+          retention-days: 90

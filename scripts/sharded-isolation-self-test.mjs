@@ -224,15 +224,15 @@ async function assertReleaseDefaults(repositoryRoot) {
   ]);
   assert.match(compose, /AUDIT_WORKERS: \$\{AUDIT_SHARD_WORKERS:-1\}/);
   assert.match(compose, /AUDIT_SHARD_TOTAL: \$\{AUDIT_SHARD_TOTAL:-8\}/);
-  assert.match(workflow, /workers:[\s\S]{0,240}?default: '1'/);
-  assert.match(workflow, /shards:[\s\S]{0,240}?default: '8'/);
-  assert.match(workflow, /shard_concurrency:[\s\S]{0,240}?default: '4'/);
-  assert.match(workflow, /AUDIT_SHARD_CONCURRENCY: \$\{\{ inputs\.shard_concurrency \}\}/);
+  assert.match(workflow, /matrix:\s*\n\s+mode: \[single-site, comparative\]/u);
+  assert.match(workflow, /run-shared-release-ci\.mjs/u);
+  assert.doesNotMatch(workflow, /AUDIT_SHARD_|run-sharded-release/u,
+    'legacy shard defaults must not control shared release CI');
   assert.match(portal, /releaseShardTotal: DEFAULT_RELEASE_SHARD_TOTAL/);
   assert.match(portal, /releaseShardWorkers: DEFAULT_RELEASE_SHARD_WORKERS/);
   assert.match(portal, /releaseShardConcurrency: DEFAULT_RELEASE_SHARD_CONCURRENCY/);
-  assert.match(documentation, /default is eight functional shards with one Playwright worker/);
-  assert.match(readme, /default to eight functional shards with one Playwright worker each/);
+  assert.match(documentation, /Legacy queue\/finalizer and sharded commands remain diagnostic/u);
+  assert.match(readme, /Legacy sharded commands remain\s+diagnostic/u);
 }
 
 function assertPipelineDiagnosticClassification() {

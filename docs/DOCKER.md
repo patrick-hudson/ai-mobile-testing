@@ -1,5 +1,8 @@
 # Docker execution and audit portal
 
+> [!IMPORTANT]
+> Single-site and Comparative release authority now use the shared durable runner. Legacy queue/finalizer and sharded commands remain diagnostic during migration and are permanently fenced after shared activation. See [Shared release authority](SHARED_RELEASE_AUTHORITY.md).
+
 The Docker image is the canonical way to run this suite. It pins the Playwright browser image to the same Playwright release used by the project and contains all three browser engines. Comparative results use the host-mounted `artifacts/` directory; durable Single-site jobs, immutable finalizations, and copied visual baselines use dedicated Docker named volumes.
 
 ## Start the portal
@@ -50,7 +53,7 @@ The live gallery does not load an entire Single-site inventory before it becomes
 
 Every launch receives an isolated directory at `artifacts/runs/<run-id>/`. Its `run.json` records the targets, selection, browser projects, safe command arguments, progress, timestamps, and exit result. `logs/runner.log` preserves the complete timestamped process output. The test reporters write their evidence into the same run directory through `AUDIT_ARTIFACT_DIR`.
 
-Portal status has three independent parts. `pipeline.status` says whether browser execution and required evidence processing completed. `release.decision` preserves the checklist result. `executionProvenance` and `reviewReasons` say whether that result is eligible for final signoff. A portal-launched release always records `portal-single-container` / `review-evidence-only` provenance, so even a `READY` checklist becomes `review-required`; final authority comes only from a new-ID sharded run with the isolated performance container. TLS bypass, flaky checks, smoke, and reduced scope also withhold signoff. The browser process exit code remains visible as diagnostic data, but it cannot overrule the checklist or provenance.
+Legacy portal status has three independent parts: pipeline state, checklist result, and provenance/review reasons. Those fields remain readable as diagnostic history, but neither a portal checklist nor a new sharded legacy run is release authority after shared activation. The shared current head supplies the revisioned decision, certified scope, and Risk Register used by automation.
 
 After Playwright exits—whether its checks pass or fail—the portal runs a visible evidence pipeline: video hashing/poster indexing, optional AI evidence review, then a final checklist rebuild. That rebuild discovers each FFmpeg-generated sibling `*-poster.jpg`, copies it into the checklist evidence directory, records its size and checksum, uses it as the video preview, and exposes a separate poster link. Videos without a generated poster remain playable and linked exactly as before. Each command has a persisted lifecycle record with start/end time, duration, exit status, and live stage-prefixed output. A required video/report failure produces the distinct non-green `evidence-failed` result. AI remains advisory and cannot turn a failed deterministic audit green.
 
@@ -87,7 +90,7 @@ The report does not collapse different kinds of truth into one green mark:
 
 | Dimension | Meaning |
 | --- | --- |
-| Site Health | `HEALTHY`, `FINDINGS`, or `INCOMPLETE` for the executed automated scope. A required execution, action video, media stage, or report-integrity failure yields `INCOMPLETE`. It is advisory and never authorizes promotion. |
+| Release Decision | `RELEASE READY`, `FEATURE READY`, or a stable `NOT READY` code for the executed scope. A required execution, action video, media stage, or publication-integrity failure yields incomplete execution and blocks that scope. |
 | Scope | Always `FULL` or `TARGETED`; a targeted `HEALTHY` verdict describes only that subset. |
 | Coverage | `COMPLETE`, `GAPS`, or `UNKNOWN`, independently reporting missing standalone oracles, executable variants, targets, and route limitations. |
 | Manual acceptance | Human-only outstanding, passed, failed, or blocked work. Automation and AI cannot complete it. |
@@ -140,7 +143,7 @@ The terminal `proof-finished` event includes a compact receipt that binds the na
 
 Before that event is printed, the content-addressed receipt is atomically published and read back as `<single-site-finalization>/<run-id>/beta-proof-receipt.json`. Verification rereads the digest-bound queue job and canonical worker input, validates its coverage and route-inventory documents, reconstructs the accepted preview digest, rederives the durable finalization from the queue, and opens every referenced report, gallery, media, and visual publication. A missing or corrupt referenced publication, or a recomputed status/receipt that disagrees with the durable finalization, is rejected. An identical restart reuses the receipt, while older finalizations with no receipt remain readable as receipt-absent. Optional revision fields remain `null` when the corresponding older authority did not publish them. The receipt caps the displayed publication list and includes a digest and count for the complete current set; it never copies event logs, result reasons, evidence bodies, credentials, or AI payloads.
 
-After the named proofs finish, generate a bounded machine-readable closeout manifest from their durable job IDs. The generator re-verifies every receipt and publication before copying report truth and gallery/media/visual counts; it marks Single-site evidence advisory and non-blocking and calls out that the embedded runner revision is not an OCI image ID:
+After the named legacy proofs finish, generate a bounded machine-readable closeout manifest from their durable job IDs. The generator re-verifies every receipt and publication before copying report truth and gallery/media/visual counts. This closeout is diagnostic migration evidence; only a shared publication can become the current release head:
 
 ```sh
 node scripts/single-site-completion-evidence.mjs \
@@ -433,7 +436,7 @@ Direct smoke/release services use the official Playwright image's root execution
 
 ## Continuous integration
 
-`docker-smoke.yml` builds the exact image and runs the smoke suite on pull requests, pushes to `main`, and manual dispatch. It uploads the complete smoke evidence even when tests fail. Because smoke intentionally leaves most release gates unexecuted, its checklist normally says `NOT_READY`; that result describes release scope rather than a broken evidence pipeline. The smoke workflow therefore uses an explicit pipeline-only gate: it requires a valid authoritative checklist, zero failures among the executed blocking checks, and no run-integrity failure, while retaining and reporting `NOT_READY` rather than implying the candidate is release-ready.
+`docker-smoke.yml` builds the exact image, validates the shared-runner resilience proof, and runs the legacy smoke profile for diagnostic coverage on pull requests, pushes to `main`, and manual dispatch. Smoke never certifies release scope. `.github/workflows/release-audit.yml` is the live shared-authority workflow for both modes, and `.github/workflows/exact-promotion.yml` is the only provided production delivery path.
 
 `release-audit.yml` is manual by design. It accepts the two target origins and worker count, runs the full suite inside Docker, and retains the release evidence for 90 days. Evidence uploads run regardless of outcome, then CI enforces the authoritative checklist decision together with the recorded pipeline status. Only a completed pipeline with `release.decision: READY` is green.
 

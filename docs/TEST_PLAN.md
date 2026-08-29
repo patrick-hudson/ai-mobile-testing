@@ -6,9 +6,9 @@ Find visual, behavioral, content, accessibility, reliability, and release-engine
 
 ## Single-site Audit mode
 
-Single-site Audit tests one explicitly identified Preview or Production deployment without inventing a second origin. It executes only cases with reviewed standalone Product Oracles; comparison-only migration and parity contracts remain outside the mode, while missing required standalone variants or target coverage remain explicit Coverage Gaps. `FULL` means the complete versioned Single-site profile, and any plugin, audit, area, or target narrowing is `TARGETED`.
+Single-site Audit tests one explicitly identified Preview or Production deployment without inventing a second origin. It executes only cases with reviewed standalone Product Oracles; comparison-only migration and parity contracts remain outside the mode, while missing required standalone variants or target coverage remain explicit Coverage Gaps. `FULL` means the complete versioned Single-site profile and can grant release authority for the exact deployment; any plugin, audit, area, or target narrowing is `TARGETED` and can certify only that feature scope. Both modes use the same durable runner, Risk Register, recovery, and release-decision contract.
 
-Its final report keeps advisory Site Health, Coverage, manual acceptance, Visual Review, Evidence Authority, and Pipeline Integrity independent. A passing automated check cannot close a Coverage Gap or manual row, a visual disposition cannot erase a deterministic Finding, and a Preview TLS bypass makes the evidence non-authoritative. Single-site results provide diagnostic and review evidence only: they neither authorize nor block promotion. The comparative pass and release rules below remain unchanged.
+Its final report keeps Release Decision, Coverage, manual acceptance, Visual Review, Evidence Authority, and Pipeline Integrity independent. A passing automated check cannot close a Coverage Gap or manual row, and a visual disposition cannot erase a deterministic Finding. Manual-review risks and an allowlisted Preview TLS exception remain visible but non-blocking; deterministic product and failed visual assertions block the certified scope. CI accepts only the current shared release head.
 
 ## Test layers
 
@@ -71,7 +71,7 @@ The target catalog contains provider-ready metadata for current and previous rea
 - `NOT RUN` and `MANUAL` are never equivalent to pass.
 - Flaky/retried checks stay visible and require triage; a retry is evidence, not erasure.
 - TLS verification is strict for release evidence. A recorded candidate development bypass may collect debugging evidence, but every affected candidate execution becomes `REVIEW` and the checklist cannot be `READY`.
-- A portal-launched release is a single-container review run. Its checklist decision is preserved, but a `READY` checklist is never presented as final authority. Go-live signoff requires a fresh `audit:release:sharded` run ID with fresh functional blobs and isolated single-worker performance provenance.
+- Legacy portal and sharded results remain reviewable but cannot become the current release head. Go-live automation requires a current shared publication for the exact subject and certified scope.
 - Manual media is accepted only after signature matching plus bounded FFprobe/FFmpeg visual-stream decoding. Uploads, attestations, and their rebuild are serialized per run; an invalid or concurrent submission cannot become passing evidence.
 
 ## Run review
@@ -85,7 +85,7 @@ Review the portal in this order:
 5. watch bounded live logs for container commands, browser activity, HTTP responses, FFmpeg work, source, shard/stage, redaction, and freshness;
 6. inspect candidate P0/P1 findings and their interaction videos, static screenshots, traces, and exact attempts first;
 7. compare corresponding production evidence to distinguish regression from baseline, then inspect P2/P3 and incomplete/manual rows;
-8. review advisory AI findings against their source evidence, complete physical-device/screen-reader checks, and record owners, waivers, and the final launch decision.
+8. review advisory AI findings against their source evidence and assign physical-device/screen-reader risks; these human rows stay prominent but do not block automated promotion unless a deterministic test fails.
 
 Overview, Runs, Findings, and Evidence use bounded server projections rather than client-side report fan-out. Filters, sorts, selections, inspectors, reload, and back/forward must preserve canonical safe URL state. A selected record excluded by a filter remains identified as outside the current page rather than silently switching. Each async region owns cancellation, request identity, freshness, retry, and stale-data presentation; a permission error, offline state, stale cursor, partial source, and unavailable source are distinct. Counts open exact collections, while computed values disclose population, formula, source, timestamp, and completeness. Media bytes are requested only after selecting one evidence record.
 

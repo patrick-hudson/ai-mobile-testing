@@ -25,8 +25,8 @@ This repository audits the quitting7oh experience in two complementary modes:
 
 | Mode | Use it for | Result authority |
 | --- | --- | --- |
-| **Single-site Audit** | Inspect one Preview or Production origin against standalone Product Oracles | Advisory site health, coverage, visual review, and evidence integrity |
-| **Comparative Audit** | Compare `https://quitting7oh.org` with `https://beta.quitting7oh-org.pages.dev` | Portal runs are review evidence; a fresh sharded run is required for release signoff |
+| **Single-site Audit** | Certify one Preview or Production origin against standalone Product Oracles | `RELEASE READY` for clean `FULL` scope or `FEATURE READY` for clean `TARGETED` scope |
+| **Comparative Audit** | Compare `https://quitting7oh.org` with `https://beta.quitting7oh-org.pages.dev` | The same release authority plus paired regression and production-baseline semantics |
 
 Every check declares a stable audit ID, user promise, expected behavior, severity,
 release-blocking policy, performed steps, observations, findings, and required
@@ -37,7 +37,7 @@ evidence. The result is a reviewable record—not a test count stripped of conte
 - **183 explicit audit contracts**: 81 feature and cross-cutting checks plus 102 generated route checks.
 - **Reproducible browsers**: pinned Chromium, Firefox, and WebKit runtimes inside Docker.
 - **Evidence matched to the assertion**: action-and-response video, relevant screenshots, or structured data.
-- **Durable execution**: queue-backed Single-site workers and an independent finalizer survive browser disconnects and container replacement.
+- **One durable runner**: both modes use the same canonical graph, fenced workers, bounded recovery, Risk Register, and revisioned release decision.
 - **Human-readable review**: searchable reports, a visual gallery, bounded logs, traces, network observations, and Playwright output.
 - **Fail-closed release truth**: incomplete execution or missing required evidence cannot become green.
 - **Optional AI review**: bounded, advisory evidence analysis that can never override a deterministic failure.
@@ -87,7 +87,7 @@ pinned Playwright image and may take a few minutes.
 
 ### Single-site Audit
 
-Use Single-site mode to audit exactly one deployment without inventing a second
+Use Single-site mode to certify exactly one deployment without inventing a second
 origin. It compiles independently observable one-origin expectations, exposes
 comparison-only exclusions, and records missing executable coverage as a gap.
 
@@ -99,7 +99,7 @@ The final report keeps these dimensions separate:
 
 | Dimension | Values | What it means |
 | --- | --- | --- |
-| **Site Health** | `HEALTHY`, `FINDINGS`, `INCOMPLETE` | Deterministic outcome for the automated scope; always advisory |
+| **Release Decision** | `RELEASE READY`, `FEATURE READY`, `NOT READY` | Authoritative automated outcome for the exact certified scope |
 | **Scope** | `FULL`, `TARGETED` | Whether the complete versioned profile or a subset ran |
 | **Coverage** | `COMPLETE`, `GAPS`, `UNKNOWN` | Whether standalone oracles, cases, routes, and targets were available |
 | **Manual acceptance** | `NOT_REQUIRED`, `OUTSTANDING`, `FAILED_OR_BLOCKED`, `COMPLETE` | Whether human-only physical-device, assistive-technology, or design review is unnecessary, pending, unsuccessful, or complete |
@@ -114,18 +114,14 @@ Comparative mode runs the established release contract between:
 - **Production baseline:** `https://quitting7oh.org`
 - **Redesigned candidate:** `https://beta.quitting7oh-org.pages.dev`
 
-A portal-launched comparison is useful review evidence, but it does not have the
-isolated sharding and performance provenance required for final signoff. Create a
-fresh run ID and use the sharded release command for authoritative evidence:
+Comparative mode compiles into the same canonical graph and durable workers as
+Single-site mode. Paired Product Oracles classify candidate regressions,
+production-only baseline defects, and unchanged shared defects without changing
+the Risk Register or release-decision shape. Legacy sharded commands remain
+diagnostic during migration and cannot authorize promotion after shared activation.
 
-```sh
-npm run audit:release:sharded
-```
-
-Visual and functional checks default to eight functional shards with one Playwright worker each.
-They run through a pool of four containers, followed by Lighthouse and browser performance budgets
-alone in a dedicated one-worker container. Every fresh blob is required before
-the final checklist is merged.
+See [Shared release authority](docs/SHARED_RELEASE_AUTHORITY.md) for scaling,
+recovery, release codes, CI, exact-artifact promotion, and rollback.
 
 ## How it works
 
@@ -133,16 +129,14 @@ the final checklist is merged.
 flowchart LR
     A[Portal or CLI] --> B[Read-only preflight]
     B --> C[Compiled audit contract]
-    C --> D[Durable queue]
-    D --> E[Playwright workers]
-    E --> F[Raw evidence]
-    F --> G[FFmpeg and finalizer]
-    G --> H[Immutable report revision]
-    G --> I[Visual gallery]
-    G -. optional .-> J[Advisory AI review]
-    H --> K[Human review and release decision]
-    I --> K
-    J --> K
+    C --> D[Canonical shared graph]
+    D --> E[Scoped durable workers]
+    E --> F[Fenced per-execution evidence]
+    F --> G[Product Oracles and media finalization]
+    G --> H[Revisioned release head]
+    H --> I[Report, Risk Register, gallery and archive]
+    I -. optional .-> J[Advisory AI review]
+    H --> K[Current-head promotion claim]
 ```
 
 ### Evidence contract

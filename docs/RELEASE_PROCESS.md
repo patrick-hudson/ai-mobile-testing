@@ -1,18 +1,18 @@
 # Release process
 
-## Single-site Audit interpretation (advisory and non-gating)
+## One release architecture
 
-A Single-site Audit examines exactly one Preview or Production deployment against standalone Product Oracles. It does not compare two origins, make a release decision, or substitute for the comparative release process below. Read its final report as several independent truths rather than one green or red gate:
+A Single-site Audit examines exactly one Preview or Production deployment against standalone Product Oracles. A clean `FULL` run can grant `RELEASE READY` for that exact deployment; a clean `TARGETED` run can grant `FEATURE READY` only for its certified scope. Comparative mode uses the same durable runner, risk, recovery, report, and release-decision contracts while adding paired production/candidate oracles.
 
-- **Site Health** is advisory for the executed automated scope. `HEALTHY` means the required executions completed without deterministic Findings; `FINDINGS` means they completed with one or more Findings; `INCOMPLETE` means required execution, evidence, processing, or publication did not complete safely. Always retain the `FULL` or `TARGETED` scope qualifier—a targeted `HEALTHY` result is not whole-site approval.
+- **Automated decision** is authoritative for the executed scope. Product and visual assertion failures block that scope. Missing or unsafe evidence produces an incomplete, not-ready decision.
 - **Coverage** reports what the compiled Single-site Product Oracle selected, omitted, classified as comparison-only, or could not execute. Coverage Gaps and known route limitations remain visible independently; they are not Findings and do not rewrite Site Health.
-- **Manual acceptance** remains a separate human record. Browser automation, AI interpretation, and a healthy automated result cannot complete physical-device, assistive-technology, or visual-design review.
+- **Manual acceptance** remains a visible Risk Register item but is non-blocking until a deterministic automated test fails.
 - **Visual Review** reports same-site baseline outcomes such as `UNCHANGED`, `CHANGED`, `REVIEWED`, absent, incompatible, or unavailable. A baseline decision or human review disposition routes visual drift; it does not erase a deterministic Finding or alter Site Health or Coverage.
 - **Pipeline Integrity** states whether collection, FFmpeg processing, immutable publication, and report generation completed safely. A pipeline failure makes the audit `INCOMPLETE`; a partial result must never be presented as healthy.
 
-Evidence Authority qualifies every result. Strict TLS using the baked public Netskope CA is the default. The `preview-bypass` exception is allowed only for an explicitly confirmed and exact-origin-allowlisted Preview deployment, and it makes the resulting evidence non-authoritative. Production-role Single-site runs remain strict. A non-authoritative result, including an otherwise `HEALTHY` one, is diagnostic evidence and must be described with that qualification.
+Evidence Authority qualifies every result. Strict TLS using the baked public Netskope CA is the default. An exact-origin Preview exception remains clearly flagged and non-blocking; Production-role runs remain strict.
 
-Use a Single-site result to investigate Findings, assign follow-up work, complete manual review, approve or disposition eligible visual evidence, and rerun the same deployment. It neither authorizes nor blocks deployment or promotion. The go-live rules below belong only to the established comparative production-versus-candidate process; a Single-site result cannot satisfy or veto that checklist.
+The canonical shared release head—not a legacy checklist or shadow result—controls automation. See [Shared release authority](SHARED_RELEASE_AUTHORITY.md) for topology, recovery, CI, promotion, cutover, and rollback.
 
 ## Before the audit
 
@@ -27,9 +27,9 @@ Use a Single-site result to investigate Findings, assign follow-up work, complet
 ## Evidence run
 
 1. Start the portal with Docker.
-2. Use a portal release launch for interactive review and debugging, or launch the authoritative release with a new ID via `npm run audit:release:sharded`. Never treat a portal single-container `READY` checklist as final signoff.
+2. Launch Single-site or Comparative mode through the shared control plane. Legacy sharded and single-container results are historical/diagnostic and cannot authorize promotion after shared activation.
 3. Keep the run detail open or reconnect later; logs and manifests are persisted.
-4. Let the full pipeline finish: parallel functional Playwright shards, the isolated single-worker Lighthouse/performance container, blob freshness preflight, video processing/posters, report generation, and optional AI review.
+4. Let the durable shared graph finish: ordinary browser work, exclusive performance work, Product Oracles, video processing/posters, immutable publication, report generation, and optional advisory AI review.
 5. Do not delete failed-run artifacts. Failed videos and traces are the most useful debugging evidence.
 
 Before final sign-off, open the run-wide Visual Gallery. Review the default attention queue first, then sort by feature suite and technical suite, filter failed/flaky/flagged work, inspect the selected test context, and use the overview for visual scanning. Accept a newly published order explicitly; do not assume live evidence silently reordered the frozen review. Open the generated checklist gallery as well and confirm its read-only snapshot revision/export time and final flag history match the retained release record.
@@ -48,9 +48,9 @@ For each candidate P0/P1 finding, record:
 
 A harness defect must be fixed in this repository and rerun. A site defect must remain failed until a new candidate deployment proves the fix. Do not update a visual baseline until a human confirms that the difference is intended.
 
-## Human acceptance
+## Human review (non-blocking)
 
-Complete the manual checklist on real current and small-screen iPhone hardware, a representative Android device, and iPad portrait/landscape. Run VoiceOver through navigation, search, calculators, score announcements, copy confirmation, and meeting status updates. Upload the video/screenshots in the portal, record reviewer/device/browser/notes, and explicitly attest the result. A manual pass cannot be saved without its required media, and the portal will reject a file whose declared type, byte signature, visual stream, or first decoded frame is invalid.
+Use the manual checklist on real current and small-screen iPhone hardware, a representative Android device, and iPad portrait/landscape when human coverage is available. Run VoiceOver through navigation, search, calculators, score announcements, copy confirmation, and meeting status updates. Upload the video/screenshots in the portal and record reviewer/device/browser/notes. Outstanding rows stay at the front of the Risk Register but do not change the automated release decision.
 
 ## Go-live decision
 
@@ -59,9 +59,9 @@ Launch only when:
 - candidate P0 failures are zero;
 - candidate P1 failures are zero or have explicit owner-approved waivers;
 - every critical journey has its required evidence;
-- visual differences are understood and approved;
+- deterministic visual assertions have no unresolved failures; human-only visual risks remain visibly assigned;
 - TLS was verified without a development bypass;
-- manual device and screen-reader rows are signed off;
+- manual device and screen-reader risks are visible and assigned; they do not block automation by themselves;
 - preview indexing/canonical behavior matches the deployment stage;
 - the final portal checklist and run logs are retained with the release record.
 - the Visual Gallery scale/accessibility gate is green in the canonical Docker profile and its metrics/trace/captures are retained.

@@ -1,83 +1,107 @@
-name: Full release audit
+name: Shared release audit
 
 on:
   workflow_dispatch:
     inputs:
+      control_server:
+        description: Published shared-control portal origin
+        required: true
+        type: string
       production_url:
         description: Production baseline origin
         required: true
         default: https://quitting7oh.org
         type: string
       candidate_url:
-        description: Release candidate origin
+        description: Audited candidate origin
         required: true
         default: https://beta.quitting7oh-org.pages.dev
         type: string
-      workers:
-        description: Playwright workers in each shard
+  workflow_call:
+    inputs:
+      control_server:
         required: true
-        default: '1'
-        type: choice
-        options: ['1', '2', '3', '4']
-      shards:
-        description: Functional shard partitions
+        type: string
+      production_url:
         required: true
-        default: '8'
-        type: choice
-        options: ['2', '3', '4', '6', '8']
-      shard_concurrency:
-        description: Maximum functional shard containers running at once
+        type: string
+      candidate_url:
         required: true
-        default: '4'
-        type: choice
-        options: ['1', '2', '3', '4', '5', '6', '8']
+        type: string
+    secrets:
+      shared_control_token:
+        required: true
 
 permissions:
   contents: read
 
 concurrency:
-  group: full-release-audit
+  group: shared-release-audit-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  release:
+  audit:
+    name: ${{ matrix.mode }} authority
     runs-on: ubuntu-latest
     timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [single-site, comparative]
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Build the portable audit image
+      - name: Build and validate the pinned audit image
         run: docker compose build --pull portal
 
-      - name: Validate plugins, TypeScript, and TLS policy in Docker
-        run: docker compose run --rm --no-deps portal npm run validate
-
-      - name: Run sharded release evidence audit
-        id: audit
-        continue-on-error: true
+      - name: Prepare secret and immutable audit intent
         env:
+          SHARED_CONTROL_TOKEN: ${{ secrets.shared_control_token }}
+          AUDIT_MODE: ${{ matrix.mode }}
           PRODUCTION_URL: ${{ inputs.production_url }}
           CANDIDATE_URL: ${{ inputs.candidate_url }}
-          AUDIT_SHARD_WORKERS: ${{ inputs.workers }}
-          AUDIT_SHARD_TOTAL: ${{ inputs.shards }}
-          AUDIT_SHARD_CONCURRENCY: ${{ inputs.shard_concurrency }}
-          AUDIT_SHARDED_RUN_ID: release-${{ github.run_id }}-${{ github.run_attempt }}
-          CANDIDATE_IGNORE_HTTPS_ERRORS: '0'
-        run: node scripts/run-sharded-release.mjs
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/shared-ci/${AUDIT_MODE}/private artifacts/shared-ci/${AUDIT_MODE}/result
+          printf '%s\n' "$SHARED_CONTROL_TOKEN" > artifacts/shared-ci/${AUDIT_MODE}/private/control.token
+          chmod 0600 artifacts/shared-ci/${AUDIT_MODE}/private/control.token
+          if [ "$AUDIT_MODE" = single-site ]; then
+            jq -n --arg url "$CANDIDATE_URL" '{schemaVersion:1,runContract:{schemaVersion:1,mode:"single-site",url:$url,targetIds:["single-site-mobile-chromium","single-site-desktop-chromium","single-site-mobile-webkit","single-site-tablet-webkit","single-site-desktop-firefox"],scope:{qualifier:"FULL",pluginIds:[],auditIds:[],areas:[]}}}' > artifacts/shared-ci/${AUDIT_MODE}/private/intent.json
+          else
+            jq -n --arg production "$PRODUCTION_URL" --arg candidate "$CANDIDATE_URL" '{schemaVersion:1,runContract:{schemaVersion:1,mode:"comparative",productionUrl:$production,candidateUrl:$candidate,targetIds:["production-mobile-chromium","candidate-mobile-chromium","production-desktop-chromium","candidate-desktop-chromium","candidate-mobile-webkit","candidate-tablet-webkit","candidate-desktop-firefox"],scope:{qualifier:"FULL",pluginIds:[],auditIds:[],areas:[]}}}' > artifacts/shared-ci/${AUDIT_MODE}/private/intent.json
+          fi
+          chmod 0600 artifacts/shared-ci/${AUDIT_MODE}/private/intent.json
 
-      - name: Upload complete release evidence
+      - name: Run live shared release authority
+        id: shared_audit
+        continue-on-error: true
+        env:
+          CONTROL_SERVER: ${{ inputs.control_server }}
+          AUDIT_MODE: ${{ matrix.mode }}
+          REQUEST_ID: shared-ci-${{ matrix.mode }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: >-
+          docker compose run --rm --no-deps portal
+          node scripts/run-shared-release-ci.mjs
+          --server "$CONTROL_SERVER"
+          --token-file "/work/artifacts/shared-ci/$AUDIT_MODE/private/control.token"
+          --intent-file "/work/artifacts/shared-ci/$AUDIT_MODE/private/intent.json"
+          --result-file "/work/artifacts/shared-ci/$AUDIT_MODE/result/shared-release-result.json"
+          --request-id "$REQUEST_ID"
+
+      - name: Remove credentials before evidence upload
+        if: always()
+        run: rm -rf artifacts/shared-ci/${{ matrix.mode }}/private
+
+      - name: Upload shared-authority receipt
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: release-audit-${{ github.run_id }}-${{ github.run_attempt }}
-          path: artifacts/sharded/release-${{ github.run_id }}-${{ github.run_attempt }}
-          if-no-files-found: error
+          name: shared-release-${{ matrix.mode }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/shared-ci/${{ matrix.mode }}/result
+          if-no-files-found: warn
           retention-days: 90
 
-      - name: Enforce authoritative checklist decision
-        if: always()
-        run: >-
-          node scripts/assert-release-decision.mjs
-          --manifest artifacts/sharded/release-${{ github.run_id }}-${{ github.run_attempt }}/checklist/manifest.json
-          --pipeline-manifest artifacts/sharded/release-${{ github.run_id }}-${{ github.run_attempt }}/sharded-run.json
+      - name: Propagate shared release decision
+        if: steps.shared_audit.outcome == 'failure'
+        run: exit 1

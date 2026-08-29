@@ -3,6 +3,7 @@
 !.github/workflows
 .github/workflows/*
 !.github/workflows/release-audit.yml
+!.github/workflows/exact-promotion.yml
 .DS_Store
 .env
 .env.*
