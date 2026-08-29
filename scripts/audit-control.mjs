@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 import { readFile } from 'node:fs/promises';
+import { readCredentialFile } from './lib/credential-file.mjs';
 
 const { command, options } = parse(process.argv.slice(2));
 const base = new URL(options.server ?? process.env.AUDIT_CONTROL_URL ?? 'http://127.0.0.1:4173');
-if (options.token) fail('AUDIT_CONTROL_USAGE', 'Use AUDIT_CONTROL_TOKEN or --token-file; command-line secrets are refused.', 2);
-const token = process.env.AUDIT_CONTROL_TOKEN ?? (options.tokenFile ? (await readFile(options.tokenFile, 'utf8')).trim() : null);
-if (!token) fail('AUDIT_CONTROL_AUTH_REQUIRED', 'Set AUDIT_CONTROL_TOKEN or --token-file.', 2);
+if (options.token) fail('AUDIT_CONTROL_USAGE', 'Use --token-file; command-line secrets are refused.', 2);
+if (!options.tokenFile) fail('AUDIT_CONTROL_AUTH_REQUIRED', '--token-file is required.', 2);
+const token = await readCredentialFile(options.tokenFile, { label: 'Control credential' });
 const run = options.run ? encodeURIComponent(options.run) : null;
 const routes = {
   launch: ['POST', '/api/control/v1/runs'],

@@ -1,11 +1,12 @@
 import { resolve } from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { pipelineOnlyOutcome, readChecklistRelease, releaseOutcome } from './lib/release-truth.mjs';
+import { readCredentialFile } from './lib/credential-file.mjs';
 
 const options = parseArguments(process.argv.slice(2));
 if (options.server) {
-  const token = process.env.AUDIT_CONTROL_TOKEN ?? (options.tokenFile ? (await readFile(options.tokenFile, 'utf8')).trim() : null);
-  if (!token) throw new Error('Set AUDIT_CONTROL_TOKEN or --token-file for API release assertion.');
+  if (!options.tokenFile) throw new Error('--token-file is required for API release assertion.');
+  const token = await readCredentialFile(options.tokenFile, { label: 'Delivery credential' });
   const response = await fetch(new URL(`/api/control/v1/runs/${encodeURIComponent(options.run)}/release/assert`, options.server), {
     method: 'POST',
     headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', 'idempotency-key': options.requestId },

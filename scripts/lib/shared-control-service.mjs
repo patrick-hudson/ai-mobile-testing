@@ -67,7 +67,12 @@ export function createSharedControlService({ store, projectId = 'default' } = {}
     async readExecutions(principal, runId) {
       assertPrincipalAuthorized(principal, CONTROL_ACTIONS.RUN_VIEW, object(runId));
       const state = await readParentRun(store, runId);
-      return { runId, runRevision: state.runRevision, executions: Object.values(state.workItems) };
+      return {
+        runId,
+        runRevision: state.runRevision,
+        executions: Object.values(state.workItems),
+        oracleExecutions: state.executionManifest?.oracleExecutions ?? [],
+      };
     },
     async readLogs(principal, runId, { limit = 200 } = {}) {
       assertPrincipalAuthorized(principal, CONTROL_ACTIONS.RUN_VIEW, object(runId));

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
+import { mkdir, mkdtemp, open, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
@@ -41,10 +42,29 @@ const clock = () => now;
 try {
   const compose = await readFile(new URL('../docker-compose.yml', import.meta.url), 'utf8');
   const workerSource = await readFile(new URL('./run-shared-worker.mjs', import.meta.url), 'utf8');
+  const controlCliSource = await readFile(new URL('./audit-control.mjs', import.meta.url), 'utf8');
+  const releaseCliSource = await readFile(new URL('./assert-release-decision.mjs', import.meta.url), 'utf8');
   assert.doesNotMatch(compose, /AUDIT_SHARED_WORKER_TOKEN:/u, 'worker bearer secrets must never be Compose environment values');
   assert.match(compose, /AUDIT_SHARED_WORKER_TOKEN_FILE: \/run\/secrets\/shared-worker-token/u);
   assert.match(workerSource, /mode-0600 file/u);
   assert.doesNotMatch(workerSource, /console\.(?:log|error).*workerCredential/u, 'worker credentials must never enter logs');
+  assert.doesNotMatch(controlCliSource, /AUDIT_CONTROL_TOKEN/u, 'control CLI credentials must not be accepted from the process environment');
+  assert.doesNotMatch(releaseCliSource, /AUDIT_CONTROL_TOKEN/u, 'release assertion credentials must not be accepted from the process environment');
+
+  const credentialOutput = path.join(root, 'principal-output', 'worker.token');
+  await mkdir(path.dirname(credentialOutput), { mode: 0o700 });
+  const principalCli = await runCommand(process.execPath, [
+    new URL('./manage-control-principal.mjs', import.meta.url).pathname,
+    '--root', path.join(root, 'principal-cli-authority'), '--action', 'create', '--id', 'cli-worker',
+    '--kind', 'worker', '--roles', 'worker', '--projects', 'project-1', '--runs', 'run-1',
+    '--credential-out', credentialOutput,
+  ], path.join(root, 'principal-cli-capture'));
+  assert.equal(principalCli.code, 0, principalCli.stderr);
+  const principalCliDocument = JSON.parse(principalCli.stdout);
+  assert.equal(principalCliDocument.credential, undefined, 'principal CLI stdout must never contain a credential');
+  assert.equal(principalCliDocument.principal.id, 'cli-worker');
+  assert.match(await readFile(credentialOutput, 'utf8'), /^amt\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{32,}\n$/u);
+  assert.equal((await stat(credentialOutput)).mode & 0o077, 0, 'principal credential output must be mode 0600');
   assert.throws(() => validateMutationDeployment({
     bindHost: '0.0.0.0',
     publishedOrigin: 'http://audit.example.test',
@@ -270,6 +290,9 @@ try {
   });
   const projectionReviewer = await authority.authenticateCredential(projectionReviewerIssued.credential);
   const projectionControl = createSharedControlService({ store: reopenedStore, projectId: 'project-1' });
+  const projectedExecutions = await projectionControl.readExecutions(projectionReviewer, 'run-projection');
+  assert.deepEqual(projectedExecutions.oracleExecutions.map(({ id }) => id), ['oracle-visual']);
+  assert.equal(projectedExecutions.executions.length, 1);
   const visualRisk = projectionView.riskRegister.risks.find(({ category }) => category === 'unreviewed-visual-change');
   const manualRisk = projectionView.riskRegister.risks.find(({ category }) => category === 'manual-check');
   let projectionState = await recoverParentRun(reopenedStore, 'run-projection');
@@ -482,6 +505,24 @@ try {
   }), (error) => error?.code === 'PROMOTION_CLAIM_EXPIRED');
 } finally {
   await rm(root, { recursive: true, force: true });
+}
+
+async function runCommand(command, args, capturePrefix) {
+  const stdoutPath = `${capturePrefix}.stdout`;
+  const stderrPath = `${capturePrefix}.stderr`;
+  const stdout = await open(stdoutPath, 'wx', 0o600);
+  const stderr = await open(stderrPath, 'wx', 0o600);
+  let code;
+  try {
+    code = await new Promise((resolve, reject) => {
+      const child = spawn(command, args, { stdio: ['ignore', stdout.fd, stderr.fd] });
+      child.once('error', reject);
+      child.once('close', resolve);
+    });
+  } finally {
+    await Promise.all([stdout.close(), stderr.close()]);
+  }
+  return { code, stdout: await readFile(stdoutPath, 'utf8'), stderr: await readFile(stderrPath, 'utf8') };
 }
 
 console.log('Shared control plane self-test passed: deployment policy, scoped credentials, CSRF/origin enforcement, revocation, and single-use head-bound promotion claims are fail closed.');
