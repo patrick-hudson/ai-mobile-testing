@@ -78,6 +78,7 @@ export function createSharedControlApi({
         const [, runId, suffix = ''] = runMatch;
         if (request.method === 'GET' && suffix === '') return ok(await service.readRun(principal, runId));
         if (request.method === 'GET' && suffix === 'publication') return ok(await service.readPublication(principal, runId));
+        if (request.method === 'GET' && suffix === 'workspace') return ok(await service.readWorkspace(principal, runId, { logLimit: numberQuery(url, 'logLimit', 200) }));
         if (request.method === 'GET' && suffix === 'executions') return ok(await service.readExecutions(principal, runId));
         if (request.method === 'GET' && suffix === 'logs') return ok(await service.readLogs(principal, runId, { limit: numberQuery(url, 'limit', 200) }));
         if (request.method === 'GET' && suffix === 'operations') return ok(await service.readOperation(principal, runId, {

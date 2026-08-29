@@ -10,8 +10,8 @@ import {
 import { parseExecutionManifest } from './execution-contract.mjs';
 import { parsePublicationEnvelope } from './publication-envelope.mjs';
 import { sealPublicationText } from './publication-text-policy.mjs';
-import { deriveReleaseDecision } from './release-decision.mjs';
-import { parseFinalReleaseSubject } from './release-subject.mjs';
+import { deriveCompilationFailureDecision, deriveReleaseDecision } from './release-decision.mjs';
+import { parseFinalReleaseSubject, parseReleaseSubjectCore } from './release-subject.mjs';
 import { parseRisk, parseRiskRegister } from './risk-contract.mjs';
 
 const VISUAL_DISPOSITIONS = new Set(['ACCEPTED', 'DEFECT_CONFIRMED']);
@@ -242,6 +242,32 @@ export function projectSharedReleaseView(input) {
   });
 }
 
+export function projectCompilationFailureView(input) {
+  assertSchemaVersion(input, 'Compilation failure projection input');
+  exactKeys(input, [
+    'schemaVersion', 'runId', 'decisionRevision', 'riskRevision', 'subjectCore', 'compilationFailure',
+  ], 'Compilation failure projection input');
+  const subjectCore = parseReleaseSubjectCore(input.subjectCore);
+  const decisionRevision = positiveRevision(input.decisionRevision, 'decisionRevision');
+  const riskRevision = positiveRevision(input.riskRevision, 'riskRevision');
+  const decision = deriveCompilationFailureDecision({
+    schemaVersion: 1,
+    runId: nonEmptyString(input.runId, 'runId'),
+    decisionRevision,
+    subjectCore,
+    compilationFailure: input.compilationFailure,
+  });
+  return freezeContract({
+    schemaVersion: 1,
+    subjectDigest: subjectCore.digest,
+    decision,
+    riskRegister: parseRiskRegister({ schemaVersion: 1, availability: 'UNAVAILABLE', risks: [] }),
+    decisionRevision,
+    riskRevision,
+    visualDispositionRevision: 0,
+  });
+}
+
 export function projectPublicationView(value) {
   const envelope = parsePublicationEnvelope(value);
   const releaseTruth = freezeContract({
@@ -249,7 +275,9 @@ export function projectPublicationView(value) {
     decisionCode: envelope.decision.code,
     ready: envelope.decision.ready,
     reason: envelope.decision.label,
-    decisionBasis: 'Shared canonical oracle results and authorized release-affecting dispositions.',
+    decisionBasis: envelope.decision.subjectStage === 'core'
+      ? 'The required inventory execution exhausted bounded recovery before final release authority could be sealed.'
+      : 'Shared canonical oracle results and authorized release-affecting dispositions.',
     blockingFailures: envelope.decision.blockingReasons.filter(({ class: reasonClass }) => reasonClass === 'product-failure').length,
     blockingIncomplete: envelope.decision.blockingReasons.filter(({ class: reasonClass }) => reasonClass !== 'product-failure').length,
     baselineIssues: envelope.riskSummary.active,
@@ -269,7 +297,7 @@ export function projectPublicationView(value) {
       runId: envelope.runId,
       envelopeDigest: envelope.digest,
     },
-    subjectDigest: envelope.finalSubjectDigest,
+    subjectDigest: envelope.finalSubjectDigest ?? envelope.subjectCoreDigest,
     decision: envelope.decision,
     riskRegister: envelope.riskRegister,
     riskSummary: envelope.riskSummary,

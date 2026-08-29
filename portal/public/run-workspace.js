@@ -641,12 +641,15 @@ function initializeRunWorkspace(root) {
             : availability === 'LOADING' ? 'Risk Register is still loading.'
               : 'Risk Register is unavailable. No no-risk claim can be made.';
     const decisionCard = document.createElement('article');
+    const coreBound = decision?.subjectStage === 'core';
+    const displayedScope = decision?.certifiedScope ?? decision?.requestedAuthority?.scope;
+    const mutationSubjectDigest = publication?.finalSubjectDigest ?? publication?.subjectCoreDigest;
     decisionCard.className = 'run-release-decision';
     decisionCard.append(
       textElement(document, 'p', 'Release Decision'),
       textElement(document, 'h3', decision?.label ?? 'Release decision unavailable'),
-      textElement(document, 'p', `Authority: ${decision?.grantedAuthority ?? 'unavailable'} · Decision revision ${publication?.decisionRevision ?? 'unavailable'} · Run revision ${publication?.runRevision ?? 'unavailable'}`),
-      textElement(document, 'p', `Certified scope: ${scopeSummary(decision?.certifiedScope)}`),
+      textElement(document, 'p', `Authority: ${decision?.grantedAuthority ?? 'not granted'} · Decision revision ${publication?.decisionRevision ?? 'unavailable'} · Run revision ${publication?.runRevision ?? 'unavailable'}`),
+      textElement(document, 'p', `${coreBound ? 'Requested' : 'Certified'} scope: ${scopeSummary(displayedScope)}`),
       textElement(document, 'p', 'Site Health remains a separate diagnostic truth. Non-blocking risks never change this decision.'),
     );
     const riskList = document.createElement('section');
@@ -673,7 +676,7 @@ function initializeRunWorkspace(root) {
         );
         const controls = document.createElement('div');
         controls.className = 'run-risk-actions';
-        const bound = { expectedSubjectDigest: publication.finalSubjectDigest, riskIdentity: risk.identity };
+        const bound = { expectedSubjectDigest: mutationSubjectDigest, riskIdentity: risk.identity };
         if (risk.category === 'unreviewed-visual-change' && risk.reviewState === 'PENDING_REVIEW'
           && oracleExecutionIds.has(risk.source.id)) {
           const rationaleLabel = textElement(document, 'label', 'Review rationale');
@@ -735,7 +738,7 @@ function initializeRunWorkspace(root) {
       row.append(
         textElement(document, 'code', execution.id),
         sharedActionButton('Rekick incomplete execution', 'rekick', {
-          expectedSubjectDigest: publication.finalSubjectDigest,
+          expectedSubjectDigest: mutationSubjectDigest,
           workItemIds: [execution.id],
         }),
       );

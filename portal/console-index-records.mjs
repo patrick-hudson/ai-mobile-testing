@@ -101,11 +101,12 @@ function scopeLabel(run) {
 }
 
 function sharedScopeLabel(decision) {
-  const scope = record(decision?.certifiedScope) ?? {};
+  const authority = decision?.grantedAuthority ?? decision?.requestedAuthority?.qualifier ?? 'NOT GRANTED';
+  const scope = record(decision?.certifiedScope) ?? record(decision?.requestedAuthority?.scope) ?? {};
   const features = safeList(scope.features);
   const definitions = safeList(scope.definitions);
   const targets = safeList(scope.targets);
-  return `${decision.grantedAuthority} · ${features.length} feature${features.length === 1 ? '' : 's'} · ${definitions.length} definition${definitions.length === 1 ? '' : 's'} · ${targets.length} target${targets.length === 1 ? '' : 's'}`;
+  return `${authority} · ${features.length} feature${features.length === 1 ? '' : 's'} · ${definitions.length} definition${definitions.length === 1 ? '' : 's'} · ${targets.length} target${targets.length === 1 ? '' : 's'}`;
 }
 
 function sharedExecutionSummary(parentRun) {
@@ -182,6 +183,8 @@ export function sharedParentRunToConsoleIndexRecord(input) {
     throw new TypeError('Shared publication identity does not match its durable parent run.');
   }
   const decision = publication.decision;
+  const coreBound = decision.subjectStage === 'core';
+  const decisionScope = decision.certifiedScope ?? decision.requestedAuthority?.scope;
   const mode = decision.mode;
   const updatedAt = timestamp(parentRun.updatedAt);
   const createdAt = timestamp(parentRun.createdAt);
@@ -199,7 +202,7 @@ export function sharedParentRunToConsoleIndexRecord(input) {
     runId: publication.runId,
     recordId: 'run',
     recordType: 'run',
-    scopeKey: indexedScopeKey(publication.finalSubjectDigest),
+    scopeKey: indexedScopeKey(publication.finalSubjectDigest ?? publication.subjectCoreDigest),
     sourceId: 'shared-parent-runs',
     sourceRevision: `shared-${publication.runRevision}`,
     sourceUpdatedAt: updatedAt,
@@ -207,11 +210,13 @@ export function sharedParentRunToConsoleIndexRecord(input) {
     sortKey: `recent:${String(Math.max(0, MAX_DATE_MS - Date.parse(updatedAt))).padStart(16, '0')}:${mode}:${publication.runId}`,
     fields: Object.freeze(compactFields({
       title: `${decision.label} · ${publication.runId}`,
-      status: boundedString(parentRun.status, 120) ?? 'published',
+      status: coreBound && terminal
+        ? 'completed-not-ready'
+        : boundedString(parentRun.status, 120) ?? 'published',
       phase: terminal ? 'release-published' : 'shared-execution',
       outcome: decision.code,
-      authority: decision.grantedAuthority,
-      qualifier: decision.grantedAuthority,
+      authority: decision.grantedAuthority ?? 'NOT_GRANTED',
+      qualifier: decision.grantedAuthority ?? decision.requestedAuthority?.qualifier,
       scopeLabel: sharedScopeLabel(decision),
       createdAt,
       finishedAt: terminal ? updatedAt : undefined,
@@ -225,8 +230,8 @@ export function sharedParentRunToConsoleIndexRecord(input) {
         : 'active',
       activityState: terminal ? 'idle' : 'active',
       finalizationStatus: 'shared-publication',
-      coverageStatus: decision.grantedAuthority,
-      evidenceAuthorityStatus: 'authoritative',
+      coverageStatus: decision.grantedAuthority ?? 'not-granted',
+      evidenceAuthorityStatus: coreBound ? 'core-bound-incomplete' : 'authoritative',
       pipelineIntegrityStatus: blockingIncomplete > 0 ? 'incomplete' : 'available',
       progressTotal: execution.total,
       progressCompleted: execution.completed,
@@ -234,9 +239,9 @@ export function sharedParentRunToConsoleIndexRecord(input) {
       blockingFailures,
       blockingIncomplete,
       terminal,
-      targetIds: safeList(decision.certifiedScope.targets),
-      auditIds: safeList(decision.certifiedScope.definitions),
-      areas: safeList(decision.certifiedScope.features),
+      targetIds: safeList(decisionScope?.targets),
+      auditIds: safeList(decisionScope?.definitions),
+      areas: safeList(decisionScope?.features),
       reasonCodes: [
         decision.code,
         `risk-register-${publication.riskRegister.availability.toLowerCase()}`,

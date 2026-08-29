@@ -228,12 +228,14 @@ export function completeSingleSiteInventoryBarrier({
   subjectCore: rawSubjectCore,
   barrier: rawBarrier,
   attempt,
+  manualRekicks = 0,
   routeInventory,
   deploymentIdentityRecheck,
 }) {
   const subjectCore = parseReleaseSubjectCore(rawSubjectCore);
   const barrier = parseInventoryBarrier(rawBarrier, subjectCore);
-  if (!Number.isSafeInteger(attempt) || attempt < 1 || attempt > barrier.maxAttempts) {
+  if (!Number.isSafeInteger(manualRekicks) || manualRekicks < 0 || manualRekicks > 3
+    || !Number.isSafeInteger(attempt) || attempt < 1 || attempt > barrier.maxAttempts + manualRekicks) {
     failContract('INVENTORY_RECOVERY_EXHAUSTED', 'Inventory completion attempt is outside its bounded recovery budget.');
   }
   const inventory = inventoryBinding(subjectCore, routeInventory);
@@ -246,6 +248,7 @@ export function completeSingleSiteInventoryBarrier({
     subjectCoreDigest: subjectCore.digest,
     barrier,
     attempt,
+    ...(manualRekicks > 0 ? { manualRekicks } : {}),
     inventory,
     routeInventory,
     deploymentIdentityRecheck,
@@ -260,7 +263,9 @@ function parseInventoryCompletion(value, subjectCore) {
   }
   const { digest, ...body } = value;
   const barrier = parseInventoryBarrier(value.barrier, subjectCore);
-  if (!Number.isSafeInteger(value.attempt) || value.attempt < 1 || value.attempt > barrier.maxAttempts
+  const manualRekicks = value.manualRekicks ?? 0;
+  if (!Number.isSafeInteger(manualRekicks) || manualRekicks < 0 || manualRekicks > 3
+    || !Number.isSafeInteger(value.attempt) || value.attempt < 1 || value.attempt > barrier.maxAttempts + manualRekicks
     || canonicalDigest(body) !== digest
     || inventoryBinding(subjectCore, value.routeInventory).inventoryDigest !== value.inventory.inventoryDigest) {
     failContract('INVENTORY_BINDING_MISMATCH', 'Inventory completion digest or route binding is corrupt.');

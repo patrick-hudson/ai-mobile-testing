@@ -8,6 +8,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { resetPortalE2EOutput } from './lib/portal-e2e-output.mjs';
+import { initializeLegacyAuthorityFence } from './lib/legacy-authority-fence.mjs';
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const outputRoot = resolve(process.env.PORTAL_E2E_OUTPUT_DIR ?? join(repositoryRoot, 'artifacts', 'portal-e2e'));
@@ -32,6 +33,8 @@ const serverLog = createWriteStream(join(outputRoot, 'portal-server.log'), { fla
 let portal;
 
 try {
+  const legacyAuthorityFenceRoot = join(temporaryRoot, 'legacy-authority');
+  await initializeLegacyAuthorityFence({ root: legacyAuthorityFenceRoot, verifyStorage: false });
   const resourceProfile = await readContainerResourceProfile();
   const fastIteration = process.env.PORTAL_E2E_FAST_ITERATION === '1';
   const methodology = {
@@ -70,6 +73,7 @@ try {
       PORTAL_ALLOWED_HOSTS: 'shared-review.example.test',
       PORTAL_E2E_FAILURE_INJECTION: '1',
       PORTAL_E2E_OPERATOR_TOKEN: operatorToken,
+      AUDIT_LEGACY_AUTHORITY_FENCE_ROOT: legacyAuthorityFenceRoot,
       AI_REVIEW_DRY_RUN: '1',
       CANDIDATE_IGNORE_HTTPS_ERRORS: '0',
     },

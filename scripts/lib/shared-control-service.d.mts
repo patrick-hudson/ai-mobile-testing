@@ -5,6 +5,7 @@ export interface SharedControlService {
   projectId: string;
   readRun(principal: ControlPrincipal, runId: string): Promise<any>;
   readPublication(principal: ControlPrincipal, runId: string): Promise<any>;
+  readWorkspace(principal: ControlPrincipal, runId: string, options?: { logLimit?: number }): Promise<any>;
   withPublicationFence(principal: ControlPrincipal, runId: string, callback: (publication: any) => any): Promise<any>;
   withReleaseAssertionFence(principal: ControlPrincipal, runId: string, callback: (publication: any, authorityContext: any) => any): Promise<any>;
   readExecutions(principal: ControlPrincipal, runId: string): Promise<any>;

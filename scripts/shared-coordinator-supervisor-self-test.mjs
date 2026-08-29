@@ -12,6 +12,7 @@ import { compileSharedLaunchPlan } from '../shared/launch-plan-compiler.mjs';
 
 const root = await mkdtemp(path.join(tmpdir(), 'shared-coordinator-supervisor-'));
 const digest = (character) => `sha256:${character.repeat(64)}`;
+let now = Date.parse('2026-08-29T12:00:00.000Z');
 try {
   const [pluginRegistry, targetRegistry] = await Promise.all([
     readFile(new URL('../audit/plugins.generated.json', import.meta.url), 'utf8').then(JSON.parse),
@@ -22,6 +23,7 @@ try {
     deploymentIdentity: 'supervisor-test',
     volumeIdentity: 'named-volume:supervisor-test',
     verifyStorage: false,
+    clock: () => now,
   });
   const supervisor = createSharedCoordinatorSupervisor({
     store,
@@ -29,7 +31,7 @@ try {
     projectId: 'project-1',
     ownerId: 'coordinator-supervisor-test',
     coordinatorLeaseMs: 60_000,
-    workLeaseMs: 30_000,
+    workLeaseMs: 1_000,
     pluginRegistry,
     targetRegistry,
   });
@@ -134,6 +136,22 @@ try {
   assert(sealedState.finalSubjectDigest);
   assert(Object.values(sealedState.workItems).every(({ executionDescriptor }) => executionDescriptor?.digest),
     'inventory expansion must preserve a compiler-issued descriptor on every browser work item');
+
+  await createParentRun(store, { runId: 'run-inventory-expiry', ...launch.createParentRunInput });
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const expiredLease = await supervisor.claim(inventoryWorker);
+    assert.equal(expiredLease.runId, 'run-inventory-expiry');
+    assert.equal(expiredLease.attempt, attempt);
+    now += 1_001;
+    const maintenance = await supervisor.maintain();
+    assert.deepEqual(maintenance.errors, [], JSON.stringify(maintenance.errors));
+  }
+  const expiredInventory = await readParentRun(store, 'run-inventory-expiry');
+  const terminalAttempt = expiredInventory.workItems[launch.inventoryBarrier.workItem.id].attempts.at(-1);
+  assert.equal(expiredInventory.compilationState, 'failed',
+    'final-attempt lease expiry must terminalize inventory compilation');
+  assert.match(terminalAttempt.canonicalResultDigest, /^sha256:[a-f0-9]{64}$/u);
+  assert.equal(expiredInventory.compilationFailure.terminalResultDigest, terminalAttempt.canonicalResultDigest);
 } finally {
   await rm(root, { recursive: true, force: true });
 }

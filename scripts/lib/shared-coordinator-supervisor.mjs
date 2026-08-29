@@ -10,6 +10,7 @@ import {
   requeueExpiredWork,
   requestStorePerformanceDrain,
   sealParentRunGraph,
+  terminalizeParentRunCompilation,
 } from './parent-run-store.mjs';
 import {
   completeSingleSiteInventoryBarrier,
@@ -108,6 +109,7 @@ export function createSharedCoordinatorSupervisor({
       subjectCore: state.subjectCore,
       barrier: state.inventoryBarrierPlan,
       attempt: barrier.canonicalResult.attempt,
+      manualRekicks: barrier.manualRekicks,
       routeInventory: artifact.diagnostic.inventory,
       deploymentIdentityRecheck: artifact.deploymentIdentityRecheck,
     });
@@ -131,6 +133,21 @@ export function createSharedCoordinatorSupervisor({
       workItems,
     });
     onEvent({ event: 'single-site-graph-sealed', runId, workItemCount: workItems.length, graphDigest: graph.digest });
+    return true;
+  }
+
+  async function terminalizeExhaustedInventory(runId, state, active) {
+    if (state.compilationState !== 'pending') return false;
+    const barriers = Object.values(state.workItems).filter(({ capability }) => capability === 'inventory:http');
+    if (barriers.length !== 1 || Object.keys(state.workItems).length !== 1
+      || barriers[0].state !== 'incomplete') return false;
+    await terminalizeParentRunCompilation(store, runId, active);
+    onEvent({
+      event: 'single-site-compilation-failed',
+      runId,
+      workItemId: barriers[0].id,
+      attemptCount: barriers[0].attempts.length,
+    });
     return true;
   }
 
@@ -173,14 +190,19 @@ export function createSharedCoordinatorSupervisor({
     let sealedGraphs = 0;
     for (const runId of runIds) {
       try {
-        const state = await recoverParentRun(store, runId);
+        let state = await recoverParentRun(store, runId);
         if (state.authorityTombstone !== null) {
           const operations = await controlService.applyAcceptedOperations(active, runId);
           completedOperations += operations.filter(({ state: operationState }) => operationState === 'completed').length;
           continue;
         }
-        requeued += await requeueExpiredWork(store, runId, active);
-        if (await sealCompletedInventory(runId, state, active)) sealedGraphs += 1;
+        const recoveredCount = await requeueExpiredWork(store, runId, active);
+        requeued += recoveredCount;
+        if (recoveredCount > 0) state = await recoverParentRun(store, runId);
+        const terminalizedInventory = await terminalizeExhaustedInventory(runId, state, active);
+        if (!terminalizedInventory && await sealCompletedInventory(runId, state, active)) {
+          sealedGraphs += 1;
+        }
         const operations = await controlService.applyAcceptedOperations(active, runId);
         completedOperations += operations.length;
         try {

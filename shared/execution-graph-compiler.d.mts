@@ -55,7 +55,7 @@ export function compileCanonicalExecutionGraph(input: {
 export function compileSingleSiteInventoryBarrier(input: { subjectCore: ReleaseSubjectCore; pluginRegistry: unknown; targetRegistry: unknown; maxAttempts?: number }): unknown;
 export function parseSingleSiteInventoryBarrier(value: unknown, subjectCore: ReleaseSubjectCore): unknown;
 export function nextSingleSiteInventoryAttempt(input: { subjectCore: ReleaseSubjectCore; barrier: unknown; failedAttempt: number; sealedGraph?: CanonicalExecutionGraph | null }): unknown;
-export function completeSingleSiteInventoryBarrier(input: { subjectCore: ReleaseSubjectCore; barrier: unknown; attempt: number; routeInventory: unknown; deploymentIdentityRecheck: { kind: string; value: string } }): unknown;
+export function completeSingleSiteInventoryBarrier(input: { subjectCore: ReleaseSubjectCore; barrier: unknown; attempt: number; manualRekicks?: number; routeInventory: unknown; deploymentIdentityRecheck: { kind: string; value: string } }): unknown;
 export function canonicalPlaywrightSelection(graph: CanonicalExecutionGraph): {
   mode: 'single-site' | 'comparative';
   caseIds: string[];

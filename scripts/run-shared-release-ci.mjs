@@ -81,18 +81,24 @@ function stableRequestId(intent) {
   return `shared-release-ci-${canonicalDigest(intent).replace(/^sha256:/u, '').slice(0, 32)}`;
 }
 
-function safeResult(requestId, result) {
+export function formatSharedReleaseCiResult(requestId, result) {
   const decision = result.publication.decision;
-  const finalSubject = parseFinalReleaseSubject(result.run.finalSubject);
+  const coreBound = result.stage === 'core';
+  if (!['core', 'final'].includes(result.stage)
+    || coreBound !== (decision.subjectStage === 'core')) {
+    throw new TypeError('Shared release CI result stage contradicts its release decision.');
+  }
+  const finalSubject = coreBound ? null : parseFinalReleaseSubject(result.run.finalSubject);
   return Object.freeze({
     schemaVersion: 1,
     kind: 'shared-release-ci-result',
+    stage: result.stage,
     confirmed: true,
     requestId,
     operationId: result.operationId,
     runId: result.runId,
     publicationDigest: result.publication.digest,
-    subjectDigest: result.publication.finalSubjectDigest,
+    subjectDigest: result.publication.finalSubjectDigest ?? result.publication.subjectCoreDigest,
     executionSetDigest: decision.executionManifestDigest,
     finalSubject,
     decision: Object.freeze({
@@ -129,7 +135,7 @@ export async function runSharedReleaseCiCommand(argv, {
   const result = await runSharedReleaseCi({
     client, requestId, intent, maximumLaunchPolls, maximumPublicationPolls, pollMs,
   });
-  const document = safeResult(requestId, result);
+  const document = formatSharedReleaseCiResult(requestId, result);
   await writeAtomicResult(options['--result-file'], document);
   stdout.write(`${JSON.stringify(document)}\n`);
   if (!document.decision.ready) {

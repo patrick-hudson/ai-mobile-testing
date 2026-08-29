@@ -58,23 +58,32 @@ export function assertSharedWorkspaceProjection(value, { runId, mode } = {}) {
   const executions = value?.executions;
   const logs = value?.logs;
   const register = publication?.riskRegister;
-  const certifiedScope = publication?.decision?.certifiedScope;
+  const coreBound = publication?.decision?.subjectStage === 'core';
+  const certifiedScope = coreBound
+    ? publication?.decision?.requestedAuthority?.scope
+    : publication?.decision?.certifiedScope;
+  const subjectDigest = publication?.finalSubjectDigest ?? publication?.subjectCoreDigest;
   if (!publication || (runId !== undefined && publication.runId !== runId)
     || (mode !== undefined && publication.decision?.mode !== mode)
     || !Number.isSafeInteger(publication.runRevision) || publication.runRevision < 1
     || !Number.isSafeInteger(publication.decisionRevision) || publication.decisionRevision < 1
     || !Number.isSafeInteger(publication.riskRevision) || publication.riskRevision < 1
-    || typeof publication.finalSubjectDigest !== 'string'
+    || typeof subjectDigest !== 'string'
+    || (coreBound ? publication.finalSubjectDigest !== null : typeof publication.finalSubjectDigest !== 'string')
     || typeof publication.decision?.label !== 'string'
-    || typeof publication.decision?.grantedAuthority !== 'string'
+    || (coreBound
+      ? publication.decision?.grantedAuthority !== null
+      : typeof publication.decision?.grantedAuthority !== 'string')
     || !canonicalScope(certifiedScope)
     || !['LOADING', 'PROVISIONAL', 'AVAILABLE', 'PARTIAL', 'EMPTY', 'UNAVAILABLE'].includes(register?.availability)
     || !Array.isArray(register?.risks) || !Array.isArray(executions?.executions)
     || !Array.isArray(executions?.oracleExecutions)
     || executions.executions.some((entry) => typeof entry?.id !== 'string' || typeof entry?.state !== 'string')
     || executions.oracleExecutions.some((entry) => typeof entry?.id !== 'string')
-    || executions.runId !== publication.runId || executions.runRevision !== publication.runRevision
-    || logs?.runId !== publication.runId || logs?.runRevision !== publication.runRevision
+    || typeof value?.snapshotToken !== 'string' || !/^sha256:[a-f0-9]{64}$/u.test(value.snapshotToken)
+    || !Number.isSafeInteger(value?.stateRevision) || value.stateRevision < 1
+    || executions.runId !== publication.runId
+    || logs?.runId !== publication.runId
     || !Array.isArray(logs?.events) || !Array.isArray(logs?.attemptLogs)) {
     throw new SharedControlBrowserError('Shared release authority is unavailable or has no coherent revision.', {
       code: 'SHARED_CONTROL_PROJECTION_INVALID',
@@ -116,15 +125,18 @@ function canonicalTimestamp(value) {
 
 export function sharedWorkspaceRevisionKey(workspace) {
   const publication = workspace?.publication;
-  if (!publication || !Number.isSafeInteger(publication.runRevision)
+  const subjectDigest = publication?.finalSubjectDigest ?? publication?.subjectCoreDigest;
+  if (!publication || !/^sha256:[a-f0-9]{64}$/u.test(workspace?.snapshotToken ?? '')
+    || !Number.isSafeInteger(publication.runRevision)
     || !Number.isSafeInteger(publication.decisionRevision)
     || !Number.isSafeInteger(publication.riskRevision)
-    || typeof publication.finalSubjectDigest !== 'string') return null;
+    || typeof subjectDigest !== 'string') return null;
   return [
+    workspace.snapshotToken,
     publication.runRevision,
     publication.decisionRevision,
     publication.riskRevision,
-    publication.finalSubjectDigest,
+    subjectDigest,
   ].join('\u0000');
 }
 
@@ -291,27 +303,12 @@ export function createSharedControlBrowserClient({
         if (attempt === authenticationAttempt) session = null;
       }
     },
-    async readWorkspace(runId, { signal, logLimit = 200, maxAttempts = 3 } = {}) {
+    async readWorkspace(runId, { signal, logLimit = 200 } = {}) {
       const root = `${PREFIX}/runs/${encodeURIComponent(runId)}`;
-      for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-        const [publication, executions, logs] = await Promise.all([
-          request(`${root}/publication`, { signal }),
-          request(`${root}/executions`, { signal }),
-          request(`${root}/logs?limit=${Math.min(1000, Math.max(1, logLimit))}`, { signal }),
-        ]);
-        const revision = publication.data?.runRevision;
-        if (Number.isSafeInteger(revision)
-          && revision === executions.data?.runRevision && revision === logs.data?.runRevision) {
-          return Object.freeze({
-            publication: publication.data,
-            executions: executions.data,
-            logs: logs.data,
-            riskAvailability: publication.data?.riskRegister?.availability ?? 'UNAVAILABLE',
-          });
-        }
-      }
-      throw new SharedControlBrowserError('Shared workspace changed while loading; no coherent revision was available.', {
-        code: 'SHARED_CONTROL_REVISION_RACE',
+      const snapshot = (await request(`${root}/workspace?logLimit=${Math.min(1000, Math.max(1, logLimit))}`, { signal })).data;
+      return Object.freeze({
+        ...snapshot,
+        riskAvailability: snapshot?.publication?.riskRegister?.availability ?? 'UNAVAILABLE',
       });
     },
     async mutate(runId, kind, { expectedRunRevision, body = {}, requestId = crypto.randomUUID(), signal } = {}) {

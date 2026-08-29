@@ -4,6 +4,7 @@ import {
   canonicalJson,
   ContractError,
 } from '../shared/canonical-contract.mjs';
+import { sealInventoryCompilationFailure } from '../shared/compilation-failure.mjs';
 import {
   parseFinalReleaseSubject,
   parseReleaseSubjectCore,
@@ -24,6 +25,7 @@ import {
 } from '../shared/work-item-evidence-index.mjs';
 import {
   assertConsumableReleaseDecision,
+  deriveCompilationFailureDecision,
   deriveReleaseDecision,
   parseReleaseDecision,
 } from '../shared/release-decision.mjs';
@@ -633,6 +635,94 @@ assert.equal(envelope2.decisionRevision, envelope1.decisionRevision, 'risk-only 
 assert.equal(parsePublicationEnvelope(envelope2).digest, envelope2.digest);
 assert.equal(verifyPublicationChain([envelope1, envelope2]).length, 2);
 expectCode('CORRUPT_DIGEST_CHAIN', () => verifyPublicationChain([envelope1, { ...envelope2, previousEnvelopeDigest: DIGEST_A }]));
+
+const compilationFailure = sealInventoryCompilationFailure({
+  schemaVersion: 1,
+  subjectCoreDigest: full.subjectCore.digest,
+  workItemId: 'inventory-barrier',
+  terminalResultDigest: DIGEST_A,
+  reason: 'Inventory exhausted bounded recovery.',
+  attemptCount: 3,
+  failedAt: '2026-08-28T19:10:00.000Z',
+});
+const coreDecision = deriveCompilationFailureDecision({
+  schemaVersion: 1,
+  runId: 'run-single-full',
+  decisionRevision: 1,
+  subjectCore: full.subjectCore,
+  compilationFailure,
+});
+const coreEnvelope = appendPublicationEnvelope(null, {
+  schemaVersion: 1,
+  runId: 'run-single-full',
+  runRevision: 1,
+  decisionRevision: 1,
+  riskRevision: 1,
+  ledgerSequences: { observations: 4, decisions: 1, risks: 0 },
+  subjectCoreDigest: full.subjectCore.digest,
+  finalSubjectDigest: null,
+  decision: coreDecision,
+  riskRegister: parseRiskRegister({ schemaVersion: 1, availability: 'UNAVAILABLE', risks: [] }),
+});
+assert.equal(parsePublicationEnvelope(coreEnvelope).finalSubjectDigest, null);
+expectCode('RELEASE_AUTHORITY_INCOMPLETE', () => assertConsumableReleaseDecision(coreDecision, {
+  expectedSubjectDigest: full.subjectCore.digest,
+  expectedAuthority: 'FULL',
+  currentDecisionRevision: 1,
+}));
+const recoveredDecision = deriveReleaseDecision({
+  schemaVersion: 1,
+  runId: 'run-single-full',
+  decisionRevision: 2,
+  finalSubject: full.finalSubject,
+  executionManifest: full.executionManifest,
+  oracleResults: full.oracleResults,
+  releaseDispositions: [],
+});
+const recoveredEnvelope = appendPublicationEnvelope(coreEnvelope, {
+  schemaVersion: 1,
+  runId: 'run-single-full',
+  runRevision: 2,
+  decisionRevision: 2,
+  riskRevision: 2,
+  ledgerSequences: { observations: 8, decisions: 2, risks: 0 },
+  subjectCoreDigest: full.subjectCore.digest,
+  finalSubjectDigest: full.finalSubject.digest,
+  decision: recoveredDecision,
+  riskRegister: risks,
+});
+assert.equal(verifyPublicationChain([coreEnvelope, recoveredEnvelope]).length, 2);
+expectCode('RELEASE_SUBJECT_MISMATCH', () => appendPublicationEnvelope(coreEnvelope, {
+  schemaVersion: 1,
+  runId: 'run-single-full',
+  runRevision: 2,
+  decisionRevision: 2,
+  riskRevision: 2,
+  ledgerSequences: { observations: 8, decisions: 2, risks: 0 },
+  subjectCoreDigest: DIGEST_B,
+  finalSubjectDigest: full.finalSubject.digest,
+  decision: recoveredDecision,
+  riskRegister: risks,
+}));
+const coreDecisionRevision2 = deriveCompilationFailureDecision({
+  schemaVersion: 1,
+  runId: 'run-single-full',
+  decisionRevision: 2,
+  subjectCore: full.subjectCore,
+  compilationFailure,
+});
+expectCode('RELEASE_SUBJECT_MISMATCH', () => appendPublicationEnvelope(recoveredEnvelope, {
+  schemaVersion: 1,
+  runId: 'run-single-full',
+  runRevision: 3,
+  decisionRevision: 2,
+  riskRevision: 2,
+  ledgerSequences: { observations: 8, decisions: 2, risks: 0 },
+  subjectCoreDigest: full.subjectCore.digest,
+  finalSubjectDigest: null,
+  decision: coreDecisionRevision2,
+  riskRegister: risks,
+}));
 
 const compatibilityRelease = parseChecklistRelease(envelope2, 'release/publication/current.json');
 assert.equal(compatibilityRelease.decisionCode, 'RELEASE_READY');

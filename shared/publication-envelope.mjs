@@ -29,8 +29,16 @@ function parseLedgerSequences(value) {
 function envelopeBody(value, previousEnvelopeDigest) {
   const decision = parseReleaseDecision(value.decision);
   const riskRegister = parseRiskRegister(value.riskRegister);
-  const finalSubjectDigest = assertDigest(value.finalSubjectDigest, 'finalSubjectDigest');
-  if (decision.subjectDigest !== finalSubjectDigest) {
+  const coreAware = Object.hasOwn(value, 'subjectCoreDigest');
+  const subjectCoreDigest = coreAware ? assertDigest(value.subjectCoreDigest, 'subjectCoreDigest') : null;
+  const finalSubjectDigest = value.finalSubjectDigest === null
+    ? null
+    : assertDigest(value.finalSubjectDigest, 'finalSubjectDigest');
+  if (decision.subjectStage === 'core') {
+    if (!coreAware || finalSubjectDigest !== null || decision.subjectDigest !== subjectCoreDigest) {
+      failContract('RELEASE_SUBJECT_MISMATCH', 'Core-bound publication does not match its release subject core.');
+    }
+  } else if (finalSubjectDigest === null || decision.subjectDigest !== finalSubjectDigest) {
     failContract('RELEASE_SUBJECT_MISMATCH', 'Publication decision does not match its final subject.');
   }
   if (decision.runId !== value.runId || decision.decisionRevision !== value.decisionRevision) {
@@ -45,6 +53,7 @@ function envelopeBody(value, previousEnvelopeDigest) {
     riskRevision: revision(value.riskRevision, 'riskRevision'),
     ledgerSequences: parseLedgerSequences(value.ledgerSequences),
     previousEnvelopeDigest,
+    ...(coreAware ? { subjectCoreDigest } : {}),
     finalSubjectDigest,
     decision,
     riskRegister,
@@ -56,13 +65,22 @@ export function appendPublicationEnvelope(previous, value) {
   assertSchemaVersion(value, 'Publication envelope input');
   exactKeys(value, [
     'schemaVersion', 'runId', 'runRevision', 'decisionRevision', 'riskRevision', 'ledgerSequences',
-    'finalSubjectDigest', 'decision', 'riskRegister',
+    'subjectCoreDigest', 'finalSubjectDigest', 'decision', 'riskRegister',
   ], 'Publication envelope input');
   const parsedPrevious = previous === null ? null : parsePublicationEnvelope(previous);
   const body = envelopeBody(value, parsedPrevious?.digest ?? null);
   if (parsedPrevious !== null) {
-    if (body.runId !== parsedPrevious.runId || body.finalSubjectDigest !== parsedPrevious.finalSubjectDigest) {
-      failContract('RELEASE_SUBJECT_MISMATCH', 'Publication chain cannot cross runs or release subjects.');
+    if (body.runId !== parsedPrevious.runId) {
+      failContract('RELEASE_SUBJECT_MISMATCH', 'Publication chain cannot cross runs.');
+    }
+    const previousCoreAware = Object.hasOwn(parsedPrevious, 'subjectCoreDigest');
+    const bodyCoreAware = Object.hasOwn(body, 'subjectCoreDigest');
+    if (previousCoreAware !== bodyCoreAware
+      || (bodyCoreAware && body.subjectCoreDigest !== parsedPrevious.subjectCoreDigest)
+      || (!bodyCoreAware && body.finalSubjectDigest !== parsedPrevious.finalSubjectDigest)
+      || (parsedPrevious.finalSubjectDigest !== null && body.finalSubjectDigest !== parsedPrevious.finalSubjectDigest)
+      || (parsedPrevious.finalSubjectDigest !== null && body.decision.subjectStage === 'core')) {
+      failContract('RELEASE_SUBJECT_MISMATCH', 'Publication chain cannot cross or reverse release-subject identity.');
     }
     if (body.runRevision !== parsedPrevious.runRevision + 1
       || body.decisionRevision < parsedPrevious.decisionRevision
@@ -92,7 +110,7 @@ export function parsePublicationEnvelope(value) {
   assertSchemaVersion(value, 'Publication envelope');
   exactKeys(value, [
     'schemaVersion', 'kind', 'runId', 'runRevision', 'decisionRevision', 'riskRevision',
-    'ledgerSequences', 'previousEnvelopeDigest', 'finalSubjectDigest', 'decision', 'riskRegister',
+    'ledgerSequences', 'previousEnvelopeDigest', 'subjectCoreDigest', 'finalSubjectDigest', 'decision', 'riskRegister',
     'riskSummary', 'digest',
   ], 'Publication envelope');
   if (value.kind !== 'release-publication-envelope') failContract('INVALID_CONTRACT', 'Publication envelope kind is invalid.');
@@ -118,7 +136,13 @@ export function verifyPublicationChain(values) {
     const envelope = parsePublicationEnvelope(values[index]);
     if (index > 0) {
       const previous = parsed[index - 1];
-      if (envelope.runId !== previous.runId || envelope.finalSubjectDigest !== previous.finalSubjectDigest
+      const previousCoreAware = Object.hasOwn(previous, 'subjectCoreDigest');
+      const envelopeCoreAware = Object.hasOwn(envelope, 'subjectCoreDigest');
+      if (envelope.runId !== previous.runId || previousCoreAware !== envelopeCoreAware
+        || (envelopeCoreAware && envelope.subjectCoreDigest !== previous.subjectCoreDigest)
+        || (!envelopeCoreAware && envelope.finalSubjectDigest !== previous.finalSubjectDigest)
+        || (previous.finalSubjectDigest !== null && envelope.finalSubjectDigest !== previous.finalSubjectDigest)
+        || (previous.finalSubjectDigest !== null && envelope.decision.subjectStage === 'core')
         || envelope.runRevision !== previous.runRevision + 1) {
         failContract('CORRUPT_DIGEST_CHAIN', `Publication envelope ${index} breaks run identity or revision order.`);
       }

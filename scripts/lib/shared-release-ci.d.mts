@@ -10,13 +10,22 @@ export interface SharedReleaseCiClient {
   }): Promise<unknown>;
 }
 
-export interface SharedReleaseCiResult {
+interface SharedReleaseCiResultBase {
   readonly schemaVersion: 1;
   readonly confirmed: true;
   readonly operationId: string;
   readonly runId: string;
   readonly run: Readonly<Record<string, unknown>>;
   readonly publication: Readonly<Record<string, unknown>>;
+}
+
+export interface SharedReleaseCiCoreResult extends SharedReleaseCiResultBase {
+  readonly stage: 'core';
+  readonly assertionExpected: null;
+}
+
+export interface SharedReleaseCiFinalResult extends SharedReleaseCiResultBase {
+  readonly stage: 'final';
   readonly assertionExpected: Readonly<{
     subjectDigest: string;
     authority: string;
@@ -25,6 +34,8 @@ export interface SharedReleaseCiResult {
     decisionRevision: number;
   }>;
 }
+
+export type SharedReleaseCiResult = SharedReleaseCiCoreResult | SharedReleaseCiFinalResult;
 
 export class SharedReleaseCiError extends Error {
   readonly code: string;

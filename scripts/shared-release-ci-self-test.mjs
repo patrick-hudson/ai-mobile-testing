@@ -4,13 +4,15 @@ import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { canonicalDigest } from '../shared/canonical-contract.mjs';
+import { sealInventoryCompilationFailure } from '../shared/compilation-failure.mjs';
 import { sealExecutionManifest, sealOracleResult, sealWorkItemResult } from '../shared/execution-contract.mjs';
 import { appendPublicationEnvelope } from '../shared/publication-envelope.mjs';
-import { projectSharedReleaseView } from '../shared/release-projection.mjs';
+import { projectCompilationFailureView, projectSharedReleaseView } from '../shared/release-projection.mjs';
 import { sealFinalReleaseSubject, sealReleaseSubjectCore } from '../shared/release-subject.mjs';
 import { createSharedReleaseHttpClient, runSharedReleaseCi } from './lib/shared-release-ci.mjs';
 import { runSharedReleaseCiCommand } from './run-shared-release-ci.mjs';
 import { deriveTargetPreflightSetIdentity } from '../shared/target-preflight-set.mjs';
+import { CONTROL_EXIT_CODES } from '../shared/control-client-contract.mjs';
 
 const D1 = `sha256:${'1'.repeat(64)}`;
 const D2 = `sha256:${'2'.repeat(64)}`;
@@ -110,7 +112,67 @@ function fixture() {
     requestId: REQUEST_ID, requestDigest: canonicalDigest(intent), state: 'accepted',
     runId: publication.runId, outcome: null,
   };
-  return { intent, launch, run, publication };
+  return { intent, launch, run, publication, core };
+}
+
+function compilationFailureFixture() {
+  const base = fixture();
+  const workItemId = 'inventory-barrier';
+  const compilationFailure = sealInventoryCompilationFailure({
+    schemaVersion: 1,
+    subjectCoreDigest: base.core.digest,
+    workItemId,
+    terminalResultDigest: D1,
+    reason: 'Inventory worker exhausted bounded recovery.',
+    attemptCount: 3,
+    failedAt: '2026-08-29T12:00:00.000Z',
+  });
+  const projection = projectCompilationFailureView({
+    schemaVersion: 1,
+    runId: base.run.runId,
+    decisionRevision: 1,
+    riskRevision: 1,
+    subjectCore: base.core,
+    compilationFailure,
+  });
+  const publication = appendPublicationEnvelope(null, {
+    schemaVersion: 1,
+    runId: base.run.runId,
+    runRevision: 1,
+    decisionRevision: projection.decisionRevision,
+    riskRevision: projection.riskRevision,
+    ledgerSequences: { observations: 4, decisions: 1, risks: 0 },
+    subjectCoreDigest: base.core.digest,
+    finalSubjectDigest: null,
+    decision: projection.decision,
+    riskRegister: projection.riskRegister,
+  });
+  const attempt = {
+    canonicalResultDigest: D1,
+  };
+  const run = {
+    ...base.run,
+    compilationState: 'failed',
+    subjectCore: base.core,
+    executionManifest: null,
+    executionManifestDigest: null,
+    finalSubject: null,
+    finalSubjectDigest: null,
+    compilationFailure,
+    workItems: { [workItemId]: { id: workItemId, state: 'incomplete', attempts: [attempt, attempt, attempt] } },
+    currentPublicationDigest: publication.digest,
+  };
+  const launch = {
+    ...base.launch,
+    state: 'completed',
+    outcome: {
+      status: 'succeeded', runId: base.run.runId,
+      subjectCoreDigest: base.core.digest,
+      executionManifestDigest: null,
+      compilationState: 'pending',
+    },
+  };
+  return { ...base, run, launch, publication, compilationFailure, projection };
 }
 
 function scriptedClient({ launch, operations, runs, publications, reprobe } = {}) {
@@ -168,6 +230,7 @@ const result = await runSharedReleaseCi(options(happyClient, happy));
 assert.equal(result.runId, happy.run.runId);
 assert.equal(result.publication.digest, happy.publication.digest);
 assert.equal(result.confirmed, true);
+assert.equal(result.stage, 'final');
 assert.deepEqual(result.assertionExpected, {
   subjectDigest: happy.publication.finalSubjectDigest,
   authority: 'FULL',
@@ -177,6 +240,23 @@ assert.deepEqual(result.assertionExpected, {
 });
 assert.deepEqual(happyClient.calls.launch, [{ requestId: REQUEST_ID, intent: happy.intent }]);
 assert.equal(happyClient.calls.reprobe, 1);
+
+const compilationFailed = compilationFailureFixture();
+const compilationFailedClient = scriptedClient({
+  launch: compilationFailed.launch,
+  operations: [compilationFailed.launch],
+  runs: [compilationFailed.run, compilationFailed.run],
+  publications: [compilationFailed.publication, compilationFailed.publication],
+  reprobe: async () => { throw new Error('core-bound failures must not reprobe as final subjects'); },
+});
+const compilationFailedResult = await runSharedReleaseCi(options(compilationFailedClient, compilationFailed));
+assert.equal(compilationFailedResult.stage, 'core');
+assert.equal(compilationFailedResult.publication.decision.code, 'NOT_READY_INCOMPLETE_EXECUTION');
+assert.equal(compilationFailedResult.publication.finalSubjectDigest, null);
+assert.equal(compilationFailedResult.publication.subjectCoreDigest, compilationFailed.core.digest);
+assert.equal(compilationFailedResult.assertionExpected, null);
+assert.equal(compilationFailedClient.calls.reprobe, 0,
+  'terminal inventory failure must return a not-ready result instead of polling or pretending to promote');
 
 async function rejectsWith(code, mutate, overrides = {}) {
   const f = fixture();
@@ -484,11 +564,35 @@ try {
   assert.doesNotMatch(resultText, /amt\.integration-token/u);
   assert.doesNotMatch(output.join(''), /amt\.integration-token/u);
   const persistedResult = JSON.parse(resultText);
+  assert.equal(persistedResult.stage, 'final');
   assert.equal(persistedResult.runId, happy.run.runId);
   assert.deepEqual(persistedResult.finalSubject, happy.run.finalSubject,
     'delivery must retain the non-secret immutable target and deployment identity contract');
 } finally {
   await new Promise((resolve) => commandApi.server.close(resolve));
+}
+
+const coreResultFile = path.join(commandRoot, 'core-result.json');
+const coreCommandApi = await listen((request, response) => {
+  response.setHeader('content-type', 'application/json');
+  request.resume();
+  if (request.method === 'POST') response.end(apiDocument(compilationFailed.launch));
+  else if (request.url === `/api/control/v1/launch-operations/${OPERATION_ID}`) response.end(apiDocument(compilationFailed.launch));
+  else if (request.url === `/api/control/v1/runs/${compilationFailed.run.runId}`) response.end(apiDocument(compilationFailed.run));
+  else response.end(apiDocument(compilationFailed.publication));
+});
+try {
+  await assert.rejects(runSharedReleaseCiCommand([
+    '--server', coreCommandApi.origin, '--token-file', credentialFile, '--intent-file', intentFile,
+    '--result-file', coreResultFile, '--request-id', REQUEST_ID, '--poll-ms', '0',
+  ], { stdout: { write() {} }, preflight: fakePreflight }),
+  (error) => error?.code === 'CI_DECISION_NOT_READY' && error?.exitCode === CONTROL_EXIT_CODES.NOT_READY);
+  const corePersistedResult = JSON.parse(await readFile(coreResultFile, 'utf8'));
+  assert.equal(corePersistedResult.stage, 'core');
+  assert.equal(corePersistedResult.assertionExpected, null);
+  assert.equal(corePersistedResult.decision.ready, false);
+} finally {
+  await new Promise((resolve) => coreCommandApi.server.close(resolve));
 }
 
 function resealDecision(value, overrides) {

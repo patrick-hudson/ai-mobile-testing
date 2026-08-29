@@ -532,6 +532,11 @@ try {
   const projectedLogs = await projectionControl.readLogs(projectionReviewer, 'run-projection');
   assert.equal(projectedLogs.runId, 'run-projection');
   assert.equal(projectedLogs.runRevision, projectedExecutions.runRevision);
+  const projectedWorkspace = await projectionControl.readWorkspace(projectionReviewer, 'run-projection');
+  assert.match(projectedWorkspace.snapshotToken, /^sha256:[a-f0-9]{64}$/u);
+  assert.notEqual(projectedWorkspace.publication.runRevision, projectedWorkspace.stateRevision,
+    'publication-envelope revision must not masquerade as the durable state revision');
+  assert.equal(projectedWorkspace.publication.digest, initialEnvelope.digest);
   const visualRisk = projectionView.riskRegister.risks.find(({ category }) => category === 'unreviewed-visual-change');
   const manualRisk = projectionView.riskRegister.risks.find(({ category }) => category === 'manual-check');
   let projectionState = await recoverParentRun(reopenedStore, 'run-projection');
@@ -719,6 +724,9 @@ try {
   await tombstoneParentRunAuthority(reopenedStore, 'run-projection', coordinator, {
     actor: { id: custodian.id, kind: custodian.kind }, reason: 'Synthetic crash after tombstone and before evidence removal.',
   });
+  await assert.rejects(() => projectionControl.readWorkspace(projectionReviewer, 'run-projection'),
+    (error) => error?.code === 'RELEASE_AUTHORITY_TOMBSTONED',
+    'aggregate workspace reads must honor the irreversible authority tombstone before evidence cleanup');
   const purgeRecoveryStore = await openParentRunStore({
     root: parentStoreRoot, storeMarker: parentStoreMarker, expectedStoreGeneration: 2,
     verifyStorage: false, clock,

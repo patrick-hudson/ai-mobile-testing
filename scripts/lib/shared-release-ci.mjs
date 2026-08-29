@@ -265,6 +265,21 @@ function validateTerminalRun(value, runId) {
     || !Number.isSafeInteger(value.runRevision) || value.runRevision < 1) {
     fail('CI_RUN_INVALID', 'Shared run response does not match the launched run.');
   }
+  if (value.compilationState === 'failed') {
+    const failure = value.compilationFailure;
+    const item = record(value.workItems) ? value.workItems[failure?.workItemId] : null;
+    if (!record(value.subjectCore) || value.subjectCore.digest !== value.subjectCoreDigest
+      || value.executionManifest !== null || value.executionManifestDigest !== null
+      || value.finalSubject !== null || value.finalSubjectDigest !== null
+      || !record(failure) || failure.subjectCoreDigest !== value.subjectCoreDigest
+      || failure.kind !== 'inventory-compilation-failure'
+      || !record(item) || item.state !== 'incomplete'
+      || !Array.isArray(item.attempts) || item.attempts.length !== failure.attemptCount
+      || item.attempts.at(-1)?.canonicalResultDigest !== failure.terminalResultDigest) {
+      fail('CI_RUN_INVALID', 'Failed inventory compilation is not bound to one exhausted core-stage execution.');
+    }
+    return { ready: true, stage: 'core', subjectCore: value.subjectCore, compilationFailure: failure };
+  }
   if (value.compilationState !== 'sealed') {
     return { ready: false, reason: 'compilation' };
   }
@@ -294,7 +309,7 @@ function validateTerminalRun(value, runId) {
   if (active.length > 0 || Object.values(value.workItems).some(({ state } = {}) => !TERMINAL_WORK_STATES.has(state))) {
     return { ready: false, reason: 'work' };
   }
-  return { ready: true, executionManifest, finalSubject };
+  return { ready: true, stage: 'final', executionManifest, finalSubject };
 }
 
 function validatePublication(value, run, terminal) {
@@ -307,7 +322,17 @@ function validatePublication(value, run, terminal) {
   if (run.currentPublicationDigest !== publication.digest) {
     fail('CI_PUBLICATION_STALE', 'Release publication is not the durable current publication head.');
   }
-  if (publication.runId !== run.runId
+  if (terminal.stage === 'core') {
+    if (publication.runId !== run.runId || publication.subjectCoreDigest !== run.subjectCoreDigest
+      || publication.finalSubjectDigest !== null || publication.decision.subjectStage !== 'core'
+      || publication.decision.subjectDigest !== run.subjectCoreDigest
+      || publication.decision.compilationFailureDigest !== terminal.compilationFailure.digest
+      || publication.decision.code !== 'NOT_READY_INCOMPLETE_EXECUTION'
+      || publication.decision.grantedAuthority !== null
+      || publication.decision.executionManifestDigest !== null) {
+      fail('CI_PUBLICATION_INVALID', 'Core-bound failure publication does not match exhausted inventory compilation.');
+    }
+  } else if (publication.runId !== run.runId
     || publication.finalSubjectDigest !== terminal.finalSubject.digest
     || publication.decision.subjectDigest !== terminal.finalSubject.digest
     || publication.decision.executionManifestDigest !== terminal.executionManifest.digest
@@ -396,22 +421,35 @@ export async function runSharedReleaseCi({
         }
         const publication = validatePublication(rawPublication, run, terminal);
         const confirmed = await confirmCandidate(client, launch.runId, run, publication);
+        if (confirmed.terminal.stage === 'core') {
+          return Object.freeze({
+            schemaVersion: 1,
+            confirmed: true,
+            stage: 'core',
+            operationId: launch.operationId,
+            runId: launch.runId,
+            run: Object.freeze(structuredClone(confirmed.run)),
+            publication: confirmed.publication,
+            assertionExpected: null,
+          });
+        }
         let reprobedIdentity;
         try {
           reprobedIdentity = await client.reprobeTargetIdentity({
             runId: launch.runId,
-            targets: terminal.finalSubject.targets,
-            expectedIdentity: terminal.finalSubject.deploymentIdentity,
+            targets: confirmed.terminal.finalSubject.targets,
+            expectedIdentity: confirmed.terminal.finalSubject.deploymentIdentity,
           });
         } catch (error) {
           fail('CI_TARGET_REPROBE_FAILED', 'Target identity reprobe failed.', error);
         }
-        if (canonicalJson(reprobedIdentity) !== canonicalJson(terminal.finalSubject.deploymentIdentity)) {
+        if (canonicalJson(reprobedIdentity) !== canonicalJson(confirmed.terminal.finalSubject.deploymentIdentity)) {
           fail('CI_TARGET_IDENTITY_DRIFT', 'Target deployment identity changed after the audited subject was sealed.');
         }
         return Object.freeze({
           schemaVersion: 1,
           confirmed: true,
+          stage: 'final',
           operationId: launch.operationId,
           runId: launch.runId,
           run: Object.freeze(structuredClone(confirmed.run)),

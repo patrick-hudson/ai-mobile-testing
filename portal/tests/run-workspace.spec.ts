@@ -211,8 +211,9 @@ test.describe('run-workspace', () => {
         }
         const root = `/api/control/v1/runs/${runId}`;
         const revision = operationAccepted ? 8 : 7;
-        if (url.pathname === `${root}/publication`) return route.fulfill({ json: { schemaVersion: 1, data: {
-          runId, runRevision: revision, decisionRevision: 3, riskRevision: 2, finalSubjectDigest,
+        if (url.pathname === `${root}/workspace`) return route.fulfill({ json: { schemaVersion: 1, data: {
+          schemaVersion: 1, snapshotToken: `sha256:${'d'.repeat(64)}`, stateRevision: revision + 10,
+          publication: { runId, runRevision: revision, decisionRevision: 3, riskRevision: 2, finalSubjectDigest,
           decision: { mode, label: 'FEATURE READY', grantedAuthority: 'TARGETED', certifiedScope: {
             features: ['navigation'], definitions: ['NAV-001'], targets: ['desktop'], knownLimits: ['checkout-parity-deferred'],
           } },
@@ -238,13 +239,13 @@ test.describe('run-workspace', () => {
               scope: { features: ['history'], definitions: ['HISTORY-001'], targets: ['desktop'], knownLimits: [] },
               actor: { kind: 'reviewer', id: 'reviewer-1' }, observedAt: '2026-08-28T14:00:00.000Z', updatedAt: '2026-08-28T15:00:00.000Z',
             })),
-          ] },
+          ] } },
+          executions: {
+            runId, executions: operationAccepted ? [] : [{ id: 'work-incomplete', state: 'incomplete' }],
+            oracleExecutions: [{ id: 'oracle-visual-1' }],
+          },
+          logs: { runId, limit: 200, truncated: false, events: [], attemptLogs: [] },
         } } });
-        if (url.pathname === `${root}/executions`) return route.fulfill({ json: { schemaVersion: 1, data: {
-          runId, runRevision: revision, executions: operationAccepted ? [] : [{ id: 'work-incomplete', state: 'incomplete' }],
-          oracleExecutions: [{ id: 'oracle-visual-1' }],
-        } } });
-        if (url.pathname === `${root}/logs`) return route.fulfill({ json: { schemaVersion: 1, data: { runId, runRevision: revision, limit: 200, truncated: false, events: [], attemptLogs: [] } } });
         if (url.pathname === `${root}/rekick` && request.method() === 'POST') {
           expect(request.headers()['x-audit-csrf']).toBe('csrf-fixture');
           expect(request.headers()['idempotency-key']).toBeTruthy();

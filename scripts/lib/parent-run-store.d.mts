@@ -30,6 +30,7 @@ export function sealParentRunGraph(store: ParentRunStore, runId: string, coordin
   inventoryWorkItemId?: string;
   workItems?: Array<{ id: string; maxAttempts: number; capability?: string; resourceClass?: 'ordinary' | 'performance'; targetId?: string; specAffinity?: string | null; executionDescriptor?: WorkExecutionDescriptor | null }>;
 }): Promise<any>;
+export function terminalizeParentRunCompilation(store: ParentRunStore, runId: string, coordinator: CoordinatorFence): Promise<any>;
 export function acquireCoordinator(store: ParentRunStore, runId: string, input: { ownerId: string; leaseMs: number }): Promise<CoordinatorFence>;
 export function takeOverCoordinator(store: ParentRunStore, runId: string, input: { ownerId: string; leaseMs: number }): Promise<CoordinatorFence>;
 export function acquireStoreCoordinator(store: ParentRunStore, input: { ownerId: string; leaseMs: number }): Promise<CoordinatorFence>;
@@ -81,8 +82,9 @@ export function cancelParentRun(store: ParentRunStore, runId: string, coordinato
 export function acceptOperation(store: ParentRunStore, runId: string, request: any): Promise<any>;
 export function getOperation(store: ParentRunStore, runId: string, idempotencyKey: string): Promise<any>;
 export function getOperationById(store: ParentRunStore, runId: string, operationId: string): Promise<any>;
-export function listAcceptedOperations(store: ParentRunStore, runId: string, options?: { limit?: number }): Promise<any[]>;
+export function listPendingOperations(store: ParentRunStore, runId: string, options?: { limit?: number }): Promise<any[]>;
 export function rekickIncompleteWork(store: ParentRunStore, runId: string, coordinator: CoordinatorFence, input: any): Promise<any>;
+export function applyRekickOperation(store: ParentRunStore, runId: string, coordinator: CoordinatorFence, operationId: string): Promise<any>;
 export function completeOperation(store: ParentRunStore, runId: string, coordinator: CoordinatorFence, operationId: string, outcome: any): Promise<any>;
 export function appendRiskLifecycleEvent(store: ParentRunStore, runId: string, coordinator: CoordinatorFence, input: any): Promise<any>;
 export function appendMutationAuditEvent(store: ParentRunStore, runId: string, coordinator: CoordinatorFence, input: any): Promise<any>;
@@ -90,6 +92,7 @@ export function tombstoneParentRunAuthority(store: ParentRunStore, runId: string
 export function purgeParentRunEvidence(store: ParentRunStore, runId: string): Promise<any>;
 export function readRunHistories(store: ParentRunStore, runId: string): Promise<Record<string, any[]>>;
 export function readBoundedAttemptLogs(store: ParentRunStore, runId: string, options?: { limit?: number }): Promise<{ entries: any[]; truncated: boolean }>;
+export function readParentRunWorkspaceSnapshot(store: ParentRunStore, runId: string, options?: { logLimit?: number }): Promise<any>;
 export function publishCurrentEnvelope(store: ParentRunStore, runId: string, coordinator: CoordinatorFence, envelope: PublicationEnvelope, hooks?: { afterEnvelopePersist?(envelope: PublicationEnvelope): void | Promise<void>; afterDecisionPersist?(envelope: PublicationEnvelope): void | Promise<void> }): Promise<PublicationEnvelope>;
 export function readCurrentEnvelope(store: ParentRunStore, runId: string): Promise<PublicationEnvelope>;
 export function withCurrentEnvelopeFence<T>(store: ParentRunStore, runId: string, callback: (envelope: PublicationEnvelope, authority: ReleaseAuthorityContext) => T | Promise<T>): Promise<T>;

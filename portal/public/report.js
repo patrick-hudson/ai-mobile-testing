@@ -299,7 +299,6 @@ async function loadSharedReport({ focus = false } = {}) {
     const workspace = assertSharedWorkspaceProjection(await sharedControl.readWorkspace(state.runId, {
       signal: controller.signal,
       logLimit: 200,
-      maxAttempts: 3,
     }), { runId: state.runId, mode: state.mode });
     if (controller.signal.aborted) return;
     renderSharedReport(workspace);
@@ -343,6 +342,8 @@ function renderSharedReportUnavailable(error) {
 function renderSharedReport(workspace) {
   const { publication, executions, logs } = workspace;
   const { decision, riskRegister } = publication;
+  const coreBound = decision.subjectStage === 'core';
+  const displayedScope = coreBound ? decision.requestedAuthority?.scope : decision.certifiedScope;
   const availability = riskRegister.availability;
   elements.report_product_risk.dataset.riskAvailability = availability;
   elements.report_product_risk.setAttribute('aria-busy', String(availability === 'LOADING'));
@@ -354,18 +355,18 @@ function renderSharedReport(workspace) {
   const decisionEyebrow = textNode('p', 'Release Decision');
   decisionEyebrow.className = 'step-label';
   const decisionTitle = textNode('h3', decision.label);
-  const decisionCode = textNode('p', `${decision.code ?? decision.label.replaceAll(' ', '_')} · ${decision.grantedAuthority} authority`);
+  const decisionCode = textNode('p', `${decision.code ?? decision.label.replaceAll(' ', '_')} · ${coreBound ? 'authority not granted' : `${decision.grantedAuthority} authority`}`);
   decisionCode.className = 'report-decision-code';
   const scope = document.createElement('div');
   scope.id = 'report-certified-scope';
   scope.className = 'report-certified-scope';
-  scope.append(textNode('h4', 'Certified scope'));
+  scope.append(textNode('h4', coreBound ? 'Requested scope' : 'Certified scope'));
   const scopeList = document.createElement('dl');
   for (const [label, values] of [
-    ['Features', decision.certifiedScope?.features],
-    ['Definitions', decision.certifiedScope?.definitions],
-    ['Targets', decision.certifiedScope?.targets],
-    ['Known limits', decision.certifiedScope?.knownLimits],
+    ['Features', displayedScope?.features],
+    ['Definitions', displayedScope?.definitions],
+    ['Targets', displayedScope?.targets],
+    ['Known limits', displayedScope?.knownLimits],
   ]) {
     const row = document.createElement('div');
     row.append(textNode('dt', label), textNode('dd', scopeValues(values, label === 'Known limits' && state.mode === 'single-site' ? 'N/A · No comparison-only limits were published.' : 'N/A')));
@@ -376,7 +377,7 @@ function renderSharedReport(workspace) {
   revisions.id = 'report-authority-revisions';
   const revisionState = textNode('p', decision.superseded
     ? 'SUPERSEDED · This decision is historical and cannot be consumed as current authority.'
-    : `CURRENT · Subject ${shortDigest(publication.finalSubjectDigest)}${publication.previousEnvelopeDigest ? ` · supersedes ${shortDigest(publication.previousEnvelopeDigest)}` : ''}`);
+    : `CURRENT · Subject ${shortDigest(publication.finalSubjectDigest ?? publication.subjectCoreDigest)}${publication.previousEnvelopeDigest ? ` · supersedes ${shortDigest(publication.previousEnvelopeDigest)}` : ''}`);
   revisionState.className = 'report-revision-state';
   decisionCard.append(decisionEyebrow, decisionTitle, decisionCode, scope, revisions, revisionState);
 

@@ -9,6 +9,7 @@ import { sealAuditedCandidateDeployment } from '../shared/release-artifact-contr
 import { buildReleaseArtifactManifest } from './lib/release-artifact.mjs';
 import { executeExactPromotion } from './lib/exact-promotion.mjs';
 import { runExactPromotionCommand } from './run-exact-promotion.mjs';
+import { formatSharedReleaseCiResult } from './run-shared-release-ci.mjs';
 
 const D1 = `sha256:${'1'.repeat(64)}`;
 const D2 = `sha256:${'2'.repeat(64)}`;
@@ -57,18 +58,24 @@ function finalSubject(mode = 'single-site') {
 }
 
 function ciResult(subject = finalSubject()) {
-  return {
-    schemaVersion: 1,
-    kind: 'shared-release-ci-result',
-    confirmed: true,
-    requestId: 'shared-release-ci-request-0001',
+  return formatSharedReleaseCiResult('shared-release-ci-request-0001', {
+    stage: 'final',
     operationId: 'a'.repeat(64),
     runId: `run-${'a'.repeat(32)}`,
-    publicationDigest: D1,
-    subjectDigest: subject.digest,
-    executionSetDigest: subject.executionManifestDigest,
-    finalSubject: subject,
-    decision: { code: 'RELEASE_READY', ready: true, authority: 'FULL', runRevision: 9, decisionRevision: 4 },
+    run: { finalSubject: subject },
+    publication: {
+      digest: D1,
+      finalSubjectDigest: subject.digest,
+      decisionRevision: 4,
+      runRevision: 9,
+      decision: {
+        subjectStage: 'final',
+        code: 'RELEASE_READY',
+        ready: true,
+        grantedAuthority: 'FULL',
+        executionManifestDigest: subject.executionManifestDigest,
+      },
+    },
     assertionExpected: {
       subjectDigest: subject.digest,
       authority: 'FULL',
@@ -76,7 +83,7 @@ function ciResult(subject = finalSubject()) {
       runRevision: 9,
       decisionRevision: 4,
     },
-  };
+  });
 }
 
 function harness({ failAssert = false, failConsume = false, failPrepare = false } = {}) {
@@ -148,6 +155,25 @@ try {
     sourceRevision: candidateDeployment.sourceRevision,
     requestId: 'exact-promotion-request-0001',
   };
+
+  const coreStageResult = structuredClone(base.ciResult);
+  coreStageResult.stage = 'core';
+  coreStageResult.finalSubject = null;
+  coreStageResult.executionSetDigest = null;
+  coreStageResult.decision = {
+    ...coreStageResult.decision,
+    code: 'NOT_READY_INCOMPLETE_EXECUTION',
+    ready: false,
+    authority: null,
+  };
+  coreStageResult.assertionExpected = null;
+  const rejectedCoreStage = harness();
+  await assert.rejects(
+    executeExactPromotion({ ...base, ciResult: coreStageResult, client: rejectedCoreStage.client, provider: rejectedCoreStage.provider }),
+    (error) => error?.code === 'EXACT_PROMOTION_CI_RESULT_INVALID',
+    'core-stage CI results must never reach promotion',
+  );
+  assert.deepEqual(rejectedCoreStage.calls, []);
 
   const successful = harness();
   const receipt = await executeExactPromotion({ ...base, client: successful.client, provider: successful.provider });

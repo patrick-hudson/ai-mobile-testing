@@ -8,7 +8,6 @@ import {
 
 const calls = [];
 let operationReads = 0;
-let publicationReads = 0;
 const jsonResponse = (status, body) => ({
   ok: status >= 200 && status < 300,
   status,
@@ -21,22 +20,22 @@ const client = createSharedControlBrowserClient({
     if (url === '/api/control/v1/session' && options.method === 'POST') {
       return jsonResponse(200, { schemaVersion: 1, data: { csrfToken: 'csrf-memory-only', principal: { id: 'reviewer-1' } } });
     }
-    if (String(url).endsWith('/publication')) {
-      publicationReads += 1;
+    if (String(url).includes('/workspace?')) {
       return jsonResponse(200, { schemaVersion: 1, data: {
-        runId: 'run-1', runRevision: publicationReads === 1 ? 6 : 7, decisionRevision: 2, riskRevision: 3,
+        schemaVersion: 1, snapshotToken: `sha256:${'a'.repeat(64)}`, stateRevision: 11,
+        publication: {
+        runId: 'run-1', runRevision: 6, decisionRevision: 2, riskRevision: 3,
         finalSubjectDigest: `sha256:${'b'.repeat(64)}`,
         decision: {
           mode: 'comparative', label: 'FEATURE READY', grantedAuthority: 'TARGETED',
           certifiedScope: { features: ['navigation'], definitions: ['NAV-001'], targets: ['desktop'], knownLimits: [] },
         },
         riskRegister: { availability: 'PARTIAL', risks: [] },
+        },
+        executions: { runId: 'run-1', executions: [{ id: 'work-incomplete', state: 'incomplete' }], oracleExecutions: [] },
+        logs: { runId: 'run-1', limit: 200, truncated: false, events: [], attemptLogs: [] },
       } });
     }
-    if (String(url).endsWith('/executions')) return jsonResponse(200, { schemaVersion: 1, data: {
-      runId: 'run-1', runRevision: 7, executions: [{ id: 'work-incomplete', state: 'incomplete' }], oracleExecutions: [],
-    } });
-    if (String(url).includes('/logs?')) return jsonResponse(200, { schemaVersion: 1, data: { runId: 'run-1', runRevision: 7, limit: 200, truncated: false, events: [], attemptLogs: [] } });
     if (String(url).endsWith('/rekick')) return jsonResponse(202, { schemaVersion: 1, data: { operationId: 'a'.repeat(64), state: 'accepted', statusUrl: `/api/control/v1/runs/run-1/operations/${'a'.repeat(64)}` } });
     if (String(url).includes('/operations/')) {
       operationReads += 1;
@@ -56,12 +55,33 @@ assert.equal(JSON.parse(calls[0].options.body).credential, credential);
 assert.equal(JSON.stringify(client.session).includes(credential), false);
 
 const workspace = await client.readWorkspace('run-1');
-assert.equal(workspace.publication.runRevision, 7);
-assert.equal(workspace.executions.runRevision, 7);
+assert.equal(workspace.publication.runRevision, 6);
+assert.equal(workspace.stateRevision, 11);
 assert.equal(workspace.riskAvailability, 'PARTIAL');
 assert.equal(workspace.logs.limit, 200);
-assert.equal(publicationReads, 2);
 assert.equal(assertSharedWorkspaceProjection(workspace, { runId: 'run-1', mode: 'comparative' }), workspace);
+const coreBoundWorkspace = {
+  ...workspace,
+  publication: {
+    ...workspace.publication,
+    subjectCoreDigest: `sha256:${'c'.repeat(64)}`,
+    finalSubjectDigest: null,
+    decision: {
+      ...workspace.publication.decision,
+      subjectStage: 'core',
+      mode: 'single-site',
+      grantedAuthority: null,
+      certifiedScope: null,
+      requestedAuthority: {
+        qualifier: 'FULL',
+        scope: { features: ['site'], definitions: ['NAV-001'], targets: ['desktop'], knownLimits: [] },
+      },
+    },
+  },
+};
+assert.equal(assertSharedWorkspaceProjection(coreBoundWorkspace, {
+  runId: 'run-1', mode: 'single-site',
+}), coreBoundWorkspace, 'a core-bound incomplete decision must remain a coherent terminal portal projection');
 assert.throws(
   () => assertSharedWorkspaceProjection(workspace, { runId: 'another-run', mode: 'comparative' }),
   /coherent revision/i,

@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
 import { canonicalDigest } from '../shared/canonical-contract.mjs';
+import { sealInventoryCompilationFailure } from '../shared/compilation-failure.mjs';
 import { sealExecutionManifest, sealOracleResult, sealWorkItemResult } from '../shared/execution-contract.mjs';
 import { appendPublicationEnvelope } from '../shared/publication-envelope.mjs';
 import { sealFinalReleaseSubject, sealReleaseSubjectCore } from '../shared/release-subject.mjs';
 import { sealRiskSourceObservationSet } from '../shared/risk-source-observation.mjs';
 import {
   appendVisualDisposition,
+  projectCompilationFailureView,
   projectSharedReleaseView,
   projectPublicationView,
 } from '../shared/release-projection.mjs';
@@ -476,6 +478,56 @@ assert.equal(provisionalRunRecord.fields.finalizationStatus, 'publication-unavai
 assert.deepEqual(provisionalRunRecord.fields.reasonCodes, ['release-publication-unavailable']);
 assert.doesNotMatch(provisionalRunRecord.fields.title, /no risks/iu,
   'An unpublished or unavailable risk projection must never masquerade as an empty register.');
+const compilationFailure = sealInventoryCompilationFailure({
+  schemaVersion: 1,
+  subjectCoreDigest: single.core.digest,
+  workItemId: 'inventory-barrier',
+  terminalResultDigest: D1,
+  reason: 'Inventory exhausted bounded recovery.',
+  attemptCount: 3,
+  failedAt: '2026-08-28T20:05:00.000Z',
+});
+const compilationFailureProjection = projectCompilationFailureView({
+  schemaVersion: 1,
+  runId: 'run-single-compilation-failed',
+  decisionRevision: 1,
+  riskRevision: 1,
+  subjectCore: single.core,
+  compilationFailure,
+});
+const compilationFailureEnvelope = appendPublicationEnvelope(null, {
+  schemaVersion: 1,
+  runId: 'run-single-compilation-failed',
+  runRevision: 1,
+  decisionRevision: 1,
+  riskRevision: 1,
+  ledgerSequences: { observations: 4, decisions: 1, risks: 0 },
+  subjectCoreDigest: single.core.digest,
+  finalSubjectDigest: null,
+  decision: compilationFailureProjection.decision,
+  riskRegister: compilationFailureProjection.riskRegister,
+});
+const compilationFailureRunRecord = sharedPublicationToConsoleIndexRecord({
+  publication: compilationFailureEnvelope,
+  parentRun: {
+    runId: compilationFailureEnvelope.runId,
+    runRevision: 5,
+    status: 'active',
+    compilationState: 'failed',
+    subjectCore: single.core,
+    subjectCoreDigest: single.core.digest,
+    workItems: { 'inventory-barrier': { id: 'inventory-barrier', state: 'incomplete' } },
+    createdAt: '2026-08-28T20:00:00.000Z',
+    updatedAt: '2026-08-28T20:05:00.000Z',
+  },
+});
+assert.equal(compilationFailureRunRecord.fields.terminal, true);
+assert.equal(compilationFailureRunRecord.fields.status, 'completed-not-ready');
+assert.equal(compilationFailureRunRecord.fields.phase, 'release-published');
+assert.equal(compilationFailureRunRecord.fields.outcome, 'NOT_READY_INCOMPLETE_EXECUTION');
+assert.equal(compilationFailureRunRecord.fields.authority, 'NOT_GRANTED');
+assert.equal(compilationFailureRunRecord.fields.evidenceAuthorityStatus, 'core-bound-incomplete');
+assert.equal(compilationFailureRunRecord.fields.activityState, 'idle');
 assert.deepEqual(parseChecklistRelease(envelope, 'release/publication/current.json'), golden.releaseTruth);
 const manifest = applySharedReleaseEligibility({}, envelope, 'Shared finalization');
 assert.deepEqual(manifest.sharedRelease, golden);

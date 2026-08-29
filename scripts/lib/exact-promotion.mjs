@@ -27,10 +27,11 @@ function safeId(value, label) {
 function parseCiResult(value) {
   if (!record(value)) fail('EXACT_PROMOTION_CI_RESULT_INVALID', 'Shared release CI result is required.');
   exactKeys(value, [
-    'schemaVersion', 'kind', 'confirmed', 'requestId', 'operationId', 'runId', 'publicationDigest',
+    'schemaVersion', 'kind', 'stage', 'confirmed', 'requestId', 'operationId', 'runId', 'publicationDigest',
     'subjectDigest', 'executionSetDigest', 'finalSubject', 'decision', 'assertionExpected',
   ], 'Shared release CI result');
-  if (value.schemaVersion !== 1 || value.kind !== 'shared-release-ci-result' || value.confirmed !== true
+  if (value.schemaVersion !== 1 || value.kind !== 'shared-release-ci-result' || value.stage !== 'final'
+    || value.confirmed !== true
     || !REQUEST_ID.test(value.requestId ?? '') || !/^[a-f0-9]{64}$/u.test(value.operationId ?? '')
     || !RUN_ID.test(value.runId ?? '') || !DIGEST.test(value.publicationDigest ?? '')) {
     fail('EXACT_PROMOTION_CI_RESULT_INVALID', 'Shared release CI result identity is invalid.');

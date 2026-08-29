@@ -8,12 +8,15 @@ import {
   nonEmptyString,
 } from './canonical-contract.mjs';
 import { parseExecutionManifest, parseOracleResult } from './execution-contract.mjs';
+import { parseInventoryCompilationFailure } from './compilation-failure.mjs';
 import {
   AUDIT_MODES,
   AUTHORITY_QUALIFIERS,
+  parseAuthority,
   parseCertifiedScope,
   parseCoverageBasis,
   parseFinalReleaseSubject,
+  parseReleaseSubjectCore,
 } from './release-subject.mjs';
 
 export const RELEASE_DECISION_CODES = Object.freeze([
@@ -56,6 +59,45 @@ function parseDisposition(value, index) {
 
 function reason(reasonClass, executionId, detail) {
   return { class: reasonClass, executionId, detail };
+}
+
+export function deriveCompilationFailureDecision(value) {
+  assertSchemaVersion(value, 'Compilation failure decision input');
+  exactKeys(value, [
+    'schemaVersion', 'runId', 'decisionRevision', 'subjectCore', 'compilationFailure',
+  ], 'Compilation failure decision input');
+  const subjectCore = parseReleaseSubjectCore(value.subjectCore);
+  const failure = parseInventoryCompilationFailure(value.compilationFailure);
+  if (failure.subjectCoreDigest !== subjectCore.digest) {
+    failContract('RELEASE_SUBJECT_MISMATCH', 'Compilation failure is not bound to the release subject core.');
+  }
+  const blockingReasons = [reason(
+    'incomplete-execution',
+    failure.workItemId,
+    'Inventory execution remained incomplete after bounded recovery.',
+  )];
+  const body = {
+    schemaVersion: 1,
+    kind: 'release-decision',
+    subjectStage: 'core',
+    runId: nonEmptyString(value.runId, 'runId'),
+    decisionRevision: positiveInteger(value.decisionRevision, 'decisionRevision'),
+    subjectDigest: subjectCore.digest,
+    compilationFailureDigest: failure.digest,
+    executionManifestDigest: null,
+    mode: subjectCore.mode,
+    requestedAuthority: subjectCore.requestedAuthority,
+    grantedAuthority: null,
+    certifiedScope: null,
+    coverageBasis: null,
+    code: 'NOT_READY_INCOMPLETE_EXECUTION',
+    label: DECISION_LABELS.NOT_READY_INCOMPLETE_EXECUTION,
+    ready: false,
+    blockingReasons,
+    superseded: false,
+    exitCode: 1,
+  };
+  return freezeContract({ ...body, digest: canonicalDigest(body) });
 }
 
 export function deriveReleaseDecision(value) {
@@ -162,6 +204,53 @@ export function deriveReleaseDecision(value) {
 
 export function parseReleaseDecision(value) {
   assertSchemaVersion(value, 'Release decision');
+  if (value.subjectStage === 'core') {
+    exactKeys(value, [
+      'schemaVersion', 'kind', 'subjectStage', 'runId', 'decisionRevision', 'subjectDigest',
+      'compilationFailureDigest', 'executionManifestDigest', 'mode', 'requestedAuthority', 'grantedAuthority', 'certifiedScope',
+      'coverageBasis', 'code', 'label', 'ready', 'blockingReasons', 'superseded', 'exitCode', 'digest',
+    ], 'Core-bound release decision');
+    if (value.kind !== 'release-decision' || value.code !== 'NOT_READY_INCOMPLETE_EXECUTION'
+      || !AUDIT_MODES.includes(value.mode) || value.executionManifestDigest !== null
+      || value.grantedAuthority !== null || value.certifiedScope !== null || value.coverageBasis !== null
+      || value.label !== DECISION_LABELS.NOT_READY_INCOMPLETE_EXECUTION || value.ready !== false
+      || value.superseded !== false || value.exitCode !== 1 || !Array.isArray(value.blockingReasons)
+      || value.blockingReasons.length !== 1) {
+      failContract('CORRUPT_DECISION', 'Core-bound release decision fields contradict incomplete compilation.');
+    }
+    const blockingReasons = value.blockingReasons.map((entry, index) => {
+      exactKeys(entry, ['class', 'executionId', 'detail'], `blockingReasons[${index}]`);
+      if (entry.class !== 'incomplete-execution') failContract('CORRUPT_DECISION', 'Core-bound decision must name incomplete execution.');
+      return {
+        class: entry.class,
+        executionId: nonEmptyString(entry.executionId, `blockingReasons[${index}].executionId`),
+        detail: nonEmptyString(entry.detail, `blockingReasons[${index}].detail`),
+      };
+    });
+    const body = {
+      schemaVersion: 1,
+      kind: 'release-decision',
+      subjectStage: 'core',
+      runId: nonEmptyString(value.runId, 'runId'),
+      decisionRevision: positiveInteger(value.decisionRevision, 'decisionRevision'),
+      subjectDigest: assertDigest(value.subjectDigest, 'subjectDigest'),
+      compilationFailureDigest: assertDigest(value.compilationFailureDigest, 'compilationFailureDigest'),
+      executionManifestDigest: null,
+      mode: value.mode,
+      requestedAuthority: parseAuthority(value.requestedAuthority, 'requestedAuthority'),
+      grantedAuthority: null,
+      certifiedScope: null,
+      coverageBasis: null,
+      code: value.code,
+      label: value.label,
+      ready: false,
+      blockingReasons,
+      superseded: false,
+      exitCode: 1,
+    };
+    if (canonicalDigest(body) !== value.digest) failContract('CORRUPT_DECISION', 'Core-bound release decision digest is corrupt.');
+    return freezeContract({ ...body, digest: value.digest });
+  }
   exactKeys(value, [
     'schemaVersion', 'kind', 'runId', 'decisionRevision', 'subjectDigest', 'executionManifestDigest',
     'mode', 'grantedAuthority', 'certifiedScope', 'coverageBasis', 'code', 'label', 'ready',
@@ -219,6 +308,9 @@ export function parseReleaseDecision(value) {
 
 export function assertConsumableReleaseDecision(value, expected) {
   const decision = parseReleaseDecision(value);
+  if (decision.subjectStage === 'core') {
+    failContract('RELEASE_AUTHORITY_INCOMPLETE', 'Inventory did not seal final release authority.');
+  }
   assertDigest(expected?.expectedSubjectDigest, 'expectedSubjectDigest');
   if (decision.subjectDigest !== expected.expectedSubjectDigest) {
     failContract('STALE_RELEASE_SUBJECT', 'Release decision does not match the subject intended for promotion.');

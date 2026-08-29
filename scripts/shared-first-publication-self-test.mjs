@@ -13,12 +13,15 @@ import { createSharedControlService } from './lib/shared-control-service.mjs';
 import { createSharedCoordinatorSupervisor } from './lib/shared-coordinator-supervisor.mjs';
 import {
   adoptAttemptEvidence,
+  applyRekickOperation,
+  cancelParentRun,
   createParentRun,
   openParentRunStore,
   publishAttemptEvidence,
   readCurrentEnvelope,
   readParentRun,
   readReleaseAuthoritySelector,
+  rekickIncompleteWork,
   transitionReleaseAuthority,
 } from './lib/parent-run-store.mjs';
 
@@ -88,6 +91,7 @@ const [pluginRegistry, targetRegistry] = await Promise.all([
 ]);
 
 const root = await mkdtemp(path.join(tmpdir(), 'shared-first-publication-'));
+const storeMarker = 'ab'.repeat(32);
 let now = Date.parse(observedAt);
 try {
   const store = await openParentRunStore({
@@ -95,6 +99,7 @@ try {
     deploymentIdentity: 'shared-first-publication-test',
     volumeIdentity: 'named-volume:shared-first-publication-test',
     backupMarker: 'backup:shared-first-publication-test',
+    storeMarker,
     verifyStorage: false,
     clock: () => now,
   });
@@ -483,6 +488,184 @@ try {
   assert.deepEqual([...new Set(singleReady.riskRegister.risks.map(({ category }) => category))].sort(), [
     'certificate-bypass', 'evidence-pipeline-limitation', 'manual-check',
   ]);
+
+  await createParentRun(store, { runId: 'run-inventory-recovery', ...singleLaunch.createParentRunInput });
+  await assert.rejects(rekickIncompleteWork(store, 'run-inventory-recovery', supervisor.coordinator(), {
+    actor: { id: 'operator-inventory-recovery', kind: 'human' },
+    workItemIds: [singleLaunch.inventoryBarrier.workItem.id],
+  }), (error) => error?.code === 'REKICK_NOT_INCOMPLETE',
+  'inventory work cannot be rekicked before compilation terminalizes');
+  let exhaustedInventoryWorkItemId = null;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const lease = await supervisor.claim(inventoryWorker);
+    assert.equal(lease.runId, 'run-inventory-recovery');
+    exhaustedInventoryWorkItemId = lease.workItemId;
+    const inbox = await publishAttemptEvidence(store, lease.runId, lease, {
+      outcome: 'operational_failure',
+      reason: `synthetic-inventory-failure-${attempt}`,
+      artifacts: [],
+      executionDescriptorDigest: lease.executionDescriptorDigest,
+    });
+    await adoptAttemptEvidence(store, lease.runId, supervisor.coordinator(), inbox);
+  }
+  await supervisor.maintain();
+  const inventoryFailed = await readParentRun(store, 'run-inventory-recovery');
+  assert.equal(inventoryFailed.compilationState, 'failed',
+    'exhausting the inventory barrier must terminalize compilation instead of waiting forever');
+  assert.equal(inventoryFailed.compilationFailure.workItemId, exhaustedInventoryWorkItemId);
+  assert.equal(inventoryFailed.compilationFailure.attemptCount, 3);
+  assert.equal(inventoryFailed.finalSubject, null, 'inventory failure must not manufacture a final release subject');
+  assert.equal(inventoryFailed.executionManifest, null, 'inventory failure must not manufacture an execution manifest');
+  const coreFailure = await readCurrentEnvelope(store, 'run-inventory-recovery');
+  assert.equal(coreFailure.decision.code, 'NOT_READY_INCOMPLETE_EXECUTION');
+  assert.equal(coreFailure.subjectCoreDigest, inventoryFailed.subjectCoreDigest);
+  assert.equal(coreFailure.finalSubjectDigest, null);
+  assert.equal(coreFailure.decision.grantedAuthority, null,
+    'a core-bound inventory failure must not claim granted release authority');
+  await assert.rejects(rekickIncompleteWork(store, 'run-inventory-recovery', supervisor.coordinator(), {
+    actor: { id: 'operator-inventory-recovery', kind: 'human' }, workItemIds: ['wrong-inventory-barrier'],
+  }), (error) => error?.code === 'REKICK_NOT_INCOMPLETE',
+  'failed compilation must reject any rekick that does not name its exact immutable barrier');
+
+  const inventoryOperator = {
+    id: 'operator-inventory-recovery', kind: 'human', roles: ['operator'],
+    projectIds: ['project-first-publication'], runIds: ['run-inventory-recovery'],
+  };
+  const rekickRequest = {
+    kind: 'rekick',
+    requestId: 'inventory-recovery-rekick-0001',
+    expectedRunRevision: inventoryFailed.runRevision,
+    body: {
+      expectedSubjectDigest: inventoryFailed.subjectCoreDigest,
+      workItemIds: [exhaustedInventoryWorkItemId],
+    },
+  };
+  await assert.rejects(controlService.acceptMutation(inventoryOperator, 'run-inventory-recovery', {
+    ...rekickRequest,
+    requestId: 'inventory-recovery-rekick-wrong-core',
+    body: { ...rekickRequest.body, expectedSubjectDigest: digest('f') },
+  }), (error) => error?.code === 'RELEASE_SUBJECT_MISMATCH');
+  const acceptedRekick = await controlService.acceptMutation(inventoryOperator, 'run-inventory-recovery', rekickRequest);
+  const durablyAppliedRekick = await applyRekickOperation(
+    store, 'run-inventory-recovery', supervisor.coordinator(), acceptedRekick.operationId,
+  );
+  assert.equal(durablyAppliedRekick.state, 'applied',
+    'rekick transition and durable operation application must commit atomically');
+  assert.deepEqual(
+    await controlService.acceptMutation(inventoryOperator, 'run-inventory-recovery', rekickRequest),
+    durablyAppliedRekick,
+    'an authorized duplicate core-bound rekick must recover the original operation',
+  );
+  await assert.rejects(controlService.acceptMutation({
+    ...inventoryOperator, id: 'viewer-inventory-recovery', roles: ['viewer'],
+  }, 'run-inventory-recovery', {
+    ...rekickRequest,
+    requestId: 'inventory-recovery-rekick-unauthorized',
+    expectedRunRevision: (await readParentRun(store, 'run-inventory-recovery')).runRevision,
+  }), (error) => error?.code === 'AUTHORIZATION_DENIED');
+  const resumed = await readParentRun(store, 'run-inventory-recovery');
+  assert.equal(resumed.compilationState, 'pending');
+  assert.equal(resumed.subjectCoreDigest, inventoryFailed.subjectCoreDigest);
+  assert.equal(resumed.workItems[exhaustedInventoryWorkItemId].attempts.length, 3);
+
+  const failedManualLease = await supervisor.claim(inventoryWorker);
+  assert.equal(failedManualLease.runId, 'run-inventory-recovery');
+  assert.equal(failedManualLease.attempt, 4);
+  const failedManualInbox = await publishAttemptEvidence(store, failedManualLease.runId, failedManualLease, {
+    outcome: 'operational_failure',
+    reason: 'synthetic-manual-inventory-failure',
+    artifacts: [],
+    executionDescriptorDigest: failedManualLease.executionDescriptorDigest,
+  });
+  await adoptAttemptEvidence(store, failedManualLease.runId, supervisor.coordinator(), failedManualInbox);
+  const replayMaintenance = await supervisor.maintain();
+  assert.equal(replayMaintenance.completedOperations, 1,
+    'replay after a worker result must complete the original applied rekick without consuming another rekick');
+  const failedAgain = await readParentRun(store, 'run-inventory-recovery');
+  const coreFailureAgain = await readCurrentEnvelope(store, 'run-inventory-recovery');
+  assert.equal(failedAgain.compilationState, 'failed');
+  assert.equal(failedAgain.compilationFailure.attemptCount, 4);
+  assert.equal(coreFailureAgain.previousEnvelopeDigest, coreFailure.digest);
+  assert.equal(coreFailureAgain.decisionRevision, coreFailure.decisionRevision + 1);
+  assert.equal(coreFailureAgain.subjectCoreDigest, coreFailure.subjectCoreDigest);
+
+  const secondRekick = await controlService.acceptMutation(inventoryOperator, 'run-inventory-recovery', {
+    kind: 'rekick',
+    requestId: 'inventory-recovery-rekick-0002',
+    expectedRunRevision: failedAgain.runRevision,
+    body: {
+      expectedSubjectDigest: failedAgain.subjectCoreDigest,
+      workItemIds: [exhaustedInventoryWorkItemId],
+    },
+  });
+  assert.equal(secondRekick.state, 'accepted');
+  assert.equal((await controlService.applyAcceptedOperations(
+    supervisor.coordinator(),
+    'run-inventory-recovery',
+  ))[0].outcome.status, 'succeeded');
+
+  const recoveryLease = await supervisor.claim(inventoryWorker);
+  assert.equal(recoveryLease.runId, 'run-inventory-recovery');
+  assert.equal(recoveryLease.attempt, 5);
+  const recoveryDocument = {
+    ...inventoryDocument,
+    workItemId: recoveryLease.workItemId,
+    executionDescriptorDigest: recoveryLease.executionDescriptorDigest,
+  };
+  const recoveryBytes = Buffer.from(`${JSON.stringify(recoveryDocument)}\n`);
+  const recoveryInbox = await publishAttemptEvidence(store, recoveryLease.runId, recoveryLease, {
+    outcome: 'completed_pass',
+    executionDescriptorDigest: recoveryLease.executionDescriptorDigest,
+    artifacts: [{
+      name: 'inventory/live-route-inventory.json',
+      mediaType: 'application/json',
+      sizeBytes: recoveryBytes.length,
+      digest: `sha256:${createHash('sha256').update(recoveryBytes).digest('hex')}`,
+      contentBase64: recoveryBytes.toString('base64'),
+    }],
+  });
+  await adoptAttemptEvidence(store, recoveryLease.runId, supervisor.coordinator(), recoveryInbox);
+  const recoveryMaintenance = await supervisor.maintain();
+  assert.deepEqual(recoveryMaintenance.errors, [], JSON.stringify(recoveryMaintenance.errors));
+  assert.equal(recoveryMaintenance.sealedGraphs, 1);
+  const recoveredInventory = await readParentRun(store, 'run-inventory-recovery');
+  assert.equal(recoveredInventory.compilationState, 'sealed');
+  assert.equal(recoveredInventory.subjectCoreDigest, inventoryFailed.subjectCoreDigest);
+  assert(recoveredInventory.finalSubjectDigest);
+  const superseding = await readCurrentEnvelope(store, 'run-inventory-recovery');
+  assert.equal(superseding.previousEnvelopeDigest, coreFailureAgain.digest);
+  assert.equal(superseding.subjectCoreDigest, inventoryFailed.subjectCoreDigest);
+  assert.equal(superseding.finalSubjectDigest, recoveredInventory.finalSubjectDigest);
+  assert.equal(superseding.decisionRevision, coreFailureAgain.decisionRevision + 1);
+
+  await createParentRun(store, { runId: 'run-inventory-cancelled-failure', ...singleLaunch.createParentRunInput });
+  let cancelledBarrierId;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const lease = await supervisor.claim(inventoryWorker);
+    assert.equal(lease.runId, 'run-inventory-cancelled-failure');
+    cancelledBarrierId = lease.workItemId;
+    const failedInbox = await publishAttemptEvidence(store, lease.runId, lease, {
+      outcome: 'operational_failure', reason: `cancel-reopen-failure-${attempt}`, artifacts: [],
+      executionDescriptorDigest: lease.executionDescriptorDigest,
+    });
+    await adoptAttemptEvidence(store, lease.runId, supervisor.coordinator(), failedInbox);
+  }
+  await supervisor.maintain();
+  await cancelParentRun(store, 'run-inventory-cancelled-failure', supervisor.coordinator(), {
+    actor: { id: inventoryOperator.id, kind: inventoryOperator.kind }, reason: 'Cancel after terminal inventory failure.',
+  });
+  await controlService.publishCurrentProjection(supervisor.coordinator(), 'run-inventory-cancelled-failure');
+  const reopened = await openParentRunStore({
+    root, storeMarker, expectedStoreGeneration: 2, verifyStorage: false, clock: () => now,
+  });
+  const cancelledFailure = await readParentRun(reopened, 'run-inventory-cancelled-failure');
+  assert.equal(cancelledFailure.status, 'cancelled');
+  assert.equal(cancelledFailure.compilationState, 'failed');
+  assert.equal(cancelledFailure.workItems[cancelledBarrierId].state, 'incomplete',
+    'cancellation must preserve the immutable exhausted inventory barrier across reopen');
+  const cancelledFailurePublication = await readCurrentEnvelope(reopened, 'run-inventory-cancelled-failure');
+  assert.equal(cancelledFailurePublication.decision.code, 'NOT_READY_INCOMPLETE_EXECUTION');
+  assert.equal(cancelledFailurePublication.decision.grantedAuthority, null);
 } finally {
   await rm(root, { recursive: true, force: true });
 }

@@ -8,6 +8,10 @@ import {
 import { parsePublicationEnvelope, verifyPublicationChain } from '../../shared/publication-envelope.mjs';
 import { parseExecutionManifest, sealWorkItemResult } from '../../shared/execution-contract.mjs';
 import { parseSingleSiteInventoryBarrier } from '../../shared/execution-graph-compiler.mjs';
+import {
+  parseInventoryCompilationFailure,
+  sealInventoryCompilationFailure,
+} from '../../shared/compilation-failure.mjs';
 import { parseFinalReleaseSubject, parseReleaseSubjectCore } from '../../shared/release-subject.mjs';
 import {
   parseCompileRiskInputs,
@@ -328,12 +332,17 @@ function validateOperationResource(value, idempotencyKey) {
     || !value.actor || typeof value.actor !== 'object' || Array.isArray(value.actor)
     || typeof value.actor.id !== 'string' || !value.actor.id
     || typeof value.actor.kind !== 'string' || !value.actor.kind
-    || !['accepted', 'completed'].includes(value.state)
+    || !['accepted', 'applied', 'completed'].includes(value.state)
     || !canonicalTimestamp(value.acceptedAt, 'operation acceptedAt')) {
     fail('STORE_CORRUPT', `Operation ${idempotencyKey} is corrupt.`);
   }
-  if (value.state === 'accepted' && (value.completedAt !== null || value.outcome !== null)) {
+  value.appliedAt ??= null;
+  if (value.state === 'accepted' && (value.appliedAt !== null || value.completedAt !== null || value.outcome !== null)) {
     fail('STORE_CORRUPT', `Accepted operation ${idempotencyKey} has a terminal outcome.`);
+  }
+  if (value.state === 'applied' && (!canonicalTimestamp(value.appliedAt, 'operation appliedAt')
+    || value.completedAt !== null || value.outcome !== null)) {
+    fail('STORE_CORRUPT', `Applied operation ${idempotencyKey} has invalid durable state.`);
   }
   if (value.state === 'completed' && (value.completedAt === null || !value.outcome || typeof value.outcome !== 'object'
     || Array.isArray(value.outcome) || !canonicalTimestamp(value.completedAt, 'operation completedAt')
@@ -762,6 +771,7 @@ async function recoverUnlocked(store, runId, { repairCache = true } = {}) {
   snapshot.authorityTombstone ??= null;
   snapshot.currentPublicationAuthorityBinding ??= null;
   snapshot.compilationBarrier ??= null;
+  snapshot.compilationFailure ??= null;
   snapshot.inventoryBarrierPlan ??= null;
   snapshot.sealedCompileRiskInputs ??= null;
   if (snapshot?.schemaVersion !== 1 || snapshot.kind !== 'durable-parent-run'
@@ -770,10 +780,29 @@ async function recoverUnlocked(store, runId, { repairCache = true } = {}) {
     || !DIGEST_PATTERN.test(snapshot.subjectCoreDigest)
     || (snapshot.finalSubjectDigest !== null && !DIGEST_PATTERN.test(snapshot.finalSubjectDigest))
     || (snapshot.executionManifestDigest !== null && !DIGEST_PATTERN.test(snapshot.executionManifestDigest))
-    || !['pending', 'sealed'].includes(snapshot.compilationState)
+    || !['pending', 'failed', 'sealed'].includes(snapshot.compilationState)
     || !snapshot.workItems || typeof snapshot.workItems !== 'object' || Array.isArray(snapshot.workItems)
     || !snapshot.operations || typeof snapshot.operations !== 'object' || Array.isArray(snapshot.operations)) {
     fail('STORE_CORRUPT', `Parent run ${runId} recovery state is invalid.`);
+  }
+  if (snapshot.compilationFailure !== null) {
+    let failure;
+    try { failure = parseInventoryCompilationFailure(snapshot.compilationFailure); } catch {
+      fail('STORE_CORRUPT', `Parent run ${runId} has an invalid compilation failure.`);
+    }
+    if (failure.subjectCoreDigest !== snapshot.subjectCoreDigest || !SAFE_ID.test(failure.workItemId)) {
+      fail('STORE_CORRUPT', `Parent run ${runId} has an invalid compilation failure.`);
+    }
+    if (snapshot.compilationState === 'failed') {
+      const item = snapshot.workItems[failure.workItemId];
+      if (!item || item.capability !== 'inventory:http' || item.state !== 'incomplete'
+        || item.attempts.length !== failure.attemptCount
+        || item.attempts.at(-1)?.canonicalResultDigest !== failure.terminalResultDigest) {
+        fail('STORE_CORRUPT', `Parent run ${runId} compilation failure is not bound to its exhausted inventory barrier.`);
+      }
+    }
+  } else if (snapshot.compilationState === 'failed') {
+    fail('STORE_CORRUPT', `Parent run ${runId} failed compilation without a sealed failure record.`);
   }
   if (snapshot.authorityTombstone !== null && (
     snapshot.authorityTombstone?.schemaVersion !== 1
@@ -790,6 +819,15 @@ async function recoverUnlocked(store, runId, { repairCache = true } = {}) {
     }
     if (compileInputs.subjectCoreDigest !== snapshot.subjectCoreDigest) {
       fail('STORE_CORRUPT', `Parent run ${runId} has misbound sealed compile risk inputs.`);
+    }
+  }
+  if (snapshot.inventoryBarrierPlan !== null) {
+    try {
+      if (!snapshot.subjectCore
+        || parseSingleSiteInventoryBarrier(snapshot.inventoryBarrierPlan, snapshot.subjectCore).digest
+          !== snapshot.inventoryBarrierPlan.digest) throw new TypeError();
+    } catch {
+      fail('STORE_CORRUPT', `Parent run ${runId} has a corrupt inventory barrier plan.`);
     }
   }
   for (const [id, item] of Object.entries(snapshot.workItems)) {
@@ -1106,6 +1144,7 @@ export async function createParentRun(store, input) {
       finalSubjectDigest,
       compilationState,
       compilationBarrier: null,
+      compilationFailure: null,
       inventoryBarrierPlan,
       sealedCompileRiskInputs,
       runnerRevision,
@@ -1239,6 +1278,44 @@ export async function sealParentRunGraph(store, runId, coordinator, input) {
       }
       next.compilationState = 'sealed';
     }, { data: { inventoryWorkItemId: completedBarrier?.id ?? null, workItemIds: manifestIds } });
+  }));
+}
+
+export async function terminalizeParentRunCompilation(store, runId, coordinator) {
+  return withDirectoryLock(store.storage, globalLockPath(store), () => withDirectoryLock(store.storage, lockPath(store, runId), async () => {
+    const state = await recoverUnlocked(store, runId);
+    await validateCoordinator(store, coordinator);
+    if (state.compilationState === 'failed') {
+      delete state.clockNow;
+      return state;
+    }
+    if (state.compilationState !== 'pending' || state.status !== 'active'
+      || state.executionManifest !== null || state.finalSubject !== null
+      || !state.subjectCore || !state.inventoryBarrierPlan) {
+      fail('COMPILATION_NOT_TERMINALIZABLE', 'Only an unsealed active inventory compilation can be terminalized.');
+    }
+    const barriers = Object.values(state.workItems).filter(({ capability }) => capability === 'inventory:http');
+    if (barriers.length !== 1 || Object.keys(state.workItems).length !== 1
+      || barriers[0].id !== state.inventoryBarrierPlan.workItem.id
+      || barriers[0].state !== 'incomplete' || barriers[0].canonicalResult !== null
+      || barriers[0].attempts.length < barriers[0].maxAttempts) {
+      fail('INVENTORY_RECOVERY_NOT_EXHAUSTED', 'Inventory compilation cannot fail before its bounded recovery is exhausted.');
+    }
+    const barrier = barriers[0];
+    const terminalAttempt = barrier.attempts.at(-1);
+    const compilationFailure = sealInventoryCompilationFailure({
+      schemaVersion: 1,
+      subjectCoreDigest: state.subjectCoreDigest,
+      workItemId: barrier.id,
+      terminalResultDigest: terminalAttempt.canonicalResultDigest,
+      reason: terminalAttempt.reason || 'Inventory execution remained incomplete after bounded recovery.',
+      attemptCount: barrier.attempts.length,
+      failedAt: terminalAttempt.completedAt,
+    });
+    return appendMutationUnlocked(store, state, 'mutation', 'inventory-compilation-failed', (next) => {
+      next.compilationState = 'failed';
+      next.compilationFailure = compilationFailure;
+    }, { data: compilationFailure });
   }));
 }
 
@@ -1816,6 +1893,15 @@ export async function requeueExpiredWork(store, runId, coordinator) {
         for (const id of expiredIds) {
           const item = next.workItems[id];
           const reason = item.lease.epoch !== coordinator.epoch ? 'coordinator-epoch-fenced' : 'lease-expired';
+          const canonicalResult = sealWorkItemResult({
+            schemaVersion: 1,
+            workItemId: item.id,
+            subjectCoreDigest: next.subjectCoreDigest,
+            attempt: item.lease.attempt,
+            authoritative: false,
+            outcome: 'operational_failure',
+            evidenceDigests: [],
+          });
           item.attempts.push({
             attempt: item.lease.attempt,
             outcome: 'operational_failure',
@@ -1825,6 +1911,7 @@ export async function requeueExpiredWork(store, runId, coordinator) {
             leaseToken: item.lease.token,
             completedAt: timestamp(store),
             reason,
+            canonicalResultDigest: canonicalResult.digest,
           });
           item.lease = null;
           item.state = item.attempts.length >= item.maxAttempts ? 'incomplete' : 'queued';
@@ -2744,6 +2831,8 @@ export async function cancelParentRun(store, runId, coordinator, input) {
     const cancelled = await appendMutationUnlocked(store, state, 'mutation', 'parent-run-cancelled', (next) => {
       next.status = 'cancelled';
       for (const item of Object.values(next.workItems)) {
+        if (next.compilationState === 'failed' && item.id === next.compilationFailure?.workItemId
+          && item.state === 'incomplete') continue;
         if (!['completed_pass', 'completed_product_failure'].includes(item.state)) {
           item.state = 'cancelled';
           item.lease = null;
@@ -2784,8 +2873,11 @@ export async function acceptOperation(store, runId, request) {
       && (!Number.isSafeInteger(request.expectedRunRevision) || request.expectedRunRevision !== state.runRevision)) {
       fail('RUN_REVISION_CONFLICT', 'Expected run revision is stale.');
     }
-    if (request.expectedSubjectDigest !== undefined && request.expectedSubjectDigest !== state.finalSubjectDigest) {
-      fail('RELEASE_SUBJECT_MISMATCH', 'Operation does not match the immutable final subject.');
+    const operationSubjectDigest = request.kind === 'rekick' && state.compilationState === 'failed'
+      ? state.subjectCoreDigest
+      : state.finalSubjectDigest;
+    if (request.expectedSubjectDigest !== undefined && request.expectedSubjectDigest !== operationSubjectDigest) {
+      fail('RELEASE_SUBJECT_MISMATCH', 'Operation does not match the immutable release subject for its current compilation stage.');
     }
     if (Object.keys(state.operations).length - expiredCompleted.size >= MAX_OPERATION_RESOURCES) {
       fail('OPERATION_LIMIT_REACHED', 'Run operation retention limit was reached.');
@@ -2799,6 +2891,7 @@ export async function acceptOperation(store, runId, request) {
       actor: request.actor,
       state: 'accepted',
       acceptedAt: timestamp(store),
+      appliedAt: null,
       completedAt: null,
       outcome: null,
     };
@@ -2825,26 +2918,65 @@ export async function getOperationById(store, runId, operationId) {
   return clone(operation);
 }
 
-export async function listAcceptedOperations(store, runId, { limit = 32 } = {}) {
+export async function listPendingOperations(store, runId, { limit = 32 } = {}) {
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 128) fail('STORE_SCHEMA_INVALID', 'Operation list limit is invalid.');
   const state = await recoverUnlocked(store, runId);
-  return Object.values(state.operations).filter(({ state: operationState }) => operationState === 'accepted').slice(0, limit).map(clone);
+  return Object.values(state.operations).filter(({ state: operationState }) => ['accepted', 'applied'].includes(operationState)).slice(0, limit).map(clone);
+}
+
+function applyIncompleteWorkRekick(next, input) {
+  const ids = [...new Set(input?.workItemIds ?? [])];
+  if (ids.length < 1 || ids.length > 64 || ids.some((id) => !SAFE_ID.test(id))) fail('STORE_SCHEMA_INVALID', 'Rekick requires 1 through 64 valid work-item IDs.');
+  if (!input?.actor || typeof input.actor.id !== 'string' || !input.actor.id
+    || !['human', 'service'].includes(input.actor.kind)) {
+    fail('STORE_SCHEMA_INVALID', 'Rekick requires an immutable authorized human or service actor.');
+  }
+  const resumesInventoryCompilation = next.compilationState === 'failed';
+  if (resumesInventoryCompilation && (ids.length !== 1 || ids[0] !== next.compilationFailure?.workItemId)) {
+    fail('REKICK_NOT_INCOMPLETE', 'Failed inventory compilation can only rekick its exact exhausted barrier.');
+  }
+  if (next.compilationState === 'pending'
+    && ids.some((id) => next.workItems[id]?.capability === 'inventory:http')) {
+    fail('REKICK_NOT_INCOMPLETE', 'Inventory compilation must terminalize before it can be rekicked.');
+  }
+  for (const id of ids) {
+    const item = next.workItems[id];
+    if (!item || item.state !== 'incomplete' || item.canonicalResult !== null || item.manualRekicks >= 3) {
+      fail('REKICK_NOT_INCOMPLETE', `Work item ${id} is not eligible for incomplete-work rekick.`);
+    }
+    item.state = 'queued';
+    item.lease = null;
+    item.manualRekicks += 1;
+  }
+  if (resumesInventoryCompilation) next.compilationState = 'pending';
+  return ids;
 }
 
 export async function rekickIncompleteWork(store, runId, coordinator, input) {
   const ids = [...new Set(input?.workItemIds ?? [])];
-  if (ids.length < 1 || ids.length > 64 || ids.some((id) => !SAFE_ID.test(id))) fail('STORE_SCHEMA_INVALID', 'Rekick requires 1 through 64 valid work-item IDs.');
   return mutate(store, runId, { coordinator, kind: 'mutation', type: 'incomplete-work-rekicked', actor: input.actor, data: { workItemIds: ids } }, (next) => {
-    for (const id of ids) {
-      const item = next.workItems[id];
-      if (!item || item.state !== 'incomplete' || item.canonicalResult !== null || item.manualRekicks >= 3) {
-        fail('REKICK_NOT_INCOMPLETE', `Work item ${id} is not eligible for incomplete-work rekick.`);
-      }
-      item.state = 'queued';
-      item.lease = null;
-      item.manualRekicks += 1;
-    }
+    applyIncompleteWorkRekick(next, input);
   });
+}
+
+export async function applyRekickOperation(store, runId, coordinator, operationId) {
+  return withDirectoryLock(store.storage, globalLockPath(store), () => withDirectoryLock(store.storage, lockPath(store, runId), async () => {
+    const state = await recoverUnlocked(store, runId);
+    await validateCoordinator(store, coordinator);
+    const operation = Object.values(state.operations).find((candidate) => candidate.operationId === operationId);
+    if (!operation) fail('OPERATION_NOT_FOUND', `Operation ${operationId} was not found.`);
+    if (operation.kind !== 'rekick') fail('OPERATION_KIND_INVALID', 'Only a rekick operation can use the atomic rekick transition.');
+    if (operation.state !== 'accepted') return clone(operation);
+    let applied;
+    await appendMutationUnlocked(store, state, 'operation', 'incomplete-work-rekick-applied', (next) => {
+      applyIncompleteWorkRekick(next, { actor: operation.actor, workItemIds: operation.body?.workItemIds });
+      const mutable = Object.values(next.operations).find((candidate) => candidate.operationId === operationId);
+      mutable.state = 'applied';
+      mutable.appliedAt = timestamp(store);
+      applied = mutable;
+    }, { actor: operation.actor, data: { operationId, workItemIds: operation.body?.workItemIds } });
+    return clone(applied);
+  }));
 }
 
 export async function completeOperation(store, runId, coordinator, operationId, outcome) {
@@ -2973,9 +3105,8 @@ export async function readRunHistories(store, runId) {
   return readAllLedgers(store.storage, runDirectory(store, runId));
 }
 
-export async function readBoundedAttemptLogs(store, runId, { limit = 200 } = {}) {
+async function readBoundedAttemptLogsUnlocked(store, runId, state, { limit = 200 } = {}) {
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000) fail('STORE_SCHEMA_INVALID', 'Attempt log limit is invalid.');
-  const state = await recoverUnlocked(store, runId, { repairCache: false });
   const entries = [];
   for (const workItemId of Object.keys(state.workItems)) {
     const directory = path.join(runDirectory(store, runId), 'inboxes', workItemId, 'logs');
@@ -2991,6 +3122,46 @@ export async function readBoundedAttemptLogs(store, runId, { limit = 200 } = {})
   }
   entries.sort((left, right) => left.occurredAt.localeCompare(right.occurredAt) || left.sequence - right.sequence);
   return { entries: entries.slice(-limit), truncated: entries.length > limit };
+}
+
+export async function readBoundedAttemptLogs(store, runId, { limit = 200 } = {}) {
+  const state = await recoverUnlocked(store, runId, { repairCache: false });
+  return readBoundedAttemptLogsUnlocked(store, runId, state, { limit });
+}
+
+export async function readParentRunWorkspaceSnapshot(store, runId, { logLimit = 200 } = {}) {
+  return withDirectoryLock(store.storage, globalLockPath(store), () => withDirectoryLock(store.storage, lockPath(store, runId), async () => {
+    const selector = await readAuthoritySelectorUnlocked(store);
+    const state = await recoverUnlocked(store, runId, { repairCache: false });
+    const publication = await readCurrentEnvelopeUnlocked(store, runId, { selector, state });
+    const [histories, workerLogs] = await Promise.all([
+      readAllLedgers(store.storage, runDirectory(store, runId)),
+      readBoundedAttemptLogsUnlocked(store, runId, state, { limit: logLimit }),
+    ]);
+    const snapshotToken = canonicalDigest({
+      schemaVersion: 1,
+      kind: 'shared-workspace-snapshot',
+      runId,
+      stateRevision: state.runRevision,
+      publicationDigest: publication.digest,
+      ledgerHeads: state.ledgerHeads,
+      attemptLogsDigest: canonicalDigest({
+        limit: logLimit,
+        truncated: workerLogs.truncated,
+        entries: workerLogs.entries.map(({ digest }) => digest),
+      }),
+    });
+    delete state.clockNow;
+    return Object.freeze({
+      schemaVersion: 1,
+      snapshotToken,
+      stateRevision: state.runRevision,
+      publication,
+      state,
+      histories,
+      workerLogs,
+    });
+  }));
 }
 
 function publicationPath(store, runId, digest) {
@@ -3046,12 +3217,22 @@ export async function publishCurrentEnvelope(store, runId, coordinator, envelope
     const state = await recoverUnlocked(store, runId);
     await validateCoordinator(store, coordinator);
     const { selector, binding } = await requireActiveAuthority(store);
-    if (state.compilationState !== 'sealed' || !state.executionManifestDigest || !state.finalSubjectDigest) {
-      fail('SEALED_MANIFEST_MISSING', 'Release authority is unavailable until the parent-run graph is sealed.');
-    }
-    if (envelope.finalSubjectDigest !== state.finalSubjectDigest
-      || envelope.decision.executionManifestDigest !== state.executionManifestDigest) {
-      fail('RELEASE_SUBJECT_MISMATCH', 'Publication envelope does not match the sealed parent-run subject.');
+    if (state.compilationState === 'failed') {
+      if (!state.compilationFailure || !Object.hasOwn(envelope, 'subjectCoreDigest')
+        || envelope.subjectCoreDigest !== state.subjectCoreDigest || envelope.finalSubjectDigest !== null
+        || envelope.decision.subjectStage !== 'core'
+        || envelope.decision.compilationFailureDigest !== state.compilationFailure.digest
+        || envelope.decision.executionManifestDigest !== null) {
+        fail('RELEASE_SUBJECT_MISMATCH', 'Compilation-failure publication does not match the parent-run subject core.');
+      }
+    } else if (state.compilationState === 'sealed' && state.executionManifestDigest && state.finalSubjectDigest) {
+      if (envelope.finalSubjectDigest !== state.finalSubjectDigest
+        || envelope.decision.executionManifestDigest !== state.executionManifestDigest
+        || (Object.hasOwn(envelope, 'subjectCoreDigest') && envelope.subjectCoreDigest !== state.subjectCoreDigest)) {
+        fail('RELEASE_SUBJECT_MISMATCH', 'Publication envelope does not match the sealed parent-run subject.');
+      }
+    } else {
+      fail('SEALED_MANIFEST_MISSING', 'Release authority is unavailable until compilation is terminal or the parent-run graph is sealed.');
     }
     const histories = await readAllLedgers(store.storage, runDirectory(store, runId));
     // U1's publication contract names the release projections: observations
@@ -3094,9 +3275,12 @@ export async function publishCurrentEnvelope(store, runId, coordinator, envelope
   }));
 }
 
-export async function readCurrentEnvelope(store, runId) {
-  const selector = await readAuthoritySelectorUnlocked(store);
-  const state = await recoverUnlocked(store, runId);
+async function readCurrentEnvelopeUnlocked(store, runId, {
+  selector = null,
+  state = null,
+} = {}) {
+  selector ??= await readAuthoritySelectorUnlocked(store);
+  state ??= await recoverUnlocked(store, runId);
   if (state.authorityTombstone !== null) {
     fail('RELEASE_AUTHORITY_TOMBSTONED', 'Parent run release authority was irreversibly tombstoned before purge.', state.authorityTombstone);
   }
@@ -3135,6 +3319,10 @@ export async function readCurrentEnvelope(store, runId) {
     fail('STORE_CORRUPT', 'Publication head disagrees with canonical recovered state.');
   }
   return current;
+}
+
+export async function readCurrentEnvelope(store, runId) {
+  return readCurrentEnvelopeUnlocked(store, runId);
 }
 
 export async function withCurrentEnvelopeFence(store, runId, callback) {

@@ -1,7 +1,7 @@
 import { expect, test, type Page, type Route } from '@playwright/test';
 import { sharedPublicationFixture } from './shared-publication-fixture.js';
 
-async function routeSharedReport(page: Page, runId: string, { failBootstrap = false, riskCount = 2 } = {}) {
+async function routeSharedReport(page: Page, runId: string, { failBootstrap = false, riskCount = 2, coreBound = false } = {}) {
   const { view } = sharedPublicationFixture('single-site', runId, 'PARTIAL');
   await page.route('**/api/**', async (route: Route) => {
     const request = route.request();
@@ -12,7 +12,7 @@ async function routeSharedReport(page: Page, runId: string, { failBootstrap = fa
         : { schemaVersion: 1, data: { csrfToken: 'csrf-report', principal: { id: 'report-reviewer' } } } });
     }
     const root = `/api/control/v1/runs/${runId}`;
-    if (url.pathname === `${root}/publication`) {
+    if (url.pathname === `${root}/workspace`) {
       const risks = [...view.riskRegister.risks];
       const baseRisk = view.riskRegister.risks[0];
       if (!baseRisk && riskCount > 0) throw new Error('The shared report risk fixture requires a base risk.');
@@ -25,18 +25,25 @@ async function routeSharedReport(page: Page, runId: string, { failBootstrap = fa
           actor: { id: 'historical-reviewer', kind: 'reviewer' }, updatedAt: '2026-08-29T15:00:00.000Z',
         });
       }
+      const requestedScope = view.decision.certifiedScope;
+      const decision = coreBound ? {
+        ...view.decision,
+        subjectStage: 'core', ready: false, code: 'NOT_READY_INCOMPLETE_EXECUTION',
+        label: 'NOT READY — INCOMPLETE EXECUTION', grantedAuthority: null, certifiedScope: null,
+        requestedAuthority: { qualifier: 'FULL', scope: requestedScope },
+      } : view.decision;
       return route.fulfill({ json: { schemaVersion: 1, data: {
-        runId, runRevision: view.revisions.run, decisionRevision: view.revisions.decision,
-        riskRevision: view.revisions.risk, finalSubjectDigest: view.subjectDigest,
-        decision: view.decision, riskRegister: { ...view.riskRegister, risks },
+        schemaVersion: 1, snapshotToken: `sha256:${'a'.repeat(64)}`, stateRevision: 17,
+        publication: {
+          runId, runRevision: view.revisions.run, decisionRevision: view.revisions.decision,
+          riskRevision: view.revisions.risk, subjectCoreDigest: `sha256:${'c'.repeat(64)}`,
+          finalSubjectDigest: coreBound ? null : view.subjectDigest,
+          decision, riskRegister: { ...view.riskRegister, risks },
+        },
+        executions: { runId, executions: [{ id: 'work-1', state: coreBound ? 'incomplete' : 'completed_pass', completedAt: '2026-08-29T14:05:00.000Z' }], oracleExecutions: [] },
+        logs: { runId, limit: 200, truncated: false, events: [], attemptLogs: [] },
       } } });
     }
-    if (url.pathname === `${root}/executions`) return route.fulfill({ json: { schemaVersion: 1, data: {
-      runId, runRevision: view.revisions.run, executions: [{ id: 'work-1', state: 'completed_pass', completedAt: '2026-08-29T14:05:00.000Z' }], oracleExecutions: [],
-    } } });
-    if (url.pathname === `${root}/logs`) return route.fulfill({ json: { schemaVersion: 1, data: {
-      runId, runRevision: view.revisions.run, limit: 200, truncated: false, events: [], attemptLogs: [],
-    } } });
     return route.fallback();
   });
 }
@@ -68,6 +75,16 @@ test.describe('shared live report authority', () => {
     await expect(page.locator('#report-product-risk')).toHaveAttribute('aria-busy', 'false');
     await expect(page.locator('#report-risk-status')).toContainText('Authority bootstrap failed');
     await expect(page.locator('#report-risk-status')).not.toContainText('LOADING');
+  });
+
+  test('renders core-bound failure as not granted with requested scope', async ({ page }) => {
+    const runId = 'shared-report-core-bound';
+    await routeSharedReport(page, runId, { coreBound: true });
+    await page.goto(`/report.html?mode=single-site&run=${runId}`);
+    await expect(page.locator('.report-decision-code')).toContainText('authority not granted');
+    await expect(page.locator('#report-certified-scope').getByRole('heading')).toHaveText('Requested scope');
+    await expect(page.locator('#report-certified-scope')).toContainText('preview-desktop');
+    await expect(page.locator('#report-certified-scope')).not.toContainText('Certified scope');
   });
 
   test('labels a legacy READY snapshot as non-authoritative evidence, never promotion authority', async ({ page }) => {

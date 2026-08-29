@@ -19,9 +19,33 @@ export interface ReleaseDecision {
   exitCode: 0 | 1;
   digest: string;
 }
+export interface CoreBoundIncompleteReleaseDecision {
+  schemaVersion: 1;
+  kind: 'release-decision';
+  subjectStage: 'core';
+  runId: string;
+  decisionRevision: number;
+  subjectDigest: string;
+  compilationFailureDigest: string;
+  executionManifestDigest: null;
+  mode: 'single-site' | 'comparative';
+  requestedAuthority: { qualifier: 'FULL' | 'TARGETED'; scope: CertifiedScope };
+  grantedAuthority: null;
+  certifiedScope: null;
+  coverageBasis: null;
+  code: 'NOT_READY_INCOMPLETE_EXECUTION';
+  label: string;
+  ready: false;
+  blockingReasons: Array<{ class: 'incomplete-execution'; executionId: string; detail: string }>;
+  superseded: false;
+  exitCode: 1;
+  digest: string;
+}
+export type AnyReleaseDecision = ReleaseDecision | CoreBoundIncompleteReleaseDecision;
 export const RELEASE_DECISION_CODES: readonly ReleaseDecisionCode[];
 export function deriveReleaseDecision(value: unknown): ReleaseDecision;
-export function parseReleaseDecision(value: unknown): ReleaseDecision;
+export function deriveCompilationFailureDecision(value: unknown): CoreBoundIncompleteReleaseDecision;
+export function parseReleaseDecision(value: unknown): AnyReleaseDecision;
 export function assertConsumableReleaseDecision(value: unknown, expected: {
   expectedSubjectDigest: string;
   expectedAuthority: 'FULL' | 'TARGETED';

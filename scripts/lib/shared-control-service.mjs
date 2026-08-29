@@ -3,7 +3,11 @@ import { canonicalJson } from '../../shared/canonical-contract.mjs';
 import { sealOracleResult, sealWorkItemResult } from '../../shared/execution-contract.mjs';
 import { appendPublicationEnvelope } from '../../shared/publication-envelope.mjs';
 import { sealPublicationText } from '../../shared/publication-text-policy.mjs';
-import { appendVisualDisposition, projectSharedReleaseView } from '../../shared/release-projection.mjs';
+import {
+  appendVisualDisposition,
+  projectCompilationFailureView,
+  projectSharedReleaseView,
+} from '../../shared/release-projection.mjs';
 import { parseRisk } from '../../shared/risk-contract.mjs';
 import { parseRiskSourceObservationSet } from '../../shared/risk-source-observation.mjs';
 import {
@@ -13,18 +17,19 @@ import {
 } from '../../shared/control-plane-contract.mjs';
 import {
   acceptOperation,
+  applyRekickOperation,
   appendMutationAuditEvent,
   appendRiskLifecycleEvent,
   cancelParentRun,
   completeOperation,
   getOperation,
   getOperationById,
-  listAcceptedOperations,
+  listPendingOperations,
   readBoundedAttemptLogs,
   readCurrentEnvelope,
   readParentRun,
+  readParentRunWorkspaceSnapshot,
   readRunHistories,
-  rekickIncompleteWork,
   purgeParentRunEvidence,
   tombstoneParentRunAuthority,
   publishCurrentEnvelope,
@@ -63,6 +68,30 @@ export function createSharedControlService({ store, projectId = 'default', admis
     async readPublication(principal, runId) {
       assertPrincipalAuthorized(principal, CONTROL_ACTIONS.RUN_VIEW, object(runId));
       return readCurrentEnvelope(store, runId);
+    },
+    async readWorkspace(principal, runId, { logLimit = 200 } = {}) {
+      assertPrincipalAuthorized(principal, CONTROL_ACTIONS.RUN_VIEW, object(runId));
+      if (!Number.isSafeInteger(logLimit) || logLimit < 1 || logLimit > MAX_LOG_EVENTS) fail('LOG_LIMIT_INVALID', 'Log limit is outside bounds.');
+      const snapshot = await readParentRunWorkspaceSnapshot(store, runId, { logLimit });
+      const events = Object.values(snapshot.histories).flat().sort((left, right) => left.runRevision - right.runRevision);
+      return Object.freeze({
+        schemaVersion: 1,
+        snapshotToken: snapshot.snapshotToken,
+        stateRevision: snapshot.stateRevision,
+        publication: snapshot.publication,
+        executions: Object.freeze({
+          runId,
+          executions: Object.values(snapshot.state.workItems),
+          oracleExecutions: snapshot.state.executionManifest?.oracleExecutions ?? [],
+        }),
+        logs: Object.freeze({
+          runId,
+          limit: logLimit,
+          truncated: events.length > logLimit || snapshot.workerLogs.truncated,
+          events: events.slice(-logLimit),
+          attemptLogs: snapshot.workerLogs.entries,
+        }),
+      });
     },
     async withPublicationFence(principal, runId, callback) {
       assertPrincipalAuthorized(principal, CONTROL_ACTIONS.PROMOTION_CONSUME, object(runId));
@@ -183,12 +212,12 @@ export function createSharedControlService({ store, projectId = 'default', admis
     },
     async applyAcceptedOperations(coordinator, runId, handlers = {}) {
       const applied = [];
-      for (const operation of await listAcceptedOperations(store, runId)) {
+      for (const operation of await listPendingOperations(store, runId)) {
         try {
           if (operation.kind === 'cancel') {
             await cancelParentRun(store, runId, coordinator, { actor: operation.actor, reason: operation.body?.reason ?? 'Operator cancellation.' });
           } else if (operation.kind === 'rekick') {
-            await rekickIncompleteWork(store, runId, coordinator, { actor: operation.actor, workItemIds: operation.body?.workItemIds });
+            await applyRekickOperation(store, runId, coordinator, operation.operationId);
           } else if (operation.kind === 'risk-acknowledge' || operation.kind === 'risk-resolve') {
             const publication = await readCurrentEnvelope(store, runId);
             const currentRisk = publication.riskRegister.risks.find(({ identity }) => identity === operation.body?.riskIdentity);
@@ -231,13 +260,50 @@ export function createSharedControlService({ store, projectId = 'default', admis
 }
 
 async function publishProjection(store, runId, coordinator) {
-  const [state, histories] = await Promise.all([readParentRun(store, runId), readRunHistories(store, runId)]);
-  if (!state.finalSubject || !state.executionManifest || state.authorityTombstone) return null;
+  const state = await readParentRun(store, runId);
+  if (state.authorityTombstone || !['failed', 'sealed'].includes(state.compilationState)) return null;
   let current = null;
   try { current = await readCurrentEnvelope(store, runId); } catch (error) {
     if (error?.code === 'PUBLICATION_UNAVAILABLE') current = null;
     else throw error;
   }
+  if (state.compilationState === 'failed') {
+    if (!state.subjectCore || !state.compilationFailure) return null;
+    const decisionRevision = current
+      ? current.decision.compilationFailureDigest === state.compilationFailure.digest
+        ? current.decisionRevision
+        : current.decisionRevision + 1
+      : 1;
+    const projection = projectCompilationFailureView({
+      schemaVersion: 1,
+      runId,
+      decisionRevision,
+      riskRevision: current?.riskRevision ?? 1,
+      subjectCore: state.subjectCore,
+      compilationFailure: state.compilationFailure,
+    });
+    if (current && current.decision.digest === projection.decision.digest
+      && canonicalJson(current.riskRegister) === canonicalJson(projection.riskRegister)) return current;
+    const next = appendPublicationEnvelope(current, {
+      schemaVersion: 1,
+      runId,
+      runRevision: current ? current.runRevision + 1 : 1,
+      decisionRevision: projection.decisionRevision,
+      riskRevision: projection.riskRevision,
+      ledgerSequences: {
+        observations: state.ledgerSequences.mutation,
+        decisions: state.ledgerSequences.decision + 1,
+        risks: state.ledgerSequences.risk,
+      },
+      subjectCoreDigest: state.subjectCoreDigest,
+      finalSubjectDigest: null,
+      decision: projection.decision,
+      riskRegister: projection.riskRegister,
+    });
+    return publishCurrentEnvelope(store, runId, coordinator, next);
+  }
+  if (!state.finalSubject || !state.executionManifest) return null;
+  const histories = await readRunHistories(store, runId);
   const assembled = assembleReleaseProjectionInputs({ state, histories });
   const project = (baseDecisionRevision, baseRiskRevision) => projectSharedReleaseView({
     schemaVersion: 1, runId, baseDecisionRevision, baseRiskRevision,
@@ -276,6 +342,9 @@ async function publishProjection(store, runId, coordinator) {
       decisions: state.ledgerSequences.decision + 1,
       risks: state.ledgerSequences.risk,
     },
+    ...(current && Object.hasOwn(current, 'subjectCoreDigest')
+      ? { subjectCoreDigest: state.subjectCoreDigest }
+      : {}),
     finalSubjectDigest: state.finalSubject.digest, decision: projection.decision, riskRegister: projection.riskRegister,
   });
   return publishCurrentEnvelope(store, runId, coordinator, next);
