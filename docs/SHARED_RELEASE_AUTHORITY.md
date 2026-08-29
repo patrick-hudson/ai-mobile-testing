@@ -55,10 +55,10 @@ shared-release-result.json
 
 The manifest binds every relative path to its byte length and SHA-256 digest. The candidate receipt binds those bytes and source revision to the audited candidate deployment. Immediately before delivery, CI rechecks the artifact, asserts the current shared head, consumes a short-lived single-use claim for the exact subject/revisions, rechecks the bytes again, and runs the pinned Wrangler Direct Upload command. Cloudflare and delivery credentials are file-only and are removed before the non-secret receipt is uploaded.
 
-A ready decision alone is insufficient. Promotion policy must also require
-authoritative evidence and explicitly reject a ready Preview run performed with
-`preview-bypass`. Until that rejection is covered by the exact-promotion verifier,
-do not treat this workflow as closed for bypass-bearing subjects.
+A ready decision alone is insufficient. Promotion policy also requires
+authoritative evidence. Shared CI retains the digest-bound subject core and exact
+promotion rejects a ready Preview run performed with `preview-bypass` before any
+provider preparation or promotion-claim side effect.
 
 A provider retry can create a duplicate deployment record with identical bytes because Cloudflare deployment creation has no idempotency key. The shared claim and receipt serialize authority; an operational duplicate does not create different release truth.
 
