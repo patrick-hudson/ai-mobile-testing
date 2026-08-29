@@ -16,16 +16,25 @@ import {
   initializeCutoverAdmissionGate,
   openCutoverAdmissionGate,
   prepareSharedAuthorityCutover,
+  recordSharedCutoverCanary,
+  reopenSharedAdmissionAfterCanaries,
   rollbackSharedAuthorityBeforeActivation,
   setSharedPromotionAvailability,
 } from './lib/shared-cutover-orchestrator.mjs';
+import {
+  initializeLegacyAuthorityFence,
+  openLegacyAuthorityFence,
+} from './lib/legacy-authority-fence.mjs';
 import { openSharedLaunchOperationStore } from './lib/shared-launch-operation-store.mjs';
 import { readTrustedStoreMarker } from './lib/shared-store-runtime.mjs';
 
-const ACTIONS = new Set(['prepare', 'activate', 'rollback', 'disable-promotion', 'enable-promotion']);
+const ACTIONS = new Set([
+  'prepare', 'activate', 'record-single-site-canary', 'record-comparative-canary', 'reopen',
+  'rollback', 'disable-promotion', 'enable-promotion',
+]);
 
 function usage() {
-  return 'Usage: run-shared-authority-cutover.mjs <prepare|activate|rollback|disable-promotion|enable-promotion> --config <operator-config.json>';
+  return 'Usage: run-shared-authority-cutover.mjs <prepare|activate|record-single-site-canary|record-comparative-canary|reopen|rollback|disable-promotion|enable-promotion> --config <operator-config.json>';
 }
 
 function parseArguments(argv) {
@@ -78,7 +87,7 @@ async function openConfiguredStore(config, action, marker) {
     return await openParentRunStore(options);
   } catch (error) {
     if (error?.code !== 'STORE_GENERATION_MISMATCH'
-      || !['activate', 'disable-promotion', 'enable-promotion'].includes(action)) throw error;
+      || !['activate', 'record-single-site-canary', 'record-comparative-canary', 'reopen', 'disable-promotion', 'enable-promotion'].includes(action)) throw error;
     return openParentRunStore({ ...options, expectedStoreGeneration: originalGeneration + 1 });
   }
 }
@@ -106,6 +115,20 @@ async function main() {
     ownerId: config.coordinatorOwnerId,
     leaseMs: config.coordinatorLeaseMs ?? 30_000,
   });
+  const legacyFenceRoot = path.join(store.root, 'legacy-authority');
+  if (config.legacyAuthorityFenceRoot
+    && path.resolve(config.legacyAuthorityFenceRoot) !== path.resolve(legacyFenceRoot)) {
+    throw new TypeError('config.legacyAuthorityFenceRoot must identify the canonical store legacy-authority directory.');
+  }
+  let legacyAuthorityFence;
+  try {
+    legacyAuthorityFence = await openLegacyAuthorityFence({ root: legacyFenceRoot });
+  } catch (error) {
+    if (action !== 'prepare' || error?.code !== 'LEGACY_AUTHORITY_UNAVAILABLE') throw error;
+    const selector = await readReleaseAuthoritySelector(store);
+    if (selector.phase !== 'SHADOW' || selector.activationEpoch !== 0) throw error;
+    legacyAuthorityFence = await initializeLegacyAuthorityFence({ root: legacyFenceRoot });
+  }
   const operatorReview = requiredObject(config.operatorReview, 'config.operatorReview');
   const commonInput = {
     cutoverId: config.cutoverId,
@@ -132,7 +155,8 @@ async function main() {
   let result;
   if (action === 'prepare') {
     result = await prepareSharedAuthorityCutover({
-      store, coordinator, admissionGate, reportDirectory: config.reportDirectory, input: commonInput,
+      store, coordinator, admissionGate, legacyAuthorityFence,
+      reportDirectory: config.reportDirectory, input: commonInput,
     });
   } else if (action === 'activate') {
     const legacySources = requiredObject(config.legacySources, 'config.legacySources');
@@ -148,18 +172,31 @@ async function main() {
       store,
       coordinator,
       admissionGate,
+      legacyAuthorityFence,
       launchOperationStore,
       cutoverId: config.cutoverId,
       legacyComparativeRoot: legacySources.comparativeRoot,
       legacySingleSiteQueueRoot: legacySources.singleSiteQueueRoot,
     });
     result = await activateSharedAuthorityCutover({
-      store, coordinator, admissionGate, reportDirectory: config.reportDirectory, input: commonInput,
+      store, coordinator, admissionGate, legacyAuthorityFence,
+      reportDirectory: config.reportDirectory, input: commonInput,
       drainObservation,
+    });
+  } else if (action === 'record-single-site-canary' || action === 'record-comparative-canary') {
+    const mode = action === 'record-single-site-canary' ? 'single-site' : 'comparative';
+    const canaries = requiredObject(config.canaries, 'config.canaries');
+    result = await recordSharedCutoverCanary({
+      store, admissionGate, reportDirectory: config.reportDirectory, cutoverId: config.cutoverId,
+      mode, runId: canaries[mode],
+    });
+  } else if (action === 'reopen') {
+    result = await reopenSharedAdmissionAfterCanaries({
+      store, admissionGate, reportDirectory: config.reportDirectory, cutoverId: config.cutoverId,
     });
   } else if (action === 'rollback') {
     result = await rollbackSharedAuthorityBeforeActivation({
-      store, coordinator, admissionGate, reportDirectory: config.reportDirectory,
+      store, coordinator, admissionGate, legacyAuthorityFence, reportDirectory: config.reportDirectory,
       cutoverId: config.cutoverId, buildIdentity: config.store.buildIdentity, operatorReview,
     });
   } else {

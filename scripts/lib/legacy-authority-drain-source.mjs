@@ -73,15 +73,19 @@ async function comparativeState(root) {
     const directory = path.join(root, entry.name);
     const terminal = await readTerminalDocument(path.join(directory, 'sharded-run.json'), entry.name);
     if (terminal) {
+      if (terminal.schemaVersion !== 2 || terminal.runId !== entry.name
+        || !['completed', 'failed', 'stopped'].includes(terminal.pipeline?.status)
+        || typeof terminal.status !== 'string'
+        || !terminal.release || !['READY', 'NOT_READY'].includes(terminal.release.decision)) {
+        fail('CUTOVER_LEGACY_SOURCE_CORRUPT', `Legacy terminal document for ${entry.name} is partial or invalid.`);
+      }
       heads.push(`comparative:${entry.name}:${canonicalDigest(terminal)}`);
       continue;
     }
-    const discoveryFiles = [
-      path.join(directory, 'logs', 'coordinator.log'),
-      path.join(directory, 'merge-lifecycle.json'),
-      path.join(directory, 'sharded-heartbeat.json'),
-    ];
-    if ((await Promise.all(discoveryFiles.map(regularFile))).some(Boolean)) active.push(`comparative:${entry.name}`);
+    // Directory creation is the legacy launch acceptance record. Treat every
+    // non-terminal run directory as active so cutover cannot slip through the
+    // window before its first heartbeat or log write.
+    active.push(`comparative:${entry.name}`);
   }
   return { active, heads };
 }

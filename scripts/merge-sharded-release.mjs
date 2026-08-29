@@ -11,6 +11,7 @@ import { readChecklistRelease, releaseOutcome, unavailableRelease } from './lib/
 import { MAX_RELEASE_SHARD_TOTAL } from './lib/sharded-defaults.mjs';
 import { expectedShardedBlobs, inspectShardedBlobs } from './lib/sharded-evidence.mjs';
 import { mergeResultsAreUsable, mergeStageIntegrityFailures } from './lib/merge-stage-integrity.mjs';
+import { openLegacyAuthorityFenceFromEnvironment } from './lib/legacy-authority-fence.mjs';
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const shardTotal = integerEnvironment('AUDIT_SHARD_TOTAL', 1, MAX_RELEASE_SHARD_TOTAL);
@@ -21,6 +22,7 @@ const lifecyclePath = join(artifactRoot, 'merge-lifecycle.json');
 const pipelineDiagnosticsPath = join(artifactRoot, PIPELINE_DIAGNOSTICS_FILENAME);
 const startedAt = new Date().toISOString();
 const shardedRunStartedAt = timestampEnvironment('AUDIT_SHARDED_STARTED_AT');
+const legacyAuthorityFence = await openLegacyAuthorityFenceFromEnvironment(process.env);
 await fs.mkdir(artifactRoot, { recursive: true });
 
 let coordinatorDiagnostics;
@@ -178,7 +180,12 @@ const lifecycle = {
   release,
   status: outcome.status,
 };
-await atomicWriteJson(lifecyclePath, lifecycle);
+const publishLegacyFinalization = () => atomicWriteJson(lifecyclePath, lifecycle);
+if (legacyAuthorityFence) {
+  await legacyAuthorityFence.withAuthority('comparative-finalization', publishLegacyFinalization);
+} else {
+  await publishLegacyFinalization();
+}
 log('merge-pipeline-finished', {
   status: lifecycle.status,
   pipelineStatus: lifecycle.pipeline.status,

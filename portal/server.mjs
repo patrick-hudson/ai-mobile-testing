@@ -21,6 +21,7 @@ import { openContainedArtifactFile } from './safe-artifact-open.mjs';
 import { createConsoleApi, handleConsoleApiRequest } from './console-api.mjs';
 import { createSharedControlApi, createSharedRequestAuthorizer } from './shared-control-api.mjs';
 import { rejectRetiredLegacyMutation } from './shared-legacy-mutation-policy.mjs';
+import { openLegacyAuthorityFenceFromEnvironment } from '../scripts/lib/legacy-authority-fence.mjs';
 import { openScopedCredentialAuthority } from './scoped-credential-authority.mjs';
 import { ControlPlaneError, validateMutationDeployment } from '../shared/control-plane-contract.mjs';
 import { assertSharedListScope, classifySharedReadRequest } from './shared-read-policy.mjs';
@@ -504,6 +505,7 @@ const previewTlsBypassOrigins = String(process.env.AUDIT_PREVIEW_TLS_BYPASS_ALLO
   .map((value) => value.trim())
   .filter(Boolean);
 const singleSiteQueue = await openJobQueue({ root: SINGLE_SITE_QUEUE_ROOT });
+const legacyAuthorityFence = await openLegacyAuthorityFenceFromEnvironment(process.env);
 const visualBaselineStore = await openVisualBaselineStore({ root: VISUAL_BASELINE_ROOT });
 const visualReviewStore = await openVisualReviewStore({ root: VISUAL_REVIEW_ROOT });
 const singleSiteAiReview = await openSingleSiteAiReviewSupervisor({
@@ -532,6 +534,7 @@ const singleSiteLaunch = createSingleSiteLaunchCoordinator({
     tlsBypassRequestOptions: { rejectUnauthorized: false },
   }),
   createJob: createSingleSiteQueueJob,
+  legacyAuthorityFence,
 });
 
 await fs.mkdir(ARTIFACT_ROOT, { recursive: true });

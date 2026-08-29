@@ -117,6 +117,7 @@ export function createSingleSiteLaunchCoordinator({
   preflight,
   validateContract = () => {},
   createJob,
+  legacyAuthorityFence = null,
 }) {
   if (!pluginRegistry || !targetRegistry || typeof runnerRevision !== 'string' || !runnerRevision.trim()) {
     throw new TypeError('Single-site launch requires immutable plugin, target, and runner revisions.');
@@ -240,7 +241,7 @@ export function createSingleSiteLaunchCoordinator({
           idempotent: false,
         });
       }
-      const job = await createJob({
+      const create = () => createJob({
         idempotencyKey,
         requestDigest,
         runContract: refreshedPreview.runContract,
@@ -250,6 +251,9 @@ export function createSingleSiteLaunchCoordinator({
         previewDigest: refreshedPreview.previewDigest,
         advisory,
       });
+      const job = legacyAuthorityFence
+        ? await legacyAuthorityFence.withAuthority('single-site-launch', create)
+        : await create();
       return Object.freeze({
         schemaVersion: SINGLE_SITE_LAUNCH_SCHEMA_VERSION,
         launched: true,

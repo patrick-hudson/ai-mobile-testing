@@ -24,6 +24,7 @@ import {
 } from './lib/single-site-visual-comparisons.mjs';
 import { validateCompleteReportPublication } from '../portal/report-publication.mjs';
 import { openVisualBaselineStore } from '../portal/visual-baselines.mjs';
+import { openLegacyAuthorityFenceFromEnvironment } from './lib/legacy-authority-fence.mjs';
 import {
   createPoolLogger,
   interruptibleDelay,
@@ -964,6 +965,8 @@ export async function runSingleSiteFinalizerPool({
     ?? readSingleSitePublicationCheckpoint;
   const preflight = dependencies.preflight ?? preflightQuitting7ohSite;
   const outboundPreflightOptions = dependencies.preflightOptions ?? preflightOptions(environment);
+  const legacyAuthorityFence = dependencies.legacyAuthorityFence
+    ?? await openLegacyAuthorityFenceFromEnvironment(environment);
   const delay = dependencies.delay ?? interruptibleDelay;
   let cycles = 0;
   let published = 0;
@@ -1021,7 +1024,7 @@ export async function runSingleSiteFinalizerPool({
           });
           continue;
         }
-        const result = await processTerminalJob({
+        const finalizeTerminal = () => processTerminalJob({
           queue,
           job,
           outputRoot: preparedOutput,
@@ -1045,6 +1048,9 @@ export async function runSingleSiteFinalizerPool({
           reported,
           signal,
         });
+        const result = legacyAuthorityFence
+          ? await legacyAuthorityFence.withAuthority('single-site-finalization', finalizeTerminal)
+          : await finalizeTerminal();
         if (result.outcome === 'invalid') invalid += 1;
         else if (result.outcome === 'retryable') retryable += 1;
         else if (result.outcome === 'unchanged') unchanged += 1;

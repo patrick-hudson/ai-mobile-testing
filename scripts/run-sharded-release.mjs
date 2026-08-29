@@ -17,6 +17,7 @@ import {
   MAX_RELEASE_SHARD_WORKERS,
 } from './lib/sharded-defaults.mjs';
 import { createFreshShardedRunDirectory, validatedShardedRunId } from './lib/sharded-evidence.mjs';
+import { openLegacyAuthorityFenceFromEnvironment } from './lib/legacy-authority-fence.mjs';
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const shardTotal = integerEnvironment('AUDIT_SHARD_TOTAL', DEFAULT_RELEASE_SHARD_TOTAL, 1, MAX_RELEASE_SHARD_TOTAL);
@@ -40,10 +41,11 @@ const shardedContainerRoot = process.env.AUDIT_SHARDED_CONTAINER_ROOT ?? '/work/
 if (!shardedContainerRoot.startsWith('/') || shardedContainerRoot.includes('\0')) {
   throw new TypeError('AUDIT_SHARDED_CONTAINER_ROOT must be an absolute container path.');
 }
-const hostRunDirectory = await createFreshShardedRunDirectory(
-  shardedHostRoot,
-  runId,
-);
+const legacyAuthorityFence = await openLegacyAuthorityFenceFromEnvironment(process.env);
+const acceptLegacyLaunch = () => createFreshShardedRunDirectory(shardedHostRoot, runId);
+const hostRunDirectory = legacyAuthorityFence
+  ? await legacyAuthorityFence.withAuthority('comparative-launch', acceptLegacyLaunch)
+  : await acceptLegacyLaunch();
 const logDirectory = join(hostRunDirectory, 'logs');
 const containerRunDirectory = `${shardedContainerRoot.replace(/\/+$/u, '')}/${runId}`;
 const lifecyclePath = join(hostRunDirectory, 'sharded-run.json');
@@ -196,7 +198,12 @@ const lifecycle = {
   stopRequestedAt: stopRequest?.requestedAt ?? null,
   stopSignal: stopRequest?.signal ?? null,
 };
-await atomicWriteJson(lifecyclePath, lifecycle);
+const publishLegacyFinalization = () => atomicWriteJson(lifecyclePath, lifecycle);
+if (legacyAuthorityFence) {
+  await legacyAuthorityFence.withAuthority('comparative-finalization', publishLegacyFinalization);
+} else {
+  await publishLegacyFinalization();
+}
 clearInterval(heartbeatTimer);
 await publishHeartbeat(outcome.status);
 writeCoordinator('sharded-release-finished', {

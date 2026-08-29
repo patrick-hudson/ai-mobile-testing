@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openJobQueue, submitJob } from './lib/job-queue.mjs';
+import { openLegacyAuthorityFenceFromEnvironment } from './lib/legacy-authority-fence.mjs';
 import { createSingleSiteLaunchCoordinator } from '../portal/single-site-launch.mjs';
 import { preflightQuitting7ohSite } from '../shared/site-preflight.mjs';
 import { resolveRunnerRevision } from '../shared/runner-revision.mjs';
@@ -131,6 +132,7 @@ export async function launchDirectSingleSiteJob(options, dependencies = {}) {
     pluginRegistry,
     targetRegistry,
     runnerRevision,
+    legacyAuthorityFence: dependencies.legacyAuthorityFence,
     validateContract: dependencies.validateContract,
     preflight: dependencies.preflight ?? ((input) => preflightQuitting7ohSite(input, {
       previewBypassOrigins: options.previewBypassOrigins,
@@ -201,13 +203,16 @@ export function validateSingleSiteLaunchDocument(rawLaunch) {
   };
 }
 
-export async function launchSingleSiteJob({ queue, launchDocument }) {
+export async function launchSingleSiteJob({ queue, launchDocument, legacyAuthorityFence = null }) {
   const launch = validateSingleSiteLaunchDocument(launchDocument);
   const submission = queueSubmissionForWorkerInput(launch.inputDocument, {
     idempotencyKey: launch.idempotencyKey,
     stageDeadlines: launch.stageDeadlines,
   });
-  const result = await submitJob(queue, submission, { inputDocument: launch.inputDocument });
+  const submit = () => submitJob(queue, submission, { inputDocument: launch.inputDocument });
+  const result = legacyAuthorityFence
+    ? await legacyAuthorityFence.withAuthority('single-site-launch', submit)
+    : await submit();
   return {
     created: result.created,
     jobId: result.state.jobId,
@@ -286,12 +291,13 @@ export async function main(argv = process.argv.slice(2)) {
   const options = parseArguments(argv);
   if (!options.queueRoot) fail('SINGLE_SITE_LAUNCH_USAGE', 'Queue root is required.');
   const queue = await openJobQueue({ root: options.queueRoot });
+  const legacyAuthorityFence = await openLegacyAuthorityFenceFromEnvironment(process.env);
   let result;
   if (options.launchPath) {
     const launchDocument = await readLaunchDocument(options.launchPath);
-    result = await launchSingleSiteJob({ queue, launchDocument });
+    result = await launchSingleSiteJob({ queue, launchDocument, legacyAuthorityFence });
   } else {
-    const direct = await launchDirectSingleSiteJob(options, { queue });
+    const direct = await launchDirectSingleSiteJob(options, { queue, legacyAuthorityFence });
     result = direct.launched.job;
     process.stdout.write(`${JSON.stringify({
       event: 'single-site-preview-accepted',

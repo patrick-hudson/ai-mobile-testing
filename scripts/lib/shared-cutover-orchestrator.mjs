@@ -19,6 +19,7 @@ import {
 } from './atomic-filesystem.mjs';
 import {
   listParentRunIds,
+  readCurrentEnvelope,
   readParentRun,
   readStoreCoordinator,
   readReleaseAuthoritySelector,
@@ -232,7 +233,7 @@ export function createCutoverAdmissionPolicy({ admissionGate } = {}) {
 }
 
 export async function captureSharedAuthorityDrainObservation({
-  store, coordinator, admissionGate, launchOperationStore, cutoverId,
+  store, coordinator, admissionGate, legacyAuthorityFence = null, launchOperationStore, cutoverId,
   legacyComparativeRoot, legacySingleSiteQueueRoot,
   clock = store?.clock ?? (() => Date.now()),
 } = {}) {
@@ -255,6 +256,13 @@ export async function captureSharedAuthorityDrainObservation({
   ]);
   if (gate.state !== 'CLOSED' || gate.cutoverId !== cutoverId) {
     fail('CUTOVER_ADMISSION_OPEN', 'Drain observation requires admission closed by this cutover.');
+  }
+  if (legacyAuthorityFence) {
+    const legacyFence = await legacyAuthorityFence.read();
+    if (legacyFence.state !== 'CLOSED' || legacyFence.cutoverId !== cutoverId
+      || legacyFence.activationEpoch !== 0) {
+      fail('CUTOVER_LEGACY_FENCE_CONFLICT', 'Drain observation requires the closed pre-activation legacy authority fence.');
+    }
   }
   if (selector.phase !== 'DRAINING' || selector.activationEpoch !== 0) {
     fail('CUTOVER_PHASE_INVALID', 'Drain observation may be captured only during pre-activation DRAINING.');
@@ -510,7 +518,7 @@ async function withCutoverLock(storage, cutoverId, operation) {
 }
 
 export async function prepareSharedAuthorityCutover({
-  store, coordinator, admissionGate, reportDirectory, input: rawInput,
+  store, coordinator, admissionGate, legacyAuthorityFence = null, reportDirectory, input: rawInput,
   clock = store?.clock ?? (() => Date.now()), hooks = {},
 } = {}) {
   ensureCoordinator(coordinator);
@@ -530,6 +538,14 @@ export async function prepareSharedAuthorityCutover({
       fail('CUTOVER_ADMISSION_OWNED', `Admission is closed by ${gate.cutoverId}.`);
     }
     let checkpoint = await initializeCheckpoint(storage, input, selector, gate, clock);
+    if (legacyAuthorityFence) {
+      const legacyFence = await legacyAuthorityFence.read();
+      if (legacyFence.state === 'OPEN') {
+        await legacyAuthorityFence.close(legacyFence.digest, input.cutoverId);
+      } else if (legacyFence.state !== 'CLOSED' || legacyFence.cutoverId !== input.cutoverId) {
+        fail('CUTOVER_LEGACY_FENCE_CONFLICT', 'Legacy authority fence is not owned by this pre-activation cutover.');
+      }
+    }
     let closed = gate;
     if (closed.state === 'OPEN') {
       closed = await admissionGate.close(closed.digest, input.cutoverId);
@@ -607,7 +623,7 @@ function parseFinalReport(value, input) {
 }
 
 export async function activateSharedAuthorityCutover({
-  store, coordinator, admissionGate, reportDirectory, input: rawInput, drainObservation,
+  store, coordinator, admissionGate, legacyAuthorityFence = null, reportDirectory, input: rawInput, drainObservation,
   clock = store?.clock ?? (() => Date.now()), hooks = {},
 } = {}) {
   ensureCoordinator(coordinator);
@@ -643,6 +659,14 @@ export async function activateSharedAuthorityCutover({
         drainObservation: observed,
         updatedAt: timestamp(clock),
       });
+      if (legacyAuthorityFence) {
+        const legacyFence = await legacyAuthorityFence.read();
+        if (legacyFence.state === 'CLOSED' && legacyFence.cutoverId === input.cutoverId) {
+          await legacyAuthorityFence.freeze(legacyFence.digest, input.cutoverId);
+        } else if (legacyFence.state !== 'FROZEN' || legacyFence.cutoverId !== input.cutoverId) {
+          fail('CUTOVER_LEGACY_FENCE_CONFLICT', 'Legacy authority fence must be frozen after the clean drain observation.');
+        }
+      }
       selector = await transitionReleaseAuthority(store, coordinator, {
         expectedSelectorDigest: selector.digest,
         phase: 'ACTIVE',
@@ -658,6 +682,15 @@ export async function activateSharedAuthorityCutover({
       observed = parseDrainObservation(observed, { input, gate, coordinator, clock: () => Date.parse(observed.observedAt) });
     }
     validateStore(store, input, { activated: true });
+    if (legacyAuthorityFence) {
+      const legacyFence = await legacyAuthorityFence.read();
+      if (legacyFence.state === 'FROZEN' && legacyFence.cutoverId === input.cutoverId) {
+        await legacyAuthorityFence.activate(legacyFence.digest, input.cutoverId, selector.activationEpoch);
+      } else if (legacyFence.state !== 'ACTIVATED' || legacyFence.cutoverId !== input.cutoverId
+        || legacyFence.activationEpoch !== selector.activationEpoch) {
+        fail('CUTOVER_LEGACY_FENCE_CONFLICT', 'Legacy authority fence does not match activated shared authority.');
+      }
+    }
     checkpoint = await writeCheckpoint(storage, {
       ...checkpoint,
       status: 'ACTIVE',
@@ -670,6 +703,209 @@ export async function activateSharedAuthorityCutover({
       input, checkpoint, selectorAfter: selector, admissionGate: gate,
       observation: observed, store, completedAt: timestamp(clock),
     }));
+    await atomicWriteJson(storage, reportPath, report, { exclusive: true });
+    return clone(report);
+  });
+}
+
+const CUTOVER_CANARY_MODES = Object.freeze(['single-site', 'comparative']);
+
+async function defaultReadCanaryEvidence(store, runId) {
+  const [state, publication] = await Promise.all([
+    readParentRun(store, runId),
+    readCurrentEnvelope(store, runId),
+  ]);
+  return {
+    mode: state.finalSubject?.mode,
+    finalSubjectDigest: state.finalSubjectDigest,
+    publicationDigest: publication.digest,
+    decisionCode: publication.decision?.code,
+    decisionRevision: publication.decisionRevision,
+  };
+}
+
+function parseCanaryEvidence(value, { mode, runId }) {
+  if (!isRecord(value) || value.mode !== mode || value.decisionCode !== 'RELEASE_READY'
+    || !Number.isSafeInteger(value.decisionRevision) || value.decisionRevision < 1) {
+    fail('CUTOVER_CANARY_NOT_READY', `${mode} canary ${runId} is not a full current ready publication.`);
+  }
+  assertDigest(value.finalSubjectDigest, 'Canary finalSubjectDigest');
+  assertDigest(value.publicationDigest, 'Canary publicationDigest');
+  return {
+    mode, runId,
+    finalSubjectDigest: value.finalSubjectDigest,
+    publicationDigest: value.publicationDigest,
+    decisionCode: value.decisionCode,
+    decisionRevision: value.decisionRevision,
+  };
+}
+
+function canaryHeadBody(value) {
+  return {
+    schemaVersion: 1,
+    kind: 'release-cutover-canary-head',
+    cutoverId: value.cutoverId,
+    revision: value.revision,
+    previousDigest: value.previousDigest,
+    receipts: value.receipts,
+    updatedAt: value.updatedAt,
+  };
+}
+
+function parseCanaryHead(value, cutoverId) {
+  parseSealed(value, 'Cutover canary head');
+  exactKeys(value, [...Object.keys(canaryHeadBody(value)), 'digest'], 'Cutover canary head');
+  if (value.schemaVersion !== 1 || value.kind !== 'release-cutover-canary-head'
+    || value.cutoverId !== cutoverId || !Number.isSafeInteger(value.revision) || value.revision < 1
+    || (value.previousDigest !== null && typeof value.previousDigest !== 'string') || !isRecord(value.receipts)) {
+    fail('CUTOVER_DOCUMENT_INVALID', 'Cutover canary head is invalid.');
+  }
+  if (value.previousDigest !== null) assertDigest(value.previousDigest, 'Cutover canary head previousDigest');
+  exactKeys(value.receipts, CUTOVER_CANARY_MODES, 'Cutover canary receipts');
+  for (const mode of CUTOVER_CANARY_MODES) {
+    const receipt = value.receipts[mode];
+    if (receipt === null) continue;
+    if (!isRecord(receipt) || receipt.mode !== mode || typeof receipt.runId !== 'string'
+      || !SAFE_ID.test(receipt.runId) || receipt.decisionCode !== 'RELEASE_READY'
+      || !Number.isSafeInteger(receipt.decisionRevision) || receipt.decisionRevision < 1) {
+      fail('CUTOVER_DOCUMENT_INVALID', `Cutover ${mode} canary receipt is invalid.`);
+    }
+    assertDigest(receipt.finalSubjectDigest, `Cutover ${mode} canary finalSubjectDigest`);
+    assertDigest(receipt.publicationDigest, `Cutover ${mode} canary publicationDigest`);
+    assertDigest(receipt.receiptDigest, `Cutover ${mode} canary receiptDigest`);
+    assertDigest(receipt.admissionGateDigest, `Cutover ${mode} canary admissionGateDigest`);
+  }
+  return clone(value);
+}
+
+async function readCanaryHead(storage, cutoverId) {
+  const file = reportStoragePath(storage, cutoverId, '.canaries.head.json');
+  if (!await pathExists(storage.fs, file)) return null;
+  return parseCanaryHead(await readBoundedJson(storage, file, {
+    label: 'cutover canary head', maximumBytes: 256 * 1_024,
+  }), cutoverId);
+}
+
+function assertActivatedCutover(selector, gate, cutoverId) {
+  if (selector.phase !== 'ACTIVE' || selector.activationEpoch !== 1) {
+    fail('CUTOVER_PHASE_INVALID', 'Canaries require active shared authority.');
+  }
+  if (gate.state !== 'CLOSED' || gate.cutoverId !== cutoverId) {
+    fail('CUTOVER_ADMISSION_OPEN', 'Canaries require admission closed by this cutover.');
+  }
+}
+
+export async function recordSharedCutoverCanary({
+  store, admissionGate, reportDirectory, cutoverId, mode, runId,
+  readCanaryEvidence = defaultReadCanaryEvidence,
+  clock = store?.clock ?? (() => Date.now()),
+} = {}) {
+  safeId(cutoverId, 'cutoverId');
+  safeId(runId, 'runId');
+  if (!CUTOVER_CANARY_MODES.includes(mode)) fail('CUTOVER_INPUT_INVALID', 'Canary mode is invalid.');
+  const storage = await openReportStorage(reportDirectory);
+  return withCutoverLock(storage, cutoverId, async () => {
+    const [selector, gate] = await Promise.all([
+      readReleaseAuthoritySelector(store), admissionGate.read(),
+    ]);
+    assertActivatedCutover(selector, gate, cutoverId);
+    const evidence = parseCanaryEvidence(await readCanaryEvidence(store, runId), { mode, runId });
+    const current = await readCanaryHead(storage, cutoverId);
+    const prior = current?.receipts[mode];
+    if (prior && prior.runId === evidence.runId
+      && prior.finalSubjectDigest === evidence.finalSubjectDigest
+      && prior.publicationDigest === evidence.publicationDigest
+      && prior.decisionRevision === evidence.decisionRevision) return clone(current);
+    const receiptBody = {
+      schemaVersion: 1,
+      kind: 'release-cutover-canary-receipt',
+      cutoverId,
+      ...evidence,
+      authoritySelectorDigest: selector.digest,
+      admissionGateDigest: gate.digest,
+      recordedAt: timestamp(clock),
+    };
+    const receipt = seal(receiptBody);
+    const receiptDirectory = reportStoragePath(storage, cutoverId, '.canaries');
+    await storage.fs.mkdir(receiptDirectory, { recursive: true, mode: 0o700 });
+    const receiptPath = containedPath(receiptDirectory, `${receipt.digest.slice(7)}.json`);
+    if (!await pathExists(storage.fs, receiptPath)) {
+      await atomicWriteJson(storage, receiptPath, receipt, { exclusive: true });
+    }
+    const summarized = { ...evidence, receiptDigest: receipt.digest, admissionGateDigest: gate.digest };
+    const next = seal(canaryHeadBody({
+      cutoverId,
+      revision: (current?.revision ?? 0) + 1,
+      previousDigest: current?.digest ?? null,
+      receipts: {
+        'single-site': current?.receipts['single-site'] ?? null,
+        comparative: current?.receipts.comparative ?? null,
+        [mode]: summarized,
+      },
+      updatedAt: timestamp(clock),
+    }));
+    await atomicWriteJson(storage, reportStoragePath(storage, cutoverId, '.canaries.head.json'), next);
+    return clone(next);
+  });
+}
+
+export async function reopenSharedAdmissionAfterCanaries({
+  store, admissionGate, reportDirectory, cutoverId,
+  readCanaryEvidence = defaultReadCanaryEvidence,
+  clock = store?.clock ?? (() => Date.now()),
+  hooks = {},
+} = {}) {
+  safeId(cutoverId, 'cutoverId');
+  const storage = await openReportStorage(reportDirectory);
+  return withCutoverLock(storage, cutoverId, async () => {
+    const reportPath = reportStoragePath(storage, cutoverId, '.reopen.json');
+    if (await pathExists(storage.fs, reportPath)) {
+      return parseSealed(await readBoundedJson(storage, reportPath, {
+        label: 'cutover reopen report', maximumBytes: 256 * 1_024,
+      }), 'Cutover reopen report');
+    }
+    const [selector, gate, canaries] = await Promise.all([
+      readReleaseAuthoritySelector(store), admissionGate.read(), readCanaryHead(storage, cutoverId),
+    ]);
+    if (selector.phase !== 'ACTIVE' || selector.activationEpoch !== 1) {
+      fail('CUTOVER_PHASE_INVALID', 'Canary reopen requires active shared authority.');
+    }
+    const recoveringOpen = gate.state === 'OPEN';
+    if (!recoveringOpen && (gate.state !== 'CLOSED' || gate.cutoverId !== cutoverId)) {
+      fail('CUTOVER_ADMISSION_OPEN', 'Canary reopen requires admission closed by this cutover.');
+    }
+    if (!canaries || CUTOVER_CANARY_MODES.some((mode) => canaries.receipts[mode] === null)) {
+      fail('CUTOVER_CANARIES_INCOMPLETE', 'Admission requires current ready Single-site and Comparative canaries.');
+    }
+    if (recoveringOpen && CUTOVER_CANARY_MODES.some(
+      (mode) => canaries.receipts[mode].admissionGateDigest !== gate.previousDigest,
+    )) {
+      fail('CUTOVER_ADMISSION_RECOVERY_INVALID', 'Open admission is not chained to the canary-validated closed gate.');
+    }
+    for (const mode of CUTOVER_CANARY_MODES) {
+      const receipt = canaries.receipts[mode];
+      const current = parseCanaryEvidence(await readCanaryEvidence(store, receipt.runId), {
+        mode, runId: receipt.runId,
+      });
+      if (current.finalSubjectDigest !== receipt.finalSubjectDigest
+        || current.publicationDigest !== receipt.publicationDigest
+        || current.decisionRevision !== receipt.decisionRevision) {
+        fail('CUTOVER_CANARY_STALE', `${mode} canary changed after it was recorded.`);
+      }
+    }
+    const opened = recoveringOpen ? gate : await admissionGate.open(gate.digest, cutoverId);
+    await hooks.afterAdmissionOpened?.(clone(opened));
+    const report = seal({
+      schemaVersion: 1,
+      kind: 'release-authority-cutover-reopen-report',
+      cutoverId,
+      status: 'ACTIVE_ADMISSION_OPEN',
+      selector,
+      canaryHead: canaries,
+      admissionGateBefore: recoveringOpen ? { recoveredPreviousDigest: gate.previousDigest } : gate,
+      admissionGateAfter: opened,
+      completedAt: timestamp(clock),
+    });
     await atomicWriteJson(storage, reportPath, report, { exclusive: true });
     return clone(report);
   });
@@ -691,7 +927,7 @@ function rollbackReportBody({ cutoverId, selectorBefore, selectorAfter, gateBefo
 }
 
 export async function rollbackSharedAuthorityBeforeActivation({
-  store, coordinator, admissionGate, reportDirectory, cutoverId, buildIdentity,
+  store, coordinator, admissionGate, legacyAuthorityFence = null, reportDirectory, cutoverId, buildIdentity,
   operatorReview: rawOperatorReview, clock = store?.clock ?? (() => Date.now()),
 } = {}) {
   ensureCoordinator(coordinator);
@@ -701,18 +937,28 @@ export async function rollbackSharedAuthorityBeforeActivation({
   const storage = await openReportStorage(reportDirectory);
   return withCutoverLock(storage, cutoverId, async () => {
     const selectorBefore = await readReleaseAuthoritySelector(store);
-    if (selectorBefore.phase !== 'DRAINING' || selectorBefore.activationEpoch !== 0) {
+    if (!['DRAINING', 'SHADOW'].includes(selectorBefore.phase) || selectorBefore.activationEpoch !== 0) {
       fail('AUTHORITY_TRANSITION_INVALID', 'Pre-activation rollback is allowed only from DRAINING before activation.');
     }
     const gateBefore = await admissionGate.read();
     if (gateBefore.state !== 'CLOSED' || gateBefore.cutoverId !== cutoverId) {
       fail('CUTOVER_ADMISSION_OPEN', 'Pre-activation rollback requires this cutover to own the closed gate.');
     }
-    const selectorAfter = await transitionReleaseAuthority(store, coordinator, {
-      expectedSelectorDigest: selectorBefore.digest,
-      phase: 'SHADOW',
-      buildIdentity,
-    });
+    const legacyFenceBefore = legacyAuthorityFence ? await legacyAuthorityFence.read() : null;
+    if (legacyFenceBefore
+      && (!['CLOSED', 'FROZEN'].includes(legacyFenceBefore.state) || legacyFenceBefore.cutoverId !== cutoverId)) {
+      fail('CUTOVER_LEGACY_FENCE_CONFLICT', 'Pre-activation rollback does not own the legacy authority fence.');
+    }
+    const selectorAfter = selectorBefore.phase === 'SHADOW' ? selectorBefore : await transitionReleaseAuthority(
+      store, coordinator, {
+        expectedSelectorDigest: selectorBefore.digest,
+        phase: 'SHADOW',
+        buildIdentity,
+      },
+    );
+    if (legacyFenceBefore) {
+      await legacyAuthorityFence.reopenPreActivation(legacyFenceBefore.digest, cutoverId);
+    }
     const gateAfter = await admissionGate.open(gateBefore.digest, cutoverId);
     const report = seal(rollbackReportBody({
       cutoverId, selectorBefore, selectorAfter, gateBefore, gateAfter,

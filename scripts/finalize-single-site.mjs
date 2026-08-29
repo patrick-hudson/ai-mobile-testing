@@ -15,6 +15,7 @@ import {
   MAX_SINGLE_SITE_PLAYWRIGHT_RESULTS_BYTES,
 } from './lib/single-site-report-input.mjs';
 import { verifyStructuredEvidencePublication } from './lib/playwright-results-compaction.mjs';
+import { openLegacyAuthorityFenceFromEnvironment } from './lib/legacy-authority-fence.mjs';
 
 const scriptPath = fileURLToPath(import.meta.url);
 const TERMINAL_STATES = new Set(['completed', 'failed', 'incomplete', 'cancelled']);
@@ -398,8 +399,14 @@ export async function main(argv = process.argv.slice(2)) {
   }
   const queue = await openJobQueue({ root: options.queueRoot });
   process.stdout.write(`${JSON.stringify({ event: 'finalizer-started', jobs: options.jobIds.length, output: path.resolve(options.output) })}\n`);
-  const document = await finalizeSingleSiteJobs({ queue, jobIds: options.jobIds });
-  await atomicWriteFinalization(options.output, document);
+  const legacyAuthorityFence = await openLegacyAuthorityFenceFromEnvironment(process.env);
+  let document;
+  const publish = async () => {
+    document = await finalizeSingleSiteJobs({ queue, jobIds: options.jobIds });
+    await atomicWriteFinalization(options.output, document);
+  };
+  if (legacyAuthorityFence) await legacyAuthorityFence.withAuthority('single-site-finalization', publish);
+  else await publish();
   process.stdout.write(`${JSON.stringify({
     event: 'finalizer-finished',
     finalizationDigest: document.finalizationDigest,

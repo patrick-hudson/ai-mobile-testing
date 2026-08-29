@@ -1,4 +1,5 @@
 import type { CoordinatorFence, ParentRunStore } from './parent-run-store.mjs';
+import type { LegacyAuthorityFence } from './legacy-authority-fence.mjs';
 
 export class SharedCutoverError extends Error {
   code: string;
@@ -87,6 +88,7 @@ export function captureSharedAuthorityDrainObservation(options: {
   store: ParentRunStore;
   coordinator: CoordinatorFence;
   admissionGate: CutoverAdmissionGate;
+  legacyAuthorityFence?: LegacyAuthorityFence | null;
   launchOperationStore: any;
   cutoverId: string;
   legacyComparativeRoot: string;
@@ -98,6 +100,7 @@ export function prepareSharedAuthorityCutover(options: {
   store: ParentRunStore;
   coordinator: CoordinatorFence;
   admissionGate: CutoverAdmissionGate;
+  legacyAuthorityFence?: LegacyAuthorityFence | null;
   reportDirectory: string;
   input: SharedCutoverInput;
   clock?: () => number;
@@ -108,6 +111,7 @@ export function activateSharedAuthorityCutover(options: {
   store: ParentRunStore;
   coordinator: CoordinatorFence;
   admissionGate: CutoverAdmissionGate;
+  legacyAuthorityFence?: LegacyAuthorityFence | null;
   reportDirectory: string;
   input: SharedCutoverInput;
   drainObservation: CutoverDrainObservation;
@@ -119,10 +123,29 @@ export function rollbackSharedAuthorityBeforeActivation(options: {
   store: ParentRunStore;
   coordinator: CoordinatorFence;
   admissionGate: CutoverAdmissionGate;
+  legacyAuthorityFence?: LegacyAuthorityFence | null;
   reportDirectory: string;
   cutoverId: string;
   buildIdentity: string;
   operatorReview: { reviewed: true; actorId: string; reviewedAt: string };
+  clock?: () => number;
+}): Promise<any>;
+
+export function recordSharedCutoverCanary(options: {
+  store: ParentRunStore;
+  admissionGate: CutoverAdmissionGate;
+  reportDirectory: string;
+  cutoverId: string;
+  mode: 'single-site' | 'comparative';
+  runId: string;
+  clock?: () => number;
+}): Promise<any>;
+
+export function reopenSharedAdmissionAfterCanaries(options: {
+  store: ParentRunStore;
+  admissionGate: CutoverAdmissionGate;
+  reportDirectory: string;
+  cutoverId: string;
   clock?: () => number;
 }): Promise<any>;
 

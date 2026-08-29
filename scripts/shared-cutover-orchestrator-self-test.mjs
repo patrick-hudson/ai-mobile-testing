@@ -20,10 +20,13 @@ import {
   captureSharedAuthorityDrainObservation,
   initializeCutoverAdmissionGate,
   prepareSharedAuthorityCutover,
+  recordSharedCutoverCanary,
+  reopenSharedAdmissionAfterCanaries,
   rollbackSharedAuthorityBeforeActivation,
   setSharedPromotionAvailability,
 } from './lib/shared-cutover-orchestrator.mjs';
 import { openSharedLaunchOperationStore } from './lib/shared-launch-operation-store.mjs';
+import { initializeLegacyAuthorityFence } from './lib/legacy-authority-fence.mjs';
 
 const marker = 'cd'.repeat(32);
 const build = 'build:cutover-current';
@@ -101,6 +104,9 @@ async function fixture(name) {
   const admissionGate = await initializeCutoverAdmissionGate({
     root: path.join(directory, 'admission'), verifyStorage: false, clock,
   });
+  const legacyAuthorityFence = await initializeLegacyAuthorityFence({
+    root: path.join(directory, 'legacy-authority'), verifyStorage: false, clock,
+  });
   const legacyComparativeRoot = path.join(directory, 'legacy-comparative');
   const legacySingleSiteQueueRoot = path.join(directory, 'legacy-single-site');
   await Promise.all([
@@ -114,7 +120,7 @@ async function fixture(name) {
     ownerId: `coordinator-${name}`, leaseMs: 60_000,
   });
   return {
-    directory, store, admissionGate, coordinator, launchOperationStore,
+    directory, store, admissionGate, legacyAuthorityFence, coordinator, launchOperationStore,
     legacyComparativeRoot, legacySingleSiteQueueRoot,
   };
 }
@@ -142,18 +148,20 @@ try {
   {
     const {
       directory, store, admissionGate, coordinator, launchOperationStore,
-      legacyComparativeRoot, legacySingleSiteQueueRoot,
+      legacyAuthorityFence, legacyComparativeRoot, legacySingleSiteQueueRoot,
     } = await fixture('happy');
     const input = request('cutover-happy');
     const prepared = await prepareSharedAuthorityCutover({
-      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
+      store, coordinator, admissionGate, legacyAuthorityFence,
+      reportDirectory: path.join(directory, 'reports'), input,
     });
     assert.equal(prepared.status, 'DRAINING');
     assert.equal(prepared.admissionGate.state, 'CLOSED');
+    assert.equal((await legacyAuthorityFence.read()).state, 'CLOSED');
     assert.equal((await readReleaseAuthoritySelector(store)).phase, 'DRAINING');
 
     const drainObservation = await captureSharedAuthorityDrainObservation({
-      store, coordinator, admissionGate, launchOperationStore, cutoverId: input.cutoverId,
+      store, coordinator, admissionGate, legacyAuthorityFence, launchOperationStore, cutoverId: input.cutoverId,
       legacyComparativeRoot, legacySingleSiteQueueRoot, clock,
     });
     assert.deepEqual(drainObservation.activeLegacyAuthoritativeRunIds, []);
@@ -164,13 +172,15 @@ try {
       'drain observation must not initialize indexes or otherwise mutate the legacy queue',
     );
     const report = await activateSharedAuthorityCutover({
-      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
+      store, coordinator, admissionGate, legacyAuthorityFence,
+      reportDirectory: path.join(directory, 'reports'), input,
       drainObservation,
     });
     assert.equal(report.status, 'ACTIVE_ADMISSION_CLOSED');
     assert.equal(report.selectorAfter.phase, 'ACTIVE');
     assert.equal(report.selectorAfter.activationEpoch, 1);
     assert.equal(report.selectorAfter.activationRevision, 73);
+    assert.equal((await legacyAuthorityFence.read()).state, 'ACTIVATED');
     assert.equal(report.storeAfter.storeGeneration, 5);
     assert.equal(report.preconditions.unexplainedAuthorityDrift, 0);
     assert.equal(report.preconditions.activeLegacyAuthoritativeRuns, 0);
@@ -179,6 +189,50 @@ try {
     assert.equal(report.operatorReview.reviewed, true);
     assert.equal(report.digest, canonicalDigest(Object.fromEntries(Object.entries(report).filter(([key]) => key !== 'digest'))));
     assert.equal(JSON.parse(await readFile(path.join(directory, 'reports', 'cutover-happy.json'), 'utf8')).digest, report.digest);
+
+    const canaryEvidence = new Map([
+      ['canary-single-site', {
+        mode: 'single-site', finalSubjectDigest: `sha256:${'1'.repeat(64)}`,
+        publicationDigest: `sha256:${'2'.repeat(64)}`, decisionCode: 'RELEASE_READY', decisionRevision: 1,
+      }],
+      ['canary-comparative', {
+        mode: 'comparative', finalSubjectDigest: `sha256:${'3'.repeat(64)}`,
+        publicationDigest: `sha256:${'4'.repeat(64)}`, decisionCode: 'RELEASE_READY', decisionRevision: 1,
+      }],
+    ]);
+    const readCanaryEvidence = async (_store, runId) => structuredClone(canaryEvidence.get(runId));
+    await recordSharedCutoverCanary({
+      store, admissionGate, reportDirectory: path.join(directory, 'reports'), cutoverId: input.cutoverId,
+      mode: 'single-site', runId: 'canary-single-site', readCanaryEvidence, clock,
+    });
+    await expectCode('CUTOVER_CANARIES_INCOMPLETE', () => reopenSharedAdmissionAfterCanaries({
+      store, admissionGate, reportDirectory: path.join(directory, 'reports'), cutoverId: input.cutoverId,
+      readCanaryEvidence, clock,
+    }));
+    assert.equal((await admissionGate.read()).state, 'CLOSED');
+    await recordSharedCutoverCanary({
+      store, admissionGate, reportDirectory: path.join(directory, 'reports'), cutoverId: input.cutoverId,
+      mode: 'comparative', runId: 'canary-comparative', readCanaryEvidence, clock,
+    });
+    canaryEvidence.get('canary-comparative').publicationDigest = `sha256:${'5'.repeat(64)}`;
+    await expectCode('CUTOVER_CANARY_STALE', () => reopenSharedAdmissionAfterCanaries({
+      store, admissionGate, reportDirectory: path.join(directory, 'reports'), cutoverId: input.cutoverId,
+      readCanaryEvidence, clock,
+    }));
+    assert.equal((await admissionGate.read()).state, 'CLOSED');
+    canaryEvidence.get('canary-comparative').publicationDigest = `sha256:${'4'.repeat(64)}`;
+    await assert.rejects(reopenSharedAdmissionAfterCanaries({
+      store, admissionGate, reportDirectory: path.join(directory, 'reports'), cutoverId: input.cutoverId,
+      readCanaryEvidence, clock,
+      hooks: { afterAdmissionOpened: () => { throw new Error('synthetic crash after admission reopen'); } },
+    }), /synthetic crash after admission reopen/u);
+    assert.equal((await admissionGate.read()).state, 'OPEN');
+    const reopenedAdmission = await reopenSharedAdmissionAfterCanaries({
+      store, admissionGate, reportDirectory: path.join(directory, 'reports'), cutoverId: input.cutoverId,
+      readCanaryEvidence, clock,
+    });
+    assert.equal(reopenedAdmission.status, 'ACTIVE_ADMISSION_OPEN');
+    assert.equal((await admissionGate.read()).state, 'OPEN');
 
     const repeated = await activateSharedAuthorityCutover({
       store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
@@ -249,6 +303,24 @@ try {
     await expectCode('CUTOVER_LEGACY_RUNS_ACTIVE', () => activateSharedAuthorityCutover({
       store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
       drainObservation: observed,
+    }));
+  }
+
+  {
+    const {
+      directory, store, admissionGate, coordinator, launchOperationStore,
+      legacyComparativeRoot, legacySingleSiteQueueRoot,
+    } = await fixture('production-observer-partial-legacy');
+    const input = request('cutover-production-observer-partial-legacy');
+    await prepareSharedAuthorityCutover({
+      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
+    });
+    const partialDirectory = path.join(legacyComparativeRoot, 'partial-legacy-run');
+    await mkdir(partialDirectory, { recursive: true });
+    await writeFile(path.join(partialDirectory, 'sharded-run.json'), '{"schemaVersion":2,"runId":"partial-legacy-run"}\n');
+    await expectCode('CUTOVER_LEGACY_SOURCE_CORRUPT', () => captureSharedAuthorityDrainObservation({
+      store, coordinator, admissionGate, launchOperationStore, cutoverId: input.cutoverId,
+      legacyComparativeRoot, legacySingleSiteQueueRoot, clock,
     }));
   }
 

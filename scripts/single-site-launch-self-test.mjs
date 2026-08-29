@@ -11,6 +11,7 @@ const url = 'https://beta.quitting7oh-org.pages.dev';
 let revision = 'revision-a';
 let identityAccepted = true;
 let jobCreates = 0;
+let legacyAuthorityOpen = true;
 
 function contract(overrides = {}) {
   return {
@@ -53,6 +54,16 @@ const coordinator = createSingleSiteLaunchCoordinator({
   targetRegistry,
   runnerRevision: 'runner:self-test',
   preflight: fakePreflight,
+  legacyAuthorityFence: {
+    async withAuthority(_capability, operation) {
+      if (!legacyAuthorityOpen) {
+        const error = new Error('Legacy authority is fenced.');
+        error.code = 'LEGACY_AUTHORITY_FENCED';
+        throw error;
+      }
+      return operation();
+    },
+  },
   validateContract(value) {
     assert(value.targetIds.every((id) => targetRegistry.singleSiteTargets.some((target) => target.id === id)));
   },
@@ -136,4 +147,14 @@ assert.equal(rejected.coverage, null);
 assert.equal(rejected.previewDigest, null);
 assert.equal(jobCreates, 1, 'Side-effect-free preview must not create a run or job.');
 
-process.stdout.write('Single-site launch self-test passed: preview is side-effect free, stale revisions create no job, and idempotent launch creates exactly one job.\n');
+identityAccepted = true;
+const fencedPreview = await coordinator.preview(contract());
+legacyAuthorityOpen = false;
+await assert.rejects(coordinator.launch({
+  runContract: contract(),
+  previewDigest: fencedPreview.previewDigest,
+  idempotencyKey: 'launch-self-test-fenced',
+}), (error) => error?.code === 'LEGACY_AUTHORITY_FENCED');
+assert.equal(jobCreates, 1, 'A closed legacy authority fence must reject launch before job creation.');
+
+process.stdout.write('Single-site launch self-test passed: preview is side-effect free, stale/fenced launches create no job, and idempotent launch creates exactly one job.\n');
