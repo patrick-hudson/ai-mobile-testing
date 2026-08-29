@@ -6,7 +6,11 @@ import {
   canonicalJson,
 } from '../../shared/canonical-contract.mjs';
 import { parsePublicationEnvelope, verifyPublicationChain } from '../../shared/publication-envelope.mjs';
-import { parseExecutionManifest, sealWorkItemResult } from '../../shared/execution-contract.mjs';
+import {
+  parseExecutionManifest,
+  parseProductFailureSignature,
+  sealWorkItemResult,
+} from '../../shared/execution-contract.mjs';
 import { parseSingleSiteInventoryBarrier } from '../../shared/execution-graph-compiler.mjs';
 import {
   parseInventoryCompilationFailure,
@@ -99,6 +103,18 @@ function schedulingString(value, label, { nullable = false, maximum = 512 } = {}
   return value;
 }
 
+function normalizedProductFailureSignature(value, outcome, errorCode = 'STORE_SCHEMA_INVALID') {
+  if (value === undefined || value === null) return null;
+  if (outcome !== 'completed_product_failure') {
+    fail(errorCode, 'Only a completed product failure can carry a product-failure signature.');
+  }
+  try {
+    return parseProductFailureSignature(value);
+  } catch (error) {
+    fail(errorCode, 'Product-failure signature is invalid.', { cause: error?.code ?? error?.message });
+  }
+}
+
 function normalizeScheduledWorkItems(value, { subjectCoreDigest = null, runnerRevision = null } = {}) {
   if (!Array.isArray(value) || value.length === 0) fail('STORE_SCHEMA_INVALID', 'A parent run requires work items.');
   const workItems = {};
@@ -139,6 +155,7 @@ function normalizeScheduledWorkItems(value, { subjectCoreDigest = null, runnerRe
       manualRekicks: 0,
       canonicalResult: null,
       canonicalRiskSourceObservationSet: null,
+      diagnosticExecutions: [],
     };
   }
   return workItems;
@@ -662,12 +679,14 @@ function validatePerformanceReservation(value, phase) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     fail('STORE_CORRUPT', 'Store performance scheduler reservation is invalid.');
   }
+  value.diagnosticExecutionId ??= null;
   const drainingKeys = [
-    'workerId', 'runId', 'workItemId', 'coordinatorEpoch', 'requestedAt', 'expiresAt',
+    'workerId', 'runId', 'workItemId', 'diagnosticExecutionId', 'coordinatorEpoch', 'requestedAt', 'expiresAt',
   ];
   const runningKeys = [...drainingKeys, 'attempt', 'leaseToken', 'acquiredAt'];
   exactKeys(value, phase === 'running' ? runningKeys : drainingKeys, 'store performance reservation');
   if (!SAFE_ID.test(value.workerId) || !SAFE_ID.test(value.runId) || !SAFE_ID.test(value.workItemId)
+    || (value.diagnosticExecutionId !== null && !/^[a-f0-9]{64}$/u.test(value.diagnosticExecutionId))
     || !Number.isSafeInteger(value.coordinatorEpoch) || value.coordinatorEpoch < 1
     || canonicalTimestamp(value.requestedAt, 'performance reservation requestedAt')
       >= canonicalTimestamp(value.expiresAt, 'performance reservation expiresAt')) {
@@ -832,6 +851,7 @@ async function recoverUnlocked(store, runId, { repairCache = true } = {}) {
   }
   for (const [id, item] of Object.entries(snapshot.workItems)) {
     item.manualRekicks ??= 0;
+    item.diagnosticExecutions ??= [];
     if (item?.id !== id || !SAFE_ID.test(id) || !Number.isSafeInteger(item.maxAttempts) || item.maxAttempts < 1
       || !['queued', 'running', 'completed_pass', 'completed_product_failure', 'cancelled', 'incomplete'].includes(item.state)
       || !Array.isArray(item.attempts)
@@ -839,8 +859,53 @@ async function recoverUnlocked(store, runId, { repairCache = true } = {}) {
       || !RESOURCE_CLASSES.has(item.resourceClass)
       || typeof item.targetId !== 'string'
       || (item.specAffinity !== null && typeof item.specAffinity !== 'string')
-      || !Number.isSafeInteger(item.manualRekicks) || item.manualRekicks < 0 || item.manualRekicks > 3) {
+      || !Number.isSafeInteger(item.manualRekicks) || item.manualRekicks < 0 || item.manualRekicks > 3
+      || !Array.isArray(item.diagnosticExecutions) || item.diagnosticExecutions.length > 8) {
       fail('STORE_CORRUPT', `Parent run ${runId} has invalid work-item state.`);
+    }
+    for (const diagnostic of item.diagnosticExecutions) {
+      const identityRecheck = diagnostic?.identityRecheck;
+      const expectedIdentity = identityRecheck?.expected;
+      const observedIdentity = identityRecheck?.observed;
+      const identityMatched = identityRecheck?.status === 'matched';
+      if (!diagnostic || typeof diagnostic !== 'object' || Array.isArray(diagnostic)
+        || !/^[a-f0-9]{64}$/u.test(diagnostic.diagnosticExecutionId)
+        || diagnostic.workItemId !== id || diagnostic.subjectCoreDigest !== snapshot.subjectCoreDigest
+        || diagnostic.finalSubjectDigest !== snapshot.finalSubjectDigest
+        || diagnostic.executionDescriptorDigest !== (item.executionDescriptor?.digest ?? null)
+        || !['queued', 'running', 'completed_pass', 'completed_product_failure', 'cancelled', 'incomplete'].includes(diagnostic.state)
+        || !Number.isSafeInteger(diagnostic.maxAttempts) || diagnostic.maxAttempts < 1 || diagnostic.maxAttempts > 16
+        || !Array.isArray(diagnostic.attempts) || diagnostic.attempts.length > diagnostic.maxAttempts
+        || !canonicalTimestamp(diagnostic.requestedAt, 'diagnostic rerun requestedAt')
+        || !diagnostic.actor || typeof diagnostic.actor.id !== 'string'
+        || !['human', 'service'].includes(diagnostic.actor.kind)
+        || diagnostic.authoritative !== false || !identityRecheck
+        || !['matched', 'mismatch', 'unverified'].includes(identityRecheck.status)
+        || typeof expectedIdentity?.kind !== 'string' || typeof expectedIdentity?.value !== 'string'
+        || canonicalJson(expectedIdentity) !== canonicalJson(snapshot.subjectCore.deploymentIdentity)
+        || (observedIdentity !== null
+          && (typeof observedIdentity?.kind !== 'string' || typeof observedIdentity?.value !== 'string'))
+        || (identityRecheck.status === 'mismatch' && observedIdentity === null)
+        || (identityRecheck.status === 'unverified' && observedIdentity !== null)
+        || (identityRecheck.detail !== undefined
+          && (identityRecheck.status !== 'unverified' || typeof identityRecheck.detail !== 'string'
+            || identityRecheck.detail.length > 512))
+        || !canonicalTimestamp(identityRecheck.checkedAt, 'diagnostic identity checkedAt')
+        || (identityMatched && (canonicalJson(observedIdentity) !== canonicalJson(expectedIdentity)
+          || identityRecheck.reason !== null || diagnostic.terminationReason !== null))
+        || (!identityMatched && (diagnostic.state !== 'incomplete' || diagnostic.attempts.length !== 0
+          || diagnostic.result !== null || diagnostic.lease !== null
+          || identityRecheck.reason !== diagnostic.terminationReason
+          || !['target_identity_mismatch', 'target_identity_unverified'].includes(diagnostic.terminationReason)))
+        || (diagnostic.state === 'queued' && diagnostic.lease !== null)
+        || (diagnostic.state === 'running' && !diagnostic.lease)
+        || (['completed_pass', 'completed_product_failure', 'incomplete'].includes(diagnostic.state)
+          && (diagnostic.lease !== null || (identityMatched && diagnostic.attempts.length < 1)))
+        || (diagnostic.state === 'cancelled' && diagnostic.lease !== null)
+        || (diagnostic.result !== null && (diagnostic.result.authoritative !== false
+          || diagnostic.result.workItemId !== id || diagnostic.result.subjectCoreDigest !== snapshot.subjectCoreDigest))) {
+        fail('STORE_CORRUPT', `Parent run ${runId} has invalid diagnostic execution lineage.`);
+      }
     }
     if (item.executionDescriptor !== null && item.executionDescriptor !== undefined) {
       let descriptor;
@@ -1540,9 +1605,13 @@ async function schedulingStatesUnlocked(store) {
 }
 
 function liveRunningItems(states, store) {
-  return states.flatMap((state) => Object.values(state.workItems)
-    .filter((item) => item.state === 'running' && item.lease && Date.parse(item.lease.expiresAt) > store.clock())
-    .map((item) => ({ state, item })));
+  return states.flatMap((state) => Object.values(state.workItems).flatMap((item) => [
+    ...(item.state === 'running' && item.lease && Date.parse(item.lease.expiresAt) > store.clock()
+      ? [{ state, item, target: item }] : []),
+    ...item.diagnosticExecutions.filter((diagnostic) => diagnostic.state === 'running'
+      && diagnostic.lease && Date.parse(diagnostic.lease.expiresAt) > store.clock())
+      .map((diagnostic) => ({ state, item, target: diagnostic })),
+  ]));
 }
 
 async function reconcilePerformanceSchedulerUnlocked(store, coordinator, states = null) {
@@ -1552,34 +1621,36 @@ async function reconcilePerformanceSchedulerUnlocked(store, coordinator, states 
   const reservation = current.reservation;
   const state = allStates.find(({ runId }) => runId === reservation.runId);
   const item = state?.workItems?.[reservation.workItemId];
+  const target = reservation.diagnosticExecutionId === null ? item
+    : item?.diagnosticExecutions.find(({ diagnosticExecutionId }) => diagnosticExecutionId === reservation.diagnosticExecutionId);
   if (current.phase === 'draining') {
     if (reservation.coordinatorEpoch !== coordinator.epoch || Date.parse(reservation.expiresAt) <= store.clock()
       || !state || state.status !== 'active' || state.authorityTombstone !== null
-      || !item || item.resourceClass !== 'performance'
-      || (!['queued', 'running'].includes(item.state))) {
+      || !item || !target || item.resourceClass !== 'performance'
+      || (!['queued', 'running'].includes(target.state))) {
       return writePerformanceSchedulerUnlocked(store, current, 'idle');
     }
-    if (item.state === 'running') {
-      if (!item.lease || item.lease.workerId !== reservation.workerId
-        || item.lease.epoch !== reservation.coordinatorEpoch) {
+    if (target.state === 'running') {
+      if (!target.lease || target.lease.workerId !== reservation.workerId
+        || target.lease.epoch !== reservation.coordinatorEpoch) {
         fail('STORE_CORRUPT', 'Draining performance reservation disagrees with its running work lease.');
       }
       return writePerformanceSchedulerUnlocked(store, current, 'running', {
         ...reservation,
-        attempt: item.lease.attempt,
-        leaseToken: item.lease.token,
-        acquiredAt: item.lease.claimedAt,
+        attempt: target.lease.attempt,
+        leaseToken: target.lease.token,
+        acquiredAt: target.lease.claimedAt,
       });
     }
     return current;
   }
   if (!state || state.status !== 'active' || state.authorityTombstone !== null || !item
-    || item.state !== 'running' || !item.lease) {
+    || !target || target.state !== 'running' || !target.lease) {
     return writePerformanceSchedulerUnlocked(store, current, 'idle');
   }
-  if (item.resourceClass !== 'performance' || item.lease.workerId !== reservation.workerId
-    || item.lease.attempt !== reservation.attempt || item.lease.epoch !== reservation.coordinatorEpoch
-    || item.lease.token !== reservation.leaseToken) {
+  if (item.resourceClass !== 'performance' || target.lease.workerId !== reservation.workerId
+    || target.lease.attempt !== reservation.attempt || target.lease.epoch !== reservation.coordinatorEpoch
+    || target.lease.token !== reservation.leaseToken) {
     fail('STORE_CORRUPT', 'Running performance scheduler disagrees with its fenced work lease.');
   }
   if (reservation.coordinatorEpoch !== coordinator.epoch) {
@@ -1631,14 +1702,17 @@ export async function requestStorePerformanceDrain(store, coordinator, input) {
     const authorized = new Set(runIds);
     const selected = states
       .filter((state) => authorized.has(state.runId) && state.status === 'active' && state.authorityTombstone === null)
-      .flatMap((state) => Object.values(state.workItems).map((item) => ({ state, item })))
-      .find(({ item }) => item.state === 'queued' && item.resourceClass === 'performance'
-        && workerCanRun(item, worker));
+      .flatMap((state) => Object.values(state.workItems).flatMap((item) => [
+        ...(item.state === 'queued' ? [{ state, item, diagnostic: null }] : []),
+        ...(queuedDiagnostic(item) ? [{ state, item, diagnostic: queuedDiagnostic(item) }] : []),
+      ]))
+      .find(({ item }) => item.resourceClass === 'performance' && workerCanRun(item, worker));
     if (!selected) fail('NO_PERFORMANCE_WORK', 'No authorized queued performance work item is available.');
     const reservation = {
       workerId: worker.workerId,
       runId: selected.state.runId,
       workItemId: selected.item.id,
+      diagnosticExecutionId: selected.diagnostic?.diagnosticExecutionId ?? null,
       coordinatorEpoch: coordinator.epoch,
       requestedAt: timestamp(store),
       expiresAt: new Date(store.clock() + leaseMs).toISOString(),
@@ -1657,8 +1731,8 @@ export function requestPerformanceDrain(store, runId, coordinator, input) {
   });
 }
 
-function createWorkLease(store, state, requested, worker, coordinator, leaseMs) {
-  const attempt = requested.attempts.length + 1;
+function createWorkLease(store, state, requested, worker, coordinator, leaseMs, diagnostic = null) {
+  const attempt = (diagnostic ?? requested).attempts.length + 1;
   return {
     runId: state.runId,
     workItemId: requested.id,
@@ -1676,7 +1750,12 @@ function createWorkLease(store, state, requested, worker, coordinator, leaseMs) 
     specAffinity: requested.specAffinity,
     executionDescriptor: requested.executionDescriptor,
     executionDescriptorDigest: requested.executionDescriptor?.digest ?? null,
+    ...(diagnostic === null ? {} : { diagnosticExecutionId: diagnostic.diagnosticExecutionId }),
   };
+}
+
+function queuedDiagnostic(item) {
+  return item.diagnosticExecutions?.find(({ state }) => state === 'queued') ?? null;
 }
 
 export async function claimStoreWorkItem(store, coordinator, input) {
@@ -1716,46 +1795,63 @@ export async function claimStoreWorkItem(store, coordinator, input) {
       if (!state || !authorized.has(state.runId) || !item) {
         fail('PERFORMANCE_DRAIN_REQUIRED', 'The active performance reservation is outside this worker authorization.');
       }
-      selected = { state, item };
+      const diagnostic = scheduler.reservation.diagnosticExecutionId === null ? null
+        : item?.diagnosticExecutions.find(({ diagnosticExecutionId }) => diagnosticExecutionId === scheduler.reservation.diagnosticExecutionId);
+      selected = { state, item, diagnostic };
     } else if (input.workItemId) {
       const state = states.find((candidate) => authorized.has(candidate.runId)
         && candidate.workItems[input.workItemId]);
       const item = state?.workItems?.[input.workItemId];
       if (!state || !item) fail('NO_WORK_AVAILABLE', `Work item ${input.workItemId} is unavailable.`);
-      if (item.state !== 'queued') {
+      const diagnostic = queuedDiagnostic(item);
+      if (item.state !== 'queued' && diagnostic === null) {
         if (['completed_pass', 'completed_product_failure', 'cancelled', 'incomplete'].includes(item.state)) {
           fail('WORK_ITEM_TERMINAL', `Work item ${item.id} is terminal.`);
         }
         fail('WORK_ITEM_LEASE_HELD', `Work item ${item.id} already has an active lease.`);
       }
-      selected = { state, item };
+      selected = { state, item, diagnostic };
     } else {
       selected = states
         .filter((state) => authorized.has(state.runId) && state.status === 'active' && state.authorityTombstone === null)
-        .flatMap((state) => Object.values(state.workItems).map((item) => ({ state, item })))
-        .find(({ item }) => item.state === 'queued' && workerCanRun(item, worker));
+        .flatMap((state) => Object.values(state.workItems).flatMap((item) => [
+          ...(item.state === 'queued' ? [{ state, item, diagnostic: null }] : []),
+          ...(queuedDiagnostic(item) ? [{ state, item, diagnostic: queuedDiagnostic(item) }] : []),
+        ]))
+        .find(({ item }) => workerCanRun(item, worker));
     }
     if (!selected) {
       const queued = states.some((state) => authorized.has(state.runId)
-        && Object.values(state.workItems).some(({ state: workState }) => workState === 'queued'));
+        && Object.values(state.workItems).some((item) => item.state === 'queued' || queuedDiagnostic(item)));
       fail(queued ? 'NO_COMPATIBLE_WORK' : 'NO_WORK_AVAILABLE', queued
         ? 'No queued work item matches this worker capability.'
         : 'No queued work item is available.');
     }
-    const { state: selectedState, item: selectedItem } = selected;
+    const { state: selectedState, item: selectedItem, diagnostic: selectedDiagnostic = null } = selected;
     if (selectedState.status === 'cancelled') fail('RUN_CANCELLED', `Parent run ${selectedState.runId} is cancelled.`);
-    if (selectedItem.state !== 'queued') fail('WORK_ITEM_LEASE_HELD', `Work item ${selectedItem.id} is not queued.`);
+    if (selectedDiagnostic === null && selectedItem.state !== 'queued') fail('WORK_ITEM_LEASE_HELD', `Work item ${selectedItem.id} is not queued.`);
+    if (selectedDiagnostic !== null && selectedDiagnostic.state !== 'queued') fail('WORK_ITEM_LEASE_HELD', `Diagnostic execution ${selectedDiagnostic.diagnosticExecutionId} is not queued.`);
     if (!workerCanRun(selectedItem, worker)) fail('WORKER_CAPABILITY_MISMATCH', `Worker cannot execute ${selectedItem.id}.`);
     return withDirectoryLock(store.storage, lockPath(store, selectedState.runId), async () => {
       const state = await recoverUnlocked(store, selectedState.runId);
       const requested = state.workItems[selectedItem.id];
-      if (!requested || requested.state !== 'queued') fail('WORK_ITEM_LEASE_HELD', `Work item ${selectedItem.id} is not queued.`);
-      const claimed = createWorkLease(store, state, requested, worker, coordinator, input.leaseMs);
+      const diagnostic = selectedDiagnostic === null ? null
+        : requested?.diagnosticExecutions.find(({ diagnosticExecutionId }) => diagnosticExecutionId === selectedDiagnostic.diagnosticExecutionId);
+      if (!requested || (diagnostic === null ? requested.state !== 'queued' : diagnostic.state !== 'queued')) {
+        fail('WORK_ITEM_LEASE_HELD', `Work item ${selectedItem.id} is not queued.`);
+      }
+      const claimed = createWorkLease(store, state, requested, worker, coordinator, input.leaseMs, diagnostic);
       await appendMutationUnlocked(store, state, 'mutation', 'work-item-claimed', (next) => {
         const item = next.workItems[requested.id];
-        item.state = 'running';
-        item.lease = claimed;
-      }, { data: { workerId: worker.workerId, workItemId: requested.id } });
+        if (diagnostic === null) {
+          item.state = 'running';
+          item.lease = claimed;
+        } else {
+          const mutable = item.diagnosticExecutions.find(({ diagnosticExecutionId }) => diagnosticExecutionId === diagnostic.diagnosticExecutionId);
+          mutable.state = 'running';
+          mutable.lease = claimed;
+        }
+      }, { data: { workerId: worker.workerId, workItemId: requested.id, diagnosticExecutionId: diagnostic?.diagnosticExecutionId ?? null } });
       if (requested.resourceClass === 'performance') {
         await writePerformanceSchedulerUnlocked(store, scheduler, 'running', {
           ...scheduler.reservation,
@@ -1778,13 +1874,17 @@ function validateWorkLease(state, lease) {
     fail('WORK_RESULT_BINDING_MISMATCH', 'Work-item lease belongs to a different parent run.');
   }
   const item = state.workItems[lease?.workItemId];
-  if (!item || item.state !== 'running' || !item.lease
-    || item.lease.token !== lease.token || item.lease.workerId !== lease.workerId
-    || item.lease.attempt !== lease.attempt || item.lease.epoch !== lease.epoch
-    || Date.parse(item.lease.expiresAt) <= state.clockNow) {
+  const target = lease?.diagnosticExecutionId === undefined
+    ? item
+    : item?.diagnosticExecutions?.find(({ diagnosticExecutionId }) => diagnosticExecutionId === lease.diagnosticExecutionId);
+  if (!item || !target || target.state !== 'running' || !target.lease
+    || target.lease.token !== lease.token || target.lease.workerId !== lease.workerId
+    || target.lease.attempt !== lease.attempt || target.lease.epoch !== lease.epoch
+    || target.lease.diagnosticExecutionId !== lease.diagnosticExecutionId
+    || Date.parse(target.lease.expiresAt) <= state.clockNow) {
     fail('STALE_WORK_LEASE', 'Work-item lease or fencing token is stale.');
   }
-  return item;
+  return target;
 }
 
 export async function heartbeatWorkItem(store, runId, lease, { leaseMs = 500 } = {}) {
@@ -1802,6 +1902,7 @@ export async function heartbeatWorkItem(store, runId, lease, { leaseMs = 500 } =
     attempt: lease.attempt,
     coordinatorEpoch: lease.epoch,
     leaseToken: lease.token,
+    diagnosticExecutionId: lease.diagnosticExecutionId ?? null,
     publishedAt: timestamp(store),
     requestedExpiresAt: new Date(store.clock() + leaseMs).toISOString(),
   };
@@ -1819,7 +1920,7 @@ export async function adoptWorkHeartbeat(store, runId, coordinator, receipt) {
   const { digest, ...body } = document;
   exactKeys(document, [
     'schemaVersion', 'kind', 'runId', 'workItemId', 'workerId', 'attempt', 'coordinatorEpoch',
-    'leaseToken', 'publishedAt', 'requestedExpiresAt', 'digest',
+    'leaseToken', 'diagnosticExecutionId', 'publishedAt', 'requestedExpiresAt', 'digest',
   ], 'attempt heartbeat inbox');
   const publishedAt = canonicalTimestamp(document.publishedAt, 'heartbeat publishedAt');
   const requestedExpiresAt = canonicalTimestamp(document.requestedExpiresAt, 'heartbeat requestedExpiresAt');
@@ -1828,6 +1929,7 @@ export async function adoptWorkHeartbeat(store, runId, coordinator, receipt) {
     || !SAFE_ID.test(document.workItemId) || !SAFE_ID.test(document.workerId)
     || !Number.isSafeInteger(document.attempt) || document.attempt < 1
     || !Number.isSafeInteger(document.coordinatorEpoch) || document.coordinatorEpoch < 1
+    || (document.diagnosticExecutionId !== null && !/^[a-f0-9]{64}$/u.test(document.diagnosticExecutionId))
     || Date.parse(requestedExpiresAt) <= Date.parse(publishedAt)
     || Date.parse(requestedExpiresAt) - Date.parse(publishedAt) > 3_600_000
     || digest !== receipt.digest || digest !== canonicalDigest(body)) fail('STORE_CORRUPT', 'Attempt heartbeat inbox is corrupt.');
@@ -1837,14 +1939,17 @@ export async function adoptWorkHeartbeat(store, runId, coordinator, receipt) {
   let renewed;
   await mutate(store, runId, { coordinator, type: 'work-item-heartbeat-adopted', data: { workItemId: document.workItemId } }, (state) => {
     const item = state.workItems[document.workItemId];
-    if (!item || item.state !== 'running' || !item.lease
-      || item.lease.token !== document.leaseToken || item.lease.workerId !== document.workerId
-      || item.lease.attempt !== document.attempt || item.lease.epoch !== document.coordinatorEpoch
-      || Date.parse(document.publishedAt) > Date.parse(item.lease.expiresAt)) {
+    const target = document.diagnosticExecutionId === null ? item
+      : item?.diagnosticExecutions?.find(({ diagnosticExecutionId }) => diagnosticExecutionId === document.diagnosticExecutionId);
+    if (!target || target.state !== 'running' || !target.lease
+      || target.lease.token !== document.leaseToken || target.lease.workerId !== document.workerId
+      || target.lease.attempt !== document.attempt || target.lease.epoch !== document.coordinatorEpoch
+      || target.lease.diagnosticExecutionId !== (document.diagnosticExecutionId ?? undefined)
+      || Date.parse(document.publishedAt) > Date.parse(target.lease.expiresAt)) {
       fail('STALE_WORK_LEASE', 'Heartbeat was published after its fenced lease expired.');
     }
-    renewed = { ...item.lease, expiresAt: document.requestedExpiresAt };
-    item.lease = renewed;
+    renewed = { ...target.lease, expiresAt: document.requestedExpiresAt };
+    target.lease = renewed;
   });
   return clone(renewed);
 }
@@ -1854,7 +1959,10 @@ async function quarantineFailedAttemptEvidenceUnlocked(store, runId, state) {
   const quarantineRoot = containedPath(runRoot, 'quarantine', 'orphan-attempts');
   const quarantined = [];
   for (const item of Object.values(state.workItems)) {
-    for (const attempt of item.attempts) {
+    for (const attempt of [
+      ...item.attempts,
+      ...item.diagnosticExecutions.flatMap(({ attempts }) => attempts),
+    ]) {
       if (attempt.outcome !== 'operational_failure' || !SAFE_ID.test(attempt.leaseToken ?? '')) continue;
       const key = `${String(attempt.attempt).padStart(6, '0')}-${attempt.leaseToken}`;
       for (const [kind, source] of [
@@ -1883,12 +1991,16 @@ export async function requeueExpiredWork(store, runId, coordinator) {
       .filter((item) => item.state === 'running'
         && (Date.parse(item.lease.expiresAt) <= store.clock() || item.lease.epoch !== coordinator.epoch))
       .map((item) => item.id);
+    const expiredDiagnostics = Object.values(state.workItems).flatMap((item) => item.diagnosticExecutions
+      .filter((diagnostic) => diagnostic.state === 'running'
+        && (Date.parse(diagnostic.lease.expiresAt) <= store.clock() || diagnostic.lease.epoch !== coordinator.epoch))
+      .map((diagnostic) => ({ workItemId: item.id, diagnosticExecutionId: diagnostic.diagnosticExecutionId })));
     const drainExpired = state.resourceScheduling.performanceDrain
       && Date.parse(state.resourceScheduling.performanceDrain.expiresAt) <= store.clock();
     const exclusiveExpired = state.resourceScheduling.exclusiveLease
       && Date.parse(state.resourceScheduling.exclusiveLease.expiresAt) <= store.clock();
     let current = state;
-    if (expiredIds.length > 0 || drainExpired || exclusiveExpired) {
+    if (expiredIds.length > 0 || expiredDiagnostics.length > 0 || drainExpired || exclusiveExpired) {
       current = await appendMutationUnlocked(store, state, 'mutation', 'expired-work-requeued', (next) => {
         for (const id of expiredIds) {
           const item = next.workItems[id];
@@ -1916,22 +2028,48 @@ export async function requeueExpiredWork(store, runId, coordinator) {
           item.lease = null;
           item.state = item.attempts.length >= item.maxAttempts ? 'incomplete' : 'queued';
         }
-        if (exclusiveExpired || expiredIds.some((id) => next.workItems[id].resourceClass === 'performance')) {
+        for (const { workItemId, diagnosticExecutionId } of expiredDiagnostics) {
+          const item = next.workItems[workItemId];
+          const diagnostic = item.diagnosticExecutions.find((entry) => entry.diagnosticExecutionId === diagnosticExecutionId);
+          const reason = diagnostic.lease.epoch !== coordinator.epoch ? 'coordinator-epoch-fenced' : 'lease-expired';
+          const result = sealWorkItemResult({
+            schemaVersion: 1, workItemId, subjectCoreDigest: next.subjectCoreDigest,
+            attempt: diagnostic.lease.attempt, authoritative: false,
+            outcome: 'operational_failure', evidenceDigests: [],
+          });
+          diagnostic.attempts.push({
+            attempt: diagnostic.lease.attempt, outcome: 'operational_failure', evidenceDigests: [], artifacts: [],
+            workerId: diagnostic.lease.workerId, leaseToken: diagnostic.lease.token,
+            completedAt: timestamp(store), reason, canonicalResultDigest: result.digest,
+          });
+          diagnostic.lease = null;
+          diagnostic.state = diagnostic.attempts.length >= diagnostic.maxAttempts ? 'incomplete' : 'queued';
+        }
+        if (exclusiveExpired || expiredIds.some((id) => next.workItems[id].resourceClass === 'performance')
+          || expiredDiagnostics.some(({ workItemId }) => next.workItems[workItemId].resourceClass === 'performance')) {
           next.resourceScheduling.exclusiveLease = null;
         }
         if (drainExpired || expiredIds.some((id) => next.workItems[id].resourceClass === 'performance'
-          && next.workItems[id].state === 'incomplete')) {
+          && next.workItems[id].state === 'incomplete')
+          || expiredDiagnostics.some(({ workItemId, diagnosticExecutionId }) => {
+            const item = next.workItems[workItemId];
+            return item.resourceClass === 'performance'
+              && item.diagnosticExecutions.find((entry) => entry.diagnosticExecutionId === diagnosticExecutionId)?.state === 'incomplete';
+          })) {
           next.resourceScheduling.performanceDrain = null;
         }
       });
     }
     const scheduler = await readPerformanceSchedulerUnlocked(store);
     if (scheduler.phase !== 'idle' && scheduler.reservation.runId === runId
-      && expiredIds.includes(scheduler.reservation.workItemId)) {
+      && (expiredIds.includes(scheduler.reservation.workItemId)
+        || expiredDiagnostics.some(({ workItemId, diagnosticExecutionId }) => (
+          workItemId === scheduler.reservation.workItemId
+          && diagnosticExecutionId === scheduler.reservation.diagnosticExecutionId)))) {
       await writePerformanceSchedulerUnlocked(store, scheduler, 'idle');
     }
     ({ quarantineRoot } = await quarantineFailedAttemptEvidenceUnlocked(store, runId, current));
-    return expiredIds.length;
+    return expiredIds.length + expiredDiagnostics.length;
   }));
   if (quarantineRoot) await store.storage.fs.rm(quarantineRoot, { recursive: true, force: true });
   return expiredCount;
@@ -1941,12 +2079,13 @@ export async function publishAttemptEvidence(store, runId, lease, result) {
   const state = await recoverUnlocked(store, runId, { repairCache: false });
   validateWorkLease(state, lease);
   if (!result || typeof result !== 'object' || Array.isArray(result)
-    || Object.keys(result).some((key) => !['outcome', 'reason', 'artifacts', 'executionDescriptorDigest', 'riskSourceObservationSet'].includes(key))
+    || Object.keys(result).some((key) => !['outcome', 'reason', 'artifacts', 'executionDescriptorDigest', 'riskSourceObservationSet', 'productFailureSignature'].includes(key))
     || !WORK_OUTCOMES.has(result?.outcome) || !Array.isArray(result.artifacts)
     || result.artifacts.length > MAX_ATTEMPT_ARTIFACTS) {
     fail('STORE_SCHEMA_INVALID', 'Attempt evidence outcome or artifacts are invalid.');
   }
   const evidenceBindingDigest = lease.executionDescriptorDigest ?? lease.subjectCoreDigest ?? state.subjectCoreDigest;
+  const productFailureSignature = normalizedProductFailureSignature(result.productFailureSignature, result.outcome);
   const uploads = result.artifacts.map((artifact, index) => decodeArtifactUpload(artifact, {
     workItemId: lease.workItemId,
     executionDescriptorDigest: evidenceBindingDigest,
@@ -1996,10 +2135,12 @@ export async function publishAttemptEvidence(store, runId, lease, result) {
     attempt: lease.attempt,
     coordinatorEpoch: lease.epoch,
     leaseToken: lease.token,
+    diagnosticExecutionId: lease.diagnosticExecutionId ?? null,
     subjectCoreDigest: lease.subjectCoreDigest ?? state.subjectCoreDigest,
     runnerRevision: lease.runnerRevision ?? state.runnerRevision,
     executionDescriptorDigest: result.executionDescriptorDigest ?? lease.executionDescriptorDigest ?? null,
     outcome: result.outcome,
+    productFailureSignature,
     reason: schedulingString(result.reason ?? null, 'Attempt evidence reason', { nullable: true, maximum: 256 }),
     riskSourceObservationSet: normalizedRiskSourceObservationSet(result.riskSourceObservationSet, {
       runId,
@@ -2044,10 +2185,11 @@ async function readAttemptEvidenceUploadIntent(store, runId, binding) {
     containedPath(runDirectory(store, runId), ...relativePath.split('/')),
     { label: 'attempt evidence upload intent', maximumBytes: 262_144 });
   const { digest, ...body } = document;
+  const signatureAware = 'productFailureSignature' in document;
   exactKeys(document, [
     'schemaVersion', 'kind', 'runId', 'workItemId', 'workerId', 'attempt', 'coordinatorEpoch',
-    'leaseToken', 'subjectCoreDigest', 'runnerRevision', 'executionDescriptorDigest', 'outcome', 'reason',
-    'riskSourceObservationSet', 'artifacts', 'createdAt', 'digest',
+    'leaseToken', 'diagnosticExecutionId', 'subjectCoreDigest', 'runnerRevision', 'executionDescriptorDigest', 'outcome', 'reason',
+    'riskSourceObservationSet', ...(signatureAware ? ['productFailureSignature'] : []), 'artifacts', 'createdAt', 'digest',
   ], 'attempt evidence upload intent');
   if (document.schemaVersion !== 1 || document.kind !== 'attempt-evidence-upload-intent'
     || document.runId !== runId || document.workItemId !== binding.workItemId
@@ -2059,10 +2201,13 @@ async function readAttemptEvidenceUploadIntent(store, runId, binding) {
   if (!SAFE_ID.test(document.workItemId) || !SAFE_ID.test(document.workerId) || !SAFE_ID.test(document.leaseToken)
     || !Number.isSafeInteger(document.attempt) || document.attempt < 1
     || !Number.isSafeInteger(document.coordinatorEpoch) || document.coordinatorEpoch < 1
+    || (document.diagnosticExecutionId !== null && !/^[a-f0-9]{64}$/u.test(document.diagnosticExecutionId))
     || !DIGEST_PATTERN.test(document.subjectCoreDigest)
     || typeof document.runnerRevision !== 'string' || !document.runnerRevision || document.runnerRevision.length > 512
     || (document.executionDescriptorDigest !== null && !DIGEST_PATTERN.test(document.executionDescriptorDigest))
     || !['completed_pass', 'completed_product_failure'].includes(document.outcome)
+    || (signatureAware && canonicalJson(normalizedProductFailureSignature(
+      document.productFailureSignature, document.outcome, 'STORE_CORRUPT')) !== canonicalJson(document.productFailureSignature))
     || (document.reason !== null && (typeof document.reason !== 'string' || !document.reason || document.reason.length > 256))) {
     fail('STORE_CORRUPT', 'Attempt evidence upload intent metadata is invalid.');
   }
@@ -2097,7 +2242,7 @@ export async function createAttemptEvidenceUploadIntent(store, runId, lease, res
   const state = await recoverUnlocked(store, runId, { repairCache: false });
   validateWorkLease(state, lease);
   if (!result || typeof result !== 'object' || Array.isArray(result)
-    || Object.keys(result).some((key) => !['outcome', 'reason', 'artifacts', 'executionDescriptorDigest', 'riskSourceObservationSet'].includes(key))
+    || Object.keys(result).some((key) => !['outcome', 'reason', 'artifacts', 'executionDescriptorDigest', 'riskSourceObservationSet', 'productFailureSignature'].includes(key))
     || !['completed_pass', 'completed_product_failure'].includes(result.outcome)
     || !Array.isArray(result.artifacts) || result.artifacts.length > MAX_ATTEMPT_ARTIFACTS) {
     fail('STORE_SCHEMA_INVALID', 'Attempt evidence upload intent has an invalid result schema.');
@@ -2107,6 +2252,7 @@ export async function createAttemptEvidenceUploadIntent(store, runId, lease, res
     fail('WORK_DESCRIPTOR_BINDING_MISMATCH', 'Attempt evidence upload intent does not match the compiler-issued execution descriptor.');
   }
   const evidenceBindingDigest = lease.executionDescriptorDigest ?? lease.subjectCoreDigest ?? state.subjectCoreDigest;
+  const productFailureSignature = normalizedProductFailureSignature(result.productFailureSignature, result.outcome);
   const artifacts = result.artifacts.map((artifact, index) => normalizeArtifactDeclaration(artifact, {
     workItemId: lease.workItemId,
     executionDescriptorDigest: evidenceBindingDigest,
@@ -2125,10 +2271,12 @@ export async function createAttemptEvidenceUploadIntent(store, runId, lease, res
     attempt: lease.attempt,
     coordinatorEpoch: lease.epoch,
     leaseToken: lease.token,
+    diagnosticExecutionId: lease.diagnosticExecutionId ?? null,
     subjectCoreDigest: lease.subjectCoreDigest ?? state.subjectCoreDigest,
     runnerRevision: lease.runnerRevision ?? state.runnerRevision,
     executionDescriptorDigest: expectedDescriptorDigest,
     outcome: result.outcome,
+    productFailureSignature,
     reason: schedulingString(result.reason ?? null, 'Attempt evidence reason', { nullable: true, maximum: 256 }),
     riskSourceObservationSet: normalizedRiskSourceObservationSet(result.riskSourceObservationSet, {
       runId,
@@ -2190,6 +2338,7 @@ export async function uploadAttemptEvidenceArtifact(store, runId, binding, chunk
     attempt: intent.attempt,
     epoch: intent.coordinatorEpoch,
     token: intent.leaseToken,
+    ...(intent.diagnosticExecutionId === null ? {} : { diagnosticExecutionId: intent.diagnosticExecutionId }),
   });
   const artifact = intent.artifacts[binding.ordinal - 1];
   if (binding.contentLength !== artifact.sizeBytes
@@ -2238,6 +2387,7 @@ export async function uploadAttemptEvidenceArtifact(store, runId, binding, chunk
       attempt: intent.attempt,
       epoch: intent.coordinatorEpoch,
       token: intent.leaseToken,
+      ...(intent.diagnosticExecutionId === null ? {} : { diagnosticExecutionId: intent.diagnosticExecutionId }),
     });
     try {
       await store.storage.fs.link(temporary, destination);
@@ -2274,7 +2424,9 @@ export async function finalizeAttemptEvidenceUpload(store, runId, binding) {
   }
   const state = await recoverUnlocked(store, runId, { repairCache: false });
   const item = state.workItems[intent.workItemId];
-  const alreadyAdopted = item?.attempts?.find((attempt) => attempt.attempt === intent.attempt
+  const attemptLineage = intent.diagnosticExecutionId === null ? item?.attempts
+    : item?.diagnosticExecutions?.find(({ diagnosticExecutionId }) => diagnosticExecutionId === intent.diagnosticExecutionId)?.attempts;
+  const alreadyAdopted = attemptLineage?.find((attempt) => attempt.attempt === intent.attempt
     && attempt.workerId === intent.workerId && attempt.leaseToken === intent.leaseToken
     && attempt.uploadIntentDigest === intent.digest && attempt.inboxDigest);
   if (!alreadyAdopted) {
@@ -2285,6 +2437,7 @@ export async function finalizeAttemptEvidenceUpload(store, runId, binding) {
       attempt: intent.attempt,
       epoch: intent.coordinatorEpoch,
       token: intent.leaseToken,
+      ...(intent.diagnosticExecutionId === null ? {} : { diagnosticExecutionId: intent.diagnosticExecutionId }),
     });
   }
   const attemptDirectory = path.posix.join('evidence', intent.workItemId,
@@ -2309,11 +2462,13 @@ export async function finalizeAttemptEvidenceUpload(store, runId, binding) {
     attempt: intent.attempt,
     coordinatorEpoch: intent.coordinatorEpoch,
     leaseToken: intent.leaseToken,
+    diagnosticExecutionId: intent.diagnosticExecutionId,
     subjectCoreDigest: intent.subjectCoreDigest,
     runnerRevision: intent.runnerRevision,
     executionDescriptorDigest: intent.executionDescriptorDigest,
     uploadIntentDigest: intent.digest,
     outcome: intent.outcome,
+    ...('productFailureSignature' in intent ? { productFailureSignature: intent.productFailureSignature } : {}),
     reason: intent.reason,
     riskSourceObservationSet: intent.riskSourceObservationSet,
     evidenceDigests: artifacts.map(({ memberDigest }) => memberDigest),
@@ -2367,6 +2522,7 @@ export async function appendAttemptLog(store, runId, lease, entry) {
     attempt: lease.attempt,
     coordinatorEpoch: lease.epoch,
     leaseToken: lease.token,
+    diagnosticExecutionId: lease.diagnosticExecutionId ?? null,
     sequence: entry.sequence,
     level: entry.level,
     message: entry.message,
@@ -2388,20 +2544,28 @@ export async function adoptAttemptEvidence(store, runId, coordinator, inbox) {
   const { digest, ...body } = document;
   const inboxKeys = [
     'schemaVersion', 'kind', 'runId', 'workItemId', 'workerId', 'attempt', 'coordinatorEpoch',
-    'leaseToken', 'subjectCoreDigest', 'runnerRevision', 'executionDescriptorDigest', 'outcome', 'reason', 'riskSourceObservationSet', 'evidenceDigests', 'artifacts', 'publishedAt', 'digest',
+    'leaseToken', 'diagnosticExecutionId', 'subjectCoreDigest', 'runnerRevision', 'executionDescriptorDigest', 'outcome', 'reason', 'riskSourceObservationSet', 'evidenceDigests', 'artifacts', 'publishedAt', 'digest',
   ];
+  const signatureAware = 'productFailureSignature' in document;
   const streamedUpload = 'uploadIntentDigest' in document;
-  exactKeys(document, streamedUpload ? [...inboxKeys, 'uploadIntentDigest'] : inboxKeys, 'attempt evidence inbox');
+  exactKeys(document, [
+    ...inboxKeys,
+    ...(signatureAware ? ['productFailureSignature'] : []),
+    ...(streamedUpload ? ['uploadIntentDigest'] : []),
+  ], 'attempt evidence inbox');
   canonicalTimestamp(document.publishedAt, 'attempt evidence publishedAt');
   if (document.schemaVersion !== 1 || document.kind !== 'attempt-evidence-inbox' || document.runId !== runId
     || document.workItemId !== inbox.workItemId || document.attempt !== inbox.attempt
     || document.leaseToken !== inbox.leaseToken || !SAFE_ID.test(document.workItemId) || !SAFE_ID.test(document.workerId)
     || !Number.isSafeInteger(document.attempt) || document.attempt < 1
     || !Number.isSafeInteger(document.coordinatorEpoch) || document.coordinatorEpoch < 1
+    || (document.diagnosticExecutionId !== null && !/^[a-f0-9]{64}$/u.test(document.diagnosticExecutionId))
     || !WORK_OUTCOMES.has(document.outcome) || !Array.isArray(document.evidenceDigests) || !Array.isArray(document.artifacts)
     || (document.reason !== null && (typeof document.reason !== 'string' || !document.reason || document.reason.length > 256))
     || document.evidenceDigests.length > MAX_ATTEMPT_ARTIFACTS || document.artifacts.length !== document.evidenceDigests.length
     || document.evidenceDigests.some((entry) => !DIGEST_PATTERN.test(entry))
+    || (signatureAware && canonicalJson(normalizedProductFailureSignature(
+      document.productFailureSignature, document.outcome, 'STORE_CORRUPT')) !== canonicalJson(document.productFailureSignature))
     || (streamedUpload && !DIGEST_PATTERN.test(document.uploadIntentDigest))
     || digest !== canonicalDigest(body) || digest !== inbox.digest) fail('STORE_CORRUPT', 'Attempt evidence inbox is corrupt.');
   if (document.subjectCoreDigest !== state.subjectCoreDigest || document.runnerRevision !== state.runnerRevision) {
@@ -2419,11 +2583,18 @@ export async function adoptAttemptEvidence(store, runId, coordinator, inbox) {
     fail('WORK_DESCRIPTOR_BINDING_MISMATCH', 'Attempt evidence does not match the compiler-issued execution descriptor.');
   }
   const existingItem = state.workItems[document.workItemId];
-  const existingAttempt = existingItem?.attempts?.find((attempt) => attempt.attempt === document.attempt
+  const existingLineage = document.diagnosticExecutionId === null ? existingItem?.attempts
+    : existingItem?.diagnosticExecutions?.find(({ diagnosticExecutionId }) => diagnosticExecutionId === document.diagnosticExecutionId)?.attempts;
+  const existingAttempt = existingLineage?.find((attempt) => attempt.attempt === document.attempt
     && attempt.workerId === document.workerId && attempt.inboxDigest === digest
     && (!streamedUpload || (attempt.leaseToken === document.leaseToken
       && attempt.uploadIntentDigest === document.uploadIntentDigest)));
-  if (existingAttempt) return clone(existingItem);
+  if (existingAttempt) {
+    if (document.diagnosticExecutionId === null) return clone(existingItem);
+    const diagnostic = existingItem.diagnosticExecutions.find(
+      ({ diagnosticExecutionId }) => diagnosticExecutionId === document.diagnosticExecutionId);
+    return clone({ ...diagnostic, id: existingItem.id });
+  }
   if (document.coordinatorEpoch !== coordinator?.epoch) {
     fail('STALE_WORK_LEASE', 'Attempt evidence belongs to a stale coordinator epoch.');
   }
@@ -2450,22 +2621,25 @@ export async function adoptAttemptEvidence(store, runId, coordinator, inbox) {
   }
   let adopted;
   await appendMutationUnlocked(store, state, 'mutation', 'attempt-evidence-adopted', (next) => {
-    const item = validateWorkLease(next, {
+    const target = validateWorkLease(next, {
       runId,
       workItemId: document.workItemId,
       workerId: document.workerId,
       attempt: document.attempt,
       epoch: document.coordinatorEpoch,
       token: document.leaseToken,
+      ...(document.diagnosticExecutionId === null ? {} : { diagnosticExecutionId: document.diagnosticExecutionId }),
     });
     const canonicalResult = sealWorkItemResult({
       schemaVersion: 1,
       workItemId: document.workItemId,
       subjectCoreDigest: next.subjectCoreDigest,
       attempt: document.attempt,
-      authoritative: !next.executionManifest?.contextWorkItemIds.includes(document.workItemId),
+      authoritative: document.diagnosticExecutionId === null
+        && !next.executionManifest?.contextWorkItemIds.includes(document.workItemId),
       outcome: document.outcome,
       evidenceDigests: document.evidenceDigests,
+      ...(signatureAware ? { productFailureSignature: document.productFailureSignature } : {}),
     });
     const attempt = {
       attempt: document.attempt,
@@ -2476,28 +2650,39 @@ export async function adoptAttemptEvidence(store, runId, coordinator, inbox) {
       leaseToken: document.leaseToken,
       completedAt: timestamp(store),
       reason: document.reason,
+      ...(signatureAware ? { productFailureSignature: document.productFailureSignature } : {}),
       inboxDigest: digest,
       ...(streamedUpload ? { uploadIntentDigest: document.uploadIntentDigest } : {}),
       canonicalResultDigest: canonicalResult.digest,
       riskSourceObservationSet,
     };
-    item.attempts.push(attempt);
-    item.lease = null;
-    if (document.outcome === 'completed_pass' || document.outcome === 'completed_product_failure') {
-      item.state = document.outcome;
-      item.canonicalResult = canonicalResult;
-      item.canonicalRiskSourceObservationSet = riskSourceObservationSet;
-    } else if (document.outcome === 'operational_failure' && item.attempts.length < item.maxAttempts) {
-      item.state = 'queued';
+    target.attempts.push(attempt);
+    target.lease = null;
+    if (document.diagnosticExecutionId !== null) {
+      if (document.outcome === 'completed_pass' || document.outcome === 'completed_product_failure') {
+        target.state = document.outcome;
+        target.result = canonicalResult;
+      } else if (document.outcome === 'operational_failure' && target.attempts.length < target.maxAttempts) {
+        target.state = 'queued';
+      } else {
+        target.state = 'incomplete';
+      }
+    } else if (document.outcome === 'completed_pass' || document.outcome === 'completed_product_failure') {
+      target.state = document.outcome;
+      target.canonicalResult = canonicalResult;
+      target.canonicalRiskSourceObservationSet = riskSourceObservationSet;
+    } else if (document.outcome === 'operational_failure' && target.attempts.length < target.maxAttempts) {
+      target.state = 'queued';
     } else {
-      item.state = document.outcome === 'cancelled' ? 'cancelled' : 'incomplete';
+      target.state = document.outcome === 'cancelled' ? 'cancelled' : 'incomplete';
     }
+    const item = next.workItems[document.workItemId];
     if (item.resourceClass === 'performance') {
       next.resourceScheduling.exclusiveLease = null;
-      if (item.state !== 'queued') next.resourceScheduling.performanceDrain = null;
+      if (target.state !== 'queued') next.resourceScheduling.performanceDrain = null;
     }
-    adopted = clone(item);
-  }, { data: { workItemId: document.workItemId, digest } });
+    adopted = document.diagnosticExecutionId === null ? clone(item) : clone({ ...target, id: item.id });
+  }, { data: { workItemId: document.workItemId, diagnosticExecutionId: document.diagnosticExecutionId, digest } });
   const scheduler = await readPerformanceSchedulerUnlocked(store);
   if (scheduler.phase === 'running' && scheduler.reservation.runId === runId
     && scheduler.reservation.workItemId === document.workItemId
@@ -2543,21 +2728,23 @@ export async function listAdoptedAttemptArtifacts(store, runId, { offset = 0, li
     ...Object.values(state.workItems),
   ].sort((left, right) => left.id.localeCompare(right.id));
   for (const item of items) {
-    const attempt = canonicalTerminalAttempt(item);
-    if (!attempt) continue;
-    for (let ordinal = 0; ordinal < attempt.artifacts.length; ordinal += 1) {
-      const value = attempt.artifacts[ordinal];
-      const artifact = validateArtifactRecord(value, {
-        runId, workItemId: item.id, attempt: attempt.attempt, leaseToken: attempt.leaseToken,
-      });
-      if (isRawAttemptLogArtifact(artifact.name)) continue;
-      if (visibleCount >= offset && descriptors.length < limit) {
-        descriptors.push(publicArtifactDescriptor(runId, item, attempt, artifact, ordinal + 1));
-      } else if (visibleCount >= offset + limit) {
-        hasMore = true;
-        break;
+    for (const lineage of terminalArtifactLineages(item)) {
+      const { attempt } = lineage;
+      for (let ordinal = 0; ordinal < attempt.artifacts.length; ordinal += 1) {
+        const value = attempt.artifacts[ordinal];
+        const artifact = validateArtifactRecord(value, {
+          runId, workItemId: item.id, attempt: attempt.attempt, leaseToken: attempt.leaseToken,
+        });
+        if (isRawAttemptLogArtifact(artifact.name)) continue;
+        if (visibleCount >= offset && descriptors.length < limit) {
+          descriptors.push(publicArtifactDescriptor(runId, item, lineage, artifact, ordinal + 1));
+        } else if (visibleCount >= offset + limit) {
+          hasMore = true;
+          break;
+        }
+        visibleCount += 1;
       }
-      visibleCount += 1;
+      if (hasMore) break;
     }
     if (hasMore) break;
   }
@@ -2594,7 +2781,7 @@ export async function openAdoptedAttemptArtifact(store, runId, input) {
     }
     const integrityFingerprint = await verifyOpenedArtifactIntegrity(store, handle, stat, descriptor, transferLease);
     return {
-      descriptor: publicArtifactDescriptor(runId, descriptor.item, descriptor.attempt, descriptor, descriptor.ordinal),
+      descriptor: publicArtifactDescriptor(runId, descriptor.item, descriptor.lineage, descriptor, descriptor.ordinal),
       opened: {
         handle,
         stat,
@@ -2699,22 +2886,37 @@ async function resolveAdoptedAttemptArtifact(store, runId, input) {
   }
   const item = state.workItems[workItemId]
     ?? (state.compilationBarrier?.id === workItemId ? state.compilationBarrier : null);
-  const attempt = canonicalTerminalAttempt(item);
-  if (!item || !attempt) {
+  const lineages = terminalArtifactLineages(item);
+  const requestedDiagnosticExecutionId = input?.diagnosticExecutionId === undefined
+    ? null
+    : input.diagnosticExecutionId;
+  if (requestedDiagnosticExecutionId !== null && !/^[a-f0-9]{64}$/u.test(requestedDiagnosticExecutionId)) {
+    fail('STORE_SCHEMA_INVALID', 'Diagnostic artifact lookup has an invalid diagnostic execution identity.');
+  }
+  const eligibleLineages = requestedName !== null
+    ? lineages.filter(({ diagnosticExecutionId }) => diagnosticExecutionId === requestedDiagnosticExecutionId)
+    : lineages;
+  if (!item || eligibleLineages.length === 0) {
     fail('ATTEMPT_ARTIFACT_UNAVAILABLE', `Work item ${workItemId} has no adopted terminal artifact.`);
   }
   let artifact = null;
   let ordinal = null;
-  for (let index = 0; index < attempt.artifacts.length; index += 1) {
-    const candidate = validateArtifactRecord(attempt.artifacts[index], {
-      runId, workItemId, attempt: attempt.attempt, leaseToken: attempt.leaseToken,
-    });
-    if ((requestedName !== null && candidate.name === requestedName)
-      || (artifactKey !== null && artifactAccessKey(item, attempt, candidate, index + 1) === artifactKey)) {
-      artifact = candidate;
-      ordinal = index + 1;
-      break;
+  let matchedLineage = null;
+  for (const lineage of eligibleLineages) {
+    const { attempt } = lineage;
+    for (let index = 0; index < attempt.artifacts.length; index += 1) {
+      const candidate = validateArtifactRecord(attempt.artifacts[index], {
+        runId, workItemId, attempt: attempt.attempt, leaseToken: attempt.leaseToken,
+      });
+      if ((requestedName !== null && candidate.name === requestedName)
+        || (artifactKey !== null && artifactAccessKey(item, lineage, candidate, index + 1) === artifactKey)) {
+        artifact = candidate;
+        ordinal = index + 1;
+        matchedLineage = lineage;
+        break;
+      }
     }
+    if (artifact) break;
   }
   if (!artifact) fail('ATTEMPT_ARTIFACT_UNAVAILABLE', `Work item ${workItemId} did not adopt the requested artifact.`);
   if (isRawAttemptLogArtifact(artifact.name)) {
@@ -2724,11 +2926,12 @@ async function resolveAdoptedAttemptArtifact(store, runId, input) {
     ...artifact,
     runId,
     workItemId,
-    attemptNumber: attempt.attempt,
-    completedAt: attempt.completedAt,
+    attemptNumber: matchedLineage.attempt.attempt,
+    completedAt: matchedLineage.attempt.completedAt,
     absolutePath: containedPath(runDirectory(store, runId), ...artifact.relativePath.split('/')),
     item,
-    attempt,
+    attempt: matchedLineage.attempt,
+    lineage: matchedLineage,
     ordinal,
   };
 }
@@ -2750,11 +2953,48 @@ function canonicalTerminalAttempt(item) {
   return null;
 }
 
-function publicArtifactDescriptor(runId, item, attempt, artifact, ordinal) {
+function terminalArtifactLineages(item) {
+  if (!item) return [];
+  const lineages = [];
+  const canonical = canonicalTerminalAttempt(item);
+  if (canonical) {
+    lineages.push({
+      attempt: canonical,
+      authoritative: true,
+      diagnosticExecutionId: null,
+      resultDigest: item.canonicalResult.digest,
+    });
+  }
+  for (const diagnostic of item.diagnosticExecutions ?? []) {
+    if (!['completed_pass', 'completed_product_failure'].includes(diagnostic.state)
+      || diagnostic.result?.authoritative !== false || !DIGEST_PATTERN.test(diagnostic.result?.digest ?? '')) continue;
+    for (let index = diagnostic.attempts.length - 1; index >= 0; index -= 1) {
+      const attempt = diagnostic.attempts[index];
+      if (attempt.outcome !== diagnostic.state || attempt.canonicalResultDigest !== diagnostic.result.digest) continue;
+      const directory = attempt.artifacts?.[0]?.relativePath?.split('/')[2] ?? '';
+      const derivedLeaseToken = directory.replace(/^\d{6}-/u, '');
+      const leaseToken = typeof attempt.leaseToken === 'string' ? attempt.leaseToken : derivedLeaseToken;
+      if (!SAFE_ID.test(leaseToken)) continue;
+      lineages.push({
+        attempt: { ...attempt, leaseToken },
+        authoritative: false,
+        diagnosticExecutionId: diagnostic.diagnosticExecutionId,
+        resultDigest: diagnostic.result.digest,
+      });
+      break;
+    }
+  }
+  return lineages;
+}
+
+function publicArtifactDescriptor(runId, item, lineage, artifact, ordinal) {
+  const { attempt } = lineage;
   return Object.freeze({
     runId,
     workItemId: item.id,
     attempt: attempt.attempt,
+    authoritative: lineage.authoritative,
+    diagnosticExecutionId: lineage.diagnosticExecutionId,
     completedAt: attempt.completedAt,
     name: artifact.name,
     logicalName: artifact.logicalName,
@@ -2763,16 +3003,19 @@ function publicArtifactDescriptor(runId, item, attempt, artifact, ordinal) {
     sizeBytes: artifact.sizeBytes,
     digest: artifact.digest,
     memberDigest: artifact.memberDigest,
-    artifactKey: artifactAccessKey(item, attempt, artifact, ordinal),
+    artifactKey: artifactAccessKey(item, lineage, artifact, ordinal),
   });
 }
 
-function artifactAccessKey(item, attempt, artifact, ordinal) {
+function artifactAccessKey(item, lineage, artifact, ordinal) {
+  const { attempt } = lineage;
   return canonicalDigest({
     schemaVersion: 1,
-    kind: 'adopted-artifact-access-key',
+    kind: lineage.authoritative ? 'adopted-artifact-access-key' : 'diagnostic-artifact-access-key',
     workItemId: item.id,
-    canonicalResultDigest: item.canonicalResult.digest,
+    ...(lineage.authoritative
+      ? { canonicalResultDigest: lineage.resultDigest }
+      : { diagnosticExecutionId: lineage.diagnosticExecutionId, diagnosticResultDigest: lineage.resultDigest }),
     attempt: attempt.attempt,
     ordinal,
     name: artifact.name,
@@ -2836,6 +3079,12 @@ export async function cancelParentRun(store, runId, coordinator, input) {
         if (!['completed_pass', 'completed_product_failure'].includes(item.state)) {
           item.state = 'cancelled';
           item.lease = null;
+        }
+        for (const diagnostic of item.diagnosticExecutions) {
+          if (['queued', 'running'].includes(diagnostic.state)) {
+            diagnostic.state = 'cancelled';
+            diagnostic.lease = null;
+          }
         }
       }
       next.resourceScheduling.performanceDrain = null;
@@ -2959,7 +3208,20 @@ export async function rekickIncompleteWork(store, runId, coordinator, input) {
   });
 }
 
-export async function applyRekickOperation(store, runId, coordinator, operationId) {
+function classifyTargetIdentityRecheck(state, input) {
+  const observed = input?.observedDeploymentIdentity;
+  const validObserved = observed && typeof observed === 'object' && !Array.isArray(observed)
+    && typeof observed.kind === 'string' && observed.kind && typeof observed.value === 'string' && observed.value
+    ? { kind: observed.kind, value: observed.value }
+    : null;
+  return {
+    observed: validObserved,
+    status: validObserved === null ? 'unverified'
+      : canonicalJson(validObserved) === canonicalJson(state.subjectCore.deploymentIdentity) ? 'matched' : 'mismatch',
+  };
+}
+
+export async function applyRekickOperation(store, runId, coordinator, operationId, input = {}) {
   return withDirectoryLock(store.storage, globalLockPath(store), () => withDirectoryLock(store.storage, lockPath(store, runId), async () => {
     const state = await recoverUnlocked(store, runId);
     await validateCoordinator(store, coordinator);
@@ -2967,6 +3229,18 @@ export async function applyRekickOperation(store, runId, coordinator, operationI
     if (!operation) fail('OPERATION_NOT_FOUND', `Operation ${operationId} was not found.`);
     if (operation.kind !== 'rekick') fail('OPERATION_KIND_INVALID', 'Only a rekick operation can use the atomic rekick transition.');
     if (operation.state !== 'accepted') return clone(operation);
+    const operationSubjectDigest = state.compilationState === 'failed'
+      ? state.subjectCoreDigest : state.finalSubjectDigest;
+    if (operation.body?.expectedSubjectDigest !== operationSubjectDigest) {
+      fail('RELEASE_SUBJECT_MISMATCH', 'A changed deployment, configuration, or scope requires a new authoritative run.');
+    }
+    const identity = classifyTargetIdentityRecheck(state, input);
+    if (identity.status === 'mismatch') {
+      fail('REKICK_TARGET_IDENTITY_MISMATCH', 'Target deployment identity changed; a new authoritative run is required.');
+    }
+    if (identity.status === 'unverified') {
+      fail('REKICK_TARGET_IDENTITY_UNVERIFIED', 'Target deployment identity could not be re-proved; rekick remains rejected.');
+    }
     let applied;
     await appendMutationUnlocked(store, state, 'operation', 'incomplete-work-rekick-applied', (next) => {
       applyIncompleteWorkRekick(next, { actor: operation.actor, workItemIds: operation.body?.workItemIds });
@@ -2974,7 +3248,76 @@ export async function applyRekickOperation(store, runId, coordinator, operationI
       mutable.state = 'applied';
       mutable.appliedAt = timestamp(store);
       applied = mutable;
-    }, { actor: operation.actor, data: { operationId, workItemIds: operation.body?.workItemIds } });
+    }, { actor: operation.actor, data: {
+      operationId, workItemIds: operation.body?.workItemIds, identityStatus: identity.status,
+    } });
+    return clone(applied);
+  }));
+}
+
+export async function applyDiagnosticRerunOperation(store, runId, coordinator, operationId, input = {}) {
+  return withDirectoryLock(store.storage, globalLockPath(store), () => withDirectoryLock(store.storage, lockPath(store, runId), async () => {
+    const state = await recoverUnlocked(store, runId);
+    await validateCoordinator(store, coordinator);
+    const operation = Object.values(state.operations).find((candidate) => candidate.operationId === operationId);
+    if (!operation) fail('OPERATION_NOT_FOUND', `Operation ${operationId} was not found.`);
+    if (operation.kind !== 'diagnostic-rerun') {
+      fail('OPERATION_KIND_INVALID', 'Only a diagnostic-rerun operation can create diagnostic execution lineage.');
+    }
+    if (operation.state !== 'accepted') return clone(operation);
+    const workItemId = operation.body?.workItemId;
+    const item = state.workItems[workItemId];
+    if (operation.body?.expectedSubjectDigest !== state.finalSubjectDigest) {
+      fail('RELEASE_SUBJECT_MISMATCH', 'A changed deployment, configuration, or scope requires a new authoritative run.');
+    }
+    if (state.status !== 'active' || state.compilationState !== 'sealed'
+      || !item || item.state !== 'completed_product_failure'
+      || item.canonicalResult?.outcome !== 'completed_product_failure'
+      || item.lease !== null || item.executionDescriptor === null) {
+      fail('DIAGNOSTIC_RERUN_NOT_FAILED', 'Diagnostic rerun requires one terminal compiler-issued product-failed work item.');
+    }
+    if (item.diagnosticExecutions.length >= 8
+      || item.diagnosticExecutions.some(({ state: diagnosticState }) => ['queued', 'running'].includes(diagnosticState))) {
+      fail('DIAGNOSTIC_RERUN_LIMIT', 'Diagnostic rerun is already active or its durable lineage bound was reached.');
+    }
+    const identity = classifyTargetIdentityRecheck(state, input);
+    const validObserved = identity.observed;
+    const identityStatus = identity.status;
+    const terminationReason = identityStatus === 'matched' ? null
+      : identityStatus === 'mismatch' ? 'target_identity_mismatch' : 'target_identity_unverified';
+    let applied;
+    await appendMutationUnlocked(store, state, 'operation', 'diagnostic-rerun-applied', (next) => {
+      const mutableItem = next.workItems[workItemId];
+      mutableItem.diagnosticExecutions.push({
+        diagnosticExecutionId: operation.operationId,
+        workItemId,
+        subjectCoreDigest: next.subjectCoreDigest,
+        finalSubjectDigest: next.finalSubjectDigest,
+        executionDescriptorDigest: mutableItem.executionDescriptor.digest,
+        requestedAt: timestamp(store),
+        actor: operation.actor,
+        authoritative: false,
+        state: identityStatus === 'matched' ? 'queued' : 'incomplete',
+        maxAttempts: mutableItem.maxAttempts,
+        lease: null,
+        attempts: [],
+        result: null,
+        terminationReason,
+        identityRecheck: {
+          status: identityStatus,
+          expected: next.subjectCore.deploymentIdentity,
+          observed: validObserved,
+          checkedAt: timestamp(store),
+          reason: terminationReason,
+          ...(identityStatus === 'unverified' && input?.failureReason
+            ? { detail: String(input.failureReason).slice(0, 512) } : {}),
+        },
+      });
+      const mutable = Object.values(next.operations).find((candidate) => candidate.operationId === operationId);
+      mutable.state = 'applied';
+      mutable.appliedAt = timestamp(store);
+      applied = mutable;
+    }, { actor: operation.actor, data: { operationId, workItemId, identityStatus, terminationReason } });
     return clone(applied);
   }));
 }

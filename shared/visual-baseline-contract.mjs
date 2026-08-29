@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 export const VISUAL_BASELINE_SCHEMA_VERSION = 1;
 export const VISUAL_BASELINE_HISTORY_SCHEMA_VERSION = 1;
 export const VISUAL_CAPTURE_METADATA_CONTENT_TYPE = 'application/vnd.quitting7oh.visual-baseline-capture+json';
+export const VISUAL_COMPARISON_POLICY_REVISION = 'pixelmatch-css-ratio-0.0025-v1';
 
 const DIGEST = /^sha256:[a-f0-9]{64}$/;
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/;
@@ -330,6 +331,47 @@ export function parseVisualReview(value) {
     }
   }
   return Object.freeze({ ...value });
+}
+
+export function parseVisualComparisonResult(value) {
+  if (!isRecord(value)) throw new TypeError('Visual comparison result must be an object.');
+  exactKeys(value, [
+    'schemaVersion', 'policyRevision', 'status', 'comparisonStatus', 'differingPixels',
+    'totalPixels', 'differingPixelRatio', 'reason', 'review', 'effects',
+  ], 'Visual comparison result');
+  if (value.schemaVersion !== 1 || value.policyRevision !== VISUAL_COMPARISON_POLICY_REVISION
+    || !VISUAL_REVIEW_STATUSES.has(value.status)) {
+    throw new TypeError('Visual comparison result identity or status is invalid.');
+  }
+  if (!isRecord(value.effects)) throw new TypeError('Visual comparison effects are invalid.');
+  exactKeys(value.effects, ['deterministicHealth', 'deterministicFindings', 'promotion'], 'Visual comparison effects');
+  if (value.effects.deterministicHealth !== 'none' || value.effects.deterministicFindings !== 'none'
+    || value.effects.promotion !== 'none') throw new TypeError('Visual comparison effects are invalid.');
+  text(value.reason, 'visual comparison reason', 1_200);
+  const review = parseVisualReview({
+    status: value.status,
+    comparisonStatus: value.comparisonStatus,
+    reviewerId: value.review?.reviewerId ?? null,
+    disposition: value.review?.disposition ?? null,
+    reviewedAt: value.review?.reviewedAt ?? null,
+  });
+  if ((value.status === 'REVIEWED') !== (isRecord(value.review))) {
+    throw new TypeError('Visual comparison review record contradicts its status.');
+  }
+  if (isRecord(value.review)) exactKeys(value.review, ['reviewerId', 'disposition', 'reviewedAt'], 'Visual comparison review');
+  if (['CHANGED', 'UNCHANGED', 'REVIEWED'].includes(value.status)) {
+    const differingPixels = value.differingPixels;
+    const totalPixels = value.totalPixels;
+    if (!Number.isSafeInteger(differingPixels) || differingPixels < 0
+      || !Number.isSafeInteger(totalPixels) || totalPixels < 1 || differingPixels > totalPixels
+      || value.differingPixelRatio !== differingPixels / totalPixels) {
+      throw new TypeError('Visual comparison pixel counts are inconsistent.');
+    }
+  } else if (value.differingPixels !== null || value.totalPixels !== null || value.differingPixelRatio !== null) {
+    throw new TypeError('Unavailable visual comparison cannot contain pixel results.');
+  }
+  return Object.freeze({ ...value, review: value.status === 'REVIEWED' ? Object.freeze({ ...value.review }) : null,
+    comparisonStatus: review.comparisonStatus });
 }
 
 export function assertVisualBaselineRecord(value) {

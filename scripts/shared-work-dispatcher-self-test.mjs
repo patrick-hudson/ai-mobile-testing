@@ -5,9 +5,11 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { auditCaseTag } from '../shared/audit-case-identity.mjs';
+import { sealOracleResult, sealWorkItemResult } from '../shared/execution-contract.mjs';
 import { sealWorkExecutionDescriptor } from '../shared/work-execution-descriptor.mjs';
 import { createSharedWorkCommand, sharedWorkExecutorPath } from './lib/shared-work-dispatcher.mjs';
 import { collectSharedPlaywrightArtifacts, validateSharedPlaywrightRows } from './lib/shared-playwright-work-item.mjs';
+import { buildSharedWorkerResultManifest } from './execute-shared-work-item.mjs';
 
 const digest = (character) => `sha256:${character.repeat(64)}`;
 const descriptor = sealWorkExecutionDescriptor({
@@ -19,6 +21,19 @@ const descriptor = sealWorkExecutionDescriptor({
   capability: 'browser:chromium', resourceClass: 'ordinary',
   origins: { candidate: 'https://candidate.example.test', production: 'https://production.example.test' },
   certificatePolicy: 'strict', route: null,
+});
+const visualDescriptor = sealWorkExecutionDescriptor({
+  ...Object.fromEntries(Object.entries(descriptor).filter(([key]) => !['schemaVersion', 'kind', 'digest'].includes(key))),
+  workItemId: 'work-visual-content',
+  definitionId: 'CONTENT-002',
+  caseId: 'CONTENT-002:tests/visual-regression.spec.ts:candidate-projects',
+  entrySpec: 'tests/visual-regression.spec.ts',
+});
+const productionDescriptor = sealWorkExecutionDescriptor({
+  ...Object.fromEntries(Object.entries(descriptor).filter(([key]) => !['schemaVersion', 'kind', 'digest'].includes(key))),
+  workItemId: 'work-comparative-a11y-production',
+  targetId: 'production-mobile-chromium',
+  targetRole: 'production',
 });
 const lease = {
   runId: 'run-dispatcher-test', workItemId: descriptor.workItemId, workerId: 'worker-a', attempt: 1,
@@ -106,39 +121,82 @@ assert.equal(createSharedWorkCommand(proofLease, '/tmp/evidence', {
 assert.throws(() => createSharedWorkCommand(proofLease, '/tmp/evidence'), /proof fixture must be used together/);
 
 function report(statuses, overrides = {}) {
+  const activeDescriptor = overrides.descriptor ?? descriptor;
   const artifactRoot = overrides.artifactRoot ?? '/evidence';
   const policy = overrides.policy ?? { mode: 'static-screenshot', rationale: 'Capture the exact rendered accessibility state for review.' };
-  const summary = (caseId = overrides.summaryCaseId ?? descriptor.caseId) => Buffer.from(JSON.stringify({
+  const summary = (caseId = overrides.summaryCaseId ?? activeDescriptor.caseId) => Buffer.from(JSON.stringify({
     schemaVersion: 1,
     caseId,
-    auditId: descriptor.definitionId,
-    coveredEnvironments: ['candidate'],
-    environment: 'candidate',
-    baseURL: descriptor.origins.candidate,
-    project: overrides.projectName ?? descriptor.targetId,
-    findings: [],
+    auditId: activeDescriptor.definitionId,
+    coveredEnvironments: [activeDescriptor.targetRole],
+    environment: activeDescriptor.targetRole,
+    baseURL: activeDescriptor.targetRole === 'production'
+      ? activeDescriptor.origins.production : activeDescriptor.origins.candidate,
+    project: overrides.projectName ?? activeDescriptor.targetId,
+    findings: overrides.findings ?? [],
     steps: [],
   })).toString('base64');
   return {
-    suites: [{ title: 'fixture', file: descriptor.entrySpec, specs: [{ title: 'fixture audit', file: 'fixtures/test.ts',
-      tags: [auditCaseTag(overrides.caseId ?? descriptor.caseId).slice(1)], tests: statuses.map((status, index) => ({
-      title: `row ${index + 1}`, projectName: overrides.projectName ?? descriptor.targetId,
+    suites: [{ title: 'fixture', file: activeDescriptor.entrySpec, specs: [{ title: 'fixture audit', file: 'fixtures/test.ts',
+      tags: [auditCaseTag(overrides.caseId ?? activeDescriptor.caseId).slice(1)], tests: statuses.map((status, index) => ({
+      title: `row ${index + 1}`, projectName: overrides.projectName ?? activeDescriptor.targetId,
       annotations: [
-        { type: 'audit-case-id', description: overrides.caseId ?? descriptor.caseId },
+        { type: 'audit-case-id', description: overrides.caseId ?? activeDescriptor.caseId },
         { type: 'audit-evidence-policy', description: JSON.stringify(policy) },
       ],
       results: [{
         status,
         retry: overrides.retry ?? 0,
+        errors: status === 'passed' ? [] : (overrides.resultErrors ?? []),
         attachments: [
           { name: 'audit-result', contentType: 'application/json', path: `${artifactRoot}/raw/row-${index + 1}/audit-result.json` },
           { name: 'audit-result-summary', contentType: 'application/json', body: summary() },
+          ...(overrides.visualComparison === undefined ? [] : [{
+            name: 'shared-visual-comparison-result', contentType: 'application/json',
+            path: `${artifactRoot}/raw/row-${index + 1}/shared-visual-comparison-result.json`,
+          }]),
           ...(overrides.missingMedia ? [] : [{ name: 'rendered-accessibility-state', contentType: 'image/png', path: `${artifactRoot}/raw/row-${index + 1}/state.png` }]),
         ],
       }],
     })) }], suites: [] }],
     errors: overrides.errors ?? [],
   };
+}
+
+async function collectFailureSignature({ activeDescriptor, message, findings = [], badResponses = [] }) {
+  const evidenceRoot = await mkdtemp(path.join(tmpdir(), 'shared-semantic-failure-'));
+  try {
+    const artifactRoot = path.join(evidenceRoot, 'playwright');
+    const rowRoot = path.join(artifactRoot, 'raw', 'row-1');
+    await mkdir(rowRoot, { recursive: true });
+    const document = report(['failed'], {
+      descriptor: activeDescriptor,
+      artifactRoot,
+      findings,
+      resultErrors: [{
+        message,
+        location: { file: '/workspace/fixtures/test.ts', line: 967, column: 5 },
+      }],
+    });
+    const row = validateSharedPlaywrightRows(document, activeDescriptor).rows[0];
+    const summary = JSON.parse(Buffer.from(
+      row.attachments.find(({ name }) => name === 'audit-result-summary').body, 'base64',
+    ).toString('utf8'));
+    await writeFile(path.join(rowRoot, 'audit-result.json'), `${JSON.stringify({
+      ...summary,
+      definition: { id: activeDescriptor.definitionId }, evidencePolicy: row.evidencePolicy,
+      browser: 'Chromium', viewport: { width: 1440, height: 900 }, timezone: 'America/Chicago',
+      startedAt: '2026-08-29T00:00:00.000Z', finishedAt: '2026-08-29T00:00:01.000Z',
+      observations: [], pageInspections: [], consoleErrors: [], consoleWarnings: [], pageErrors: [],
+      httpResponses: [], failedRequests: [], badResponses, runtimeExpectations: [], thirdPartyTelemetryDiagnostics: [],
+    })}\n`);
+    await writeFile(path.join(rowRoot, 'state.png'), Buffer.from('semantic-failure-state'));
+    return (await collectSharedPlaywrightArtifacts({
+      document, descriptor: activeDescriptor, artifactRoot, evidenceRoot,
+    })).productFailureSignature;
+  } finally {
+    await rm(evidenceRoot, { recursive: true, force: true });
+  }
 }
 
 assert.equal(validateSharedPlaywrightRows(report(['passed']), descriptor).outcome, 'completed_pass');
@@ -172,11 +230,44 @@ try {
   })}\n`);
   await writeFile(path.join(rowRoot, 'state.png'), Buffer.from('purposeful-static-image'));
   const collected = await collectSharedPlaywrightArtifacts({ document, descriptor, artifactRoot, evidenceRoot });
+  assert.equal(collected.visualRiskSource.status, 'NOT_APPLICABLE');
   assert.equal(collected.artifacts[0].path, 'playwright/raw/row-1/audit-result.json');
   assert.match(collected.artifacts[1].path, /^playwright\/inline\/row-1\/attachment-2-[a-f0-9]{16}\.json$/);
   assert.equal(collected.artifacts[2].path, 'playwright/raw/row-1/state.png');
   assert.equal(JSON.stringify(collected.rows).includes(artifactRoot), false);
   assert.equal(collected.rows[0].attachments.every(({ path: artifactPath }) => !artifactPath.startsWith('/')), true);
+  const failureFinding = {
+    severity: 'P1', title: 'Primary navigation is hidden',
+    detail: 'Observed at https://candidate.example/path?run=123456.', blocking: true,
+  };
+  const failedDocument = report(['failed'], {
+    artifactRoot,
+    findings: [failureFinding],
+    resultErrors: [{
+      message: 'Error: expect(locator).toBeVisible() failed for https://candidate.example/path?run=123456',
+      location: { file: '/workspace/tests/accessibility.spec.ts', line: 48, column: 7 },
+    }],
+  });
+  const failedRow = validateSharedPlaywrightRows(failedDocument, descriptor).rows[0];
+  const failedSummary = JSON.parse(Buffer.from(
+    failedRow.attachments.find(({ name }) => name === 'audit-result-summary').body, 'base64',
+  ).toString('utf8'));
+  await writeFile(path.join(rowRoot, 'audit-result.json'), `${JSON.stringify({
+    ...failedSummary,
+    definition: { id: descriptor.definitionId }, evidencePolicy: failedRow.evidencePolicy,
+    browser: 'Chromium', viewport: { width: 1440, height: 900 }, timezone: 'America/Chicago',
+    startedAt: '2026-08-29T00:00:00.000Z', finishedAt: '2026-08-29T00:00:01.000Z',
+    observations: [], pageInspections: [], consoleErrors: [], consoleWarnings: [], pageErrors: [],
+    httpResponses: [], failedRequests: [], badResponses: [], runtimeExpectations: [], thirdPartyTelemetryDiagnostics: [],
+  })}\n`);
+  const failedCollected = await collectSharedPlaywrightArtifacts({
+    document: failedDocument, descriptor, artifactRoot, evidenceRoot,
+  });
+  assert.match(failedCollected.productFailureSignature.assertionIdentities[0],
+    new RegExp(`^case:${descriptor.caseId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\|location:tests/accessibility\\.spec\\.ts:48\\|matcher:tobevisible\\|semantic:sha256:[a-f0-9]{64}$`));
+  assert(failedCollected.productFailureSignature.findingIdentities.some((identity) => identity.includes('primary-navigation-is-hidden')));
+  assert.equal(JSON.stringify(failedCollected.productFailureSignature).includes('candidate.example'), false,
+    'Failure signatures must strip target URLs and dynamic detail text.');
   const escaped = structuredClone(document);
   escaped.suites[0].specs[0].tests[0].results[0].attachments[0].path = '/tmp/outside-audit-result.json';
   await assert.rejects(
@@ -185,6 +276,200 @@ try {
   );
 } finally {
   await rm(evidenceRoot, { recursive: true, force: true });
+}
+
+const production500Signature = await collectFailureSignature({
+  activeDescriptor: productionDescriptor,
+  message: 'Error: expect(received).toEqual(expected)\nExpected: []\nReceived: [{"url":"https://production.example.test/api/content","status":500}]\nObserved at 2026-08-29T01:02:03.000Z',
+  badResponses: [{ url: 'https://production.example.test/api/content', status: 500 }],
+});
+const candidate404Signature = await collectFailureSignature({
+  activeDescriptor: descriptor,
+  message: 'Error: expect(received).toEqual(expected)\nExpected: []\nReceived: [{"url":"https://candidate.example.test/api/content","status":404}]\nObserved at 2026-08-29T01:03:04.000Z',
+  badResponses: [{ url: 'https://candidate.example.test/api/content', status: 404 }],
+});
+const candidate500Signature = await collectFailureSignature({
+  activeDescriptor: descriptor,
+  message: 'Error: expect(received).toEqual(expected)\nExpected: []\nReceived: [{"url":"https://candidate.example.test/api/content","status":500}]\nObserved at 2026-08-29T09:08:07.000Z',
+  badResponses: [{ url: 'https://candidate.example.test/api/content', status: 500 }],
+});
+const candidate500OtherPathSignature = await collectFailureSignature({
+  activeDescriptor: descriptor,
+  message: 'Error: expect(received).toEqual(expected)\nExpected: []\nReceived: [{"url":"https://candidate.example.test/api/search","status":500}]\nObserved at 2026-08-29T09:08:07.000Z',
+  badResponses: [{ url: 'https://candidate.example.test/api/search', status: 500 }],
+});
+assert.notEqual(candidate404Signature.digest, production500Signature.digest,
+  'Different HTTP failure semantics at one assertion locus must not collide.');
+assert.equal(candidate500Signature.digest, production500Signature.digest,
+  'Equivalent failures must ignore only target origins and volatile timestamps.');
+assert.notEqual(candidate500OtherPathSignature.digest, production500Signature.digest,
+  'Different failing paths at one assertion locus must not collide.');
+
+const finding500Signature = await collectFailureSignature({
+  activeDescriptor: productionDescriptor,
+  message: 'Error: expect(locator).toBeVisible() failed because the error panel remained visible.',
+  findings: [{
+    severity: 'P1', title: 'Content endpoint failed',
+    detail: 'GET https://production.example.test/api/content returned 500; observed at 2026-08-29T01:02:03.000Z.',
+    blocking: true,
+  }],
+});
+const finding404Signature = await collectFailureSignature({
+  activeDescriptor: descriptor,
+  message: 'Error: expect(locator).toBeVisible() failed because the error panel remained visible.',
+  findings: [{
+    severity: 'P1', title: 'Content endpoint failed',
+    detail: 'GET https://candidate.example.test/api/content returned 404; observed at 2026-08-29T01:03:04.000Z.',
+    blocking: true,
+  }],
+});
+const finding500CandidateSignature = await collectFailureSignature({
+  activeDescriptor: descriptor,
+  message: 'Error: expect(locator).toBeVisible() failed because the error panel remained visible.',
+  findings: [{
+    severity: 'P1', title: 'Content endpoint failed',
+    detail: 'GET https://candidate.example.test/api/content returned 500; observed at 2026-08-29T09:08:07.000Z.',
+    blocking: true,
+  }],
+});
+const nonblockingFinding500Signature = await collectFailureSignature({
+  activeDescriptor: descriptor,
+  message: 'Error: expect(locator).toBeVisible() failed because the error panel remained visible.',
+  findings: [{
+    severity: 'P1', title: 'Content endpoint failed',
+    detail: 'GET https://candidate.example.test/api/content returned 500; observed at 2026-08-29T09:08:07.000Z.',
+    blocking: false,
+  }],
+});
+assert.notEqual(finding404Signature.digest, finding500Signature.digest,
+  'Same-title findings with materially different detail must not collide.');
+assert.equal(finding500CandidateSignature.digest, finding500Signature.digest,
+  'Equivalent finding semantics must ignore only target origins and volatile timestamps.');
+assert.notEqual(nonblockingFinding500Signature.digest, finding500Signature.digest,
+  'A finding blocking-state change must remain material to the signature.');
+assert.equal(await collectFailureSignature({
+  activeDescriptor: descriptor,
+  message: 'Error: expect(received).toEqual(expected)',
+}), null, 'A failure without a semantic expected/actual payload must remain unsigned and fail closed.');
+assert.equal(await collectFailureSignature({
+  activeDescriptor: descriptor,
+  message: `Error: expect(received).toEqual(expected) Expected: [] Received: ${'x'.repeat(70 * 1024)}`,
+}), null, 'An unbounded failure payload must remain unsigned and fail closed.');
+
+function comparativeOracle(candidateSignature, productionSignature) {
+  const result = (workItemId, productFailureSignature) => sealWorkItemResult({
+    schemaVersion: 1, workItemId, subjectCoreDigest: digest('a'), attempt: 1, authoritative: true,
+    outcome: 'completed_product_failure', evidenceDigests: [], productFailureSignature,
+  });
+  return sealOracleResult({
+    schemaVersion: 1,
+    oracleExecution: {
+      id: 'oracle-semantic-collision', definitionId: descriptor.definitionId,
+      productOracleVariant: 'A11Y-001:semantic-collision',
+      baselinePolicy: 'context-unless-candidate-regression-proven',
+      requiredWorkItemIds: [descriptor.workItemId, productionDescriptor.workItemId],
+      workItemBindings: [
+        { workItemId: descriptor.workItemId, targetRole: 'candidate', comparisonKey: 'mobile-chromium' },
+        { workItemId: productionDescriptor.workItemId, targetRole: 'production', comparisonKey: 'mobile-chromium' },
+      ],
+    },
+    finalSubjectDigest: digest('f'),
+    workItemResults: [
+      result(descriptor.workItemId, candidateSignature),
+      result(productionDescriptor.workItemId, productionSignature),
+    ],
+  });
+}
+assert.equal(comparativeOracle(candidate404Signature, production500Signature).comparisonResults[0].classification,
+  'candidate-worsened');
+assert.equal(comparativeOracle(candidate500Signature, production500Signature).comparisonResults[0].classification,
+  'reproduced-unchanged');
+
+const visualEvidenceRoot = await mkdtemp(path.join(tmpdir(), 'shared-visual-risk-artifacts-'));
+try {
+  const artifactRoot = path.join(visualEvidenceRoot, 'playwright');
+  const rowRoot = path.join(artifactRoot, 'raw', 'row-1');
+  await mkdir(rowRoot, { recursive: true });
+  const visualComparison = {
+    schemaVersion: 1,
+    kind: 'shared-visual-comparison-result',
+    caseId: visualDescriptor.caseId,
+    targetId: visualDescriptor.targetId,
+    observedAt: '2026-08-29T00:00:01.000Z',
+    items: [{
+      id: 'home-light',
+      comparison: {
+        schemaVersion: 1,
+        policyRevision: 'pixelmatch-css-ratio-0.0025-v1',
+        status: 'CHANGED', comparisonStatus: 'CHANGED', differingPixels: 400,
+        totalPixels: 10000, differingPixelRatio: 0.04,
+        reason: 'Pixel difference ratio 0.04 exceeds the reviewed tolerance.',
+        review: null,
+        effects: { deterministicHealth: 'none', deterministicFindings: 'none', promotion: 'none' },
+      },
+    }],
+  };
+  const document = report(['passed'], { descriptor: visualDescriptor, artifactRoot, visualComparison });
+  const row = validateSharedPlaywrightRows(document, visualDescriptor).rows[0];
+  const summary = JSON.parse(Buffer.from(row.attachments.find(({ name }) => name === 'audit-result-summary').body, 'base64').toString('utf8'));
+  await writeFile(path.join(rowRoot, 'audit-result.json'), `${JSON.stringify({
+    ...summary,
+    definition: { id: visualDescriptor.definitionId }, evidencePolicy: row.evidencePolicy,
+    browser: 'Chromium', viewport: { width: 1440, height: 900 }, timezone: 'America/Chicago',
+    startedAt: '2026-08-29T00:00:00.000Z', finishedAt: '2026-08-29T00:00:01.000Z',
+    observations: [], pageInspections: [], consoleErrors: [], consoleWarnings: [], pageErrors: [],
+    httpResponses: [], failedRequests: [], badResponses: [], runtimeExpectations: [], thirdPartyTelemetryDiagnostics: [],
+  })}\n`);
+  await writeFile(path.join(rowRoot, 'state.png'), Buffer.from('purposeful-visual-state'));
+  await writeFile(path.join(rowRoot, 'shared-visual-comparison-result.json'), `${JSON.stringify(visualComparison)}\n`);
+  const collected = await collectSharedPlaywrightArtifacts({
+    document, descriptor: visualDescriptor, artifactRoot, evidenceRoot: visualEvidenceRoot,
+  });
+  assert.equal(collected.visualRiskSource.status, 'COMPLETE');
+  assert.deepEqual(collected.visualRiskSource.changedItems.map(({ id }) => id), ['home-light']);
+  const failedManifest = buildSharedWorkerResultManifest({
+    descriptor: visualDescriptor,
+    identity: {
+      runId: 'run-visual-failure', workItemId: visualDescriptor.workItemId, attempt: 1,
+      subjectCoreDigest: visualDescriptor.subjectCoreDigest, runnerRevision: visualDescriptor.runnerRevision,
+      executionDescriptorDigest: visualDescriptor.digest,
+    },
+    result: { ...collected, outcome: 'completed_product_failure', reason: 'playwright-product-failure' },
+  });
+  assert.equal(failedManifest.outcome, 'completed_product_failure',
+    'Visual risk publication must not weaken a failed visual assertion into a non-blocking outcome.');
+  const unavailableManifest = buildSharedWorkerResultManifest({
+    descriptor: visualDescriptor,
+    identity: {
+      runId: 'run-visual-unavailable', workItemId: visualDescriptor.workItemId, attempt: 1,
+      subjectCoreDigest: visualDescriptor.subjectCoreDigest, runnerRevision: visualDescriptor.runnerRevision,
+      executionDescriptorDigest: visualDescriptor.digest,
+    },
+    result: { outcome: 'completed_pass', reason: null, artifacts: [] },
+  });
+  assert.equal(unavailableManifest.riskSourceOutput.producerStates.find(({ producer }) => producer === 'visual').status,
+    'UNAVAILABLE', 'An in-scope visual execution without collector output must disclose producer failure.');
+
+  const absentComparison = structuredClone(visualComparison);
+  absentComparison.items[0].comparison = {
+    ...absentComparison.items[0].comparison,
+    status: 'absent', comparisonStatus: null, differingPixels: null, totalPixels: null,
+    differingPixelRatio: null, reason: 'No compatible production counterpart was available.',
+  };
+  await writeFile(path.join(rowRoot, 'shared-visual-comparison-result.json'), `${JSON.stringify(absentComparison)}\n`);
+  const unavailable = await collectSharedPlaywrightArtifacts({
+    document, descriptor: visualDescriptor, artifactRoot, evidenceRoot: visualEvidenceRoot,
+  });
+  assert.equal(unavailable.visualRiskSource.status, 'UNAVAILABLE',
+    'An in-scope candidate visual without an in-worker reference must disclose producer unavailability.');
+
+  const missingDocument = report(['passed'], { descriptor: visualDescriptor, artifactRoot });
+  const missing = await collectSharedPlaywrightArtifacts({
+    document: missingDocument, descriptor: visualDescriptor, artifactRoot, evidenceRoot: visualEvidenceRoot,
+  });
+  assert.equal(missing.visualRiskSource.status, 'UNAVAILABLE');
+} finally {
+  await rm(visualEvidenceRoot, { recursive: true, force: true });
 }
 
 const discoveryRoot = await mkdtemp(path.join(tmpdir(), 'shared-proof-discovery-'));

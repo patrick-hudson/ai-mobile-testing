@@ -4,13 +4,17 @@ import * as fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { canonicalDigest } from '../shared/canonical-contract.mjs';
+import { sealProductFailureSignature } from '../shared/execution-contract.mjs';
 import { sealWorkItemEvidenceMember } from '../shared/work-item-evidence-index.mjs';
 import {
   classifyExecutionFailure,
   runSharedWorkerPool,
 } from './lib/shared-worker-pool.mjs';
 import { maintainSharedWorkerLease } from './lib/shared-worker-heartbeat.mjs';
-import { collectSharedWorkerEvidence } from './lib/shared-worker-evidence.mjs';
+import {
+  collectSharedWorkerAttempt,
+  collectSharedWorkerEvidence,
+} from './lib/shared-worker-evidence.mjs';
 import {
   acquireCoordinator,
   adoptAttemptEvidence,
@@ -34,6 +38,11 @@ import {
 } from './lib/parent-run-store.mjs';
 
 const digest = (character) => `sha256:${character.repeat(64)}`;
+const productFailureSignature = sealProductFailureSignature({
+  schemaVersion: 1,
+  assertionIdentities: ['case:NAV-001|location:tests/navigation.spec.ts:42|matcher:tobevisible'],
+  findingIdentities: ['case:NAV-001|finding:primary-navigation-hidden|severity:p1'],
+});
 const upload = (name, content, mediaType = 'text/plain') => {
   const bytes = Buffer.from(content);
   return {
@@ -108,9 +117,11 @@ try {
     'Playwright finding exit cannot disagree with the identity-bound result outcome',
   );
   await fs.writeFile(path.join(executorEvidenceRoot, 'result.json'), JSON.stringify(executorResult({
-    outcome: 'completed_product_failure', reason: 'assertion-failed',
+    outcome: 'completed_product_failure', reason: 'assertion-failed', productFailureSignature,
   })));
   const failedCollection = await collectSharedWorkerEvidence(executorEvidenceRoot, { code: 1, signal: null }, executorLease);
+  assert.deepEqual(failedCollection.productFailureSignature, productFailureSignature,
+    'The production collector must preserve the sealed structured product-failure identity.');
   assert.deepEqual({
     outcome: failedCollection.outcome, reason: failedCollection.reason,
     executionDescriptorDigest: failedCollection.executionDescriptorDigest, artifacts: failedCollection.artifacts,
@@ -119,6 +130,61 @@ try {
   });
   assert(failedCollection.riskSourceObservationSet.producerStates.every(({ status }) => status === 'UNAVAILABLE'),
     'legacy executor manifests fail closed instead of implying a complete empty risk register');
+
+  await fs.rm(path.join(executorEvidenceRoot, 'result.json'));
+  const signalledAttempt = await collectSharedWorkerAttempt(
+    executorEvidenceRoot, { code: null, signal: 'SIGKILL' }, executorLease,
+  );
+  assert.deepEqual({
+    outcome: signalledAttempt.result.outcome,
+    reason: signalledAttempt.result.reason,
+    retryable: signalledAttempt.retryable,
+    logEvent: signalledAttempt.logEvent,
+  }, {
+    outcome: 'operational_failure',
+    reason: 'worker_process_terminated',
+    retryable: true,
+    logEvent: 'operational-recovery',
+  }, 'the production collector must retain a trusted executor signal as bounded operational recovery');
+  assert.match(signalledAttempt.logMessage, /^operational-recovery: worker_process_terminated;/,
+    'the production outcome log must expose the exact operational reason');
+  const browserSignalledAttempt = await collectSharedWorkerAttempt(
+    executorEvidenceRoot, { code: null, signal: 'SIGUSR2' }, executorLease,
+  );
+  assert.equal(browserSignalledAttempt.result.reason, 'browser_process_crash',
+    'the fixed executor reserved signal must retain the exact browser-process crash reason');
+
+  await assert.rejects(
+    collectSharedWorkerAttempt(executorEvidenceRoot, { code: 2, signal: null }, executorLease),
+    { code: 'SHARED_WORK_EVIDENCE_INVALID' },
+    'an unclassified executor exit without a structured result must not synthesize canonical product truth',
+  );
+
+  await fs.writeFile(path.join(executorEvidenceRoot, 'runtime-failure.json'), '{"failureKind":"browser_process_crash"}\n');
+  await assert.rejects(
+    collectSharedWorkerAttempt(executorEvidenceRoot, { code: 1, signal: null }, executorLease),
+    { code: 'SHARED_WORK_EVIDENCE_INVALID' },
+    'worker-writable runtime files must neither become operational authority nor synthesize product truth',
+  );
+  await fs.rm(path.join(executorEvidenceRoot, 'runtime-failure.json'));
+
+  for (const timeoutReason of ['assertion_timeout', 'navigation_timeout']) {
+    await fs.writeFile(path.join(executorEvidenceRoot, 'result.json'), JSON.stringify(executorResult({
+      outcome: 'completed_product_failure', reason: timeoutReason,
+    })));
+    const timeoutAttempt = await collectSharedWorkerAttempt(
+      executorEvidenceRoot, { code: 1, signal: null }, executorLease,
+    );
+    assert.deepEqual({
+      outcome: timeoutAttempt.result.outcome,
+      reason: timeoutAttempt.result.reason,
+      retryable: timeoutAttempt.retryable,
+    }, {
+      outcome: 'completed_product_failure',
+      reason: timeoutReason,
+      retryable: false,
+    }, `${timeoutReason} must remain a terminal product failure in the production collector path`);
+  }
   await fs.writeFile(path.join(executorEvidenceRoot, 'result.json'), JSON.stringify(executorResult()));
   assert.deepEqual((await collectSharedWorkerEvidence(executorEvidenceRoot, { code: 0, signal: null }, executorLease)).artifacts, [],
     'files not declared by the executor manifest are never uploaded');
@@ -198,7 +264,7 @@ try {
   }), chromiumInbox, 'an exact artifact upload retry is idempotent even when wall-clock time advances');
   await adoptAttemptEvidence(store, 'capability-run', coordinator, chromiumInbox);
   const firefoxInbox = await publishAttemptEvidence(store, 'capability-run', firefox, {
-    outcome: 'completed_product_failure', artifacts: [
+    outcome: 'completed_product_failure', productFailureSignature, artifacts: [
       upload('logs/failure.txt', 'firefox-failure'),
       upload('Logs/stdout.txt', 'firefox-uppercase-log'),
       upload('evidence/worker.LOG', 'firefox-suffix-log'),
@@ -216,6 +282,8 @@ try {
   await adoptAttemptEvidence(store, 'capability-run', coordinator, performanceInbox);
   const capabilityState = await readParentRun(store, 'capability-run');
   assert.equal(capabilityState.workItems['firefox-b'].attempts.length, 1, 'product failures stay terminal and receive no retry');
+  assert.deepEqual(capabilityState.workItems['firefox-b'].canonicalResult.productFailureSignature, productFailureSignature,
+    'The coordinator store must bind the worker failure signature into the canonical work-item result.');
   assert.equal(capabilityState.workItems['chromium-a'].attempts[0].artifacts[0].name, 'screens/home.png');
   assert.deepEqual(capabilityState.workItems['chromium-a'].canonicalResult.evidenceDigests,
     capabilityState.workItems['chromium-a'].attempts[0].artifacts.map(({ memberDigest }) => memberDigest),
@@ -755,11 +823,12 @@ try {
   assert.deepEqual(multipleWorkers, oneWorker,
     'worker topology changes scheduling only, not canonical result identity or evidence membership');
 
-  const [playwrightConfig, compose, sharedCoordinatorSource, sharedWorkerSource, sharedEvidenceSource, sharedDispatcherSource] = await Promise.all([
+  const [playwrightConfig, compose, sharedCoordinatorSource, sharedWorkerSource, sharedExecutorSource, sharedEvidenceSource, sharedDispatcherSource] = await Promise.all([
     fs.readFile(new URL('../playwright.config.ts', import.meta.url), 'utf8'),
     fs.readFile(new URL('../docker-compose.yml', import.meta.url), 'utf8'),
     fs.readFile(new URL('./run-shared-coordinator.mjs', import.meta.url), 'utf8'),
     fs.readFile(new URL('./run-shared-worker.mjs', import.meta.url), 'utf8'),
+    fs.readFile(new URL('./execute-shared-work-item.mjs', import.meta.url), 'utf8'),
     fs.readFile(new URL('./lib/shared-worker-evidence.mjs', import.meta.url), 'utf8'),
     fs.readFile(new URL('./lib/shared-work-dispatcher.mjs', import.meta.url), 'utf8'),
   ]);
@@ -804,6 +873,10 @@ try {
   assert.doesNotMatch(compose, /AUDIT_SHARED_(?:PERFORMANCE_)?EXECUTOR_JSON/,
     'Compose workers must use only the fixed repository-owned dispatcher.');
   assert.doesNotMatch(sharedWorkerSource, /AUDIT_SHARED_EXECUTOR_JSON/);
+  assert.match(sharedWorkerSource, /collectSharedWorkerAttempt\(evidenceRoot, completion, lease\)/,
+    'the deployed worker entry must use the production failure-classification collector');
+  assert.match(sharedExecutorSource, /process\.kill\(process\.pid, 'SIGUSR2'\)/,
+    'the fixed executor must propagate its child runtime signal for OS observation by the production worker');
   assert.match(sharedWorkerSource, /\/v1\/heartbeat/);
   assert.match(sharedCoordinatorSource, /requestUrl\.pathname === '\/v1\/heartbeat'/);
   assert.match(sharedCoordinatorSource, /heartbeatWorkItem\(store, leaseRunId, body\.lease/);
@@ -824,8 +897,10 @@ try {
     'large finalize hashing must use the evidence-upload timeout rather than the metadata timeout');
   assert.match(sharedCoordinatorSource, /server\.requestTimeout = uploadTimeoutMs \+ 30_000/,
     'coordinator request lifetime must exceed the worker large-upload timeout');
-  assert.doesNotMatch(sharedCoordinatorSource, /\/v1\/result'|publishAttemptEvidence/,
-    'the production coordinator must not retain the base64 JSON result endpoint');
+  assert.doesNotMatch(sharedCoordinatorSource, /\/v1\/result'/,
+    'the production coordinator must not retain the general base64 JSON result endpoint');
+  assert.match(sharedCoordinatorSource, /requestUrl\.pathname === '\/v1\/runtime-failure'/,
+    'the coordinator must expose only the narrow lease-fenced runtime recovery route');
   assert.doesNotMatch(sharedWorkerSource, /AUDIT_SHARED_STORE_ROOT|shared\/canonical/,
     'workers exchange bounded evidence over HTTP and never learn the canonical store root');
 

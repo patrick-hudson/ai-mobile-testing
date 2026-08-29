@@ -2,6 +2,8 @@ import { readFile } from 'node:fs/promises';
 import type { Page } from '@playwright/test';
 import { ENVIRONMENTS, projectMetadata, resolveEnvironmentPath } from '../audit/environments.js';
 import { REPRESENTATIVE_VISUAL_ROUTES } from '../audit/routes.js';
+import { visualComparisonUnavailable } from '../audit/visual-policy.js';
+import { compareVisualBaselineFiles } from '../scripts/compare-visual-baselines.js';
 import {
   expect,
   standaloneStaticEvidence,
@@ -292,6 +294,7 @@ for (const visualRoute of REPRESENTATIVE_VISUAL_ROUTES) {
     const candidateLightPath = testInfo.outputPath(`${visualRoute.label}-candidate-light.png`);
     await page.screenshot({ path: candidateLightPath, fullPage: fullPageScreenshot, mask: [mask], maskColor: '#777777', animations: 'disabled', caret: 'hide', scale: 'css', timeout: 90_000 });
     const comparisonGroup = `${visualRoute.label}-light-production-vs-candidate`;
+    let sharedVisualComparison = visualComparisonUnavailable('absent', 'No compatible production visual reference was available to this execution.');
     await audit.attachVisual('paired-candidate-light', { path: candidateLightPath, contentType: 'image/png' }, {
       attachmentKey: `${comparisonGroup}-actual`,
       comparisonGroup,
@@ -336,6 +339,10 @@ for (const visualRoute of REPRESENTATIVE_VISUAL_ROUTES) {
       });
       const productionLightPath = testInfo.outputPath(`${visualRoute.label}-production-light.png`);
       await productionPage.screenshot({ path: productionLightPath, fullPage: true, animations: 'disabled', caret: 'hide', scale: 'css', timeout: 90_000 });
+      sharedVisualComparison = (await compareVisualBaselineFiles({
+        baselinePath: productionLightPath,
+        currentPath: candidateLightPath,
+      })).comparison;
       await audit.attachVisual('paired-production-light', { path: productionLightPath, contentType: 'image/png' }, {
         attachmentKey: `${comparisonGroup}-baseline`,
         comparisonGroup,
@@ -386,6 +393,14 @@ for (const visualRoute of REPRESENTATIVE_VISUAL_ROUTES) {
     } else {
       audit.observe('Production comparison coverage', 'Paired mobile and desktop Chromium visual projects own the production comparison artifact.');
     }
+    await audit.attachJson('shared-visual-comparison-result', {
+      schemaVersion: 1,
+      kind: 'shared-visual-comparison-result',
+      caseId: testInfo.annotations.find(({ type }) => type === 'audit-case-id')?.description,
+      targetId: testInfo.project.name,
+      observedAt: new Date().toISOString(),
+      items: [{ id: `${visualRoute.label}-light`, comparison: sharedVisualComparison }],
+    });
     await expect(page).toHaveScreenshot(`${visualRoute.label}-light.png`, {
       fullPage: fullPageScreenshot,
       mask: [mask],

@@ -56,6 +56,19 @@ export interface VisualBaselineRecord {
 export const VISUAL_BASELINE_SCHEMA_VERSION: 1;
 export const VISUAL_BASELINE_HISTORY_SCHEMA_VERSION: 1;
 export const VISUAL_CAPTURE_METADATA_CONTENT_TYPE: 'application/vnd.quitting7oh.visual-baseline-capture+json';
+export const VISUAL_COMPARISON_POLICY_REVISION: 'pixelmatch-css-ratio-0.0025-v1';
+export interface VisualComparisonResultContract {
+  schemaVersion: 1;
+  policyRevision: typeof VISUAL_COMPARISON_POLICY_REVISION;
+  status: VisualReviewStatus;
+  comparisonStatus: 'UNCHANGED' | 'CHANGED' | null;
+  differingPixels: number | null;
+  totalPixels: number | null;
+  differingPixelRatio: number | null;
+  reason: string;
+  review: null | { reviewerId: string; disposition: string; reviewedAt: string };
+  effects: { deterministicHealth: 'none'; deterministicFindings: 'none'; promotion: 'none' };
+}
 export function visualBaselineCanonicalJson(value: unknown): string;
 export function visualBaselineDigest(value: unknown): string;
 export function normalizedRelativePath(value: unknown): string;
@@ -84,4 +97,5 @@ export function compareVisualBaselineIdentity(baseline: unknown, current: unknow
 };
 export function parseVisualBaselineEvidence(value: unknown): VisualBaselineEvidence;
 export function parseVisualReview(value: unknown): Readonly<Record<string, unknown>>;
+export function parseVisualComparisonResult(value: unknown): Readonly<VisualComparisonResultContract>;
 export function assertVisualBaselineRecord(value: unknown): VisualBaselineRecord;

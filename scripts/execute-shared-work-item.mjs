@@ -19,6 +19,7 @@ import { collectSharedPlaywrightArtifacts } from './lib/shared-playwright-work-i
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const MAX_JSON_BYTES = 16 * 1_048_576;
+const VISUAL_SPEC = 'tests/visual-regression.spec.ts';
 
 function required(name) {
   const value = process.env[name];
@@ -163,7 +164,11 @@ async function spawnPlaywright(descriptor, artifactRoot, signal) {
     });
     logger('fixed-command-finished', completion);
     if (completion.signal !== null || ![0, 1].includes(completion.code)) {
-      throw new Error(`Playwright terminated operationally with code ${completion.code} and signal ${completion.signal}.`);
+      const error = new Error(`Playwright terminated operationally with code ${completion.code} and signal ${completion.signal}.`);
+      if (completion.signal !== null) {
+        error.executionFailure = { kind: 'browser_process_crash', trustedPlatformSignal: true, signal: completion.signal };
+      }
+      throw error;
     }
     const resultsPath = path.join(artifactRoot, 'results.json');
     const document = await boundedJson(resultsPath, 'Playwright results');
@@ -297,6 +302,53 @@ async function executeInventory(descriptor, artifactRoot) {
   };
 }
 
+function visualRiskSourceOutput(descriptor, result) {
+  const defaultStatus = descriptor.operation === 'playwright' && descriptor.entrySpec === VISUAL_SPEC
+    ? 'UNAVAILABLE'
+    : 'NOT_APPLICABLE';
+  const source = result.visualRiskSource ?? { status: defaultStatus, changedItems: [] };
+  return {
+    producerState: source.status,
+    observations: source.status === 'COMPLETE' ? source.changedItems.map(({ id, comparison }) => ({
+      producer: 'visual',
+      category: 'unreviewed-visual-change',
+      severity: 'high',
+      source: { kind: 'visual-result', id: `${descriptor.workItemId}:${id}` },
+      explanation: comparison.reason,
+      recommendedAction: 'Review the candidate, reference, and diff evidence for this visual change.',
+      reviewState: 'PENDING_REVIEW',
+      observedAt: source.observedAt,
+    })) : [],
+  };
+}
+
+export function buildSharedWorkerResultManifest({ descriptor, identity, result } = {}) {
+  descriptor = parseWorkExecutionDescriptor(descriptor);
+  identity = validateIdentity(identity, descriptor);
+  const visual = visualRiskSourceOutput(descriptor, result);
+  return {
+    schemaVersion: 1,
+    kind: 'shared-worker-result',
+    ...identity,
+    outcome: result.outcome,
+    reason: result.reason,
+    productFailureSignature: result.productFailureSignature ?? null,
+    riskSourceOutput: {
+      producerStates: [
+        { producer: 'visual', status: visual.producerState },
+        {
+          producer: 'baseline',
+          status: descriptor.mode === 'comparative' && descriptor.targetRole === 'production'
+            ? 'COMPLETE' : 'NOT_APPLICABLE',
+        },
+        { producer: 'evidence-pipeline', status: 'COMPLETE' },
+      ],
+      observations: visual.observations,
+    },
+    artifacts: result.artifacts,
+  };
+}
+
 export async function executeSharedWorkItem({ descriptor, identity, evidenceRoot, signal } = {}) {
   descriptor = parseWorkExecutionDescriptor(descriptor);
   identity = validateIdentity(identity, descriptor);
@@ -308,30 +360,7 @@ export async function executeSharedWorkItem({ descriptor, identity, evidenceRoot
   const result = descriptor.operation === 'inventory'
     ? await executeInventory(descriptor, artifactRoot)
     : await spawnPlaywright(descriptor, artifactRoot, signal);
-  const manifest = {
-    schemaVersion: 1,
-    kind: 'shared-worker-result',
-    ...identity,
-    outcome: result.outcome,
-    reason: result.reason,
-    riskSourceOutput: {
-      producerStates: [
-        {
-          producer: 'visual',
-          status: descriptor.operation === 'playwright' && descriptor.entrySpec?.includes('visual-regression')
-            ? 'COMPLETE' : 'NOT_APPLICABLE',
-        },
-        {
-          producer: 'baseline',
-          status: descriptor.mode === 'comparative' && descriptor.targetRole === 'production'
-            ? 'COMPLETE' : 'NOT_APPLICABLE',
-        },
-        { producer: 'evidence-pipeline', status: 'COMPLETE' },
-      ],
-      observations: result.riskSourceObservations ?? [],
-    },
-    artifacts: result.artifacts,
-  };
+  const manifest = buildSharedWorkerResultManifest({ descriptor, identity, result });
   await fs.writeFile(path.join(evidenceRoot, 'result.json'), `${JSON.stringify(manifest)}\n`, { mode: 0o600 });
   return manifest;
 }
@@ -341,12 +370,26 @@ async function main() {
   const identity = parseJson('AUDIT_SHARED_RESULT_IDENTITY', required('AUDIT_SHARED_RESULT_IDENTITY'));
   const abort = new AbortController();
   for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => abort.abort(new Error(`Executor received ${signal}.`)));
-  const result = await executeSharedWorkItem({
-    descriptor,
-    identity,
-    evidenceRoot: required('AUDIT_SHARED_EVIDENCE_DIR'),
-    signal: abort.signal,
-  });
+  let result;
+  try {
+    result = await executeSharedWorkItem({
+      descriptor,
+      identity,
+      evidenceRoot: required('AUDIT_SHARED_EVIDENCE_DIR'),
+      signal: abort.signal,
+    });
+  } catch (error) {
+    const runtimeSignal = error?.executionFailure?.trustedPlatformSignal === true
+      && error.executionFailure.kind === 'browser_process_crash'
+      && typeof error.executionFailure.signal === 'string'
+      ? error.executionFailure.signal
+      : null;
+    if (runtimeSignal !== null) {
+      process.kill(process.pid, 'SIGUSR2');
+      await new Promise(() => {});
+    }
+    throw error;
+  }
   process.exitCode = result.outcome === 'completed_pass' ? 0 : 1;
 }
 

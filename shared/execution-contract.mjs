@@ -2,6 +2,7 @@ import {
   assertDigest,
   assertSchemaVersion,
   canonicalDigest,
+  canonicalJson,
   exactKeys,
   failContract,
   freezeContract,
@@ -17,9 +18,18 @@ export const WORK_ITEM_OUTCOMES = Object.freeze([
   'incomplete_unknown',
 ]);
 const MAX_WORK_ITEM_EVIDENCE_DIGESTS = 64;
+const MAX_FAILURE_IDENTITIES = 64;
 const BASELINE_POLICIES = new Set([
   'not-applicable',
   'context-unless-candidate-regression-proven',
+]);
+const COMPARISON_CLASSIFICATIONS = new Set([
+  'passed',
+  'production-only',
+  'reproduced-unchanged',
+  'candidate-introduced',
+  'candidate-worsened',
+  'incomplete',
 ]);
 
 function positiveInteger(value, label) {
@@ -32,6 +42,37 @@ function orderedEvidenceDigests(value) {
     failContract('INVALID_CONTRACT', `evidenceDigests must be an array with at most ${MAX_WORK_ITEM_EVIDENCE_DIGESTS} entries.`);
   }
   return value.map((digest) => assertDigest(digest, 'evidenceDigests entry'));
+}
+
+export function sealProductFailureSignature(value) {
+  assertSchemaVersion(value, 'Product-failure signature');
+  exactKeys(value, ['schemaVersion', 'assertionIdentities', 'findingIdentities'], 'Product-failure signature');
+  const assertionIdentities = uniqueStrings(value.assertionIdentities, 'assertionIdentities');
+  const findingIdentities = uniqueStrings(value.findingIdentities, 'findingIdentities');
+  if (assertionIdentities.length + findingIdentities.length === 0
+    || assertionIdentities.length + findingIdentities.length > MAX_FAILURE_IDENTITIES) {
+    failContract('INVALID_CONTRACT', `Product-failure signature must contain 1-${MAX_FAILURE_IDENTITIES} normalized identities.`);
+  }
+  const body = {
+    schemaVersion: 1,
+    kind: 'product-failure-signature',
+    assertionIdentities,
+    findingIdentities,
+  };
+  return freezeContract({ ...body, digest: canonicalDigest(body) });
+}
+
+export function parseProductFailureSignature(value) {
+  assertSchemaVersion(value, 'Product-failure signature');
+  exactKeys(value, ['schemaVersion', 'kind', 'assertionIdentities', 'findingIdentities', 'digest'], 'Product-failure signature');
+  if (value.kind !== 'product-failure-signature') failContract('INVALID_CONTRACT', 'Product-failure signature kind is invalid.');
+  const sealed = sealProductFailureSignature({
+    schemaVersion: value.schemaVersion,
+    assertionIdentities: value.assertionIdentities,
+    findingIdentities: value.findingIdentities,
+  });
+  if (sealed.digest !== value.digest) failContract('CORRUPT_EXECUTION_DIGEST', 'Product-failure signature digest is corrupt.');
+  return sealed;
 }
 
 function parseWorkItem(value, index) {
@@ -195,11 +236,19 @@ export function parseExecutionManifest(value) {
 
 export function sealWorkItemResult(value) {
   assertSchemaVersion(value, 'Work-item result');
+  const signatureAware = Object.hasOwn(value, 'productFailureSignature');
   exactKeys(value, [
     'schemaVersion', 'workItemId', 'subjectCoreDigest', 'attempt', 'authoritative', 'outcome', 'evidenceDigests',
+    ...(signatureAware ? ['productFailureSignature'] : []),
   ], 'Work-item result');
   if (typeof value.authoritative !== 'boolean') failContract('INVALID_CONTRACT', 'Work-item result authoritative must be boolean.');
   if (!WORK_ITEM_OUTCOMES.includes(value.outcome)) failContract('INVALID_CONTRACT', 'Work-item outcome is unsupported.');
+  const productFailureSignature = signatureAware && value.productFailureSignature !== null
+    ? parseProductFailureSignature(value.productFailureSignature)
+    : null;
+  if (productFailureSignature !== null && value.outcome !== 'completed_product_failure') {
+    failContract('INVALID_CONTRACT', 'Only a completed product failure can carry a product-failure signature.');
+  }
   const body = {
     schemaVersion: 1,
     kind: 'work-item-result',
@@ -209,15 +258,17 @@ export function sealWorkItemResult(value) {
     authoritative: value.authoritative,
     outcome: value.outcome,
     evidenceDigests: orderedEvidenceDigests(value.evidenceDigests),
+    ...(signatureAware ? { productFailureSignature } : {}),
   };
   return freezeContract({ ...body, digest: canonicalDigest(body) });
 }
 
 export function parseWorkItemResult(value) {
   assertSchemaVersion(value, 'Work-item result');
+  const signatureAware = Object.hasOwn(value, 'productFailureSignature');
   exactKeys(value, [
     'schemaVersion', 'kind', 'workItemId', 'subjectCoreDigest', 'attempt', 'authoritative', 'outcome',
-    'evidenceDigests', 'digest',
+    'evidenceDigests', ...(signatureAware ? ['productFailureSignature'] : []), 'digest',
   ], 'Work-item result');
   if (value.kind !== 'work-item-result') failContract('INVALID_CONTRACT', 'Work-item result kind is invalid.');
   const sealed = sealWorkItemResult({
@@ -228,21 +279,71 @@ export function parseWorkItemResult(value) {
     authoritative: value.authoritative,
     outcome: value.outcome,
     evidenceDigests: value.evidenceDigests,
+    ...(signatureAware ? { productFailureSignature: value.productFailureSignature } : {}),
   });
   if (sealed.digest !== value.digest) failContract('CORRUPT_EXECUTION_DIGEST', 'Work-item result digest is corrupt.');
   return sealed;
 }
 
-function oracleOutcome(oracleExecution, results) {
+function comparisonClassification(candidate, production) {
+  const terminal = (result) => result && ['completed_pass', 'completed_product_failure'].includes(result.outcome);
+  if (!terminal(candidate) || !terminal(production)) return 'incomplete';
+  if (candidate.outcome === 'completed_pass') {
+    return production.outcome === 'completed_product_failure' ? 'production-only' : 'passed';
+  }
+  if (production.outcome === 'completed_pass') return 'candidate-introduced';
+  const candidateSignature = candidate.productFailureSignature?.digest ?? null;
+  const productionSignature = production.productFailureSignature?.digest ?? null;
+  return candidateSignature !== null && candidateSignature === productionSignature
+    ? 'reproduced-unchanged'
+    : 'candidate-worsened';
+}
+
+function deriveComparisonResults(oracleExecution, results) {
+  if (oracleExecution.baselinePolicy !== 'context-unless-candidate-regression-proven') return [];
+  const resultById = new Map(results.map((result) => [result.workItemId, result]));
+  const groups = new Map();
+  for (const binding of oracleExecution.workItemBindings) {
+    const group = groups.get(binding.comparisonKey) ?? { comparisonKey: binding.comparisonKey };
+    if (group[binding.targetRole]) failContract('INVALID_CONTRACT', `Oracle comparison pair ${binding.comparisonKey} repeats role ${binding.targetRole}.`);
+    group[binding.targetRole] = {
+      workItemId: binding.workItemId,
+      result: resultById.get(binding.workItemId),
+    };
+    groups.set(binding.comparisonKey, group);
+  }
+  return [...groups.values()].sort((left, right) => left.comparisonKey.localeCompare(right.comparisonKey)).map((group) => {
+    const candidate = group.candidate?.result;
+    const production = group.production?.result;
+    return {
+      comparisonKey: group.comparisonKey,
+      candidateWorkItemId: group.candidate?.workItemId ?? null,
+      productionWorkItemId: group.production?.workItemId ?? null,
+      candidateProductFailureSignatureDigest: candidate?.productFailureSignature?.digest ?? null,
+      productionProductFailureSignatureDigest: production?.productFailureSignature?.digest ?? null,
+      classification: comparisonClassification(candidate, production),
+    };
+  });
+}
+
+function oracleOutcome(oracleExecution, results, comparisonResults = null) {
   if (oracleExecution.baselinePolicy === 'not-applicable') {
     if (results.some(({ outcome }) => outcome === 'completed_product_failure')) return 'completed_product_failure';
     return results.every(({ outcome }) => outcome === 'completed_pass') ? 'completed_pass' : 'incomplete';
   }
+  const comparisons = comparisonResults ?? deriveComparisonResults(oracleExecution, results);
+  if (comparisons.some(({ classification }) => ['candidate-introduced', 'candidate-worsened'].includes(classification))) {
+    return 'completed_product_failure';
+  }
+  return comparisons.some(({ classification }) => classification === 'incomplete') ? 'incomplete' : 'completed_pass';
+}
+
+function preComparisonOracleOutcome(oracleExecution, results) {
+  if (oracleExecution.baselinePolicy === 'not-applicable') return oracleOutcome(oracleExecution, results);
   const resultById = new Map(results.map((result) => [result.workItemId, result]));
   const groups = new Map();
   for (const binding of oracleExecution.workItemBindings) {
     const group = groups.get(binding.comparisonKey) ?? {};
-    if (group[binding.targetRole]) failContract('INVALID_CONTRACT', `Oracle comparison pair ${binding.comparisonKey} repeats role ${binding.targetRole}.`);
     group[binding.targetRole] = resultById.get(binding.workItemId);
     groups.set(binding.comparisonKey, group);
   }
@@ -278,6 +379,12 @@ export function sealOracleResult(value) {
   }
   const subjectCoreDigests = [...new Set(results.map(({ subjectCoreDigest }) => subjectCoreDigest))];
   if (subjectCoreDigests.length !== 1) failContract('RELEASE_SUBJECT_MISMATCH', 'Oracle work-item results cross subject cores.');
+  const workItemOutcomes = results.map(({ workItemId, outcome, productFailureSignature }) => ({
+    workItemId,
+    outcome,
+    productFailureSignature: productFailureSignature ?? null,
+  }));
+  const comparisonResults = deriveComparisonResults(oracleExecution, workItemOutcomes);
   const body = {
     schemaVersion: 1,
     kind: 'oracle-result',
@@ -290,8 +397,9 @@ export function sealOracleResult(value) {
     productOracleVariant: oracleExecution.productOracleVariant,
     baselinePolicy: oracleExecution.baselinePolicy,
     workItemBindings: oracleExecution.workItemBindings,
-    workItemOutcomes: results.map(({ workItemId, outcome }) => ({ workItemId, outcome })),
-    outcome: oracleOutcome(oracleExecution, results),
+    workItemOutcomes,
+    comparisonResults,
+    outcome: oracleOutcome(oracleExecution, workItemOutcomes, comparisonResults),
   };
   return freezeContract({ ...body, digest: canonicalDigest(body) });
 }
@@ -300,9 +408,14 @@ export function parseOracleResult(value) {
   assertSchemaVersion(value, 'Oracle result');
   const legacy = value && typeof value === 'object'
     && !('productOracleVariant' in value) && !('baselinePolicy' in value) && !('workItemBindings' in value);
+  const comparisonAware = !legacy && Object.hasOwn(value, 'comparisonResults');
   exactKeys(value, legacy ? [
     'schemaVersion', 'kind', 'oracleExecutionId', 'definitionId', 'finalSubjectDigest', 'subjectCoreDigest',
     'adoptedWorkItemIds', 'workItemResultDigests', 'workItemOutcomes', 'outcome', 'digest',
+  ] : comparisonAware ? [
+    'schemaVersion', 'kind', 'oracleExecutionId', 'definitionId', 'finalSubjectDigest', 'subjectCoreDigest',
+    'adoptedWorkItemIds', 'workItemResultDigests', 'productOracleVariant', 'baselinePolicy',
+    'workItemBindings', 'workItemOutcomes', 'comparisonResults', 'outcome', 'digest',
   ] : [
     'schemaVersion', 'kind', 'oracleExecutionId', 'definitionId', 'finalSubjectDigest', 'subjectCoreDigest',
     'adoptedWorkItemIds', 'workItemResultDigests', 'productOracleVariant', 'baselinePolicy',
@@ -320,9 +433,17 @@ export function parseOracleResult(value) {
     failContract('INVALID_CONTRACT', 'workItemOutcomes must be a non-empty array.');
   }
   const workItemOutcomes = value.workItemOutcomes.map((entry, index) => {
-    exactKeys(entry, ['workItemId', 'outcome'], `workItemOutcomes[${index}]`);
+    exactKeys(entry, comparisonAware ? ['workItemId', 'outcome', 'productFailureSignature'] : ['workItemId', 'outcome'], `workItemOutcomes[${index}]`);
     if (!WORK_ITEM_OUTCOMES.includes(entry.outcome)) failContract('INVALID_CONTRACT', `workItemOutcomes[${index}].outcome is unsupported.`);
-    return { workItemId: nonEmptyString(entry.workItemId, `workItemOutcomes[${index}].workItemId`), outcome: entry.outcome };
+    return {
+      workItemId: nonEmptyString(entry.workItemId, `workItemOutcomes[${index}].workItemId`),
+      outcome: entry.outcome,
+      ...(comparisonAware ? {
+        productFailureSignature: entry.productFailureSignature === null
+          ? null
+          : parseProductFailureSignature(entry.productFailureSignature),
+      } : {}),
+    };
   });
   const oracleExecution = parseOracleExecution({
     id: value.oracleExecutionId,
@@ -349,13 +470,24 @@ export function parseOracleResult(value) {
       workItemBindings: oracleExecution.workItemBindings,
     } : {}),
     workItemOutcomes,
+    ...(comparisonAware ? { comparisonResults: deriveComparisonResults(oracleExecution, workItemOutcomes) } : {}),
     outcome: value.outcome,
   };
+  if (comparisonAware) {
+    if (!Array.isArray(value.comparisonResults)
+      || canonicalJson(body.comparisonResults) !== canonicalJson(value.comparisonResults)
+      || value.comparisonResults.some(({ classification } = {}) => !COMPARISON_CLASSIFICATIONS.has(classification))) {
+      failContract('CORRUPT_EXECUTION_DIGEST', 'Oracle comparison results contradict sealed work-item evidence.');
+    }
+  }
   if (body.adoptedWorkItemIds.length !== body.workItemResultDigests.length
     || JSON.stringify(body.adoptedWorkItemIds) !== JSON.stringify(workItemOutcomes.map(({ workItemId }) => workItemId))) {
     failContract('CORRUPT_EXECUTION_DIGEST', 'Oracle result membership and digest counts disagree.');
   }
-  if (oracleOutcome(oracleExecution, workItemOutcomes) !== body.outcome) {
+  const expectedOutcome = comparisonAware
+    ? oracleOutcome(oracleExecution, workItemOutcomes, body.comparisonResults)
+    : preComparisonOracleOutcome(oracleExecution, workItemOutcomes);
+  if (expectedOutcome !== body.outcome) {
     failContract('CORRUPT_EXECUTION_DIGEST', 'Oracle outcome contradicts its adopted work-item outcomes.');
   }
   if (canonicalDigest(body) !== value.digest) failContract('CORRUPT_EXECUTION_DIGEST', 'Oracle result digest is corrupt.');

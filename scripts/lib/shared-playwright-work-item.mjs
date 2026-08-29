@@ -3,11 +3,19 @@ import { createHash } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import path from 'node:path';
+import { sealProductFailureSignature } from '../../shared/execution-contract.mjs';
+import { parseVisualComparisonResult } from '../../shared/visual-baseline-contract.mjs';
 
 const AUDIT_EVIDENCE_POLICY_ANNOTATION = 'audit-evidence-policy';
 const EVIDENCE_MODES = new Set(['interaction-video', 'static-screenshot', 'structured-data']);
 const MEDIA_TYPE = /^[a-z0-9][a-z0-9.+-]{0,126}\/[a-z0-9][a-z0-9.+-]{0,126}$/i;
 const MAX_INLINE_ATTACHMENT_BYTES = 256 * 1_024;
+const MAX_FAILURE_SEMANTIC_BYTES = 64 * 1_024;
+const VISUAL_SPEC = 'tests/visual-regression.spec.ts';
+const VISUAL_RESULT_ATTACHMENT = 'shared-visual-comparison-result';
+const ANSI_ESCAPE = /\u001b\[[0-?]*[ -/]*[@-~]/g;
+const OBSERVATION_TIMESTAMP = /\b(observed|recorded|captured) at \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z\b/gi;
+const CORRELATION_UUID = /\b(trace|request|run)[ -]?id([:= ]+)[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/gi;
 
 function isRecord(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -17,6 +25,95 @@ function fail(code, message) {
   const error = new Error(message);
   error.code = code;
   throw error;
+}
+
+function stableIdentityToken(value) {
+  if (typeof value !== 'string') return null;
+  const normalized = value.toLowerCase()
+    .replace(/https?:\/\/\S+/g, '<url>')
+    .replace(/\b[0-9a-f]{8,}\b/g, '<dynamic>')
+    .replace(/\b\d{4,}\b/g, '<number>')
+    .replace(/[^a-z0-9<>._:/#-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 240);
+  return normalized || null;
+}
+
+function escapedRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function normalizedFailureSemantics(value, descriptor) {
+  if (typeof value !== 'string' || value.length < 1
+    || Buffer.byteLength(value, 'utf8') > MAX_FAILURE_SEMANTIC_BYTES || value.includes('\0')) return null;
+  let normalized = value.replace(ANSI_ESCAPE, '');
+  for (const origin of [descriptor.origins?.candidate, descriptor.origins?.production]) {
+    if (typeof origin === 'string' && origin.length > 0) {
+      normalized = normalized.replace(new RegExp(`${escapedRegExp(origin)}(?=$|[/?#])`, 'g'), '<origin>');
+    }
+  }
+  normalized = normalized
+    .replace(OBSERVATION_TIMESTAMP, '$1 at <timestamp>')
+    .replace(CORRELATION_UUID, '$1-id$2<uuid>')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return normalized || null;
+}
+
+function semanticDigest(value) {
+  return `sha256:${createHash('sha256').update(value).digest('hex')}`;
+}
+
+function hasAssertionSemantics(message, matcher) {
+  const withoutCall = message
+    .replace(/^error:\s*/i, '')
+    .replace(new RegExp(`expect\\([^)]*\\)\\.${matcher}\\([^)]*\\)`, 'ig'), '')
+    .replace(new RegExp(`\\b${matcher}\\b`, 'ig'), '')
+    .replace(/\b(?:assertion|error|expect|expected|failed|received|actual)\b/gi, '')
+    .replace(/[\s()[\]{}:;,."'`-]+/g, '');
+  return withoutCall.length > 0;
+}
+
+function errorIdentity(error, descriptor) {
+  if (!isRecord(error)) return null;
+  const message = typeof error.message === 'string' ? error.message : '';
+  const matcher = message.match(/\b(to[A-Z][A-Za-z0-9]*)\b/)?.[1] ?? null;
+  const location = isRecord(error.location) ? error.location : null;
+  const stackLocation = typeof error.stack === 'string'
+    ? error.stack.match(/(?:^|\n)\s*at .*?([^\s():]+\.(?:[cm]?[jt]sx?)):(\d+):(\d+)/)
+    : null;
+  const file = location?.file ?? stackLocation?.[1] ?? descriptor.entrySpec;
+  const portableFile = String(file).replaceAll('\\', '/');
+  const stableFile = portableFile.includes('/tests/')
+    ? `tests/${portableFile.split('/tests/').at(-1)}`
+    : descriptor.entrySpec;
+  const line = Number.isSafeInteger(location?.line) ? location.line
+    : (stackLocation ? Number(stackLocation[2]) : null);
+  const matcherIdentity = stableIdentityToken(matcher);
+  const semantics = normalizedFailureSemantics(message, descriptor);
+  if (matcherIdentity === null || semantics === null || !hasAssertionSemantics(semantics, matcher)
+    || !Number.isSafeInteger(line) || line < 1) return null;
+  return `case:${descriptor.caseId}|location:${stableFile}:${line}|matcher:${matcherIdentity}|semantic:${semanticDigest(semantics)}`;
+}
+
+function findingIdentity(finding, descriptor) {
+  if (!isRecord(finding)) return null;
+  const stableId = ['id', 'ruleId', 'code', 'kind', 'category'].map((key) => stableIdentityToken(finding[key])).find(Boolean);
+  const stableTitle = stableIdentityToken(finding.title);
+  const severity = stableIdentityToken(finding.severity);
+  const identity = stableId ?? stableTitle;
+  const title = normalizedFailureSemantics(finding.title, descriptor);
+  const detail = normalizedFailureSemantics(finding.detail, descriptor);
+  if (identity === null || title === null || severity === null || detail === null
+    || typeof finding.blocking !== 'boolean') return null;
+  const semantics = JSON.stringify({
+    title,
+    severity,
+    blocking: finding.blocking,
+    detail,
+  });
+  return `case:${descriptor.caseId}|finding:${identity}|severity:${severity}|semantic:${semanticDigest(semantics)}`;
 }
 
 function collectTests(suites, output = [], inheritedFiles = []) {
@@ -117,6 +214,33 @@ function pathIsExactAbsolute(value) {
     && !value.split('/').some((segment, index) => index > 0 && (segment === '' || segment === '.' || segment === '..'));
 }
 
+function parseVisualRiskSource(value, descriptor) {
+  if (!isRecord(value) || Object.keys(value).sort().join('\0') !== [
+    'caseId', 'items', 'kind', 'observedAt', 'schemaVersion', 'targetId',
+  ].sort().join('\0') || value.schemaVersion !== 1 || value.kind !== 'shared-visual-comparison-result'
+    || value.caseId !== descriptor.caseId || value.targetId !== descriptor.targetId
+    || typeof value.observedAt !== 'string' || new Date(value.observedAt).toISOString() !== value.observedAt
+    || !Array.isArray(value.items) || value.items.length < 1 || value.items.length > 256) {
+    throw new TypeError('Shared visual comparison output has an invalid identity or shape.');
+  }
+  const ids = new Set();
+  const items = value.items.map((item) => {
+    if (!isRecord(item) || Object.keys(item).sort().join('\0') !== ['comparison', 'id'].join('\0')
+      || typeof item.id !== 'string' || !/^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,127})$/.test(item.id)
+      || ids.has(item.id)) throw new TypeError('Shared visual comparison item is invalid or duplicated.');
+    ids.add(item.id);
+    return Object.freeze({ id: item.id, comparison: parseVisualComparisonResult(item.comparison) });
+  });
+  if (items.some(({ comparison }) => ['absent', 'incompatible', 'unavailable'].includes(comparison.status))) {
+    return Object.freeze({ status: 'UNAVAILABLE', observedAt: value.observedAt, changedItems: Object.freeze([]) });
+  }
+  return Object.freeze({
+    status: 'COMPLETE',
+    observedAt: value.observedAt,
+    changedItems: Object.freeze(items.filter(({ comparison }) => comparison.status === 'CHANGED')),
+  });
+}
+
 function summaryFrom(attachments, descriptor, index) {
   const summaries = attachments.filter(({ name, contentType, body }) => (
     name === 'audit-result-summary' && contentType === 'application/json' && body !== null
@@ -178,6 +302,8 @@ export function validateSharedPlaywrightRows(document, descriptor) {
   if (rows.length === 0) fail('PLAYWRIGHT_ROW_MISSING', 'Playwright published no row for the compiler-issued work item.');
   const expectedTag = auditCaseTag(descriptor.caseId);
   const expectedJsonTag = expectedTag.startsWith('@') ? expectedTag.slice(1) : expectedTag;
+  const assertionIdentities = [];
+  let failureIdentityComplete = true;
   const normalized = rows.map(({ test, spec, sourceFiles }, index) => {
     if (!isRecord(test) || typeof test.projectName !== 'string' || !Array.isArray(test.results)
       || !Array.isArray(test.annotations)) {
@@ -204,6 +330,16 @@ export function validateSharedPlaywrightRows(document, descriptor) {
     const attachments = normalizedAttachments(test.results[0].attachments, index);
     const summary = summaryFrom(attachments, descriptor, index);
     enforcePrimaryEvidence(policy, attachments, summary, status, index);
+    if (status !== 'passed') {
+      const errors = Array.isArray(test.results[0].errors) ? test.results[0].errors
+        : (isRecord(test.results[0].error) ? [test.results[0].error] : []);
+      if (errors.length === 0) failureIdentityComplete = false;
+      for (const error of errors) {
+        const identity = errorIdentity(error, descriptor);
+        if (identity === null) failureIdentityComplete = false;
+        else assertionIdentities.push(identity);
+      }
+    }
     return {
       row: index + 1,
       title: String(spec.title ?? test.title ?? '').slice(0, 1_024),
@@ -222,6 +358,8 @@ export function validateSharedPlaywrightRows(document, descriptor) {
   return Object.freeze({
     outcome: normalized.every(({ status }) => status === 'passed') ? 'completed_pass' : 'completed_product_failure',
     rows: Object.freeze(normalized.map(Object.freeze)),
+    failureAssertionIdentities: Object.freeze([...new Set(assertionIdentities)].sort()),
+    failureIdentityComplete,
   });
 }
 
@@ -274,6 +412,7 @@ function validateAuditRecord(record, row, descriptor, index) {
     || JSON.stringify(summary.steps) !== JSON.stringify(record.steps)) {
     fail('PLAYWRIGHT_ROW_IDENTITY_MISMATCH', `Playwright row ${index} full audit evidence disagrees with its summary or descriptor.`);
   }
+  return record;
 }
 
 export async function collectSharedPlaywrightArtifacts({ document, descriptor, artifactRoot, evidenceRoot } = {}) {
@@ -290,6 +429,13 @@ export async function collectSharedPlaywrightArtifacts({ document, descriptor, a
   const declarations = [];
   const paths = new Set();
   const publicRows = [];
+  const findingIdentities = [];
+  let findingIdentityComplete = true;
+  const visualInScope = descriptor.entrySpec === VISUAL_SPEC;
+  let visualRiskSource = visualInScope
+    ? Object.freeze({ status: 'UNAVAILABLE', observedAt: null, changedItems: Object.freeze([]) })
+    : Object.freeze({ status: 'NOT_APPLICABLE', observedAt: null, changedItems: Object.freeze([]) });
+  let visualResultCount = 0;
   for (let rowIndex = 0; rowIndex < validated.rows.length; rowIndex += 1) {
     const row = validated.rows[rowIndex];
     const publicAttachments = [];
@@ -297,6 +443,24 @@ export async function collectSharedPlaywrightArtifacts({ document, descriptor, a
       const attachment = row.attachments[attachmentIndex];
       if (attachment.body !== null) {
         const bytes = Buffer.from(attachment.body, 'base64');
+        if (attachment.name === 'audit-result') {
+          let record;
+          try { record = JSON.parse(bytes.toString('utf8')); } catch {
+            fail('PLAYWRIGHT_STRUCTURED_EVIDENCE_INVALID', `Playwright row ${rowIndex} audit result is not valid JSON.`);
+          }
+          validateAuditRecord(record, row, descriptor, rowIndex);
+          for (const finding of record.findings) {
+            const identity = findingIdentity(finding, descriptor);
+            if (identity === null) findingIdentityComplete = false;
+            else findingIdentities.push(identity);
+          }
+        }
+        if (attachment.name === VISUAL_RESULT_ATTACHMENT) {
+          visualResultCount += 1;
+          try { visualRiskSource = parseVisualRiskSource(JSON.parse(bytes.toString('utf8')), descriptor); } catch {
+            visualRiskSource = Object.freeze({ status: 'UNAVAILABLE', observedAt: null, changedItems: Object.freeze([]) });
+          }
+        }
         const suffix = attachment.contentType === 'application/json' ? 'json' : 'bin';
         const fingerprint = createHash('sha256').update(bytes).digest('hex').slice(0, 16);
         const relative = `playwright/inline/row-${rowIndex + 1}/attachment-${attachmentIndex + 1}-${fingerprint}.${suffix}`;
@@ -326,17 +490,49 @@ export async function collectSharedPlaywrightArtifacts({ document, descriptor, a
       }
       paths.add(relative);
       const bytes = await fs.readFile(candidate);
+      if (attachment.name === VISUAL_RESULT_ATTACHMENT) {
+        visualResultCount += 1;
+        try { visualRiskSource = parseVisualRiskSource(JSON.parse(bytes.toString('utf8')), descriptor); } catch {
+          visualRiskSource = Object.freeze({ status: 'UNAVAILABLE', observedAt: null, changedItems: Object.freeze([]) });
+        }
+      }
       declarations.push(declaration(relative, attachment, row, bytes));
       publicAttachments.push({ name: attachment.name, contentType: attachment.contentType, path: relative });
       if (attachment.name === 'audit-result') {
-        validateAuditRecord(await boundedAttachmentJson(candidate, `Playwright row ${rowIndex} audit result`), row, descriptor, rowIndex);
+        const record = validateAuditRecord(
+          await boundedAttachmentJson(candidate, `Playwright row ${rowIndex} audit result`), row, descriptor, rowIndex,
+        );
+        for (const finding of record.findings) {
+          const identity = findingIdentity(finding, descriptor);
+          if (identity === null) findingIdentityComplete = false;
+          else findingIdentities.push(identity);
+        }
       }
     }
     publicRows.push({ ...row, attachments: publicAttachments });
   }
+  if (!visualInScope && visualResultCount > 0) {
+    fail('PLAYWRIGHT_ROW_IDENTITY_MISMATCH', 'Non-visual work published a visual comparison result.');
+  }
+  if (visualInScope && visualResultCount !== 1) {
+    visualRiskSource = Object.freeze({ status: 'UNAVAILABLE', observedAt: null, changedItems: Object.freeze([]) });
+  }
+  const assertionIdentities = [...new Set(validated.failureAssertionIdentities)].sort();
+  const normalizedFindingIdentities = [...new Set(findingIdentities)].sort();
+  const productFailureSignature = validated.outcome === 'completed_product_failure'
+    && validated.failureIdentityComplete && findingIdentityComplete
+    && assertionIdentities.length + normalizedFindingIdentities.length > 0
+    ? sealProductFailureSignature({
+      schemaVersion: 1,
+      assertionIdentities,
+      findingIdentities: normalizedFindingIdentities,
+    })
+    : null;
   return Object.freeze({
     outcome: validated.outcome,
     rows: Object.freeze(publicRows.map(Object.freeze)),
     artifacts: Object.freeze(declarations.map(Object.freeze)),
+    visualRiskSource,
+    productFailureSignature,
   });
 }

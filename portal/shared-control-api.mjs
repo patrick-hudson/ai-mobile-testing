@@ -205,7 +205,7 @@ function sessionToken(request) {
   return String(request.headers?.cookie ?? '').split(';').map((part) => part.trim()).find((part) => part.startsWith('audit_session='))?.slice(14) ?? '';
 }
 function mutationKind(suffix) {
-  return ({ cancel: 'cancel', rekick: 'rekick', 'risks/acknowledge': 'risk-acknowledge', 'risks/resolve': 'risk-resolve', 'visual/disposition': 'visual-disposition', purge: 'purge' })[suffix] ?? null;
+  return ({ cancel: 'cancel', rekick: 'rekick', 'diagnostic-rerun': 'diagnostic-rerun', 'risks/acknowledge': 'risk-acknowledge', 'risks/resolve': 'risk-resolve', 'visual/disposition': 'visual-disposition', purge: 'purge' })[suffix] ?? null;
 }
 function numberQuery(url, name, fallback) { const value = Number(url.searchParams.get(name) ?? fallback); return value; }
 function response(status, body, extraHeaders = {}) { return Object.freeze({ handled: true, status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', ...extraHeaders }, body }); }

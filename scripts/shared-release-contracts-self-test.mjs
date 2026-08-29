@@ -17,6 +17,7 @@ import {
   parseWorkItemResult,
   sealExecutionManifest,
   sealOracleResult,
+  sealProductFailureSignature,
   sealWorkItemResult,
 } from '../shared/execution-contract.mjs';
 import {
@@ -44,6 +45,21 @@ import { projectSharedReleasePublication } from '../reporters/report-model.ts';
 
 const DIGEST_A = `sha256:${'a'.repeat(64)}`;
 const DIGEST_B = `sha256:${'b'.repeat(64)}`;
+const FAILURE_SIGNATURE_A = sealProductFailureSignature({
+  schemaVersion: 1,
+  assertionIdentities: ['assertion:primary-navigation:visible'],
+  findingIdentities: ['finding:primary-navigation:hidden'],
+});
+const FAILURE_SIGNATURE_B = sealProductFailureSignature({
+  schemaVersion: 1,
+  assertionIdentities: ['assertion:primary-navigation:visible'],
+  findingIdentities: ['finding:primary-navigation:missing'],
+});
+const FAILURE_SIGNATURE_WORSE = sealProductFailureSignature({
+  schemaVersion: 1,
+  assertionIdentities: ['assertion:primary-navigation:visible', 'assertion:signup:usable'],
+  findingIdentities: ['finding:primary-navigation:hidden', 'finding:signup:blocked'],
+});
 
 function expectCode(code, operation) {
   assert.throws(operation, (error) => error instanceof ContractError && error.code === code);
@@ -522,7 +538,28 @@ const productionOnlyFailureOracle = sealOracleResult({
 });
 assert.equal(productionOnlyFailureOracle.outcome, 'completed_pass',
   'A production-only defect must remain baseline context.');
+assert.deepEqual(productionOnlyFailureOracle.comparisonResults.map(({ classification }) => classification),
+  ['production-only']);
 const unchangedFailureOracle = sealOracleResult({
+  schemaVersion: 1,
+  oracleExecution: comparativeManifest.oracleExecutions[0],
+  finalSubjectDigest: comparativeSubject.digest,
+  workItemResults: [
+    workResult(comparativeCore.digest, {
+      workItemId: 'work-candidate', outcome: 'completed_product_failure', evidenceDigests: [DIGEST_B],
+      productFailureSignature: FAILURE_SIGNATURE_A,
+    }),
+    workResult(comparativeCore.digest, {
+      workItemId: 'work-production', outcome: 'completed_product_failure', evidenceDigests: [DIGEST_A],
+      productFailureSignature: FAILURE_SIGNATURE_A,
+    }),
+  ],
+});
+assert.equal(unchangedFailureOracle.outcome, 'completed_pass',
+  'The same normalized failure identity must remain baseline context despite different artifacts.');
+assert.deepEqual(unchangedFailureOracle.comparisonResults.map(({ classification }) => classification),
+  ['reproduced-unchanged']);
+const unsignedPairedFailureOracle = sealOracleResult({
   schemaVersion: 1,
   oracleExecution: comparativeManifest.oracleExecutions[0],
   finalSubjectDigest: comparativeSubject.digest,
@@ -531,8 +568,74 @@ const unchangedFailureOracle = sealOracleResult({
     workResult(comparativeCore.digest, { workItemId: 'work-production', outcome: 'completed_product_failure' }),
   ],
 });
-assert.equal(unchangedFailureOracle.outcome, 'completed_pass',
-  'A defect reproduced on both sides must remain baseline context absent regression proof.');
+assert.equal(unsignedPairedFailureOracle.outcome, 'completed_product_failure',
+  'Paired failures without normalized failure identities must fail closed.');
+assert.deepEqual(unsignedPairedFailureOracle.comparisonResults.map(({ classification }) => classification),
+  ['candidate-worsened']);
+const {
+  digest: _comparisonAwareDigest,
+  comparisonResults: _comparisonResults,
+  workItemOutcomes: comparisonAwareOutcomes,
+  ...preComparisonOracleFields
+} = unchangedFailureOracle;
+const preComparisonOracleBody = {
+  ...preComparisonOracleFields,
+  workItemOutcomes: comparisonAwareOutcomes.map(({ workItemId, outcome }) => ({ workItemId, outcome })),
+};
+const preComparisonOracle = {
+  ...preComparisonOracleBody,
+  digest: canonicalDigest(preComparisonOracleBody),
+};
+assert.deepEqual(parseOracleResult(preComparisonOracle), preComparisonOracle,
+  'Previously sealed paired oracle results must remain readable.');
+assert.equal(deriveReleaseDecision({
+  schemaVersion: 1,
+  runId: 'run-comparative-pre-comparison',
+  decisionRevision: 1,
+  finalSubject: comparativeSubject,
+  executionManifest: comparativeManifest,
+  oracleResults: [preComparisonOracle],
+  releaseDispositions: [],
+}).code, 'NOT_READY_TEST_FAILURE',
+  'A paired legacy result without sealed failure equivalence must fail closed.');
+const differentFailureOracle = sealOracleResult({
+  schemaVersion: 1,
+  oracleExecution: comparativeManifest.oracleExecutions[0],
+  finalSubjectDigest: comparativeSubject.digest,
+  workItemResults: [
+    workResult(comparativeCore.digest, {
+      workItemId: 'work-candidate', outcome: 'completed_product_failure', evidenceDigests: [DIGEST_B],
+      productFailureSignature: FAILURE_SIGNATURE_B,
+    }),
+    workResult(comparativeCore.digest, {
+      workItemId: 'work-production', outcome: 'completed_product_failure', evidenceDigests: [DIGEST_A],
+      productFailureSignature: FAILURE_SIGNATURE_A,
+    }),
+  ],
+});
+assert.equal(differentFailureOracle.outcome, 'completed_product_failure',
+  'Different normalized candidate and production failures must block release.');
+assert.deepEqual(differentFailureOracle.comparisonResults.map(({ classification }) => classification),
+  ['candidate-worsened']);
+const worsenedFailureOracle = sealOracleResult({
+  schemaVersion: 1,
+  oracleExecution: comparativeManifest.oracleExecutions[0],
+  finalSubjectDigest: comparativeSubject.digest,
+  workItemResults: [
+    workResult(comparativeCore.digest, {
+      workItemId: 'work-candidate', outcome: 'completed_product_failure', evidenceDigests: [DIGEST_A],
+      productFailureSignature: FAILURE_SIGNATURE_WORSE,
+    }),
+    workResult(comparativeCore.digest, {
+      workItemId: 'work-production', outcome: 'completed_product_failure', evidenceDigests: [DIGEST_A],
+      productFailureSignature: FAILURE_SIGNATURE_A,
+    }),
+  ],
+});
+assert.equal(worsenedFailureOracle.outcome, 'completed_product_failure',
+  'Additional normalized candidate failures must block release as a worsened defect.');
+assert.deepEqual(worsenedFailureOracle.comparisonResults.map(({ classification }) => classification),
+  ['candidate-worsened']);
 const candidateRegressionOracle = sealOracleResult({
   schemaVersion: 1,
   oracleExecution: comparativeManifest.oracleExecutions[0],
@@ -544,6 +647,8 @@ const candidateRegressionOracle = sealOracleResult({
 });
 assert.equal(candidateRegressionOracle.outcome, 'completed_product_failure',
   'A candidate failure against a passing production pair must block release.');
+assert.deepEqual(candidateRegressionOracle.comparisonResults.map(({ classification }) => classification),
+  ['candidate-introduced']);
 const forgedPolicyOracle = sealOracleResult({
   schemaVersion: 1,
   oracleExecution: {

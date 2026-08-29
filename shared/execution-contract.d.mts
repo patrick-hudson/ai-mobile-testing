@@ -1,4 +1,11 @@
 export type WorkItemOutcome = 'completed_pass' | 'completed_product_failure' | 'operational_failure' | 'cancelled' | 'incomplete_unknown';
+export interface ProductFailureSignature {
+  schemaVersion: 1;
+  kind: 'product-failure-signature';
+  assertionIdentities: string[];
+  findingIdentities: string[];
+  digest: string;
+}
 export interface ExecutionManifest {
   schemaVersion: 1;
   kind: 'execution-manifest';
@@ -24,6 +31,7 @@ export interface WorkItemResult {
   authoritative: boolean;
   outcome: WorkItemOutcome;
   evidenceDigests: string[];
+  productFailureSignature?: ProductFailureSignature | null;
   digest: string;
 }
 export interface OracleResult {
@@ -38,11 +46,21 @@ export interface OracleResult {
   productOracleVariant: string;
   baselinePolicy: 'not-applicable' | 'context-unless-candidate-regression-proven';
   workItemBindings: Array<{ workItemId: string; targetRole: string; comparisonKey: string }>;
-  workItemOutcomes: Array<{ workItemId: string; outcome: WorkItemOutcome }>;
+  workItemOutcomes: Array<{ workItemId: string; outcome: WorkItemOutcome; productFailureSignature?: ProductFailureSignature | null }>;
+  comparisonResults?: Array<{
+    comparisonKey: string;
+    candidateWorkItemId: string | null;
+    productionWorkItemId: string | null;
+    candidateProductFailureSignatureDigest: string | null;
+    productionProductFailureSignatureDigest: string | null;
+    classification: 'passed' | 'production-only' | 'reproduced-unchanged' | 'candidate-introduced' | 'candidate-worsened' | 'incomplete';
+  }>;
   outcome: 'completed_pass' | 'completed_product_failure' | 'incomplete';
   digest: string;
 }
 export const WORK_ITEM_OUTCOMES: readonly WorkItemOutcome[];
+export function sealProductFailureSignature(value: Omit<ProductFailureSignature, 'kind' | 'digest'>): Readonly<ProductFailureSignature>;
+export function parseProductFailureSignature(value: unknown): Readonly<ProductFailureSignature>;
 export function sealExecutionManifest(value: unknown): ExecutionManifest;
 export function parseExecutionManifest(value: unknown): ExecutionManifest;
 export function sealWorkItemResult(value: unknown): WorkItemResult;

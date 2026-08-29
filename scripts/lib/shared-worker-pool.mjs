@@ -4,13 +4,9 @@ import {
   claimWorkItem,
   publishAttemptEvidence,
 } from './parent-run-store.mjs';
+import { classifyExecutionFailure } from './shared-worker-failure.mjs';
 
-const OPERATIONAL_FAILURE_ALLOWLIST = new Set([
-  'browser_process_crash',
-  'container_evicted',
-  'worker_process_terminated',
-  'coordinator_transport_unavailable',
-]);
+export { classifyExecutionFailure } from './shared-worker-failure.mjs';
 const TERMINAL_OUTCOMES = new Set(['completed_pass', 'completed_product_failure']);
 const SAFE_WORKER_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,127})$/;
 const CAPABILITY = /^[a-z][a-z0-9.-]*:[a-z][a-z0-9.-]*$/;
@@ -47,17 +43,9 @@ function validateWorker(value) {
   });
 }
 
-export function classifyExecutionFailure(value = {}) {
-  const kind = typeof value.kind === 'string' && value.kind ? value.kind : 'unclassified_execution_failure';
-  const operational = value.trustedPlatformSignal === true && OPERATIONAL_FAILURE_ALLOWLIST.has(kind);
-  return operational
-    ? { outcome: 'operational_failure', reason: kind, retryable: true }
-    : { outcome: 'completed_product_failure', reason: kind, retryable: false };
-}
-
 function validateSuccessfulExecution(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || !TERMINAL_OUTCOMES.has(value.outcome)
-    || Object.keys(value).some((key) => !['outcome', 'reason', 'artifacts', 'riskSourceObservationSet'].includes(key))
+    || Object.keys(value).some((key) => !['outcome', 'reason', 'artifacts', 'riskSourceObservationSet', 'productFailureSignature'].includes(key))
     || !Array.isArray(value.artifacts)) {
     fail('SHARED_WORKER_RESULT_INVALID', 'Worker execution must return one completed outcome and artifact uploads.');
   }
@@ -65,6 +53,7 @@ function validateSuccessfulExecution(value) {
     outcome: value.outcome,
     reason: value.reason ?? null,
     ...(value.riskSourceObservationSet ? { riskSourceObservationSet: value.riskSourceObservationSet } : {}),
+    ...(value.productFailureSignature ? { productFailureSignature: value.productFailureSignature } : {}),
     artifacts: [...value.artifacts],
   };
 }

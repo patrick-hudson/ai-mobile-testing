@@ -36,10 +36,24 @@ try {
     runId,
     subjectCoreDigest: `sha256:${'a'.repeat(64)}`,
     runnerRevision: 'runner-streaming-http',
-    workItems: [{
-      id: 'stream-http-work', maxAttempts: 2, capability: 'browser:chromium', resourceClass: 'ordinary',
-      targetId: 'candidate-desktop-chromium', specAffinity: null,
-    }],
+    workItems: [
+      {
+        id: 'stream-http-work', maxAttempts: 2, capability: 'browser:chromium', resourceClass: 'ordinary',
+        targetId: 'candidate-desktop-chromium', specAffinity: null,
+      },
+      {
+        id: 'zx-assertion-timeout-work', maxAttempts: 2, capability: 'browser:chromium', resourceClass: 'ordinary',
+        targetId: 'candidate-desktop-chromium', specAffinity: null,
+      },
+      {
+        id: 'zy-navigation-timeout-work', maxAttempts: 2, capability: 'browser:chromium', resourceClass: 'ordinary',
+        targetId: 'candidate-desktop-chromium', specAffinity: null,
+      },
+      {
+        id: 'zz-runtime-recovery-work', maxAttempts: 2, capability: 'browser:chromium', resourceClass: 'ordinary',
+        targetId: 'candidate-desktop-chromium', specAffinity: null,
+      },
+    ],
   });
   const authority = await openScopedCredentialAuthority({ root: credentialRoot });
   const worker = await authority.createPrincipal({
@@ -70,7 +84,9 @@ try {
     const value = await response.json();
     return { response, value };
   };
-  const claimed = await post('/v1/claim', { capabilities: ['browser:chromium'], resourceClasses: ['ordinary'] });
+  const claimed = await post('/v1/claim', {
+    capabilities: ['browser:chromium'], resourceClasses: ['ordinary'], workItemId: 'stream-http-work',
+  });
   assert.equal(claimed.response.status, 200, JSON.stringify(claimed.value));
   let activeLease = claimed.value;
   const bytes = Buffer.alloc(256 * 1_024, 0x5a);
@@ -197,9 +213,79 @@ try {
   assert.equal(state.workItems['stream-http-work'].attempts[0].uploadIntentDigest, intent.value.intentDigest);
   assert.deepEqual(state.workItems['stream-http-work'].canonicalResult.evidenceDigests, [member.memberDigest]);
 
+  for (const [workItemId, reason] of [
+    ['zx-assertion-timeout-work', 'assertion_timeout'],
+    ['zy-navigation-timeout-work', 'navigation_timeout'],
+  ]) {
+    const timeoutClaim = await post('/v1/claim', {
+      capabilities: ['browser:chromium'], resourceClasses: ['ordinary'],
+    });
+    assert.equal(timeoutClaim.response.status, 200, JSON.stringify(timeoutClaim.value));
+    assert.equal(timeoutClaim.value.workItemId, workItemId);
+    const timeoutIntent = await post('/v1/result-intent', {
+      lease: timeoutClaim.value,
+      result: {
+        outcome: 'completed_product_failure', reason,
+        executionDescriptorDigest: timeoutClaim.value.executionDescriptorDigest ?? null, artifacts: [],
+      },
+    });
+    assert.equal(timeoutIntent.response.status, 201, JSON.stringify(timeoutIntent.value));
+    const timeoutFinalized = await post('/v1/result-finalize', {
+      lease: timeoutClaim.value, intentDigest: timeoutIntent.value.intentDigest,
+    });
+    assert.equal(timeoutFinalized.response.status, 202, JSON.stringify(timeoutFinalized.value));
+    assert.equal(timeoutFinalized.value.state, 'completed_product_failure',
+      `${reason} must remain terminal through the deployed coordinator route`);
+  }
+
+  const runtimeClaim = await post('/v1/claim', {
+    capabilities: ['browser:chromium'], resourceClasses: ['ordinary'], workItemId: 'runtime-recovery-work',
+  });
+  assert.equal(runtimeClaim.response.status, 200, JSON.stringify(runtimeClaim.value));
+  assert.equal(runtimeClaim.value.workItemId, 'zz-runtime-recovery-work');
+  const arbitraryOperationalIntent = await post('/v1/result-intent', {
+    lease: runtimeClaim.value,
+    result: {
+      outcome: 'operational_failure', reason: 'browser_process_crash',
+      executionDescriptorDigest: runtimeClaim.value.executionDescriptorDigest ?? null, artifacts: [],
+    },
+  });
+  assert.equal(arbitraryOperationalIntent.response.status, 422,
+    'workers cannot reopen the general result route for arbitrary operational claims');
+  const untrustedRuntime = await post('/v1/runtime-failure', {
+    lease: runtimeClaim.value, signal: 'NOT_A_SIGNAL', reason: 'browser_process_crash',
+  });
+  assert.equal(untrustedRuntime.response.status, 422,
+    'the runtime route accepts neither worker-selected reasons nor unclassified signals');
+  const recovered = await post('/v1/runtime-failure', { lease: runtimeClaim.value, signal: 'SIGUSR2' });
+  assert.equal(recovered.response.status, 202, JSON.stringify(recovered.value));
+  assert.equal(recovered.value.state, 'queued', 'a trusted runtime signal receives one bounded retry');
+  const recoveredHeartbeat = await post('/v1/heartbeat', { lease: runtimeClaim.value });
+  assert.equal(recoveredHeartbeat.response.status, 202, JSON.stringify(recoveredHeartbeat.value));
+  assert.equal(recoveredHeartbeat.value.terminal, true,
+    'a heartbeat racing adopted operational recovery must acknowledge the exact terminal attempt');
+  const retried = await post('/v1/claim', {
+    capabilities: ['browser:chromium'], resourceClasses: ['ordinary'], workItemId: 'runtime-recovery-work',
+  });
+  assert.equal(retried.response.status, 200, JSON.stringify(retried.value));
+  assert.equal(retried.value.workItemId, 'zz-runtime-recovery-work');
+  assert.equal(retried.value.attempt, 2);
+  const exhausted = await post('/v1/runtime-failure', { lease: retried.value, signal: 'SIGKILL' });
+  assert.equal(exhausted.response.status, 202, JSON.stringify(exhausted.value));
+  assert.equal(exhausted.value.state, 'incomplete', 'runtime recovery stops at the server-issued attempt bound');
+  const recoveredState = await readParentRun(store, runId);
+  for (const workItemId of ['zx-assertion-timeout-work', 'zy-navigation-timeout-work']) {
+    assert.equal(recoveredState.workItems[workItemId].attempts.length, 1,
+      'a terminal timeout must not receive another attempt');
+  }
+  assert.equal(recoveredState.workItems['zz-runtime-recovery-work'].attempts[0].outcome, 'operational_failure');
+  assert.equal(recoveredState.workItems['zz-runtime-recovery-work'].attempts[0].reason, 'browser_process_crash');
+  assert.equal(recoveredState.workItems['zz-runtime-recovery-work'].attempts[1].reason, 'worker_process_terminated');
+  assert.equal(recoveredState.workItems['zz-runtime-recovery-work'].attempts.length, 2);
+
   const retired = await post('/v1/result', { lease: activeLease, result: { ...result, artifacts: [] } });
   assert.equal(retired.response.status, 404, 'the buffered base64 result route must remain retired');
-  process.stdout.write('Shared streaming evidence HTTP self-test passed: raw uploads span heartbeats, finalize exactly once, replay safely, and never use the retired JSON evidence route.\n');
+  process.stdout.write('Shared streaming evidence HTTP self-test passed: raw uploads span heartbeats, timeout failures stay terminal, OS-signalled recovery is bounded, finalize replays safely, and the retired JSON evidence route stays closed.\n');
 } finally {
   if (coordinator) await stopProcess(coordinator);
   await fs.rm(root, { recursive: true, force: true });

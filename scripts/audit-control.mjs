@@ -70,6 +70,7 @@ function routesFor(run, options) {
     'wait-operation': ['GET', operationPath(run, options)],
     cancel: ['POST', `/api/control/v1/runs/${run}/cancel`],
     rekick: ['POST', `/api/control/v1/runs/${run}/rekick`],
+    'diagnostic-rerun': ['POST', `/api/control/v1/runs/${run}/diagnostic-rerun`],
     'risk-acknowledge': ['POST', `/api/control/v1/runs/${run}/risks/acknowledge`],
     'risk-resolve': ['POST', `/api/control/v1/runs/${run}/risks/resolve`],
     'visual-disposition': ['POST', `/api/control/v1/runs/${run}/visual/disposition`],

@@ -13,9 +13,9 @@ export interface ParentRunStore { root: string; clock(): number; manifest: any; 
 export interface CoordinatorFence { ownerId: string; epoch: number; token: string; acquiredAt: string; expiresAt: string }
 export interface ReleaseAuthorityBinding { storeMarkerDigest: string; storeGeneration: number; activationEpoch: 0 | 1; writerProtocol: string; digest: string }
 export interface ReleaseAuthorityContext { selector: any; binding: ReleaseAuthorityBinding }
-export interface WorkLease { runId: string; workItemId: string; workerId: string; attempt: number; epoch: number; token: string; claimedAt: string; expiresAt: string; subjectCoreDigest: string; runnerRevision: string; capability: string; resourceClass: 'ordinary' | 'performance'; targetId: string; specAffinity: string | null; executionDescriptor: WorkExecutionDescriptor | null; executionDescriptorDigest: string | null }
+export interface WorkLease { runId: string; workItemId: string; workerId: string; attempt: number; epoch: number; token: string; claimedAt: string; expiresAt: string; subjectCoreDigest: string; runnerRevision: string; capability: string; resourceClass: 'ordinary' | 'performance'; targetId: string; specAffinity: string | null; executionDescriptor: WorkExecutionDescriptor | null; executionDescriptorDigest: string | null; diagnosticExecutionId?: string }
 export interface WorkHeartbeatReceipt { relativePath: string; digest: string; workItemId: string; leaseToken: string }
-export interface StorePerformanceReservation { workerId: string; runId: string; workItemId: string; coordinatorEpoch: number; requestedAt: string; expiresAt: string; attempt?: number; leaseToken?: string; acquiredAt?: string }
+export interface StorePerformanceReservation { workerId: string; runId: string; workItemId: string; diagnosticExecutionId: string | null; coordinatorEpoch: number; requestedAt: string; expiresAt: string; attempt?: number; leaseToken?: string; acquiredAt?: string }
 export interface StorePerformanceScheduler { schemaVersion: 1; kind: 'store-performance-scheduler'; revision: number; phase: 'idle' | 'draining' | 'running'; reservation: StorePerformanceReservation | null; updatedAt: string; digest: string }
 export function openParentRunStore(options: any): Promise<ParentRunStore>;
 export function createParentRun(store: ParentRunStore, input: any): Promise<any>;
@@ -64,9 +64,9 @@ export function finalizeAttemptEvidenceUpload(store: ParentRunStore, runId: stri
 }): Promise<any>;
 export function appendAttemptLog(store: ParentRunStore, runId: string, lease: WorkLease, entry: { sequence: number; level: 'debug' | 'info' | 'warn' | 'error'; message: string }): Promise<any>;
 export function adoptAttemptEvidence(store: ParentRunStore, runId: string, coordinator: CoordinatorFence, inbox: any): Promise<any>;
-export function readAdoptedAttemptArtifactJson(store: ParentRunStore, runId: string, input: { workItemId: string; name: string; maximumBytes?: number }): Promise<any>;
+export function readAdoptedAttemptArtifactJson(store: ParentRunStore, runId: string, input: { workItemId: string; name: string; diagnosticExecutionId?: string; maximumBytes?: number }): Promise<any>;
 export interface AdoptedAttemptArtifactDescriptor {
-  runId: string; workItemId: string; attempt: number; completedAt: string;
+  runId: string; workItemId: string; attempt: number; authoritative: boolean; diagnosticExecutionId: string | null; completedAt: string;
   name: string; logicalName: string; purpose: 'structured' | 'primary' | 'diagnostic';
   mediaType: string; sizeBytes: number; digest: string; memberDigest: string; artifactKey: string;
 }
@@ -84,7 +84,8 @@ export function getOperation(store: ParentRunStore, runId: string, idempotencyKe
 export function getOperationById(store: ParentRunStore, runId: string, operationId: string): Promise<any>;
 export function listPendingOperations(store: ParentRunStore, runId: string, options?: { limit?: number }): Promise<any[]>;
 export function rekickIncompleteWork(store: ParentRunStore, runId: string, coordinator: CoordinatorFence, input: any): Promise<any>;
-export function applyRekickOperation(store: ParentRunStore, runId: string, coordinator: CoordinatorFence, operationId: string): Promise<any>;
+export function applyRekickOperation(store: ParentRunStore, runId: string, coordinator: CoordinatorFence, operationId: string, input?: { observedDeploymentIdentity?: { kind: string; value: string } | null; failureReason?: string | null }): Promise<any>;
+export function applyDiagnosticRerunOperation(store: ParentRunStore, runId: string, coordinator: CoordinatorFence, operationId: string, input?: { observedDeploymentIdentity?: { kind: string; value: string } | null; failureReason?: string | null }): Promise<any>;
 export function completeOperation(store: ParentRunStore, runId: string, coordinator: CoordinatorFence, operationId: string, outcome: any): Promise<any>;
 export function appendRiskLifecycleEvent(store: ParentRunStore, runId: string, coordinator: CoordinatorFence, input: any): Promise<any>;
 export function appendMutationAuditEvent(store: ParentRunStore, runId: string, coordinator: CoordinatorFence, input: any): Promise<any>;

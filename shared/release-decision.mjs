@@ -61,6 +61,21 @@ function reason(reasonClass, executionId, detail) {
   return { class: reasonClass, executionId, detail };
 }
 
+function lacksProvenPairedEquivalence(result) {
+  if (result.baselinePolicy !== 'context-unless-candidate-regression-proven'
+    || Array.isArray(result.comparisonResults)) return false;
+  const outcomes = new Map(result.workItemOutcomes.map(({ workItemId, outcome }) => [workItemId, outcome]));
+  const groups = new Map();
+  for (const binding of result.workItemBindings) {
+    const group = groups.get(binding.comparisonKey) ?? {};
+    group[binding.targetRole] = outcomes.get(binding.workItemId);
+    groups.set(binding.comparisonKey, group);
+  }
+  return [...groups.values()].some(({ candidate, production }) => (
+    candidate === 'completed_product_failure' && production === 'completed_product_failure'
+  ));
+}
+
 export function deriveCompilationFailureDecision(value) {
   assertSchemaVersion(value, 'Compilation failure decision input');
   exactKeys(value, [
@@ -165,8 +180,11 @@ export function deriveReleaseDecision(value) {
   }
 
   const productReasons = [
-    ...oracleResults.filter(({ outcome }) => outcome === 'completed_product_failure')
-      .map(({ oracleExecutionId }) => reason('product-failure', oracleExecutionId, 'A canonical Product Oracle failed.')),
+    ...oracleResults.filter((result) => result.outcome === 'completed_product_failure' || lacksProvenPairedEquivalence(result))
+      .map(({ oracleExecutionId }) => reason(
+        'product-failure', oracleExecutionId,
+        'A canonical Product Oracle failed or lacked sealed evidence that paired failures were unchanged.',
+      )),
     ...dispositions.filter(({ kind }) => kind === 'visual-defect')
       .map(({ executionId, reason: detail }) => reason('product-failure', executionId, detail)),
   ];

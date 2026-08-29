@@ -5169,6 +5169,8 @@ async function listSharedArtifactsForPortal(runId, offset, limit, request) {
       purpose: artifact.purpose,
       workItemId: artifact.workItemId,
       attempt: artifact.attempt,
+      authoritative: artifact.authoritative,
+      diagnosticExecutionId: artifact.diagnosticExecutionId,
       bytes: artifact.sizeBytes,
       digest: artifact.digest,
       memberDigest: artifact.memberDigest,

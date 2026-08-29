@@ -3,6 +3,7 @@ const TERMINAL_OPERATION_STATES = new Set(['completed', 'succeeded', 'failed', '
 const MUTATION_PATHS = Object.freeze({
   cancel: 'cancel',
   rekick: 'rekick',
+  diagnosticRerun: 'diagnostic-rerun',
   riskAcknowledge: 'risks/acknowledge',
   riskResolve: 'risks/resolve',
   visualDisposition: 'visual/disposition',
@@ -78,6 +79,10 @@ export function assertSharedWorkspaceProjection(value, { runId, mode } = {}) {
     || !['LOADING', 'PROVISIONAL', 'AVAILABLE', 'PARTIAL', 'EMPTY', 'UNAVAILABLE'].includes(register?.availability)
     || !Array.isArray(register?.risks) || !Array.isArray(executions?.executions)
     || !Array.isArray(executions?.oracleExecutions)
+    || (executions?.diagnosticExecutions !== undefined
+      && (!Array.isArray(executions.diagnosticExecutions)
+        || executions.diagnosticExecutions.some((entry) => typeof entry?.diagnosticExecutionId !== 'string'
+          || typeof entry?.workItemId !== 'string' || typeof entry?.state !== 'string')))
     || executions.executions.some((entry) => typeof entry?.id !== 'string' || typeof entry?.state !== 'string')
     || executions.oracleExecutions.some((entry) => typeof entry?.id !== 'string')
     || typeof value?.snapshotToken !== 'string' || !/^sha256:[a-f0-9]{64}$/u.test(value.snapshotToken)

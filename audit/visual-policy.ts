@@ -1,9 +1,9 @@
-import { parseTimestamp } from '../shared/visual-baseline-contract.mjs';
+import { parseTimestamp, VISUAL_COMPARISON_POLICY_REVISION } from '../shared/visual-baseline-contract.mjs';
 import type { VisualReviewStatus } from '../shared/visual-baseline-contract.mjs';
 
 export const VISUAL_COMPARISON_POLICY = Object.freeze({
   schemaVersion: 1 as const,
-  revision: 'pixelmatch-css-ratio-0.0025-v1',
+  revision: VISUAL_COMPARISON_POLICY_REVISION,
   algorithm: 'pixelmatch' as const,
   maximumDifferingPixelRatio: 0.0025,
   includeAA: false,

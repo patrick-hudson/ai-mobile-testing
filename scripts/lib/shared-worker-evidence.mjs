@@ -2,13 +2,58 @@ import { createHash } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import path from 'node:path';
+import { parseProductFailureSignature } from '../../shared/execution-contract.mjs';
 import { sealWorkItemEvidenceMember } from '../../shared/work-item-evidence-index.mjs';
 import { sealRiskSourceObservationSet } from '../../shared/risk-source-observation.mjs';
+import { classifyExecutionFailure } from './shared-worker-failure.mjs';
 
 export const MAX_WORKER_ARTIFACTS = 64;
 export const MAX_WORKER_ARTIFACT_BYTES = 512 * 1_048_576;
 export const MAX_WORKER_EVIDENCE_BYTES = 1_024 * 1_048_576;
 const MEDIA_TYPE = /^[a-z0-9][a-z0-9.+-]{0,126}\/[a-z0-9][a-z0-9.+-]{0,126}$/i;
+function safeLogDetail(value) {
+  return String(value ?? '').replace(/[\r\n\u001b]/g, ' ').slice(0, 384);
+}
+
+export async function collectSharedWorkerAttempt(evidenceRoot, completion, lease) {
+  try {
+    const result = await collectSharedWorkerEvidence(evidenceRoot, completion, lease);
+    const logEvent = result.outcome === 'completed_pass' ? 'command-completed' : 'product-failure';
+    return Object.freeze({
+      result,
+      retryable: false,
+      logEvent,
+      logMessage: result.outcome === 'completed_pass'
+        ? `command-completed; streaming ${result.artifacts.length} evidence artifacts`
+        : `product-failure: ${result.reason}; streaming ${result.artifacts.length} evidence artifacts`,
+    });
+  } catch (error) {
+    const runtimeSignal = completion?.signal !== null && typeof completion?.signal === 'string'
+      ? completion.signal
+      : null;
+    if (runtimeSignal === null) {
+      const rejected = new Error(`Executor did not publish a valid structured result: ${safeLogDetail(error?.message)}`);
+      rejected.code = 'SHARED_WORK_EVIDENCE_INVALID';
+      rejected.cause = error;
+      throw rejected;
+    }
+    const runtimeFailure = runtimeSignal === 'SIGUSR2' ? 'browser_process_crash' : 'worker_process_terminated';
+    const classified = classifyExecutionFailure({ kind: runtimeFailure, trustedPlatformSignal: true });
+    const logEvent = classified.retryable ? 'operational-recovery' : 'product-failure';
+    return Object.freeze({
+      result: {
+        outcome: classified.outcome,
+        reason: classified.reason,
+        executionDescriptorDigest: lease.executionDescriptorDigest ?? null,
+        artifacts: [],
+      },
+      retryable: classified.retryable,
+      runtimeSignal,
+      logEvent,
+      logMessage: `${logEvent}: ${classified.reason}; ${safeLogDetail(error?.message)}`,
+    });
+  }
+}
 
 function artifactPath(root, value) {
   if (typeof value !== 'string' || !value || value.length > 240 || value.includes('\\') || value.includes('\0')) {
@@ -50,15 +95,21 @@ export async function collectSharedWorkerEvidence(evidenceRoot, { code, signal =
     'schemaVersion', 'kind', 'runId', 'workItemId', 'attempt', 'subjectCoreDigest', 'runnerRevision',
     'executionDescriptorDigest', 'outcome', 'reason', 'artifacts',
   ];
+  const hasProductFailureSignature = Object.prototype.hasOwnProperty.call(manifest ?? {}, 'productFailureSignature');
   const hasRiskSourceOutput = Object.prototype.hasOwnProperty.call(manifest ?? {}, 'riskSourceOutput');
   if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)
-    || Object.keys(manifest).length !== resultKeys.length + (hasRiskSourceOutput ? 1 : 0)
+    || Object.keys(manifest).length !== resultKeys.length + (hasRiskSourceOutput ? 1 : 0) + (hasProductFailureSignature ? 1 : 0)
     || resultKeys.some((key) => !(key in manifest))
     || manifest.schemaVersion !== 1 || manifest.kind !== 'shared-worker-result'
     || !['completed_pass', 'completed_product_failure'].includes(manifest.outcome)
     || (manifest.reason !== null && (typeof manifest.reason !== 'string' || !manifest.reason || manifest.reason.length > 256))
     || !Array.isArray(manifest.artifacts) || manifest.artifacts.length > MAX_WORKER_ARTIFACTS) {
     throw new Error('Executor result manifest has an invalid schema.');
+  }
+  let productFailureSignature = null;
+  if (hasProductFailureSignature && manifest.productFailureSignature !== null) {
+    if (manifest.outcome !== 'completed_product_failure') throw new Error('Only a completed product failure can carry a product-failure signature.');
+    productFailureSignature = parseProductFailureSignature(manifest.productFailureSignature);
   }
   const riskSourceOutput = hasRiskSourceOutput ? manifest.riskSourceOutput : {
     producerStates: [
@@ -169,6 +220,7 @@ export async function collectSharedWorkerEvidence(evidenceRoot, { code, signal =
     reason: manifest.reason,
     executionDescriptorDigest: manifest.executionDescriptorDigest,
     riskSourceObservationSet,
+    productFailureSignature,
     artifacts: uploads,
   };
 }

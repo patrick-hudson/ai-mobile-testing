@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { auditCaseTag } from '../shared/audit-case-identity.mjs';
 import {
   parseRiskSourceObservationSet,
   sealCompileRiskInputs,
@@ -11,6 +12,9 @@ import {
 import { compileSharedLaunchPlan } from '../shared/launch-plan-compiler.mjs';
 import { createSharedControlService } from './lib/shared-control-service.mjs';
 import { createSharedCoordinatorSupervisor } from './lib/shared-coordinator-supervisor.mjs';
+import { collectSharedPlaywrightArtifacts } from './lib/shared-playwright-work-item.mjs';
+import { collectSharedWorkerEvidence } from './lib/shared-worker-evidence.mjs';
+import { buildSharedWorkerResultManifest } from './execute-shared-work-item.mjs';
 import {
   adoptAttemptEvidence,
   applyRekickOperation,
@@ -27,6 +31,72 @@ import {
 
 const digest = (character) => `sha256:${character.repeat(64)}`;
 const observedAt = '2026-08-29T12:00:00.000Z';
+
+async function realVisualWorkerResult(lease) {
+  const evidenceRoot = await mkdtemp(path.join(tmpdir(), 'shared-real-visual-risk-'));
+  try {
+    const descriptor = lease.executionDescriptor;
+    const artifactRoot = path.join(evidenceRoot, 'playwright');
+    const rowRoot = path.join(artifactRoot, 'raw', 'row-1');
+    await mkdir(rowRoot, { recursive: true });
+    const policy = { mode: 'static-screenshot', rationale: 'Capture the exact rendered visual state for review.' };
+    const summary = {
+      schemaVersion: 1, caseId: descriptor.caseId, auditId: descriptor.definitionId,
+      coveredEnvironments: [descriptor.targetRole], environment: descriptor.targetRole,
+      baseURL: descriptor.origins.candidate, project: descriptor.targetId, findings: [], steps: [],
+    };
+    const comparison = {
+      schemaVersion: 1, kind: 'shared-visual-comparison-result', caseId: descriptor.caseId,
+      targetId: descriptor.targetId, observedAt, items: [{ id: 'home-light', comparison: {
+        schemaVersion: 1, policyRevision: 'pixelmatch-css-ratio-0.0025-v1',
+        status: 'CHANGED', comparisonStatus: 'CHANGED', differingPixels: 400,
+        totalPixels: 10_000, differingPixelRatio: 0.04,
+        reason: 'Pixel difference ratio 0.04 exceeds the reviewed tolerance.', review: null,
+        effects: { deterministicHealth: 'none', deterministicFindings: 'none', promotion: 'none' },
+      } }],
+    };
+    await writeFile(path.join(rowRoot, 'audit-result.json'), `${JSON.stringify({
+      ...summary, definition: { id: descriptor.definitionId }, evidencePolicy: policy,
+      browser: 'Chromium', viewport: { width: 390, height: 844 }, timezone: 'America/Chicago',
+      startedAt: observedAt, finishedAt: observedAt, observations: [], pageInspections: [],
+      consoleErrors: [], consoleWarnings: [], pageErrors: [], httpResponses: [], failedRequests: [],
+      badResponses: [], runtimeExpectations: [], thirdPartyTelemetryDiagnostics: [],
+    })}\n`);
+    await writeFile(path.join(rowRoot, 'state.png'), Buffer.from('real-visual-state'));
+    await writeFile(path.join(rowRoot, 'shared-visual-comparison-result.json'), `${JSON.stringify(comparison)}\n`);
+    const document = {
+      suites: [{ file: descriptor.entrySpec, specs: [{ file: 'fixtures/test.ts',
+        tags: [auditCaseTag(descriptor.caseId).slice(1)], tests: [{ projectName: descriptor.targetId,
+          annotations: [
+            { type: 'audit-case-id', description: descriptor.caseId },
+            { type: 'audit-evidence-policy', description: JSON.stringify(policy) },
+          ], results: [{ status: 'passed', retry: 0, attachments: [
+            { name: 'audit-result', contentType: 'application/json', path: path.join(rowRoot, 'audit-result.json') },
+            { name: 'audit-result-summary', contentType: 'application/json', body: Buffer.from(JSON.stringify(summary)).toString('base64') },
+            { name: 'shared-visual-comparison-result', contentType: 'application/json', path: path.join(rowRoot, 'shared-visual-comparison-result.json') },
+            { name: 'rendered-visual-state', contentType: 'image/png', path: path.join(rowRoot, 'state.png') },
+          ] }] }]}], suites: [] }], errors: [],
+    };
+    const result = await collectSharedPlaywrightArtifacts({ document, descriptor, artifactRoot, evidenceRoot });
+    const identity = {
+      runId: lease.runId, workItemId: lease.workItemId, attempt: lease.attempt,
+      subjectCoreDigest: lease.subjectCoreDigest, runnerRevision: lease.runnerRevision,
+      executionDescriptorDigest: lease.executionDescriptorDigest,
+    };
+    await writeFile(path.join(evidenceRoot, 'result.json'), `${JSON.stringify(buildSharedWorkerResultManifest({
+      descriptor, identity, result: { ...result, reason: null, artifacts: [] },
+    }))}\n`);
+    const collected = await collectSharedWorkerEvidence(evidenceRoot, { code: 0, signal: null }, lease);
+    return {
+      ...collected,
+      artifacts: await Promise.all(collected.artifacts.map(async ({ sourcePath, ...artifact }) => ({
+        ...artifact, contentBase64: (await readFile(sourcePath)).toString('base64'),
+      }))),
+    };
+  } finally {
+    await rm(evidenceRoot, { recursive: true, force: true });
+  }
+}
 
 function observationSet(overrides = {}) {
   return sealRiskSourceObservationSet({
@@ -103,7 +173,11 @@ try {
     verifyStorage: false,
     clock: () => now,
   });
-  const controlService = createSharedControlService({ store, projectId: 'project-first-publication' });
+  const controlService = createSharedControlService({
+    store,
+    projectId: 'project-first-publication',
+    reprobeTargetIdentity: async ({ subjectCore: currentSubjectCore }) => currentSubjectCore.deploymentIdentity,
+  });
   const supervisor = createSharedCoordinatorSupervisor({
     store,
     controlService,
@@ -332,6 +406,7 @@ try {
     deploymentIdentity: { kind: 'target-preflight-set', value: digest('4') },
   });
   await createParentRun(store, { runId: 'run-mixed-baseline-comparative', ...mixedBaselineLaunch.createParentRunInput });
+  let failedCandidatePair = false;
   while (true) {
     let lease;
     try { lease = await supervisor.claim(worker); } catch (error) {
@@ -340,7 +415,8 @@ try {
     }
     if (lease.runId !== 'run-mixed-baseline-comparative') continue;
     const productionFailure = lease.executionDescriptor.targetRole === 'production';
-    const candidateOnlyFailure = lease.executionDescriptor.targetId === 'candidate-desktop-chromium';
+    const candidateRegression = !failedCandidatePair
+      && lease.executionDescriptor.targetId === 'candidate-mobile-chromium';
     const riskSourceObservationSet = sealRiskSourceObservationSet({
       schemaVersion: 1,
       runId: lease.runId,
@@ -355,7 +431,7 @@ try {
       ],
       observations: [],
     });
-    const failed = productionFailure || candidateOnlyFailure;
+    const failed = productionFailure || candidateRegression;
     const inbox = await publishAttemptEvidence(store, lease.runId, lease, {
       outcome: failed ? 'completed_product_failure' : 'completed_pass',
       reason: failed ? 'mixed-baseline-fixture' : null,
@@ -363,11 +439,12 @@ try {
       executionDescriptorDigest: lease.executionDescriptorDigest,
     });
     await adoptAttemptEvidence(store, lease.runId, supervisor.coordinator(), inbox);
+    if (candidateRegression) failedCandidatePair = true;
   }
   await supervisor.maintain();
   const mixedBaseline = await readCurrentEnvelope(store, 'run-mixed-baseline-comparative');
   assert.equal(mixedBaseline.decision.code, 'NOT_READY_TEST_FAILURE',
-    'An unrelated candidate-only regression must still block release.');
+    'A candidate failure without sealed equivalence to its failed production pair must block release.');
   assert(mixedBaseline.riskRegister.risks.some(({ category, source }) => (
     category === 'production-baseline-defect' && source.kind === 'oracle-execution'
   )), 'Production baseline context must remain visible beside a separate candidate regression.');
@@ -548,6 +625,7 @@ try {
   const acceptedRekick = await controlService.acceptMutation(inventoryOperator, 'run-inventory-recovery', rekickRequest);
   const durablyAppliedRekick = await applyRekickOperation(
     store, 'run-inventory-recovery', supervisor.coordinator(), acceptedRekick.operationId,
+    { observedDeploymentIdentity: inventoryFailed.subjectCore.deploymentIdentity },
   );
   assert.equal(durablyAppliedRekick.state, 'applied',
     'rekick transition and durable operation application must commit atomically');
@@ -666,6 +744,57 @@ try {
   const cancelledFailurePublication = await readCurrentEnvelope(reopened, 'run-inventory-cancelled-failure');
   assert.equal(cancelledFailurePublication.decision.code, 'NOT_READY_INCOMPLETE_EXECUTION');
   assert.equal(cancelledFailurePublication.decision.grantedAuthority, null);
+
+  const visualLaunch = compileSharedLaunchPlan({
+    intent: { schemaVersion: 1, runContract: {
+      schemaVersion: 1, mode: 'comparative',
+      candidateUrl: 'https://candidate.example.test', productionUrl: 'https://production.example.test',
+      targetIds: ['candidate-mobile-chromium', 'production-mobile-chromium'],
+      scope: { qualifier: 'TARGETED', pluginIds: [], auditIds: ['A11Y-001', 'CONTENT-002'], areas: [] },
+    } },
+    pluginRegistry, targetRegistry,
+    runnerRevision: digest('1'), configurationRevision: digest('2'), environmentRevision: digest('3'),
+    deploymentIdentity: { kind: 'target-preflight-set', value: digest('4') },
+  });
+  const compiledVisualWork = visualLaunch.createParentRunInput.workItems
+    .filter(({ executionDescriptor }) => executionDescriptor?.entrySpec === 'tests/visual-regression.spec.ts');
+  assert(compiledVisualWork.length > 0);
+  assert(compiledVisualWork.every(({ executionDescriptor }) => executionDescriptor.targetRole === 'candidate'),
+    'Comparative compilation must not schedule production visual rows that the visual spec intentionally captures in-worker.');
+  await createParentRun(store, { runId: 'run-real-visual-risk', ...visualLaunch.createParentRunInput });
+  while (true) {
+    let lease;
+    try { lease = await supervisor.claim(worker); } catch (error) {
+      if (error?.code === 'NO_WORK_AVAILABLE') break;
+      throw error;
+    }
+    if (lease.runId !== 'run-real-visual-risk') continue;
+    const workerResult = lease.executionDescriptor.entrySpec === 'tests/visual-regression.spec.ts'
+      ? await realVisualWorkerResult(lease)
+      : {
+          outcome: 'completed_pass', reason: null, artifacts: [],
+          executionDescriptorDigest: lease.executionDescriptorDigest,
+          riskSourceObservationSet: sealRiskSourceObservationSet({
+            schemaVersion: 1, runId: lease.runId, workItemId: lease.workItemId,
+            subjectCoreDigest: lease.subjectCoreDigest, attempt: lease.attempt, workerId: worker.id,
+            producerStates: [
+              { producer: 'visual', status: 'NOT_APPLICABLE' },
+              { producer: 'baseline', status: lease.executionDescriptor.targetRole === 'production' ? 'COMPLETE' : 'NOT_APPLICABLE' },
+              { producer: 'evidence-pipeline', status: 'COMPLETE' },
+            ], observations: [],
+          }),
+        };
+    const inbox = await publishAttemptEvidence(store, lease.runId, lease, workerResult);
+    await adoptAttemptEvidence(store, lease.runId, supervisor.coordinator(), inbox);
+  }
+  const visualMaintenance = await supervisor.maintain();
+  assert.deepEqual(visualMaintenance.errors, [], JSON.stringify(visualMaintenance.errors));
+  const visualPublication = await readCurrentEnvelope(store, 'run-real-visual-risk');
+  assert.equal(visualPublication.decision.code, 'FEATURE_READY');
+  assert(visualPublication.riskRegister.risks.some(({ category, reviewState, source }) => (
+    category === 'unreviewed-visual-change' && reviewState === 'PENDING_REVIEW'
+      && source.kind === 'visual-result' && source.id.endsWith(':home-light')
+  )), 'A real Playwright comparison artifact must survive executor, collector, adoption, and risk projection.');
 } finally {
   await rm(root, { recursive: true, force: true });
 }

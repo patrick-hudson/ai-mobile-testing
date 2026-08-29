@@ -17,6 +17,7 @@ import {
 } from '../../shared/control-plane-contract.mjs';
 import {
   acceptOperation,
+  applyDiagnosticRerunOperation,
   applyRekickOperation,
   appendMutationAuditEvent,
   appendRiskLifecycleEvent,
@@ -39,6 +40,7 @@ import {
 export const CONTROL_OPERATION_KINDS = Object.freeze({
   cancel: CONTROL_ACTIONS.RUN_CANCEL,
   rekick: CONTROL_ACTIONS.RUN_REKICK,
+  'diagnostic-rerun': CONTROL_ACTIONS.RUN_DIAGNOSTIC_RERUN,
   'risk-acknowledge': CONTROL_ACTIONS.RISK_ACKNOWLEDGE,
   'risk-resolve': CONTROL_ACTIONS.RISK_RESOLVE,
   'visual-disposition': CONTROL_ACTIONS.VISUAL_DISPOSITION,
@@ -56,9 +58,28 @@ function namespacedKey(principal, kind, runId, requestId) {
   return `op-${createHash('sha256').update(`${principal.id}\0${kind}\0${runId}\0${requestId}`).digest('hex')}`;
 }
 
-export function createSharedControlService({ store, projectId = 'default', admissionPolicy = null } = {}) {
+export function createSharedControlService({
+  store, projectId = 'default', admissionPolicy = null, reprobeTargetIdentity = null,
+} = {}) {
   if (!store) throw new TypeError('Shared control service requires the durable parent-run store.');
+  if (reprobeTargetIdentity !== null && typeof reprobeTargetIdentity !== 'function') {
+    throw new TypeError('Shared control target identity reprobe must be a function.');
+  }
   const object = (runId) => ({ projectId, runId });
+  const reprobeIdentity = async (runId) => {
+    const state = await readParentRun(store, runId);
+    let observedDeploymentIdentity = null;
+    let failureReason = null;
+    try {
+      if (!reprobeTargetIdentity) throw new Error('Coordinator target identity reprobe is unavailable.');
+      observedDeploymentIdentity = await reprobeTargetIdentity({
+        runId, subjectCore: state.subjectCore, finalSubject: state.finalSubject,
+      });
+    } catch (error) {
+      failureReason = String(error?.message ?? error).slice(0, 512);
+    }
+    return { observedDeploymentIdentity, failureReason };
+  };
   return Object.freeze({
     projectId,
     async readRun(principal, runId) {
@@ -82,6 +103,8 @@ export function createSharedControlService({ store, projectId = 'default', admis
         executions: Object.freeze({
           runId,
           executions: Object.values(snapshot.state.workItems),
+          diagnosticExecutions: Object.values(snapshot.state.workItems)
+            .flatMap(({ diagnosticExecutions = [] }) => diagnosticExecutions),
           oracleExecutions: snapshot.state.executionManifest?.oracleExecutions ?? [],
         }),
         logs: Object.freeze({
@@ -108,6 +131,8 @@ export function createSharedControlService({ store, projectId = 'default', admis
         runId,
         runRevision: state.runRevision,
         executions: Object.values(state.workItems),
+        diagnosticExecutions: Object.values(state.workItems)
+          .flatMap(({ diagnosticExecutions = [] }) => diagnosticExecutions),
         oracleExecutions: state.executionManifest?.oracleExecutions ?? [],
       };
     },
@@ -131,9 +156,22 @@ export function createSharedControlService({ store, projectId = 'default', admis
         if (!Number.isSafeInteger(expectedRunRevision) || expectedRunRevision < 1) fail('EXPECTED_REVISION_REQUIRED', 'A positive expectedRunRevision is required.', 409);
         if (!body || typeof body !== 'object' || Array.isArray(body)) fail('OPERATION_BODY_INVALID', 'Operation body must be a JSON object.');
         if (Buffer.byteLength(canonicalJson(body)) > MAX_BODY_BYTES) fail('OPERATION_BODY_TOO_LARGE', 'Operation body exceeds the durable bound.', 413);
-        if (['rekick', 'risk-acknowledge', 'risk-resolve', 'visual-disposition', 'purge'].includes(kind)
+        if (['rekick', 'diagnostic-rerun', 'risk-acknowledge', 'risk-resolve', 'visual-disposition', 'purge'].includes(kind)
           && typeof body.expectedSubjectDigest !== 'string') {
           fail('RELEASE_SUBJECT_REQUIRED', 'Release-affecting and review mutations must pin the immutable final subject.', 409);
+        }
+        if (kind === 'diagnostic-rerun') {
+          const state = await readParentRun(store, runId);
+          if (body.expectedSubjectDigest !== state.finalSubjectDigest) {
+            fail('RELEASE_SUBJECT_MISMATCH', 'A changed deployment, configuration, or scope requires a new authoritative run.', 409);
+          }
+          const item = state.workItems?.[body.workItemId];
+          if (state.status !== 'active' || state.compilationState !== 'sealed'
+            || !item || item.state !== 'completed_product_failure'
+            || item.canonicalResult?.outcome !== 'completed_product_failure'
+            || item.executionDescriptor === null) {
+            fail('DIAGNOSTIC_RERUN_NOT_FAILED', 'Diagnostic rerun requires one terminal compiler-issued product-failed work item.', 409);
+          }
         }
         if (kind === 'risk-acknowledge' || kind === 'risk-resolve') {
           const publication = await readCurrentEnvelope(store, runId);
@@ -217,7 +255,11 @@ export function createSharedControlService({ store, projectId = 'default', admis
           if (operation.kind === 'cancel') {
             await cancelParentRun(store, runId, coordinator, { actor: operation.actor, reason: operation.body?.reason ?? 'Operator cancellation.' });
           } else if (operation.kind === 'rekick') {
-            await applyRekickOperation(store, runId, coordinator, operation.operationId);
+            await applyRekickOperation(store, runId, coordinator, operation.operationId, await reprobeIdentity(runId));
+          } else if (operation.kind === 'diagnostic-rerun') {
+            await applyDiagnosticRerunOperation(
+              store, runId, coordinator, operation.operationId, await reprobeIdentity(runId),
+            );
           } else if (operation.kind === 'risk-acknowledge' || operation.kind === 'risk-resolve') {
             const publication = await readCurrentEnvelope(store, runId);
             const currentRisk = publication.riskRegister.risks.find(({ identity }) => identity === operation.body?.riskIdentity);

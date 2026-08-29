@@ -3,7 +3,7 @@ import { constants as fsConstants } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { collectSharedWorkerEvidence } from './lib/shared-worker-evidence.mjs';
+import { collectSharedWorkerAttempt } from './lib/shared-worker-evidence.mjs';
 import { maintainSharedWorkerLease } from './lib/shared-worker-heartbeat.mjs';
 import { createSharedWorkCommand } from './lib/shared-work-dispatcher.mjs';
 import { SHARED_DOCKER_RESILIENCE_ENV } from '../shared/shared-docker-resilience-contract.mjs';
@@ -117,14 +117,18 @@ const execute = async ({ lease, signal: abortSignal }) => {
       child.stdin.on('error', reject);
       child.stdin.end(`${JSON.stringify(lease)}\n`);
     });
-    const result = await collectSharedWorkerEvidence(evidenceRoot, completion, lease);
+    const attempt = await collectSharedWorkerAttempt(evidenceRoot, completion, lease);
+    const { result } = attempt;
     const outcomeLog = await post('/v1/log', {
-      lease, sequence: 2, level: result.outcome === 'completed_pass' ? 'info' : 'error',
-      message: result.outcome === 'completed_pass'
-        ? `command-completed; streaming ${result.artifacts.length} evidence artifacts`
-        : `product-failure: ${result.reason}; streaming ${result.artifacts.length} evidence artifacts`,
+      lease, sequence: 2, level: result.outcome === 'completed_pass' ? 'info' : (attempt.retryable ? 'warn' : 'error'),
+      message: attempt.logMessage,
     }, abortSignal);
     if (!outcomeLog.response.ok) throw new Error(`Coordinator rejected outcome log: ${outcomeLog.value.error ?? outcomeLog.response.status}`);
+    if (result.outcome === 'operational_failure') {
+      const recovered = await post('/v1/runtime-failure', { lease, signal: attempt.runtimeSignal }, abortSignal);
+      if (!recovered.response.ok) throw new Error(`Coordinator rejected runtime recovery: ${recovered.value.error ?? recovered.response.status}`);
+      return recovered.value;
+    }
     const declaredResult = {
       ...result,
       artifacts: result.artifacts.map(({ sourcePath: _sourcePath, ...artifact }) => artifact),

@@ -9,6 +9,7 @@ import {
   heartbeatWorkItem,
   MAX_ATTEMPT_ARTIFACT_BYTES,
   openParentRunStore,
+  publishAttemptEvidence,
   readParentRun,
   uploadAttemptEvidenceArtifact,
 } from './lib/parent-run-store.mjs';
@@ -16,6 +17,10 @@ import { createSharedControlService } from './lib/shared-control-service.mjs';
 import { createSharedCoordinatorSupervisor } from './lib/shared-coordinator-supervisor.mjs';
 import { openScopedCredentialAuthority } from '../portal/scoped-credential-authority.mjs';
 import { assertPrincipalAuthorized, CONTROL_ACTIONS } from '../shared/control-plane-contract.mjs';
+import {
+  probeTargetPreflightSet,
+  targetPreflightInputsForSubject,
+} from '../shared/target-preflight-set.mjs';
 import { readTrustedStoreMarker, sharedStoreBuildIdentity, sharedStoreGeneration, sharedStoreRollbackBuilds } from './lib/shared-store-runtime.mjs';
 
 const required = (name) => {
@@ -53,6 +58,9 @@ async function readJson(request) {
 const leaseMs = boundedInteger('AUDIT_SHARED_LEASE_MS', 30_000, 1_000, 3_600_000);
 const coordinatorLeaseMs = boundedInteger('AUDIT_SHARED_COORDINATOR_LEASE_MS', 60_000, 5_000, 3_600_000);
 const uploadTimeoutMs = boundedInteger('AUDIT_SHARED_UPLOAD_TIMEOUT_MS', 20 * 60_000, 30_000, 3_600_000);
+const WORKER_SUPERVISOR_RUNTIME_SIGNALS = new Set([
+  'SIGABRT', 'SIGBUS', 'SIGFPE', 'SIGHUP', 'SIGILL', 'SIGKILL', 'SIGPIPE', 'SIGSEGV', 'SIGTERM', 'SIGTRAP', 'SIGUSR2',
+]);
 const port = boundedInteger('AUDIT_SHARED_COORDINATOR_PORT', 4_180, 1_024, 65_535);
 const storeMarker = await readTrustedStoreMarker(required('AUDIT_SHARED_STORE_MARKER_FILE'));
 const backupMarker = await readTrustedStoreMarker(required('AUDIT_SHARED_BACKUP_MARKER_FILE'), 'shared backup marker');
@@ -68,7 +76,26 @@ const store = await openParentRunStore({
   backupMarker,
   prequalifiedRollbackBuilds: sharedStoreRollbackBuilds(process.env, buildIdentity),
 });
-const controlService = createSharedControlService({ store, projectId: process.env.AUDIT_SHARED_PROJECT_ID ?? 'default' });
+const controlService = createSharedControlService({
+  store,
+  projectId: process.env.AUDIT_SHARED_PROJECT_ID ?? 'default',
+  reprobeTargetIdentity: async ({ subjectCore }) => {
+    const inputs = targetPreflightInputsForSubject({
+      mode: subjectCore.mode,
+      targets: subjectCore.targets,
+      certificatePolicy: subjectCore.certificatePolicy,
+      singleSiteDeploymentRole: subjectCore.mode === 'single-site' ? subjectCore.targets[0].role : null,
+    });
+    const preflightOptions = subjectCore.mode === 'single-site'
+      && subjectCore.certificatePolicy === 'preview-bypass'
+      ? {
+        previewBypassOrigins: [subjectCore.targets[0].origin],
+        tlsBypassRequestOptions: { rejectUnauthorized: false },
+      }
+      : {};
+    return (await probeTargetPreflightSet(inputs, { preflightOptions })).identity;
+  },
+});
 const credentialAuthority = await openScopedCredentialAuthority({ root: required('AUDIT_SHARED_CREDENTIAL_ROOT') });
 const projectId = process.env.AUDIT_SHARED_PROJECT_ID ?? 'default';
 const [pluginRegistry, targetRegistry] = await Promise.all([
@@ -163,9 +190,16 @@ const server = http.createServer(async (request, response) => {
         if (error?.code !== 'STALE_WORK_LEASE') throw error;
         const state = await readParentRun(store, leaseRunId);
         const item = state.workItems?.[body.lease?.workItemId];
-        const adoptedAttempt = item?.attempts?.find((attempt) => attempt.attempt === body.lease?.attempt
+        const diagnostic = body.lease?.diagnosticExecutionId === undefined ? null
+          : item?.diagnosticExecutions?.find(
+            ({ diagnosticExecutionId }) => diagnosticExecutionId === body.lease.diagnosticExecutionId);
+        const lineage = diagnostic?.attempts ?? item?.attempts;
+        const adoptedAttempt = lineage?.find((attempt) => attempt.attempt === body.lease?.attempt
           && attempt.workerId === principal.id && attempt.leaseToken === body.lease?.token && attempt.inboxDigest);
-        if (!adoptedAttempt || !['completed_pass', 'completed_product_failure'].includes(item.state)) throw error;
+        const terminalState = diagnostic?.state ?? item?.state;
+        const attemptIsTerminal = ['completed_pass', 'completed_product_failure'].includes(terminalState)
+          || (adoptedAttempt?.outcome === 'operational_failure' && ['queued', 'incomplete'].includes(terminalState));
+        if (!adoptedAttempt || !attemptIsTerminal) throw error;
         return json(response, 202, { ...body.lease, terminal: true });
       }
     }
@@ -175,6 +209,21 @@ const server = http.createServer(async (request, response) => {
         return json(response, 422, { error: 'Workers may publish only completed product outcomes; operational recovery requires coordinator-trusted evidence.' });
       }
       return json(response, 201, await createAttemptEvidenceUploadIntent(store, leaseRunId, body.lease, body.result));
+    }
+    if (requestUrl.pathname === '/v1/runtime-failure') {
+      if (body.lease?.workerId !== principal.id) throw Object.assign(new Error('Worker lease belongs to another principal.'), { status: 403 });
+      if (!body || typeof body !== 'object' || Array.isArray(body)
+        || Object.keys(body).length !== 2 || !('lease' in body) || !WORKER_SUPERVISOR_RUNTIME_SIGNALS.has(body.signal)) {
+        return json(response, 422, { error: 'Runtime failure must contain only a server-issued lease and an allowlisted OS signal.' });
+      }
+      const inbox = await publishAttemptEvidence(store, leaseRunId, body.lease, {
+        outcome: 'operational_failure',
+        reason: body.signal === 'SIGUSR2' ? 'browser_process_crash' : 'worker_process_terminated',
+        executionDescriptorDigest: body.lease.executionDescriptorDigest ?? null,
+        artifacts: [],
+      });
+      const adopted = await adoptAttemptEvidence(store, leaseRunId, coordinator, inbox);
+      return json(response, 202, { workItemId: adopted.id, state: adopted.state, canonicalResult: adopted.canonicalResult });
     }
     if (requestUrl.pathname === '/v1/result-finalize') {
       if (body.lease?.workerId !== principal.id) throw Object.assign(new Error('Worker lease belongs to another principal.'), { status: 403 });

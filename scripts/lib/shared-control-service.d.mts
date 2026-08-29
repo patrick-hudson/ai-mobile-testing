@@ -22,4 +22,5 @@ export declare function createSharedControlService(options: {
   admissionPolicy?: {
     withMutationAdmission<T>(kind: string, requestId: string, operation: () => Promise<T>): Promise<T>;
   } | null;
+  reprobeTargetIdentity?: ((input: { runId: string; subjectCore: any; finalSubject: any }) => Promise<any>) | null;
 }): SharedControlService;
