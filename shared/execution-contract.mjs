@@ -43,46 +43,60 @@ function parseOracleExecution(value, index) {
 
 export function sealExecutionManifest(value) {
   assertSchemaVersion(value, 'Execution manifest');
-  exactKeys(value, ['schemaVersion', 'subjectCoreDigest', 'workItems', 'oracleExecutions'], 'Execution manifest');
+  exactKeys(value, ['schemaVersion', 'subjectCoreDigest', 'workItems', 'oracleExecutions', 'contextWorkItemIds'], 'Execution manifest');
   if (!Array.isArray(value.workItems) || !Array.isArray(value.oracleExecutions)
     || value.workItems.length === 0 || value.oracleExecutions.length === 0) {
     failContract('EMPTY_EXECUTION_MANIFEST', 'Execution manifest must declare required work and oracle executions.');
   }
   const workItems = value.workItems.map(parseWorkItem).sort((left, right) => left.id.localeCompare(right.id));
   const oracleExecutions = value.oracleExecutions.map(parseOracleExecution).sort((left, right) => left.id.localeCompare(right.id));
+  const contextWorkItemIds = uniqueStrings(value.contextWorkItemIds, 'contextWorkItemIds');
   if (new Set(workItems.map(({ id }) => id)).size !== workItems.length
     || new Set(oracleExecutions.map(({ id }) => id)).size !== oracleExecutions.length) {
     failContract('DUPLICATE_EXECUTION_ID', 'Execution manifest IDs must be unique within their kind.');
   }
   const workIds = new Set(workItems.map(({ id }) => id));
+  const workById = new Map(workItems.map((item) => [item.id, item]));
+  const contextIds = new Set(contextWorkItemIds);
+  for (const workItemId of contextIds) {
+    if (!workIds.has(workItemId)) failContract('UNDECLARED_WORK_ITEM', `Context references undeclared work item ${workItemId}.`);
+  }
   const adopted = new Set();
   for (const oracle of oracleExecutions) {
     for (const workItemId of oracle.requiredWorkItemIds) {
       if (!workIds.has(workItemId)) failContract('UNDECLARED_WORK_ITEM', `Oracle ${oracle.id} references undeclared work item ${workItemId}.`);
+      if (contextIds.has(workItemId)) failContract('CONTEXT_WORK_ADOPTED', `Context work item ${workItemId} cannot be adopted by Product Oracle ${oracle.id}.`);
+      if (workById.get(workItemId).definitionId !== oracle.definitionId) {
+        failContract('ORACLE_DEFINITION_MISMATCH', `Oracle ${oracle.id} cannot adopt work item ${workItemId} from another definition.`);
+      }
       if (adopted.has(workItemId)) failContract('DUPLICATE_WORK_ADOPTION', `Work item ${workItemId} is adopted by more than one oracle.`);
       adopted.add(workItemId);
     }
   }
-  if (adopted.size !== workItems.length) failContract('UNADOPTED_WORK_ITEM', 'Every work item must be adopted by exactly one oracle.');
+  if (adopted.size + contextIds.size !== workItems.length) {
+    failContract('UNADOPTED_WORK_ITEM', 'Every work item must be adopted by exactly one oracle or explicitly classified as context.');
+  }
   const body = {
     schemaVersion: 1,
     kind: 'execution-manifest',
     subjectCoreDigest: assertDigest(value.subjectCoreDigest, 'subjectCoreDigest'),
     workItems,
     oracleExecutions,
+    contextWorkItemIds,
   };
   return freezeContract({ ...body, digest: canonicalDigest(body) });
 }
 
 export function parseExecutionManifest(value) {
   assertSchemaVersion(value, 'Execution manifest');
-  exactKeys(value, ['schemaVersion', 'kind', 'subjectCoreDigest', 'workItems', 'oracleExecutions', 'digest'], 'Execution manifest');
+  exactKeys(value, ['schemaVersion', 'kind', 'subjectCoreDigest', 'workItems', 'oracleExecutions', 'contextWorkItemIds', 'digest'], 'Execution manifest');
   if (value.kind !== 'execution-manifest') failContract('INVALID_CONTRACT', 'Execution manifest kind is invalid.');
   const sealed = sealExecutionManifest({
     schemaVersion: value.schemaVersion,
     subjectCoreDigest: value.subjectCoreDigest,
     workItems: value.workItems,
     oracleExecutions: value.oracleExecutions,
+    contextWorkItemIds: value.contextWorkItemIds,
   });
   if (sealed.digest !== value.digest) failContract('CORRUPT_EXECUTION_DIGEST', 'Execution manifest digest is corrupt.');
   return sealed;

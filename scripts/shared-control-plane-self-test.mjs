@@ -734,6 +734,7 @@ function releaseFixture() {
     schemaVersion: 1, subjectCoreDigest: core.digest,
     workItems: [{ id: 'work-visual', definitionId: 'VISUAL-001', targetId: 'candidate', targetRole: 'audited' }],
     oracleExecutions: [{ id: 'oracle-visual', definitionId: 'VISUAL-001', requiredWorkItemIds: ['work-visual'] }],
+    contextWorkItemIds: [],
   });
   const finalSubject = sealFinalReleaseSubject({
     schemaVersion: 1, subjectCore: core, executionManifest: manifest,

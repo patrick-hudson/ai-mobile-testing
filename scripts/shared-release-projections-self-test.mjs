@@ -48,6 +48,7 @@ function fixture(mode, outcome = 'completed_pass') {
     subjectCoreDigest: core.digest,
     workItems,
     oracleExecutions: [{ id: 'oracle-visual', definitionId: 'VISUAL-001', requiredWorkItemIds: workItems.map(({ id }) => id) }],
+    contextWorkItemIds: [],
   });
   const finalSubject = sealFinalReleaseSubject({
     schemaVersion: 1,

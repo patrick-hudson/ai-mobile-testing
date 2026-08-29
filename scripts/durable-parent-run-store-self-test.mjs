@@ -184,6 +184,7 @@ const graphManifest = sealExecutionManifest({
   subjectCoreDigest: graphCore.digest,
   workItems: [{ id: 'work-seal', definitionId: 'HOME-001', targetId: 'desktop', targetRole: 'candidate' }],
   oracleExecutions: [{ id: 'oracle-seal', definitionId: 'HOME-001', requiredWorkItemIds: ['work-seal'] }],
+  contextWorkItemIds: [],
 });
 const graphFinalSubject = sealFinalReleaseSubject({
   schemaVersion: 1,

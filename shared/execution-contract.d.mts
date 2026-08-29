@@ -5,6 +5,7 @@ export interface ExecutionManifest {
   subjectCoreDigest: string;
   workItems: Array<{ id: string; definitionId: string; targetId: string; targetRole: string }>;
   oracleExecutions: Array<{ id: string; definitionId: string; requiredWorkItemIds: string[] }>;
+  contextWorkItemIds: string[];
   digest: string;
 }
 export interface WorkItemResult {

@@ -516,6 +516,13 @@ export async function createParentRun(store, input) {
         canonicalResult: null,
       };
     }
+    if (compilationState === 'sealed' && executionManifest) {
+      const storedIds = Object.keys(workItems).sort();
+      const manifestIds = executionManifest.workItems.map(({ id }) => id).sort();
+      if (canonicalJson(storedIds) !== canonicalJson(manifestIds)) {
+        fail('SEALED_MANIFEST_MISMATCH', 'Sealed execution manifest does not match the durable work-item queue.');
+      }
+    }
     const state = {
       schemaVersion: 1,
       kind: 'durable-parent-run',
@@ -1086,7 +1093,7 @@ export async function adoptAttemptEvidence(store, runId, coordinator, inbox) {
       workItemId: document.workItemId,
       subjectCoreDigest: next.subjectCoreDigest,
       attempt: document.attempt,
-      authoritative: true,
+      authoritative: !next.executionManifest?.contextWorkItemIds.includes(document.workItemId),
       outcome: document.outcome,
       evidenceDigests: document.evidenceDigests,
     });

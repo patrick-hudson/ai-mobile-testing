@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { canonicalDigest } from '../shared/canonical-contract.mjs';
 import { sealReleaseSubjectCore } from '../shared/release-subject.mjs';
 import {
@@ -11,8 +13,19 @@ import {
   nextSingleSiteInventoryAttempt,
 } from '../shared/execution-graph-compiler.mjs';
 import { compileDefinitionCoverageManifest } from '../shared/run-compiler.mjs';
+import {
+  acquireCoordinator,
+  adoptAttemptEvidence,
+  claimWorkItem,
+  createParentRun,
+  openParentRunStore,
+  publishAttemptEvidence,
+  requestPerformanceDrain,
+  sealParentRunGraph,
+} from './lib/parent-run-store.mjs';
 
 const DIGEST = (character) => `sha256:${character.repeat(64)}`;
+const DURABLE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const candidateOrigin = 'https://beta.example.test';
 const productionOrigin = 'https://example.test';
 
@@ -25,6 +38,7 @@ const pluginRegistry = {
       { id: 'NAV-001', area: 'navigation', title: 'Navigation works', severity: 'P0', manual: false, singleSiteClassification: 'standalone-compatible', expected: 'Navigation works.' },
       { id: 'ENV-002', area: 'environment', title: 'Inventoried routes work', severity: 'P0', manual: false, singleSiteClassification: 'standalone-compatible', expected: 'Every discovered route renders valid HTML.' },
       { id: 'ENV-003', area: 'environment', title: 'Migration parity', severity: 'P1', manual: false, singleSiteClassification: 'comparison-only', expected: 'Candidate preserves production mappings.' },
+      { id: 'PERF-001', area: 'performance', title: 'Performance budget', severity: 'P1', manual: false, singleSiteClassification: 'standalone-compatible', expected: 'Performance remains within budget.' },
       { id: 'MANUAL-001', area: 'accessibility', title: 'Human screen reader review', severity: 'P1', manual: true, singleSiteClassification: 'standalone-compatible', expected: 'A human reviews announcements.' },
     ],
     auditCases: [
@@ -53,6 +67,11 @@ const pluginRegistry = {
         supportedModes: ['comparative'], supportedProjects: ['production-mobile'],
         oracleVariants: { comparative: 'ENV-003:production-context' },
       },
+      {
+        caseId: 'PERF-001:standalone', auditId: 'PERF-001', entrySpec: 'tests/performance.spec.ts', applicability: 'all',
+        supportedModes: ['single-site'], supportedProjects: ['candidate-mobile'],
+        oracleVariants: { singleSite: 'PERF-001:standalone' },
+      },
     ],
   }],
 };
@@ -68,6 +87,9 @@ const targetRegistry = {
   singleSiteTargets: [
     { id: 'single-mobile', sourceComparativeTargetId: 'candidate-mobile', engine: 'chromium', browserProduct: 'chromium', deviceClass: 'mobile' },
     { id: 'single-desktop', sourceComparativeTargetId: 'candidate-mobile', engine: 'chromium', browserProduct: 'chromium', deviceClass: 'desktop' },
+    { id: 'single-firefox', sourceComparativeTargetId: 'candidate-mobile', engine: 'firefox', browserProduct: 'firefox', deviceClass: 'desktop' },
+    { id: 'single-webkit', sourceComparativeTargetId: 'candidate-mobile', engine: 'webkit', browserProduct: 'webkit', deviceClass: 'mobile' },
+    { id: 'single-edge', sourceComparativeTargetId: 'candidate-mobile', engine: 'chromium', browserProduct: 'msedge', deviceClass: 'desktop', requiredCapability: 'msedge' },
   ],
 };
 
@@ -95,7 +117,9 @@ const inventory = {
 
 const singleCore = subject({ mode: 'single-site', definitions: ['NAV-001'], targets: ['single-mobile'], features: ['navigation'] });
 const singleBarrier = compileSingleSiteInventoryBarrier({ subjectCore: singleCore, pluginRegistry, targetRegistry, maxAttempts: 2 });
-assert.equal(singleBarrier.workItem.capability, 'route-inventory');
+assert.equal(singleBarrier.workItem.capability, 'inventory:http');
+assert.equal(singleBarrier.workItem.resourceClass, 'ordinary');
+assert.match(singleBarrier.workItem.id, DURABLE_ID);
 assert.equal(nextSingleSiteInventoryAttempt({ subjectCore: singleCore, barrier: singleBarrier, failedAttempt: 1 }).attempt, 2);
 const singleInventoryCompletion = completeSingleSiteInventoryBarrier({
   subjectCore: singleCore,
@@ -114,6 +138,11 @@ const single = compileCanonicalExecutionGraph({
 assert.equal(single.mode, 'single-site');
 assert.equal(single.executionManifest.workItems.length, 1);
 assert.equal(single.executionManifest.oracleExecutions.length, 1);
+assert.deepEqual(single.executionManifest.contextWorkItemIds, []);
+assert.equal(single.workItemPlans[0].capability, 'browser:chromium');
+assert.equal(single.workItemPlans[0].resourceClass, 'ordinary');
+assert.match(single.workItemPlans[0].id, DURABLE_ID);
+assert.match(single.oraclePlans[0].id, DURABLE_ID);
 assert.equal(single.workItemPlans[0].inventoryDigest, canonicalDigest(inventory));
 assert.deepEqual(single.coverageBasis.excludedAsNotApplicable, ['ENV-003']);
 assert.equal(single.finalSubject.digest, single.finalSubjectDigest);
@@ -176,7 +205,7 @@ const comparative = compileCanonicalExecutionGraph({
 assert.equal(comparative.executionManifest.oracleExecutions.length, 1);
 assert.deepEqual(
   comparative.executionManifest.oracleExecutions[0].requiredWorkItemIds,
-  comparative.executionManifest.workItems.map(({ id }) => id),
+  comparative.workItemPlans.map(({ id }) => id),
   'A Comparative oracle must remain incomplete until its declared candidate/production tuple is adopted.',
 );
 assert.deepEqual([...new Set(comparative.executionManifest.workItems.map(({ targetRole }) => targetRole))].sort(), ['candidate', 'production']);
@@ -187,6 +216,162 @@ assert.equal(comparative.contextPlans[0].authority, 'non-blocking-production-bas
 const comparativeSelection = canonicalPlaywrightSelection(comparative);
 assert(comparativeSelection.caseIds.includes('ENV-003:production-context'), 'Production-only baseline context must still be scheduled.');
 assert.deepEqual(comparativeSelection.contextExecutionIds, comparative.contextPlans.map(({ id }) => id));
+assert.deepEqual(comparative.executionManifest.contextWorkItemIds, comparative.contextPlans.map(({ id }) => id));
+assert.deepEqual(
+  comparative.executionManifest.workItems.map(({ id }) => id),
+  [...comparative.workItemPlans, ...comparative.contextPlans].map(({ id }) => id).sort(),
+  'Every scheduled context item must be sealed into the durable execution manifest.',
+);
+assert(comparative.contextPlans.every(({ id }) => !comparative.oraclePlans.some(({ requiredWorkItemIds }) => requiredWorkItemIds.includes(id))),
+  'Context work must remain outside Product Oracle authority.');
+
+const browserMatrixCore = subject({
+  mode: 'single-site', definitions: ['NAV-001'],
+  targets: ['single-mobile', 'single-firefox', 'single-webkit', 'single-edge'], features: ['navigation'],
+});
+const browserMatrixBarrier = compileSingleSiteInventoryBarrier({ subjectCore: browserMatrixCore, pluginRegistry, targetRegistry });
+const browserMatrix = compileCanonicalExecutionGraph({
+  subjectCore: browserMatrixCore,
+  pluginRegistry,
+  targetRegistry,
+  inventoryCompletion: completeSingleSiteInventoryBarrier({
+    subjectCore: browserMatrixCore,
+    barrier: browserMatrixBarrier,
+    attempt: 1,
+    routeInventory: inventory,
+    deploymentIdentityRecheck: browserMatrixCore.deploymentIdentity,
+  }),
+  deploymentIdentityRecheck: browserMatrixCore.deploymentIdentity,
+});
+assert.deepEqual(Object.fromEntries(browserMatrix.workItemPlans.map(({ targetId, capability, resourceClass }) => (
+  [targetId, { capability, resourceClass }]
+))), {
+  'single-edge': { capability: 'browser:msedge', resourceClass: 'ordinary' },
+  'single-firefox': { capability: 'browser:firefox', resourceClass: 'ordinary' },
+  'single-mobile': { capability: 'browser:chromium', resourceClass: 'ordinary' },
+  'single-webkit': { capability: 'browser:webkit', resourceClass: 'ordinary' },
+});
+
+const performanceCore = subject({ mode: 'single-site', definitions: ['PERF-001'], targets: ['single-mobile'], features: ['performance'] });
+const performanceBarrier = compileSingleSiteInventoryBarrier({ subjectCore: performanceCore, pluginRegistry, targetRegistry });
+const performanceGraph = compileCanonicalExecutionGraph({
+  subjectCore: performanceCore,
+  pluginRegistry,
+  targetRegistry,
+  inventoryCompletion: completeSingleSiteInventoryBarrier({
+    subjectCore: performanceCore,
+    barrier: performanceBarrier,
+    attempt: 1,
+    routeInventory: inventory,
+    deploymentIdentityRecheck: performanceCore.deploymentIdentity,
+  }),
+  deploymentIdentityRecheck: performanceCore.deploymentIdentity,
+});
+assert.equal(performanceGraph.workItemPlans[0].capability, 'performance:lighthouse');
+assert.equal(performanceGraph.workItemPlans[0].resourceClass, 'performance');
+
+function durableWorkItems(graph) {
+  return [...graph.workItemPlans, ...graph.contextPlans].map((plan) => ({
+    id: plan.id,
+    maxAttempts: 2,
+    capability: plan.capability,
+    resourceClass: plan.resourceClass,
+    targetId: plan.targetId,
+    specAffinity: plan.entrySpec,
+  }));
+}
+
+const durableRoot = await mkdtemp(path.join(tmpdir(), 'canonical-graph-store-'));
+try {
+  const store = await openParentRunStore({
+    root: durableRoot,
+    deploymentIdentity: 'compose-project:canonical-graph',
+    volumeIdentity: 'named-volume:canonical-graph',
+    volumeDriver: 'local',
+    verifyStorage: false,
+  });
+  await assert.rejects(
+    () => createParentRun(store, {
+      runId: 'missing-context-run',
+      subjectCore: comparativeCore,
+      executionManifest: comparative.executionManifest,
+      finalSubject: comparative.finalSubject,
+      compilationState: 'sealed',
+      runnerRevision: 'runner-fixture',
+      workItems: durableWorkItems(comparative).filter(({ id }) => id !== comparative.contextPlans[0].id),
+    }),
+    (error) => error?.code === 'SEALED_MANIFEST_MISMATCH',
+    'A sealed run cannot omit scheduled contextual work from its durable queue.',
+  );
+  await createParentRun(store, {
+    runId: 'inventory-run',
+    subjectCore: singleCore,
+    compilationState: 'pending',
+    runnerRevision: 'runner-fixture',
+    workItems: [{
+      ...singleBarrier.workItem,
+      maxAttempts: singleBarrier.maxAttempts,
+      specAffinity: 'scripts/probe-single-site.mjs',
+    }],
+  });
+  for (const [runId, graph, subjectCore] of [
+    ['browser-matrix-run', browserMatrix, browserMatrixCore],
+    ['comparative-context-run', comparative, comparativeCore],
+    ['performance-run', performanceGraph, performanceCore],
+  ]) {
+    await createParentRun(store, {
+      runId,
+      subjectCore,
+      executionManifest: graph.executionManifest,
+      finalSubject: graph.finalSubject,
+      compilationState: 'sealed',
+      runnerRevision: 'runner-fixture',
+      workItems: durableWorkItems(graph),
+    });
+  }
+  const coordinator = await acquireCoordinator(store, 'inventory-run', { ownerId: 'compiler-test', leaseMs: 60_000 });
+  const inventoryLease = await claimWorkItem(store, 'inventory-run', coordinator, {
+    workerId: 'inventory-worker', capabilities: ['inventory:http'], resourceClasses: ['ordinary'], leaseMs: 10_000,
+  });
+  assert.equal(inventoryLease.workItemId, singleBarrier.workItem.id);
+
+  for (const plan of browserMatrix.workItemPlans) {
+    const lease = await claimWorkItem(store, 'browser-matrix-run', coordinator, {
+      workerId: `worker-${plan.targetId}`,
+      workItemId: plan.id,
+      capabilities: [plan.capability],
+      resourceClasses: [plan.resourceClass],
+      leaseMs: 10_000,
+    });
+    assert.equal(lease.capability, plan.capability);
+  }
+  await sealParentRunGraph(store, 'comparative-context-run', coordinator, {
+    executionManifest: comparative.executionManifest,
+    finalSubject: comparative.finalSubject,
+  });
+  const contextLease = await claimWorkItem(store, 'comparative-context-run', coordinator, {
+    workerId: 'context-worker',
+    workItemId: comparative.contextPlans[0].id,
+    capabilities: [comparative.contextPlans[0].capability],
+    resourceClasses: [comparative.contextPlans[0].resourceClass],
+    leaseMs: 10_000,
+  });
+  assert.equal(contextLease.workItemId, comparative.contextPlans[0].id);
+  const contextInbox = await publishAttemptEvidence(store, 'comparative-context-run', contextLease, {
+    outcome: 'completed_pass', reason: null, artifacts: [],
+  });
+  const adoptedContext = await adoptAttemptEvidence(store, 'comparative-context-run', coordinator, contextInbox);
+  assert.equal(adoptedContext.canonicalResult.authoritative, false,
+    'Context evidence must remain outside canonical Product Oracle authority.');
+
+  await requestPerformanceDrain(store, 'performance-run', coordinator, { workerId: 'performance-worker' });
+  const performanceLease = await claimWorkItem(store, 'performance-run', coordinator, {
+    workerId: 'performance-worker', capabilities: ['performance:lighthouse'], resourceClasses: ['performance'], leaseMs: 10_000,
+  });
+  assert.equal(performanceLease.workItemId, performanceGraph.workItemPlans[0].id);
+} finally {
+  await rm(durableRoot, { recursive: true, force: true });
+}
 assert.throws(
   () => compileCanonicalExecutionGraph({
     subjectCore: subject({ mode: 'comparative', definitions: ['ENV-003'], targets: ['production-mobile'], features: ['environment'] }),
@@ -294,6 +479,11 @@ assert.deepEqual(
   legacyCoverage.executions.map(({ caseId, targetId }) => `${caseId}@${targetId}`).sort(),
   'The canonical graph must preserve every existing Single-site executable Product Oracle membership.',
 );
+for (const plan of [...actualGraph.workItemPlans, ...actualGraph.oraclePlans]) assert.match(plan.id, DURABLE_ID);
+assert(actualGraph.workItemPlans.every(({ capability, resourceClass }) => (
+  /^(?:browser:(?:chromium|firefox|webkit|msedge)|performance:lighthouse)$/.test(capability)
+  && ['ordinary', 'performance'].includes(resourceClass)
+)), 'Every real Single-site work item must use a durable worker scheduling class.');
 
 const comparativeTargetIds = actualTargetRegistry.defaultTargetIds;
 const comparativeDefinitions = actualPluginRegistry.plugins.flatMap(({ auditDefinitions, auditCases }) => auditDefinitions
@@ -331,5 +521,13 @@ const actualWorkById = new Map(actualComparativeGraph.workItemPlans.map((plan) =
 assert(actualComparativeGraph.oraclePlans.every(({ requiredWorkItemIds }) => (
   requiredWorkItemIds.some((id) => actualWorkById.get(id)?.targetRole === 'candidate')
 )), 'Every real Comparative Product Oracle must contain candidate evidence.');
+for (const plan of [...actualComparativeGraph.workItemPlans, ...actualComparativeGraph.contextPlans, ...actualComparativeGraph.oraclePlans]) {
+  assert.match(plan.id, DURABLE_ID);
+}
+assert.deepEqual(
+  actualComparativeGraph.executionManifest.workItems.map(({ id }) => id),
+  [...actualComparativeGraph.workItemPlans, ...actualComparativeGraph.contextPlans].map(({ id }) => id).sort(),
+  'The real Comparative manifest must seal every scheduled authoritative and contextual execution.',
+);
 
 process.stdout.write('Canonical graph compiler self-test passed: Single-site inventory and Comparative paired Product Oracles share one sealed graph contract.\n');

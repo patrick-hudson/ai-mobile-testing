@@ -189,7 +189,7 @@ services:
         condition: service_completed_successfully
     environment:
       AUDIT_SHARED_COORDINATOR_URL: http://shared-coordinator:4180
-      AUDIT_SHARED_WORKER_CAPABILITIES: browser:chromium,browser:firefox,browser:webkit
+      AUDIT_SHARED_WORKER_CAPABILITIES: ${AUDIT_SHARED_ORDINARY_CAPABILITIES:-inventory:http,browser:chromium,browser:firefox,browser:webkit}
       AUDIT_SHARED_RESOURCE_CLASS: ordinary
       AUDIT_SHARED_EXECUTOR_JSON: ${AUDIT_SHARED_EXECUTOR_JSON:-}
       AUDIT_SHARED_WORKER_TOKEN_FILE: /run/secrets/shared-worker/token
@@ -213,7 +213,7 @@ services:
         condition: service_completed_successfully
     environment:
       AUDIT_SHARED_COORDINATOR_URL: http://shared-coordinator:4180
-      AUDIT_SHARED_WORKER_CAPABILITIES: browser:chromium,browser:firefox,browser:webkit
+      AUDIT_SHARED_WORKER_CAPABILITIES: ${AUDIT_SHARED_ORDINARY_CAPABILITIES:-inventory:http,browser:chromium,browser:firefox,browser:webkit}
       AUDIT_SHARED_RESOURCE_CLASS: ordinary
       AUDIT_SHARED_EXECUTOR_JSON: ${AUDIT_SHARED_EXECUTOR_JSON:-}
       AUDIT_SHARED_WORKER_TOKEN_FILE: /run/secrets/shared-worker/token

@@ -85,6 +85,7 @@ function fullSingleSiteFixture() {
     subjectCoreDigest: subjectCore.digest,
     workItems: [{ id: 'work-home', definitionId: 'HOME-001', targetId: 'desktop-chromium', targetRole: 'candidate' }],
     oracleExecutions: [{ id: 'oracle-home', definitionId: 'HOME-001', requiredWorkItemIds: ['work-home'] }],
+    contextWorkItemIds: [],
   });
   const finalSubject = sealFinalReleaseSubject({
     schemaVersion: 1,
@@ -175,6 +176,7 @@ const targetedManifest = sealExecutionManifest({
     { id: 'oracle-nav', definitionId: 'NAV-001', requiredWorkItemIds: ['work-nav'] },
     { id: 'oracle-search', definitionId: 'SEARCH-001', requiredWorkItemIds: ['work-search'] },
   ],
+  contextWorkItemIds: [],
 });
 const targetedSubject = sealFinalReleaseSubject({
   schemaVersion: 1,
@@ -207,6 +209,38 @@ expectCode('EMPTY_EXECUTION_MANIFEST', () => sealExecutionManifest({
   subjectCoreDigest: full.subjectCore.digest,
   workItems: [],
   oracleExecutions: [],
+  contextWorkItemIds: [],
+}));
+expectCode('UNDECLARED_WORK_ITEM', () => sealExecutionManifest({
+  schemaVersion: 1,
+  subjectCoreDigest: full.subjectCore.digest,
+  workItems: [{ id: 'work-home', definitionId: 'HOME-001', targetId: 'desktop-chromium', targetRole: 'candidate' }],
+  oracleExecutions: [{ id: 'oracle-home', definitionId: 'HOME-001', requiredWorkItemIds: ['work-home'] }],
+  contextWorkItemIds: ['work-missing'],
+}));
+expectCode('CONTEXT_WORK_ADOPTED', () => sealExecutionManifest({
+  schemaVersion: 1,
+  subjectCoreDigest: full.subjectCore.digest,
+  workItems: [{ id: 'work-home', definitionId: 'HOME-001', targetId: 'desktop-chromium', targetRole: 'candidate' }],
+  oracleExecutions: [{ id: 'oracle-home', definitionId: 'HOME-001', requiredWorkItemIds: ['work-home'] }],
+  contextWorkItemIds: ['work-home'],
+}));
+expectCode('UNADOPTED_WORK_ITEM', () => sealExecutionManifest({
+  schemaVersion: 1,
+  subjectCoreDigest: full.subjectCore.digest,
+  workItems: [
+    { id: 'work-home', definitionId: 'HOME-001', targetId: 'desktop-chromium', targetRole: 'candidate' },
+    { id: 'work-unclassified', definitionId: 'HOME-001', targetId: 'desktop-chromium', targetRole: 'production' },
+  ],
+  oracleExecutions: [{ id: 'oracle-home', definitionId: 'HOME-001', requiredWorkItemIds: ['work-home'] }],
+  contextWorkItemIds: [],
+}));
+expectCode('ORACLE_DEFINITION_MISMATCH', () => sealExecutionManifest({
+  schemaVersion: 1,
+  subjectCoreDigest: full.subjectCore.digest,
+  workItems: [{ id: 'work-home', definitionId: 'OTHER-001', targetId: 'desktop-chromium', targetRole: 'candidate' }],
+  oracleExecutions: [{ id: 'oracle-home', definitionId: 'HOME-001', requiredWorkItemIds: ['work-home'] }],
+  contextWorkItemIds: [],
 }));
 expectCode('UNDECLARED_EXECUTION_RESULT', () => deriveReleaseDecision({
   schemaVersion: 1,
@@ -379,6 +413,7 @@ const comparativeManifest = sealExecutionManifest({
     { id: 'work-production', definitionId: 'HOME-001', targetId: 'desktop-chromium', targetRole: 'production' },
   ],
   oracleExecutions: [{ id: 'oracle-paired', definitionId: 'HOME-001', requiredWorkItemIds: ['work-candidate', 'work-production'] }],
+  contextWorkItemIds: [],
 });
 const comparativeSubject = sealFinalReleaseSubject({
   schemaVersion: 1,

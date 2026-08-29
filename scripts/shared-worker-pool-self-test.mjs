@@ -402,6 +402,10 @@ try {
   }
   assert.match(workerABlock, /shared-worker-ordinary-a-secret:/);
   assert.match(workerBBlock, /shared-worker-ordinary-b-secret:/);
+  assert.match(workerABlock, /inventory:http,browser:chromium,browser:firefox,browser:webkit/,
+    'Ordinary shared workers must claim the Single-site inventory barrier as well as browser work.');
+  assert.match(workerBBlock, /inventory:http,browser:chromium,browser:firefox,browser:webkit/,
+    'Every interchangeable ordinary worker must advertise the same inventory and browser capabilities.');
   assert.doesNotMatch(workerABlock, /shared-worker-ordinary-b-secret:/,
     'worker A must not mount worker B credentials');
   assert.doesNotMatch(workerBBlock, /shared-worker-ordinary-a-secret:/,

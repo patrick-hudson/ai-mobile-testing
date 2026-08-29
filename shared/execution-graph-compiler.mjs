@@ -175,11 +175,15 @@ export function compileSingleSiteInventoryBarrier({ subjectCore: rawSubjectCore,
     kind: 'single-site-inventory-barrier',
     subjectCoreDigest: subjectCore.digest,
     workItem: {
-      id: `inventory:single-site:${subjectCore.digest}`,
+      id: durableExecutionId('inventory-single-site', {
+        kind: 'single-site-inventory',
+        subjectCoreDigest: subjectCore.digest,
+      }),
       definitionId: 'INVENTORY',
       targetId,
       targetRole: subjectCore.targets[0].role,
-      capability: 'route-inventory',
+      capability: 'inventory:http',
+      resourceClass: 'ordinary',
     },
     maxAttempts,
   };
@@ -256,15 +260,31 @@ function targetSupportsCase(mode, target, auditCase) {
   return auditCase.supportedProjects.includes(registryTargetId);
 }
 
-function encodedId(value) {
-  return encodeURIComponent(value).replaceAll('%', '~');
+function durableExecutionId(prefix, identity) {
+  return `${prefix}-${canonicalDigest(identity).slice('sha256:'.length)}`;
+}
+
+function schedulingClass(target, auditCase) {
+  if (String(auditCase.entrySpec).includes('performance')) {
+    return { capability: 'performance:lighthouse', resourceClass: 'performance' };
+  }
+  const engine = target.requiredCapability ?? nonEmptyString(target.engine, `${target.id}.engine`);
+  return {
+    capability: String(engine).includes(':') ? String(engine) : `browser:${engine}`,
+    resourceClass: 'ordinary',
+  };
 }
 
 function workPlan({ mode, definition, auditCase, target, role, inventory }) {
-  const suffix = inventory ? `#${inventory.inventoryDigest}` : '';
-  const id = `work:${mode}:${encodedId(auditCase.caseId)}@${encodedId(target.id)}${suffix}`;
-  const capability = target.requiredCapability
-    ?? (String(auditCase.entrySpec).includes('performance') ? 'isolated-performance' : 'browser');
+  const id = durableExecutionId(`work-${mode}`, {
+    kind: 'canonical-work-item',
+    mode,
+    definitionId: definition.id,
+    caseId: auditCase.caseId,
+    targetId: target.id,
+    inventoryDigest: inventory?.inventoryDigest ?? null,
+  });
+  const { capability, resourceClass } = schedulingClass(target, auditCase);
   return {
     id,
     definitionId: definition.id,
@@ -275,6 +295,7 @@ function workPlan({ mode, definition, auditCase, target, role, inventory }) {
     targetId: target.id,
     targetRole: role,
     capability,
+    resourceClass,
     productOracleVariant: auditCase.oracleVariants[mode === 'single-site' ? 'singleSite' : 'comparative'],
     productOracleExpected: mode === 'single-site'
       ? (definition.standaloneOracle?.expected ?? definition.expected)
@@ -316,7 +337,9 @@ function appendGenericRoutePlans({ subjectCore, modeCatalog, completedInventory,
     };
     workItemPlans.push(plan);
     oraclePlans.push({
-      id: `oracle:single-site:${encodedId(caseId)}@${encodedId(target.id)}`,
+      id: durableExecutionId('oracle-single-site', {
+        kind: 'canonical-oracle-execution', mode: 'single-site', definitionId: definition.id, caseId, targetId: target.id,
+      }),
       definitionId: definition.id,
       productOracleVariant: 'generic-page-inspection-v1',
       requiredWorkItemIds: [plan.id],
@@ -423,7 +446,10 @@ export function compileCanonicalExecutionGraph({
         for (const plan of casePlans) {
           workItemPlans.push(plan);
           oraclePlans.push({
-            id: `oracle:single-site:${encodedId(auditCase.caseId)}@${encodedId(plan.targetId)}`,
+            id: durableExecutionId('oracle-single-site', {
+              kind: 'canonical-oracle-execution', mode: 'single-site', definitionId: definition.id,
+              caseId: auditCase.caseId, targetId: plan.targetId,
+            }),
             definitionId: definition.id,
             productOracleVariant: plan.productOracleVariant,
             requiredWorkItemIds: [plan.id],
@@ -434,7 +460,9 @@ export function compileCanonicalExecutionGraph({
         if (casePlans.some(({ targetRole: role }) => role === 'candidate')) {
           workItemPlans.push(...casePlans);
           oraclePlans.push({
-            id: `oracle:comparative:${encodedId(auditCase.caseId)}`,
+            id: durableExecutionId('oracle-comparative', {
+              kind: 'canonical-oracle-execution', mode: 'comparative', definitionId: definition.id, caseId: auditCase.caseId,
+            }),
             definitionId: definition.id,
             productOracleVariant: auditCase.oracleVariants.comparative,
             requiredWorkItemIds: casePlans.map(({ id }) => id),
@@ -466,8 +494,10 @@ export function compileCanonicalExecutionGraph({
   const executionManifest = sealExecutionManifest({
     schemaVersion: 1,
     subjectCoreDigest: subjectCore.digest,
-    workItems: workItemPlans.map(({ id, definitionId, targetId, targetRole }) => ({ id, definitionId, targetId, targetRole })),
+    workItems: [...workItemPlans, ...contextPlans]
+      .map(({ id, definitionId, targetId, targetRole }) => ({ id, definitionId, targetId, targetRole })),
     oracleExecutions: oraclePlans.map(({ id, definitionId, requiredWorkItemIds }) => ({ id, definitionId, requiredWorkItemIds })),
+    contextWorkItemIds: contextPlans.map(({ id }) => id),
   });
   const finalSubject = sealFinalReleaseSubject({
     schemaVersion: 1,
@@ -523,10 +553,13 @@ export function parseCanonicalExecutionGraph(value) {
     || !Array.isArray(value.workItemPlans) || !Array.isArray(value.oraclePlans) || !Array.isArray(value.contextPlans)) {
     failContract('CORRUPT_EXECUTION_DIGEST', 'Canonical execution graph contract bindings disagree.');
   }
-  const plannedWork = value.workItemPlans.map(({ id, definitionId, targetId, targetRole }) => ({ id, definitionId, targetId, targetRole }));
+  const plannedWork = [...value.workItemPlans, ...value.contextPlans]
+    .map(({ id, definitionId, targetId, targetRole }) => ({ id, definitionId, targetId, targetRole }))
+    .sort((left, right) => left.id.localeCompare(right.id));
   const plannedOracles = value.oraclePlans.map(({ id, definitionId, requiredWorkItemIds }) => ({ id, definitionId, requiredWorkItemIds }));
   if (canonicalJson(plannedWork) !== canonicalJson(executionManifest.workItems)
-    || canonicalJson(plannedOracles) !== canonicalJson(executionManifest.oracleExecutions)) {
+    || canonicalJson(plannedOracles) !== canonicalJson(executionManifest.oracleExecutions)
+    || canonicalJson(value.contextPlans.map(({ id }) => id).sort()) !== canonicalJson(executionManifest.contextWorkItemIds)) {
     failContract('CORRUPT_EXECUTION_DIGEST', 'Canonical graph plans disagree with the sealed execution manifest.');
   }
   return freezeContract(value);

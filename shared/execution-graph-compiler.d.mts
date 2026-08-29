@@ -11,6 +11,7 @@ export interface CanonicalWorkItemPlan {
   targetId: string;
   targetRole: string;
   capability: string;
+  resourceClass: 'ordinary' | 'performance';
   productOracleVariant: string;
   productOracleExpected: string;
   inventoryDigest: string | null;
