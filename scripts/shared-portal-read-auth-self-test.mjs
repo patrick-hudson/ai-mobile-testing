@@ -18,6 +18,7 @@ import {
   publishAttemptEvidence,
   readParentRun,
 } from './lib/parent-run-store.mjs';
+import { initializeCutoverAdmissionGate } from './lib/shared-cutover-orchestrator.mjs';
 
 const root = await mkdtemp(path.join(tmpdir(), 'shared-portal-read-auth-'));
 let portal = null;
@@ -66,6 +67,10 @@ try {
     volumeIdentity: 'named-volume:self-test-shared-portal',
     storeMarker: sharedStoreMarker,
     backupMarker: sharedBackupMarker,
+    verifyStorage: false,
+  });
+  await initializeCutoverAdmissionGate({
+    root: path.join(sharedStore.root, 'cutover-admission'),
     verifyStorage: false,
   });
   const sharedRunId = 'shared-op-0001';

@@ -19,6 +19,7 @@ export interface CutoverAdmissionGateDocument {
 export interface CutoverAdmissionGate {
   root: string;
   read(): Promise<CutoverAdmissionGateDocument>;
+  withOpen<T>(operation: (gate: CutoverAdmissionGateDocument) => Promise<T> | T): Promise<T>;
   close(expectedDigest: string, cutoverId: string): Promise<CutoverAdmissionGateDocument>;
   open(expectedDigest: string, cutoverId: string): Promise<CutoverAdmissionGateDocument>;
 }
@@ -65,6 +66,33 @@ export function openCutoverAdmissionGate(options: {
   verifyStorage?: boolean;
   clock?: () => number;
 }): Promise<CutoverAdmissionGate>;
+
+export function initializeCutoverAdmissionGate(options: {
+  root: string;
+  filesystem?: any;
+  nonce?: () => string;
+  verifyStorage?: boolean;
+  clock?: () => number;
+}): Promise<CutoverAdmissionGate>;
+
+export function createCutoverAdmissionPolicy(options: {
+  admissionGate: CutoverAdmissionGate;
+}): {
+  withLaunchAdmission<T>(requestId: string, operation: () => Promise<T>): Promise<T>;
+  withPromotionAdmission<T>(requestId: string, operation: () => Promise<T>): Promise<T>;
+  withMutationAdmission<T>(kind: string, requestId: string, operation: () => Promise<T>): Promise<T>;
+};
+
+export function captureSharedAuthorityDrainObservation(options: {
+  store: ParentRunStore;
+  coordinator: CoordinatorFence;
+  admissionGate: CutoverAdmissionGate;
+  launchOperationStore: any;
+  cutoverId: string;
+  legacyComparativeRoot: string;
+  legacySingleSiteQueueRoot: string;
+  clock?: () => number;
+}): Promise<CutoverDrainObservation>;
 
 export function prepareSharedAuthorityCutover(options: {
   store: ParentRunStore;

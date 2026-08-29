@@ -50,7 +50,7 @@ function namespacedKey(principal, kind, runId, requestId) {
   return `op-${createHash('sha256').update(`${principal.id}\0${kind}\0${runId}\0${requestId}`).digest('hex')}`;
 }
 
-export function createSharedControlService({ store, projectId = 'default' } = {}) {
+export function createSharedControlService({ store, projectId = 'default', admissionPolicy = null } = {}) {
   if (!store) throw new TypeError('Shared control service requires the durable parent-run store.');
   const object = (runId) => ({ projectId, runId });
   return Object.freeze({
@@ -94,64 +94,69 @@ export function createSharedControlService({ store, projectId = 'default' } = {}
       };
     },
     async acceptMutation(principal, runId, { kind, requestId, expectedRunRevision, body }) {
-      const action = CONTROL_OPERATION_KINDS[kind];
-      if (!action) fail('OPERATION_KIND_INVALID', 'Operation kind is unsupported.');
-      assertPrincipalAuthorized(principal, action, object(runId));
-      if (!Number.isSafeInteger(expectedRunRevision) || expectedRunRevision < 1) fail('EXPECTED_REVISION_REQUIRED', 'A positive expectedRunRevision is required.', 409);
-      if (!body || typeof body !== 'object' || Array.isArray(body)) fail('OPERATION_BODY_INVALID', 'Operation body must be a JSON object.');
-      if (Buffer.byteLength(canonicalJson(body)) > MAX_BODY_BYTES) fail('OPERATION_BODY_TOO_LARGE', 'Operation body exceeds the durable bound.', 413);
-      if (['rekick', 'risk-acknowledge', 'risk-resolve', 'visual-disposition', 'purge'].includes(kind)
-        && typeof body.expectedSubjectDigest !== 'string') {
-        fail('RELEASE_SUBJECT_REQUIRED', 'Release-affecting and review mutations must pin the immutable final subject.', 409);
-      }
-      if (kind === 'risk-acknowledge' || kind === 'risk-resolve') {
-        const publication = await readCurrentEnvelope(store, runId);
-        const risk = publication.riskRegister.risks.find(({ identity }) => identity === body?.riskIdentity);
-        if (!risk) fail('RISK_OBSERVATION_CONFLICT', 'Risk mutation must name a current immutable observation.', 409);
-        if (risk.category === 'unreviewed-visual-change') {
-          fail('RISK_LIFECYCLE_NOT_APPLICABLE', 'Visual review risks require an explicit visual disposition.', 409);
+      const accept = async () => {
+        const action = CONTROL_OPERATION_KINDS[kind];
+        if (!action) fail('OPERATION_KIND_INVALID', 'Operation kind is unsupported.');
+        assertPrincipalAuthorized(principal, action, object(runId));
+        if (!Number.isSafeInteger(expectedRunRevision) || expectedRunRevision < 1) fail('EXPECTED_REVISION_REQUIRED', 'A positive expectedRunRevision is required.', 409);
+        if (!body || typeof body !== 'object' || Array.isArray(body)) fail('OPERATION_BODY_INVALID', 'Operation body must be a JSON object.');
+        if (Buffer.byteLength(canonicalJson(body)) > MAX_BODY_BYTES) fail('OPERATION_BODY_TOO_LARGE', 'Operation body exceeds the durable bound.', 413);
+        if (['rekick', 'risk-acknowledge', 'risk-resolve', 'visual-disposition', 'purge'].includes(kind)
+          && typeof body.expectedSubjectDigest !== 'string') {
+          fail('RELEASE_SUBJECT_REQUIRED', 'Release-affecting and review mutations must pin the immutable final subject.', 409);
         }
-        if (kind === 'risk-acknowledge' && risk.reviewState !== 'OPEN') {
-          fail('RISK_REVIEW_STATE_CONFLICT', 'Only an open risk can be acknowledged.', 409);
+        if (kind === 'risk-acknowledge' || kind === 'risk-resolve') {
+          const publication = await readCurrentEnvelope(store, runId);
+          const risk = publication.riskRegister.risks.find(({ identity }) => identity === body?.riskIdentity);
+          if (!risk) fail('RISK_OBSERVATION_CONFLICT', 'Risk mutation must name a current immutable observation.', 409);
+          if (risk.category === 'unreviewed-visual-change') {
+            fail('RISK_LIFECYCLE_NOT_APPLICABLE', 'Visual review risks require an explicit visual disposition.', 409);
+          }
+          if (kind === 'risk-acknowledge' && risk.reviewState !== 'OPEN') {
+            fail('RISK_REVIEW_STATE_CONFLICT', 'Only an open risk can be acknowledged.', 409);
+          }
+          if (kind === 'risk-resolve' && !['OPEN', 'ACKNOWLEDGED'].includes(risk.reviewState)) {
+            fail('RISK_REVIEW_STATE_CONFLICT', 'Only an open or acknowledged risk can be resolved.', 409);
+          }
+          if (kind === 'risk-resolve' && ['certificate-bypass', 'coverage-gap', 'evidence-pipeline-limitation'].includes(risk.category)) {
+            fail('ACTIVE_RISK_CANNOT_RESOLVE', 'A live derived risk may be acknowledged but cannot be resolved while its sealed source remains active.', 409);
+          }
         }
-        if (kind === 'risk-resolve' && !['OPEN', 'ACKNOWLEDGED'].includes(risk.reviewState)) {
-          fail('RISK_REVIEW_STATE_CONFLICT', 'Only an open or acknowledged risk can be resolved.', 409);
+        if (kind === 'visual-disposition') {
+          const [publication, state] = await Promise.all([readCurrentEnvelope(store, runId), readParentRun(store, runId)]);
+          const risk = publication.riskRegister.risks.find(({ identity }) => identity === body.riskIdentity);
+          if (!risk || risk.category !== 'unreviewed-visual-change') {
+            fail('VISUAL_REVIEW_OBSERVATION_CONFLICT', 'Visual disposition must name a current visual-review observation.', 409);
+          }
+          if (!['ACCEPTED', 'DEFECT_CONFIRMED'].includes(body.disposition)
+            || typeof body.rationale !== 'string' || body.rationale.length < 1 || body.rationale.length > 2_048
+            || typeof body.executionId !== 'string'
+            || !state.executionManifest?.oracleExecutions?.some(({ id }) => id === body.executionId)) {
+            fail('VISUAL_REVIEW_INVALID', 'Visual disposition value, rationale, or execution identity is invalid.', 400);
+          }
         }
-        if (kind === 'risk-resolve' && ['certificate-bypass', 'coverage-gap', 'evidence-pipeline-limitation'].includes(risk.category)) {
-          fail('ACTIVE_RISK_CANNOT_RESOLVE', 'A live derived risk may be acknowledged but cannot be resolved while its sealed source remains active.', 409);
+        const idempotencyKey = namespacedKey(principal, kind, runId, requestId);
+        const operationRequest = {
+          idempotencyKey,
+          kind,
+          actor: actor(principal),
+          body: { ...body, expectedRunRevision },
+        };
+        try {
+          await getOperation(store, runId, idempotencyKey);
+          return acceptOperation(store, runId, operationRequest);
+        } catch (error) {
+          if (error?.code !== 'OPERATION_NOT_FOUND') throw error;
         }
-      }
-      if (kind === 'visual-disposition') {
-        const [publication, state] = await Promise.all([readCurrentEnvelope(store, runId), readParentRun(store, runId)]);
-        const risk = publication.riskRegister.risks.find(({ identity }) => identity === body.riskIdentity);
-        if (!risk || risk.category !== 'unreviewed-visual-change') {
-          fail('VISUAL_REVIEW_OBSERVATION_CONFLICT', 'Visual disposition must name a current visual-review observation.', 409);
-        }
-        if (!['ACCEPTED', 'DEFECT_CONFIRMED'].includes(body.disposition)
-          || typeof body.rationale !== 'string' || body.rationale.length < 1 || body.rationale.length > 2_048
-          || typeof body.executionId !== 'string'
-          || !state.executionManifest?.oracleExecutions?.some(({ id }) => id === body.executionId)) {
-          fail('VISUAL_REVIEW_INVALID', 'Visual disposition value, rationale, or execution identity is invalid.', 400);
-        }
-      }
-      const idempotencyKey = namespacedKey(principal, kind, runId, requestId);
-      const operationRequest = {
-        idempotencyKey,
-        kind,
-        actor: actor(principal),
-        body: { ...body, expectedRunRevision },
+        return acceptOperation(store, runId, {
+          ...operationRequest,
+          expectedRunRevision,
+          expectedSubjectDigest: body?.expectedSubjectDigest,
+        });
       };
-      try {
-        await getOperation(store, runId, idempotencyKey);
-        return acceptOperation(store, runId, operationRequest);
-      } catch (error) {
-        if (error?.code !== 'OPERATION_NOT_FOUND') throw error;
-      }
-      return acceptOperation(store, runId, {
-        ...operationRequest,
-        expectedRunRevision,
-        expectedSubjectDigest: body?.expectedSubjectDigest,
-      });
+      return admissionPolicy
+        ? admissionPolicy.withMutationAdmission(kind, requestId, accept)
+        : accept();
     },
     async readOperation(principal, runId, { kind, requestId }) {
       const action = CONTROL_OPERATION_KINDS[kind];

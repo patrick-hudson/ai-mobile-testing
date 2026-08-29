@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { constants as fsConstants, promises as fs } from 'node:fs';
+import path from 'node:path';
 
 import { canonicalDigest } from '../shared/canonical-contract.mjs';
 import {
@@ -7,14 +8,18 @@ import {
   PARENT_RUN_WRITER_PROTOCOL,
   acquireStoreCoordinator,
   openParentRunStore,
+  readReleaseAuthoritySelector,
 } from './lib/parent-run-store.mjs';
 import {
   activateSharedAuthorityCutover,
+  captureSharedAuthorityDrainObservation,
+  initializeCutoverAdmissionGate,
   openCutoverAdmissionGate,
   prepareSharedAuthorityCutover,
   rollbackSharedAuthorityBeforeActivation,
   setSharedPromotionAvailability,
 } from './lib/shared-cutover-orchestrator.mjs';
+import { openSharedLaunchOperationStore } from './lib/shared-launch-operation-store.mjs';
 import { readTrustedStoreMarker } from './lib/shared-store-runtime.mjs';
 
 const ACTIONS = new Set(['prepare', 'activate', 'rollback', 'disable-promotion', 'enable-promotion']);
@@ -84,7 +89,19 @@ async function main() {
   if (config.schemaVersion !== 1) throw new TypeError('Operator config must use schemaVersion 1.');
   const marker = await readTrustedStoreMarker(config.store?.storeMarkerFile, 'trusted shared store marker');
   const store = await openConfiguredStore(config, action, marker);
-  const admissionGate = await openCutoverAdmissionGate({ root: config.admissionRoot });
+  const admissionRoot = path.join(store.root, 'cutover-admission');
+  if (config.admissionRoot && path.resolve(config.admissionRoot) !== path.resolve(admissionRoot)) {
+    throw new TypeError('config.admissionRoot must identify the canonical store cutover-admission directory.');
+  }
+  let admissionGate;
+  try {
+    admissionGate = await openCutoverAdmissionGate({ root: admissionRoot });
+  } catch (error) {
+    if (action !== 'prepare' || error?.code !== 'CUTOVER_ADMISSION_UNAVAILABLE') throw error;
+    const selector = await readReleaseAuthoritySelector(store);
+    if (selector.phase !== 'SHADOW' || selector.activationEpoch !== 0) throw error;
+    admissionGate = await initializeCutoverAdmissionGate({ root: admissionRoot });
+  }
   const coordinator = await acquireStoreCoordinator(store, {
     ownerId: config.coordinatorOwnerId,
     leaseMs: config.coordinatorLeaseMs ?? 30_000,
@@ -118,9 +135,27 @@ async function main() {
       store, coordinator, admissionGate, reportDirectory: config.reportDirectory, input: commonInput,
     });
   } else if (action === 'activate') {
+    const legacySources = requiredObject(config.legacySources, 'config.legacySources');
+    const launchOperationRoot = path.join(store.root, 'launch-operations');
+    if (config.launchOperationRoot
+      && path.resolve(config.launchOperationRoot) !== path.resolve(launchOperationRoot)) {
+      throw new TypeError('config.launchOperationRoot must identify the canonical store launch-operations directory.');
+    }
+    const launchOperationStore = await openSharedLaunchOperationStore({
+      root: launchOperationRoot, requireExisting: true,
+    });
+    const drainObservation = await captureSharedAuthorityDrainObservation({
+      store,
+      coordinator,
+      admissionGate,
+      launchOperationStore,
+      cutoverId: config.cutoverId,
+      legacyComparativeRoot: legacySources.comparativeRoot,
+      legacySingleSiteQueueRoot: legacySources.singleSiteQueueRoot,
+    });
     result = await activateSharedAuthorityCutover({
       store, coordinator, admissionGate, reportDirectory: config.reportDirectory, input: commonInput,
-      drainObservation: await readBoundedJsonFile(config.drainObservationFile, 'Drain observation'),
+      drainObservation,
     });
   } else if (action === 'rollback') {
     result = await rollbackSharedAuthorityBeforeActivation({

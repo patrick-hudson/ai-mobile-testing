@@ -19,6 +19,7 @@ export function createSharedRequestAuthorizer({ authority } = {}) {
 
 export function createSharedControlApi({
   authority, service, claimStore, expectedOrigin, launch = null, readLaunchOperation = null,
+  admissionPolicy = null,
   requestAuthorizer = createSharedRequestAuthorizer({ authority }),
   sessionCookiePath = SHARED_CONTROL_API_PREFIX,
 } = {}) {
@@ -58,10 +59,11 @@ export function createSharedControlApi({
           const intent = parseLaunchIntent(recordBody(request.body));
           assertPrincipalAuthorized(principal, CONTROL_ACTIONS.RUN_LAUNCH, { projectId: service.projectId });
           if (typeof launch !== 'function') throw new ControlPlaneError('LAUNCH_UNAVAILABLE', 'Shared launch is unavailable.', 503);
-          const operation = await launch(principal, {
-            requestId: requireIdempotencyKey(request),
-            intent,
-          });
+          const requestId = requireIdempotencyKey(request);
+          const accept = () => launch(principal, { requestId, intent });
+          const operation = admissionPolicy
+            ? await admissionPolicy.withLaunchAdmission(requestId, accept)
+            : await accept();
           const statusUrl = `${SHARED_CONTROL_API_PREFIX}/launch-operations/${operation.operationId}`;
           return accepted({ ...launchOperationView(operation), statusUrl }, { location: statusUrl });
         }
@@ -90,15 +92,19 @@ export function createSharedControlApi({
           const body = recordBody(request.body);
           if (!body.expected || typeof body.expected !== 'object' || Array.isArray(body.expected)) throw new ControlPlaneError('CONTROL_BODY_INVALID', 'expected is required.', 400);
           if (body.expected.projectId !== service.projectId) throw new ControlPlaneError('PROMOTION_SCOPE_MISMATCH', 'Promotion project does not match this control service.', 409);
-          const { publication, claim } = await service.withReleaseAssertionFence(principal, runId,
+          const requestId = request.headers['idempotency-key'] ?? body.requestId;
+          const assertRelease = () => service.withReleaseAssertionFence(principal, runId,
             async (current, authorityContext) => ({
               publication: current,
               claim: await issuePromotionClaim(claimStore, {
                 principal, publication: current, authorityContext,
                 expected: { ...body.expected, projectId: service.projectId }, ttlMs: body.ttlMs,
-                requestId: request.headers['idempotency-key'] ?? body.requestId,
+                requestId,
               }),
             }));
+          const { publication, claim } = admissionPolicy
+            ? await admissionPolicy.withPromotionAdmission(requestId, assertRelease)
+            : await assertRelease();
           return ok({
             ...claim,
             result: createReleaseAssertionResult(publication, { projectId: service.projectId }),
@@ -107,10 +113,14 @@ export function createSharedControlApi({
         if (request.method === 'POST' && suffix === 'promotion/consume') {
           mutation(request, authentication, expectedOrigin);
           const body = recordBody(request.body);
-          return ok(await consumePromotionClaim(claimStore, requireString(body.token, 'token'), {
+          const token = requireString(body.token, 'token');
+          const consume = () => consumePromotionClaim(claimStore, token, {
             principal, expectedSubjectDigest: requireString(body.expectedSubjectDigest, 'expectedSubjectDigest'),
             withCurrentPublication: (callback) => service.withPublicationFence(principal, runId, callback),
-          }));
+          });
+          return ok(admissionPolicy
+            ? await admissionPolicy.withPromotionAdmission(token, consume)
+            : await consume());
         }
         const kind = mutationKind(suffix);
         if (request.method === 'POST' && kind) {

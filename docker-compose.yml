@@ -63,6 +63,7 @@ services:
       PORTAL_VISUAL_BASELINE_ROOT: /var/lib/ai-mobile-testing/baselines
       PORTAL_SHARED_CREDENTIAL_ROOT: /var/lib/ai-mobile-testing/shared/credentials
       AUDIT_SHARED_STORE_ROOT: /var/lib/ai-mobile-testing/shared/canonical
+      AUDIT_SHARED_ADMISSION_ROOT: /var/lib/ai-mobile-testing/shared/canonical/cutover-admission
       AUDIT_SHARED_STORE_MARKER_FILE: /var/lib/ai-mobile-testing/shared/trust/store-marker
       AUDIT_SHARED_BACKUP_MARKER_FILE: /var/lib/ai-mobile-testing/shared/trust/backup-marker
       AUDIT_SHARED_DEPLOYMENT_IDENTITY: ${AUDIT_SHARED_DEPLOYMENT_IDENTITY:-compose:ai-mobile-testing}

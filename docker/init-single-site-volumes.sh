@@ -53,6 +53,13 @@ if [[ -d "$shared_trust_root" ]]; then
   done
 fi
 
+if [[ -d /var/lib/ai-mobile-testing/shared/canonical ]]; then
+  node scripts/init-shared-admission.mjs /var/lib/ai-mobile-testing/shared/canonical
+  chown -R pwuser:pwuser /var/lib/ai-mobile-testing/shared/canonical/cutover-admission
+  find /var/lib/ai-mobile-testing/shared/canonical/cutover-admission -xdev -type d -exec chmod 2770 {} +
+  find /var/lib/ai-mobile-testing/shared/canonical/cutover-admission -xdev -type f -exec chmod 0660 {} +
+fi
+
 for volume_root in "${sensitive_roots[@]}"; do
   if [[ ! -d "$volume_root" || -L "$volume_root" ]]; then
     printf '[SINGLE_SITE_VOLUME_INIT] Credential volume must be a real directory: %s\n' "$volume_root" >&2

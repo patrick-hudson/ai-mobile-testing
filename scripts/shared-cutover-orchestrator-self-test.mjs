@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -9,17 +9,21 @@ import { runShadowValidation } from '../shared/shadow-validation.mjs';
 import {
   PARENT_RUN_STORE_SCHEMA_VERSION,
   PARENT_RUN_WRITER_PROTOCOL,
+  acceptOperation,
   acquireStoreCoordinator,
+  createParentRun,
   openParentRunStore,
   readReleaseAuthoritySelector,
 } from './lib/parent-run-store.mjs';
 import {
   activateSharedAuthorityCutover,
-  openCutoverAdmissionGate,
+  captureSharedAuthorityDrainObservation,
+  initializeCutoverAdmissionGate,
   prepareSharedAuthorityCutover,
   rollbackSharedAuthorityBeforeActivation,
   setSharedPromotionAvailability,
 } from './lib/shared-cutover-orchestrator.mjs';
+import { openSharedLaunchOperationStore } from './lib/shared-launch-operation-store.mjs';
 
 const marker = 'cd'.repeat(32);
 const build = 'build:cutover-current';
@@ -94,13 +98,25 @@ async function fixture(name) {
     verifyStorage: false,
     clock,
   });
-  const admissionGate = await openCutoverAdmissionGate({
+  const admissionGate = await initializeCutoverAdmissionGate({
     root: path.join(directory, 'admission'), verifyStorage: false, clock,
+  });
+  const legacyComparativeRoot = path.join(directory, 'legacy-comparative');
+  const legacySingleSiteQueueRoot = path.join(directory, 'legacy-single-site');
+  await Promise.all([
+    mkdir(legacyComparativeRoot, { recursive: true }),
+    mkdir(path.join(legacySingleSiteQueueRoot, 'jobs'), { recursive: true }),
+  ]);
+  const launchOperationStore = await openSharedLaunchOperationStore({
+    root: path.join(directory, 'launch-operations'), clock,
   });
   const coordinator = await acquireStoreCoordinator(store, {
     ownerId: `coordinator-${name}`, leaseMs: 60_000,
   });
-  return { directory, store, admissionGate, coordinator };
+  return {
+    directory, store, admissionGate, coordinator, launchOperationStore,
+    legacyComparativeRoot, legacySingleSiteQueueRoot,
+  };
 }
 
 function request(cutoverId) {
@@ -120,8 +136,14 @@ async function expectCode(code, operation) {
 }
 
 try {
+  await expectCode('LAUNCH_OPERATION_STORE_UNAVAILABLE', () => openSharedLaunchOperationStore({
+    root: path.join(root, 'missing-launch-operations'), requireExisting: true, clock,
+  }));
   {
-    const { directory, store, admissionGate, coordinator } = await fixture('happy');
+    const {
+      directory, store, admissionGate, coordinator, launchOperationStore,
+      legacyComparativeRoot, legacySingleSiteQueueRoot,
+    } = await fixture('happy');
     const input = request('cutover-happy');
     const prepared = await prepareSharedAuthorityCutover({
       store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
@@ -130,9 +152,20 @@ try {
     assert.equal(prepared.admissionGate.state, 'CLOSED');
     assert.equal((await readReleaseAuthoritySelector(store)).phase, 'DRAINING');
 
+    const drainObservation = await captureSharedAuthorityDrainObservation({
+      store, coordinator, admissionGate, launchOperationStore, cutoverId: input.cutoverId,
+      legacyComparativeRoot, legacySingleSiteQueueRoot, clock,
+    });
+    assert.deepEqual(drainObservation.activeLegacyAuthoritativeRunIds, []);
+    assert.equal(drainObservation.legacyHeadMarkers.length, 1);
+    assert.deepEqual(
+      await readdir(legacySingleSiteQueueRoot),
+      ['jobs'],
+      'drain observation must not initialize indexes or otherwise mutate the legacy queue',
+    );
     const report = await activateSharedAuthorityCutover({
       store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
-      drainObservation: observation(input.cutoverId, prepared.admissionGate, coordinator),
+      drainObservation,
     });
     assert.equal(report.status, 'ACTIVE_ADMISSION_CLOSED');
     assert.equal(report.selectorAfter.phase, 'ACTIVE');
@@ -168,6 +201,55 @@ try {
       store, coordinator, phase: 'ACTIVE', buildIdentity: build,
     });
     assert.equal(reenabled.phase, 'ACTIVE');
+  }
+
+  {
+    const {
+      directory, store, admissionGate, coordinator, launchOperationStore,
+      legacyComparativeRoot, legacySingleSiteQueueRoot,
+    } = await fixture('production-observer-operation');
+    const input = request('cutover-production-observer-operation');
+    await createParentRun(store, {
+      runId: 'run-cutover-operation', subjectCoreDigest: `sha256:${'e'.repeat(64)}`,
+      workItems: [{ id: 'work-cutover-operation', maxAttempts: 1, capability: 'browser:chromium', targetId: 'candidate' }],
+    });
+    const accepted = await acceptOperation(store, 'run-cutover-operation', {
+      idempotencyKey: 'cutover-operation-0001', kind: 'cancel',
+      actor: { id: 'operator-cutover', kind: 'human' }, body: { reason: 'drain proof' },
+    });
+    await prepareSharedAuthorityCutover({
+      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
+    });
+    const observed = await captureSharedAuthorityDrainObservation({
+      store, coordinator, admissionGate, launchOperationStore, cutoverId: input.cutoverId,
+      legacyComparativeRoot, legacySingleSiteQueueRoot, clock,
+    });
+    const operationIdentity = `run-cutover-operation:${accepted.operationId}`;
+    assert.deepEqual(observed.releaseChangingMutationIds, [operationIdentity]);
+    assert.deepEqual(observed.unresolvedOperationIds, [operationIdentity]);
+  }
+
+  {
+    const {
+      directory, store, admissionGate, coordinator, launchOperationStore,
+      legacyComparativeRoot, legacySingleSiteQueueRoot,
+    } = await fixture('production-observer-active-legacy');
+    const input = request('cutover-production-observer-active-legacy');
+    await prepareSharedAuthorityCutover({
+      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
+    });
+    const activeDirectory = path.join(legacyComparativeRoot, 'active-legacy-run');
+    await mkdir(path.join(activeDirectory, 'logs'), { recursive: true });
+    await writeFile(path.join(activeDirectory, 'logs', 'coordinator.log'), '{"event":"started"}\n');
+    const observed = await captureSharedAuthorityDrainObservation({
+      store, coordinator, admissionGate, launchOperationStore, cutoverId: input.cutoverId,
+      legacyComparativeRoot, legacySingleSiteQueueRoot, clock,
+    });
+    assert.deepEqual(observed.activeLegacyAuthoritativeRunIds, ['comparative:active-legacy-run']);
+    await expectCode('CUTOVER_LEGACY_RUNS_ACTIVE', () => activateSharedAuthorityCutover({
+      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
+      drainObservation: observed,
+    }));
   }
 
   {

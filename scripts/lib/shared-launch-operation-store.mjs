@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { lstat as nativeLstat } from 'node:fs/promises';
 import { canonicalDigest, canonicalJson } from '../../shared/canonical-contract.mjs';
 import {
   atomicWriteJson,
@@ -123,9 +124,20 @@ function validateOperation(value, expectedOperationId = null) {
   return Object.freeze(structuredClone(value));
 }
 
-export async function openSharedLaunchOperationStore({ root, clock = Date.now, verifyStorage = false } = {}) {
+export async function openSharedLaunchOperationStore({
+  root, clock = Date.now, verifyStorage = false, requireExisting = false,
+} = {}) {
   if (typeof root !== 'string' || !root || typeof clock !== 'function') {
     throw new TypeError('Shared launch operation store requires root and clock.');
+  }
+  if (requireExisting) {
+    let stat;
+    try { stat = await nativeLstat(root); } catch (error) {
+      fail('LAUNCH_OPERATION_STORE_UNAVAILABLE', 'Shared launch operation store is unavailable.', 503);
+    }
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      fail('LAUNCH_OPERATION_STORE_UNAVAILABLE', 'Shared launch operation store must be a real directory.', 503);
+    }
   }
   const storage = await openAtomicStorage({ root, verify: verifyStorage });
   return Object.freeze({ ...storage, clock });

@@ -15,4 +15,10 @@ export interface SharedControlService {
   applyAcceptedOperations(coordinator: any, runId: string, handlers?: Record<string, Function>): Promise<any[]>;
   publishCurrentProjection(coordinator: any, runId: string): Promise<any>;
 }
-export declare function createSharedControlService(options: { store: ParentRunStore; projectId?: string }): SharedControlService;
+export declare function createSharedControlService(options: {
+  store: ParentRunStore;
+  projectId?: string;
+  admissionPolicy?: {
+    withMutationAdmission<T>(kind: string, requestId: string, operation: () => Promise<T>): Promise<T>;
+  } | null;
+}): SharedControlService;

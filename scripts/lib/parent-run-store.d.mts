@@ -33,6 +33,7 @@ export function acquireCoordinator(store: ParentRunStore, runId: string, input: 
 export function takeOverCoordinator(store: ParentRunStore, runId: string, input: { ownerId: string; leaseMs: number }): Promise<CoordinatorFence>;
 export function acquireStoreCoordinator(store: ParentRunStore, input: { ownerId: string; leaseMs: number }): Promise<CoordinatorFence>;
 export function takeOverStoreCoordinator(store: ParentRunStore, input: { ownerId: string; leaseMs: number }): Promise<CoordinatorFence>;
+export function readStoreCoordinator(store: ParentRunStore): Promise<(CoordinatorFence & { digest: string }) | null>;
 export function readReleaseAuthoritySelector(store: ParentRunStore): Promise<any>;
 export function readReleaseAuthorityContext(store: ParentRunStore, options?: { requireActive?: boolean }): Promise<any>;
 export function transitionReleaseAuthority(store: ParentRunStore, coordinator: CoordinatorFence, input: {

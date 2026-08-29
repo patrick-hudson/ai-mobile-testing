@@ -18,25 +18,31 @@ import {
   withDirectoryLock,
 } from './atomic-filesystem.mjs';
 import {
+  listParentRunIds,
+  readParentRun,
+  readStoreCoordinator,
   readReleaseAuthoritySelector,
   transitionReleaseAuthority,
 } from './parent-run-store.mjs';
+import { listRecoverableSharedLaunchOperations } from './shared-launch-operation-store.mjs';
+import { inspectLegacyAuthorityDrainSources } from './legacy-authority-drain-source.mjs';
 
 const SAFE_ID = /^[A-Za-z0-9._-]{1,128}$/u;
 const MAX_OBSERVATION_AGE_MS = 5 * 60_000;
 const AE_CASE_IDS = Object.freeze(Array.from({ length: 16 }, (_, index) => `AE${index + 1}`));
 
 export class SharedCutoverError extends Error {
-  constructor(code, message, details = undefined) {
+  constructor(code, message, details = undefined, statusCode = undefined) {
     super(message);
     this.name = 'SharedCutoverError';
     this.code = code;
     this.details = details;
+    this.statusCode = statusCode;
   }
 }
 
-function fail(code, message, details) {
-  throw new SharedCutoverError(code, message, details);
+function fail(code, message, details, statusCode) {
+  throw new SharedCutoverError(code, message, details, statusCode);
 }
 
 function timestamp(clock) {
@@ -103,24 +109,27 @@ function parseGate(value) {
   return clone(value);
 }
 
-export async function openCutoverAdmissionGate({ root, filesystem, nonce, verifyStorage = true, clock = () => Date.now() } = {}) {
+async function openAdmissionGateStorage({ root, filesystem, nonce, verifyStorage = true } = {}) {
   if (typeof root !== 'string' || !root) fail('CUTOVER_INPUT_INVALID', 'Admission gate root is required.');
-  const storage = await openAtomicStorage({ root, filesystem, nonce, verify: verifyStorage });
+  return openAtomicStorage({ root, filesystem, nonce, verify: verifyStorage });
+}
+
+function admissionGateHandle(storage, { clock }) {
   const gatePath = containedPath(storage.root, 'release-admission-gate.json');
   const lockPath = containedPath(storage.root, '.release-admission-gate.lock');
-  if (!await pathExists(storage.fs, gatePath)) {
-    const body = gateBody({
-      state: 'OPEN', revision: 1, cutoverId: null, previousDigest: null, updatedAt: timestamp(clock),
-    });
-    try {
-      await atomicWriteJson(storage, gatePath, seal(body), { exclusive: true });
-    } catch (error) {
-      if (error?.code !== 'ATOMIC_ALREADY_EXISTS') throw error;
-    }
-  }
 
   async function read() {
-    return parseGate(await readBoundedJson(storage, gatePath, { label: 'release admission gate', maximumBytes: 64 * 1_024 }));
+    try {
+      return parseGate(await readBoundedJson(storage, gatePath, { label: 'release admission gate', maximumBytes: 64 * 1_024 }));
+    } catch (error) {
+      if (error instanceof SharedCutoverError && error.code === 'CUTOVER_ADMISSION_UNAVAILABLE') throw error;
+      fail(
+        'CUTOVER_ADMISSION_UNAVAILABLE',
+        'Release admission is unavailable because its durable gate is missing, corrupt, or unreadable.',
+        { cause: error?.code ?? error?.message },
+        503,
+      );
+    }
   }
 
   async function transition({ expectedDigest, state, cutoverId }) {
@@ -149,12 +158,151 @@ export async function openCutoverAdmissionGate({ root, filesystem, nonce, verify
     });
   }
 
+  async function withOpen(operation) {
+    if (typeof operation !== 'function') fail('CUTOVER_INPUT_INVALID', 'Admission operation is required.');
+    return withDirectoryLock(storage, lockPath, async () => {
+      const current = await read();
+      if (current.state !== 'OPEN') {
+        const error = new SharedCutoverError(
+          'CUTOVER_ADMISSION_CLOSED',
+          `Release admission is closed by ${current.cutoverId}; retry after the cutover completes.`,
+          { cutoverId: current.cutoverId, gateDigest: current.digest },
+        );
+        error.statusCode = 503;
+        throw error;
+      }
+      return operation(current);
+    });
+  }
+
   return Object.freeze({
     root: storage.root,
     read,
+    withOpen,
     close: (expectedDigest, cutoverId) => transition({ expectedDigest, state: 'CLOSED', cutoverId }),
     open: (expectedDigest, cutoverId) => transition({ expectedDigest, state: 'OPEN', cutoverId }),
   });
+}
+
+export async function initializeCutoverAdmissionGate(options = {}) {
+  const clock = options.clock ?? (() => Date.now());
+  const storage = await openAdmissionGateStorage(options);
+  const gatePath = containedPath(storage.root, 'release-admission-gate.json');
+  if (!await pathExists(storage.fs, gatePath)) {
+    const body = gateBody({
+      state: 'OPEN', revision: 1, cutoverId: null, previousDigest: null, updatedAt: timestamp(clock),
+    });
+    try {
+      await atomicWriteJson(storage, gatePath, seal(body), { exclusive: true });
+    } catch (error) {
+      if (error?.code !== 'ATOMIC_ALREADY_EXISTS') throw error;
+    }
+  }
+  const gate = admissionGateHandle(storage, { clock });
+  await gate.read();
+  return gate;
+}
+
+export async function openCutoverAdmissionGate(options = {}) {
+  const clock = options.clock ?? (() => Date.now());
+  const storage = await openAdmissionGateStorage(options);
+  const gate = admissionGateHandle(storage, { clock });
+  await gate.read();
+  return gate;
+}
+
+const RELEASE_CHANGING_MUTATIONS = new Set(['cancel', 'rekick', 'visual-disposition', 'purge']);
+
+export function createCutoverAdmissionPolicy({ admissionGate } = {}) {
+  if (!admissionGate || typeof admissionGate.withOpen !== 'function') {
+    fail('CUTOVER_ADMISSION_UNAVAILABLE', 'A durable release-admission gate is required.', undefined, 503);
+  }
+  return Object.freeze({
+    withLaunchAdmission(_requestId, operation) {
+      return admissionGate.withOpen(operation);
+    },
+    withPromotionAdmission(_requestId, operation) {
+      return admissionGate.withOpen(operation);
+    },
+    withMutationAdmission(kind, _requestId, operation) {
+      if (!RELEASE_CHANGING_MUTATIONS.has(kind)) return operation();
+      return admissionGate.withOpen(operation);
+    },
+  });
+}
+
+export async function captureSharedAuthorityDrainObservation({
+  store, coordinator, admissionGate, launchOperationStore, cutoverId,
+  legacyComparativeRoot, legacySingleSiteQueueRoot,
+  clock = store?.clock ?? (() => Date.now()),
+} = {}) {
+  ensureCoordinator(coordinator);
+  safeId(cutoverId, 'cutoverId');
+  if (!store || !admissionGate || !launchOperationStore) {
+    fail('CUTOVER_INPUT_INVALID', 'Drain observation requires the canonical store, admission gate, and launch-operation store.');
+  }
+  const [gate, selector, durableCoordinator, legacy, launchOperations, runIds] = await Promise.all([
+    admissionGate.read(),
+    readReleaseAuthoritySelector(store),
+    readStoreCoordinator(store),
+    inspectLegacyAuthorityDrainSources({
+      comparativeRoot: legacyComparativeRoot,
+      singleSiteQueueRoot: legacySingleSiteQueueRoot,
+      clock,
+    }),
+    listRecoverableSharedLaunchOperations(launchOperationStore),
+    listParentRunIds(store),
+  ]);
+  if (gate.state !== 'CLOSED' || gate.cutoverId !== cutoverId) {
+    fail('CUTOVER_ADMISSION_OPEN', 'Drain observation requires admission closed by this cutover.');
+  }
+  if (selector.phase !== 'DRAINING' || selector.activationEpoch !== 0) {
+    fail('CUTOVER_PHASE_INVALID', 'Drain observation may be captured only during pre-activation DRAINING.');
+  }
+  if (!durableCoordinator || durableCoordinator.ownerId !== coordinator.ownerId
+    || durableCoordinator.epoch !== coordinator.epoch || durableCoordinator.token !== coordinator.token
+    || Date.parse(durableCoordinator.expiresAt) <= clock()) {
+    fail('CUTOVER_WRITER_NOT_SINGLETON', 'Drain observation requires the live singleton coordinator fence.');
+  }
+
+  const unresolvedOperationIds = [];
+  const releaseChangingMutationIds = [];
+  const unfencedLegacyLeaseIds = [...legacy.unfencedLegacyLeaseIds];
+  for (const error of launchOperations.errors) {
+    unresolvedOperationIds.push(`launch-corrupt:${error.operationId}:${error.code}`);
+  }
+  for (const operation of launchOperations.operations) {
+    unresolvedOperationIds.push(`launch:${operation.operationId}`);
+  }
+  for (const runId of runIds) {
+    const state = await readParentRun(store, runId);
+    for (const operation of Object.values(state.operations ?? {})) {
+      if (operation.state !== 'accepted') continue;
+      const identity = `${runId}:${operation.operationId}`;
+      unresolvedOperationIds.push(identity);
+      if (RELEASE_CHANGING_MUTATIONS.has(operation.kind)) releaseChangingMutationIds.push(identity);
+    }
+    for (const item of Object.values(state.workItems ?? {})) {
+      if (item.state !== 'running' || !item.lease) continue;
+      if (item.lease.epoch === coordinator.epoch && Date.parse(item.lease.expiresAt) > clock()) {
+        unfencedLegacyLeaseIds.push(`shared-preactivation:${runId}:${item.id}:${item.lease.token}`);
+      }
+    }
+  }
+  const body = {
+    schemaVersion: 1,
+    kind: 'release-cutover-drain-observation',
+    cutoverId,
+    observedAt: timestamp(clock),
+    admissionGateDigest: gate.digest,
+    activeLegacyAuthoritativeRunIds: [...legacy.activeLegacyAuthoritativeRunIds].sort(),
+    releaseChangingMutationIds: [...new Set(releaseChangingMutationIds)].sort(),
+    unresolvedOperationIds: [...new Set(unresolvedOperationIds)].sort(),
+    unfencedLegacyLeaseIds: [...new Set(unfencedLegacyLeaseIds)].sort(),
+    canonicalWriterOwnerIds: [durableCoordinator.ownerId],
+    legacyHeadMarkers: [...legacy.legacyHeadMarkers].sort(),
+  };
+  return Object.freeze(seal(body));
 }
 
 function parseExpectedStore(value) {

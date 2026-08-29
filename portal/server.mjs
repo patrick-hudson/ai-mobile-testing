@@ -35,6 +35,10 @@ import {
   readParentRun,
 } from '../scripts/lib/parent-run-store.mjs';
 import { createSharedControlService } from '../scripts/lib/shared-control-service.mjs';
+import {
+  createCutoverAdmissionPolicy,
+  openCutoverAdmissionGate,
+} from '../scripts/lib/shared-cutover-orchestrator.mjs';
 import { openPromotionClaimStore } from '../scripts/lib/promotion-claim-store.mjs';
 import { readTrustedStoreMarker, sharedStoreBuildIdentity, sharedStoreGeneration, sharedStoreRollbackBuilds } from '../scripts/lib/shared-store-runtime.mjs';
 import {
@@ -564,6 +568,17 @@ if (process.env.PORTAL_SHARED_CONTROL === '1') {
   const launchOperationStore = await openSharedLaunchOperationStore({
     root: join(controlStore.root, 'launch-operations'),
   });
+  const admissionRoot = join(controlStore.root, 'cutover-admission');
+  if (process.env.AUDIT_SHARED_ADMISSION_ROOT
+    && resolve(process.env.AUDIT_SHARED_ADMISSION_ROOT) !== resolve(admissionRoot)) {
+    throw new ControlPlaneError(
+      'CUTOVER_ADMISSION_ROOT_MISMATCH',
+      'AUDIT_SHARED_ADMISSION_ROOT must identify the canonical store cutover-admission directory.',
+      503,
+    );
+  }
+  const admissionGate = await openCutoverAdmissionGate({ root: admissionRoot });
+  const admissionPolicy = createCutoverAdmissionPolicy({ admissionGate });
   sharedProjectId = process.env.AUDIT_SHARED_PROJECT_ID ?? 'default';
   const sharedLaunchService = createSharedLaunchService({
     operationStore: launchOperationStore,
@@ -626,10 +641,13 @@ if (process.env.PORTAL_SHARED_CONTROL === '1') {
   sharedControlApi = createSharedControlApi({
     authority: credentialAuthority,
     requestAuthorizer: sharedRequestAuthorizer,
-    service: createSharedControlService({ store: controlStore, projectId: sharedProjectId }),
+    service: createSharedControlService({
+      store: controlStore, projectId: sharedProjectId, admissionPolicy,
+    }),
     claimStore,
     expectedOrigin: deployment.publishedOrigin,
     sessionCookiePath: '/',
+    admissionPolicy,
     launch: async (principal, request) => {
       const operation = await sharedLaunchService.accept(principal, request);
       setImmediate(() => {

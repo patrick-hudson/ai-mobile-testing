@@ -619,6 +619,11 @@ async function readGlobalCoordinator(store) {
   return value;
 }
 
+export async function readStoreCoordinator(store) {
+  const coordinator = await readGlobalCoordinator(store);
+  return coordinator === null ? null : clone(coordinator);
+}
+
 function sealCoordinatorLease(value) {
   const body = {
     schemaVersion: 1,
