@@ -20,11 +20,11 @@ An execution that is skipped or does not apply to its target is not test coverag
 
 ### Single-site Audit
 
-An Audit mode that evaluates one quitting7oh deployment using only standalone Product Oracles and produces an advisory Site Health Verdict without requiring a second origin.
+An Audit mode that evaluates one quitting7oh deployment using only standalone Product Oracles and produces an advisory Site Health Verdict plus a scope-qualified Release Decision without requiring a second origin.
 
 ### Scope Qualifier
 
-The `FULL` or `TARGETED` label attached to a Single-site Audit. `FULL` means the complete versioned Single-site profile without narrowing filters; `TARGETED` means a selected subset of definitions, cases, areas, plugins, or targets. It qualifies Site Health and is not a synonym for Coverage Status.
+The `FULL` or `TARGETED` label attached to an audit. `FULL` means the complete versioned profile without narrowing filters; `TARGETED` means a selected subset of definitions, cases, areas, plugins, or targets. It qualifies Site Health and Release Decision authority and is not a synonym for Coverage Status.
 
 ### Deployment Role
 
@@ -78,13 +78,13 @@ The explicit build identifier or reviewed asset-manifest and response-validator 
 
 ### Visual Review Status
 
-The UNCHANGED, CHANGED, or REVIEWED state vocabulary for one compatible Same-site Visual Baseline comparison. It routes visual drift into human review without becoming a deterministic Finding or promotion decision. The shipped comparator produces UNCHANGED or CHANGED; REVIEWED is reserved but is not yet a persisted portal mutation.
+The UNCHANGED, CHANGED, or REVIEWED state vocabulary for one compatible Same-site Visual Baseline comparison. It routes visual drift into human review without automatically becoming a deterministic Finding or release blocker. A review that confirms a defect may create a failed visual result, while an accepted change remains non-blocking. The shipped comparator produces UNCHANGED or CHANGED; REVIEWED is reserved but is not yet a persisted portal mutation.
 
 Absent, incompatible, and unavailable comparisons remain explicit non-comparison states rather than being coerced to UNCHANGED.
 
 ### Manual Acceptance Status
 
-The separately reported state of catalogued physical-device, assistive-technology, or other human-only checks. Automated execution and advisory AI cannot satisfy, waive, or hide outstanding manual work.
+The separately reported state of catalogued physical-device, assistive-technology, or other human-only checks. Automated execution and advisory AI cannot satisfy, waive, or hide outstanding manual work, and outstanding manual work does not block an automated Release Decision.
 
 ## Release truth
 
@@ -98,7 +98,7 @@ A production-side issue preserved for comparison and diagnosis that does not blo
 
 ### Evidence Authority
 
-The status that determines whether retained Evidence is trustworthy enough to participate in a release decision, independently of whether the observed product behavior passed or failed.
+The status that describes whether retained Evidence is trustworthy and complete enough for its declared purpose, independently of whether observed product behavior passed or failed. A limitation that invalidates a required execution makes that execution incomplete; other authority limitations remain visible in the Risk Register.
 
 ### Pipeline Integrity
 
@@ -110,7 +110,7 @@ The immutable Single-site stage that copies referenced attempt evidence into a c
 
 ### Release Decision
 
-The authoritative conclusion produced from release-blocking outcomes on applicable candidate and environment-unknown executions, required paired-environment contracts, incomplete coverage, and Pipeline Integrity.
+The authoritative, scope-qualified `RELEASE READY`, `FEATURE READY`, or `NOT READY` conclusion shared by Single-site and Comparative audits. Confirmed failed required automated executions and required executions that remain incomplete after bounded recovery prevent readiness; Risk Register entries do not.
 
 ### Site Health Verdict
 
@@ -162,7 +162,7 @@ Logical Media Items are distinct from stored media blobs: identical bytes captur
 
 ### Product Risk
 
-A non-authoritative portal attention queue that orders canonical Findings and explicitly labelled visual-review or manual-attention records for operator review. Every item retains its source type and authority; Product Risk is not a Release Decision, Site Health Verdict, or durable audit state.
+A non-authoritative cross-mode attention projection presented to operators as the Risk Register. It orders coverage gaps, manual work, unreviewed visual changes, production baseline defects, and evidence or pipeline limitations while retaining each item's source, severity, scope, action, and review state. Product Risk is not a Release Decision, Site Health Verdict, or durable audit state and never changes delivery exit behavior.
 
 ### Run Trust
 
