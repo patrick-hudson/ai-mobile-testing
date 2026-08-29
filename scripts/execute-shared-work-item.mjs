@@ -4,9 +4,9 @@ import * as fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { auditCaseTag } from '../shared/audit-case-identity.mjs';
-import { canonicalDigest } from '../shared/canonical-contract.mjs';
 import { buildLiveRouteInventory } from '../shared/live-route-inventory.mjs';
 import { preflightQuitting7ohSite } from '../shared/site-preflight.mjs';
+import { deriveTargetPreflightSetIdentity } from '../shared/target-preflight-set.mjs';
 import { sealSharedGenericRouteExecutionPublication } from '../shared/single-site-route-plan.mjs';
 import { parseWorkExecutionDescriptor } from '../shared/work-execution-descriptor.mjs';
 import {
@@ -275,16 +275,8 @@ async function executeInventory(descriptor, artifactRoot) {
       maxRedirects: 4,
     },
   });
-  const deploymentIdentityRecheck = preflight.accepted && preflight.preflightDigest ? {
-    kind: 'target-preflight-set',
-    value: canonicalDigest([{
-      origin: preflight.origin,
-      role: preflight.deploymentRole,
-      identityFingerprint: preflight.identityFingerprint,
-      deploymentRevision: preflight.deploymentRevision.fingerprint,
-      preflightDigest: preflight.preflightDigest,
-    }]),
-  } : null;
+  let deploymentIdentityRecheck = null;
+  try { deploymentIdentityRecheck = deriveTargetPreflightSetIdentity([preflight]); } catch { /* reported by preflight */ }
   const inventoryResult = {
     schemaVersion: 1,
     kind: 'shared-single-site-inventory-result',

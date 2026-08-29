@@ -168,6 +168,10 @@ import {
   openVisualReviewStore,
 } from './visual-review-dispositions.mjs';
 import { preflightQuitting7ohSite } from '../shared/site-preflight.mjs';
+import {
+  probeTargetPreflightSet,
+  targetPreflightInputsForRunContract,
+} from '../shared/target-preflight-set.mjs';
 import { resolveRunnerRevision, runnerRevisionDigest } from '../shared/runner-revision.mjs';
 import {
   parseVisualBaselineEvidence,
@@ -589,34 +593,23 @@ if (process.env.PORTAL_SHARED_CONTROL === '1') {
     projectId: sharedProjectId,
     compilePlan: async (intent) => {
       const contract = intent.runContract;
-      const preflightInputs = contract.mode === 'single-site'
-        ? [{ url: contract.url, deploymentRole: contract.deploymentRole, certificatePolicy: contract.certificatePolicy }]
-        : [
-          { url: contract.productionUrl, deploymentRole: 'production', certificatePolicy: 'strict' },
-          { url: contract.candidateUrl, deploymentRole: 'preview', certificatePolicy: 'strict' },
-        ];
-      const preflights = await Promise.all(preflightInputs.map((input) => preflightQuitting7ohSite(input, {
-        previewBypassOrigins: previewTlsBypassOrigins,
-        tlsBypassRequestOptions: { rejectUnauthorized: false },
-      })));
-      const rejected = preflights.find((result) => !result.accepted || !result.preflightDigest);
-      if (rejected) {
+      let deploymentIdentity;
+      try {
+        ({ identity: deploymentIdentity } = await probeTargetPreflightSet(
+          targetPreflightInputsForRunContract(contract), {
+            preflightOptions: {
+              previewBypassOrigins: previewTlsBypassOrigins,
+              tlsBypassRequestOptions: { rejectUnauthorized: false },
+            },
+          },
+        ));
+      } catch (error) {
         throw new ControlPlaneError(
           'SHARED_LAUNCH_PREFLIGHT_REJECTED',
-          rejected.issues?.[0]?.message ?? 'Shared launch preflight rejected a target.',
+          error instanceof Error ? error.message : 'Shared launch preflight rejected a target.',
           422,
         );
       }
-      const deploymentIdentity = {
-        kind: 'target-preflight-set',
-        value: canonicalDigest(preflights.map((result) => ({
-          origin: result.origin,
-          role: result.deploymentRole,
-          identityFingerprint: result.identityFingerprint,
-          deploymentRevision: result.deploymentRevision.fingerprint,
-          preflightDigest: result.preflightDigest,
-        }))),
-      };
       return compileSharedLaunchPlan({
         intent,
         pluginRegistry: pluginRegistryDocument,

@@ -92,6 +92,7 @@
     "shared-control-plane:self-test": "node scripts/shared-control-plane-self-test.mjs",
     "release-assertion-cli:self-test": "node scripts/release-assertion-cli-self-test.mjs",
     "shared-release-ci:self-test": "node scripts/shared-release-ci-self-test.mjs",
+    "shared-release-ci:run": "node scripts/run-shared-release-ci.mjs",
     "shared-control-browser-client:self-test": "node scripts/shared-control-browser-client-self-test.mjs",
     "shared-portal-read-auth:self-test": "node scripts/shared-portal-read-auth-self-test.mjs",
     "audit:control": "node scripts/audit-control.mjs",

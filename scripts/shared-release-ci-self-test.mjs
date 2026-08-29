@@ -1,20 +1,41 @@
 import assert from 'node:assert/strict';
+import { chmod, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:http';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { canonicalDigest } from '../shared/canonical-contract.mjs';
 import { sealExecutionManifest, sealOracleResult, sealWorkItemResult } from '../shared/execution-contract.mjs';
 import { appendPublicationEnvelope } from '../shared/publication-envelope.mjs';
 import { projectSharedReleaseView } from '../shared/release-projection.mjs';
 import { sealFinalReleaseSubject, sealReleaseSubjectCore } from '../shared/release-subject.mjs';
-import { runSharedReleaseCi } from './lib/shared-release-ci.mjs';
+import { createSharedReleaseHttpClient, runSharedReleaseCi } from './lib/shared-release-ci.mjs';
+import { runSharedReleaseCiCommand } from './run-shared-release-ci.mjs';
+import { deriveTargetPreflightSetIdentity } from '../shared/target-preflight-set.mjs';
 
 const D1 = `sha256:${'1'.repeat(64)}`;
 const D2 = `sha256:${'2'.repeat(64)}`;
 const OPERATION_ID = 'a'.repeat(64);
 const REQUEST_ID = 'release-ci-stable-request-0001';
 
+const fakePreflights = (targets) => targets.map((target, index) => ({
+  accepted: true,
+  origin: target.origin,
+  deploymentRole: target.role === 'production' ? 'production' : 'preview',
+  identityFingerprint: `identity-${index}`,
+  deploymentRevision: { fingerprint: `revision-${index}` },
+  preflightDigest: `preflight-${index}`,
+}));
+const fakePreflight = async (input) => fakePreflights([{
+  origin: new URL(input.url).origin,
+  role: input.deploymentRole,
+}])[0];
+
 function fixture() {
   const core = sealReleaseSubjectCore({
     schemaVersion: 1,
-    deploymentIdentity: { kind: 'build', value: 'build-live-123' },
+    deploymentIdentity: deriveTargetPreflightSetIdentity(fakePreflights([
+      { role: 'audited', origin: 'https://beta.example.test' },
+    ])),
     targets: [{ role: 'audited', origin: 'https://beta.example.test' }],
     mode: 'single-site',
     requestedAuthority: {
@@ -247,6 +268,225 @@ await rejectsWith('CI_PUBLICATION_CHANGED', (f) => ({
 await rejectsWith('CI_TARGET_IDENTITY_DRIFT', (f) => ({
   reprobe: async () => ({ ...f.run.finalSubject.deploymentIdentity, value: 'build-drifted' }),
 }));
+
+assert.deepEqual(
+  deriveTargetPreflightSetIdentity(fakePreflights(happy.run.finalSubject.targets)),
+  deriveTargetPreflightSetIdentity([...fakePreflights(happy.run.finalSubject.targets)].reverse()),
+  'target-preflight-set identity must be canonical across launch, inventory, and CI reprobe ordering',
+);
+
+async function listen(handler) {
+  const server = createServer(handler);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  return { server, origin: `http://127.0.0.1:${address.port}` };
+}
+
+function apiDocument(data) { return JSON.stringify({ schemaVersion: 1, data }); }
+const completed = completedLaunch(happy.launch, happy);
+let launchRequests = 0;
+const api = await listen((request, response) => {
+  assert.equal(request.headers.authorization, 'Bearer amt.integration-token.abcdefghijklmnopqrstuvwxyz012345');
+  response.setHeader('content-type', 'application/json');
+  if (request.method === 'POST' && request.url === '/api/control/v1/runs') {
+    launchRequests += 1;
+    assert.equal(request.headers['idempotency-key'], REQUEST_ID);
+    request.resume();
+    response.statusCode = 202;
+    response.end(apiDocument(completed));
+    return;
+  }
+  if (request.url === `/api/control/v1/launch-operations/${OPERATION_ID}`) response.end(apiDocument(completed));
+  else if (request.url === `/api/control/v1/runs/${happy.run.runId}`) response.end(apiDocument(happy.run));
+  else if (request.url === `/api/control/v1/runs/${happy.run.runId}/publication`) response.end(apiDocument(happy.publication));
+  else { response.statusCode = 404; response.end(JSON.stringify({ schemaVersion: 1, error: { code: 'MISSING', message: 'missing' } })); }
+});
+try {
+  let lostFirstLaunchResponse = true;
+  const client = createSharedReleaseHttpClient({
+    baseUrl: api.origin,
+    token: 'amt.integration-token.abcdefghijklmnopqrstuvwxyz012345',
+    fetchImpl: async (...args) => {
+      const response = await fetch(...args);
+      if (lostFirstLaunchResponse && args[1]?.method === 'POST') {
+        lostFirstLaunchResponse = false;
+        await response.arrayBuffer();
+        throw Object.assign(new Error('simulated response loss'), { code: 'ECONNRESET' });
+      }
+      return response;
+    },
+    preflight: fakePreflight,
+    timeoutMs: 2_000,
+    maximumResponseBytes: 1_000_000,
+  });
+  const live = await runSharedReleaseCi(options(client, happy));
+  assert.equal(live.publication.digest, happy.publication.digest);
+  assert.equal(launchRequests, 2, 'response-loss retry must reuse the stable launch request identity');
+} finally {
+  await new Promise((resolve) => api.server.close(resolve));
+}
+
+const comparativeIntent = {
+  schemaVersion: 1,
+  runContract: {
+    schemaVersion: 1,
+    mode: 'comparative',
+    productionUrl: 'https://www.example.test',
+    candidateUrl: 'https://beta.example.test',
+    targetIds: ['candidate-desktop', 'production-desktop'],
+    scope: { qualifier: 'FULL', pluginIds: [], auditIds: [], areas: [] },
+  },
+};
+const comparativeTargets = [
+  { role: 'candidate', origin: 'https://beta.example.test' },
+  { role: 'production', origin: 'https://www.example.test' },
+];
+let comparativeBody = null;
+const comparativeApi = await listen((request, response) => {
+  const chunks = [];
+  request.on('data', (chunk) => chunks.push(chunk));
+  request.on('end', () => {
+    comparativeBody = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    response.setHeader('content-type', 'application/json');
+    response.statusCode = 202;
+    response.end(apiDocument({
+      ...completed,
+      requestDigest: canonicalDigest(comparativeIntent),
+      mode: 'comparative',
+    }));
+  });
+});
+try {
+  const client = createSharedReleaseHttpClient({
+    baseUrl: comparativeApi.origin,
+    token: 'amt.integration-token.abcdefghijklmnopqrstuvwxyz012345',
+    preflight: fakePreflight,
+  });
+  await client.launch({ requestId: REQUEST_ID, intent: comparativeIntent });
+  assert.equal(comparativeBody.runContract.mode, 'comparative');
+  assert.deepEqual(
+    await client.reprobeTargetIdentity({ targets: comparativeTargets }),
+    deriveTargetPreflightSetIdentity(await Promise.all([
+      fakePreflight({ url: 'https://beta.example.test', deploymentRole: 'preview' }),
+      fakePreflight({ url: 'https://www.example.test', deploymentRole: 'production' }),
+    ])),
+  );
+} finally {
+  await new Promise((resolve) => comparativeApi.server.close(resolve));
+}
+
+const redirectTarget = await listen((_request, response) => response.end(apiDocument(completed)));
+const redirectSource = await listen((_request, response) => {
+  response.statusCode = 307;
+  response.setHeader('location', `${redirectTarget.origin}/stolen`);
+  response.end();
+});
+try {
+  const client = createSharedReleaseHttpClient({
+    baseUrl: redirectSource.origin,
+    token: 'amt.integration-token.abcdefghijklmnopqrstuvwxyz012345',
+    preflight: async () => { throw new Error('not reached'); },
+  });
+  await assert.rejects(() => client.launch({ requestId: REQUEST_ID, intent: happy.intent }),
+    (error) => error?.code === 'CI_HTTP_CROSS_ORIGIN_REDIRECT');
+} finally {
+  await Promise.all([
+    new Promise((resolve) => redirectSource.server.close(resolve)),
+    new Promise((resolve) => redirectTarget.server.close(resolve)),
+  ]);
+}
+
+const failureApi = await listen((_request, response) => {
+  response.statusCode = 503;
+  response.setHeader('content-type', 'application/json');
+  response.end(JSON.stringify({
+    schemaVersion: 1,
+    error: { code: 'LAUNCH_UNAVAILABLE', message: 'offline amt.integration-token.abcdefghijklmnopqrstuvwxyz012345' },
+  }));
+});
+try {
+  const client = createSharedReleaseHttpClient({
+    baseUrl: failureApi.origin,
+    token: 'amt.integration-token.abcdefghijklmnopqrstuvwxyz012345',
+    preflight: async () => { throw new Error('not reached'); },
+  });
+  await assert.rejects(() => client.launch({ requestId: REQUEST_ID, intent: happy.intent }),
+    (error) => error?.code === 'CI_HTTP_LAUNCH_UNAVAILABLE' && error.status === 503
+      && !error.message.includes('amt.integration-token'));
+} finally {
+  await new Promise((resolve) => failureApi.server.close(resolve));
+}
+
+const oversizedApi = await listen((_request, response) => {
+  response.setHeader('content-type', 'application/json');
+  response.end(apiDocument({ padding: 'x'.repeat(2_048) }));
+});
+try {
+  const client = createSharedReleaseHttpClient({
+    baseUrl: oversizedApi.origin,
+    token: 'amt.integration-token.abcdefghijklmnopqrstuvwxyz012345',
+    preflight: async () => { throw new Error('not reached'); },
+    maximumResponseBytes: 1_024,
+  });
+  await assert.rejects(() => client.launch({ requestId: REQUEST_ID, intent: happy.intent }),
+    (error) => error?.code === 'CI_HTTP_RESPONSE_TOO_LARGE');
+} finally {
+  await new Promise((resolve) => oversizedApi.server.close(resolve));
+}
+
+const slowApi = await listen((_request, response) => {
+  setTimeout(() => {
+    response.setHeader('content-type', 'application/json');
+    response.end(apiDocument(completed));
+  }, 100);
+});
+try {
+  const client = createSharedReleaseHttpClient({
+    baseUrl: slowApi.origin,
+    token: 'amt.integration-token.abcdefghijklmnopqrstuvwxyz012345',
+    preflight: async () => { throw new Error('not reached'); },
+    timeoutMs: 20,
+    maximumLaunchAttempts: 1,
+  });
+  await assert.rejects(() => client.launch({ requestId: REQUEST_ID, intent: happy.intent }),
+    (error) => error?.code === 'CI_HTTP_TRANSPORT_FAILED');
+} finally {
+  await new Promise((resolve) => slowApi.server.close(resolve));
+}
+
+const commandRoot = await mkdtemp(path.join(tmpdir(), 'shared-release-ci-command-'));
+const credentialFile = path.join(commandRoot, 'credential');
+const intentFile = path.join(commandRoot, 'intent.json');
+const resultFile = path.join(commandRoot, 'result.json');
+await writeFile(credentialFile, 'amt.integration-token.abcdefghijklmnopqrstuvwxyz012345\n', { mode: 0o600 });
+await chmod(credentialFile, 0o600);
+await writeFile(intentFile, `${JSON.stringify(happy.intent)}\n`, { mode: 0o600 });
+await chmod(intentFile, 0o600);
+const commandApi = await listen((request, response) => {
+  response.setHeader('content-type', 'application/json');
+  request.resume();
+  if (request.method === 'POST') response.end(apiDocument(completed));
+  else if (request.url === `/api/control/v1/launch-operations/${OPERATION_ID}`) response.end(apiDocument(completed));
+  else if (request.url === `/api/control/v1/runs/${happy.run.runId}`) response.end(apiDocument(happy.run));
+  else response.end(apiDocument(happy.publication));
+});
+try {
+  const output = [];
+  await runSharedReleaseCiCommand([
+    '--server', commandApi.origin, '--token-file', credentialFile, '--intent-file', intentFile,
+    '--result-file', resultFile, '--request-id', REQUEST_ID, '--poll-ms', '0',
+  ], {
+    stdout: { write: (value) => output.push(String(value)) },
+    preflight: fakePreflight,
+  });
+  const resultText = await readFile(resultFile, 'utf8');
+  assert.equal((await stat(resultFile)).mode & 0o777, 0o600);
+  assert.doesNotMatch(resultText, /amt\.integration-token/u);
+  assert.doesNotMatch(output.join(''), /amt\.integration-token/u);
+  assert.equal(JSON.parse(resultText).runId, happy.run.runId);
+} finally {
+  await new Promise((resolve) => commandApi.server.close(resolve));
+}
 
 function resealDecision(value, overrides) {
   const body = { ...value, ...overrides };
