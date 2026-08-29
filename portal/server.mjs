@@ -5890,6 +5890,9 @@ async function refreshExternalShardedRuns() {
       if (error?.code === 'ENOENT') return;
       throw error;
     }
+    const presentExternalRunIds = new Set(
+      entries.filter((entry) => entry.isDirectory() && SAFE_RUN_ID.test(entry.name)).map((entry) => entry.name),
+    );
     for (const entry of entries) {
       if (!entry.isDirectory() || !SAFE_RUN_ID.test(entry.name)) continue;
       if (purgingRunIds.has(entry.name)) continue;
@@ -5919,6 +5922,11 @@ async function refreshExternalShardedRuns() {
       if (!existing) runs.set(entry.name, run);
       await new Promise((resolveImmediate) => setImmediate(resolveImmediate));
     }
+    for (const [id, run] of runs) {
+      if (!run.externalManaged || run.purgeQuarantine || purgingRunIds.has(id)
+        || presentExternalRunIds.has(id) || TERMINAL_STATUSES.has(run.manifest.status)) continue;
+      markMissingExternalRunEvidence(run);
+    }
   } finally {
     const durationMs = Math.round((performance.now() - startedAt) * 10) / 10;
     externalRunSyncDiagnostics = {
@@ -5934,6 +5942,45 @@ async function refreshExternalShardedRuns() {
       console.warn(`[portal external sync] ${JSON.stringify(externalRunSyncDiagnostics)}`);
     }
   }
+}
+
+function markMissingExternalRunEvidence(run) {
+  const finishedAt = new Date().toISOString();
+  const reason = 'The external sharded artifact directory disappeared before a terminal lifecycle was published.';
+  run.manifest.status = 'evidence-failed';
+  run.manifest.phase = `External sharded evidence unavailable · ${reason}`;
+  run.manifest.finishedAt = finishedAt;
+  run.manifest.exitCode = 1;
+  run.manifest.pipeline = {
+    status: 'failed',
+    completed: false,
+    reason,
+    finishedAt,
+  };
+  run.manifest.release = unavailableRelease(
+    'No release decision is usable because active external evidence disappeared before finalization.',
+    'external-artifact-directory',
+  );
+  run.manifest.reviewReasons = [];
+  run.manifest.lifecycleDiagnostics = {
+    source: 'external-artifact-directory',
+    reportedStatus: null,
+    reportedPipeline: null,
+    reportedReleaseDecision: null,
+    reportedRelease: null,
+    releaseValidationError: null,
+    derivedStatus: 'pipeline-failed',
+    problems: [reason],
+  };
+  run.externalState.leaseFailed = true;
+  run.externalState.nextRefreshAt = 0;
+  upsertComparativeConsoleRun(run);
+  appendEvent(run, 'snapshot', { manifest: publicManifest(run.manifest) });
+  appendEvent(run, 'status', {
+    status: run.manifest.status,
+    message: terminalMessage(run.manifest),
+    manifest: publicManifest(run.manifest),
+  });
 }
 
 async function createExternalRun(id, directory) {

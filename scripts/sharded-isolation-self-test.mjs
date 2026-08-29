@@ -112,6 +112,7 @@ async function assertShardedCoordinatorStopsAndTimesOut(temporaryRoot) {
   const fakeBin = join(temporaryRoot, 'fake-bin');
   const fakeDocker = join(fakeBin, 'docker');
   const invocations = join(temporaryRoot, 'docker-invocations.log');
+  const isolatedShardedRoot = join(temporaryRoot, 'sharded-artifacts');
   await fs.mkdir(fakeBin, { recursive: true });
   await fs.writeFile(fakeDocker, `#!/bin/sh
 printf '%s\\n' "$*" >> "$FAKE_DOCKER_INVOCATIONS"
@@ -134,6 +135,8 @@ wait $!
     AUDIT_SHARDED_HEARTBEAT_MS: '1000',
     AUDIT_SHARDED_LEASE_MS: '10000',
     AUDIT_COMMAND_STOP_GRACE_MS: '1000',
+    AUDIT_SHARDED_HOST_ROOT: isolatedShardedRoot,
+    AUDIT_SHARDED_CONTAINER_ROOT: '/work/isolated-sharded-artifacts',
   };
 
   const cancelledId = `cancel-test-${process.pid}`;
@@ -152,7 +155,7 @@ wait $!
     new Promise((_, reject) => setTimeout(() => reject(new Error(`Cancelled coordinator did not exit: ${cancelledOutput.slice(-2_000)}`)), 10_000)),
   ]);
   const cancelledLifecycle = JSON.parse(await fs.readFile(
-    join(repositoryRoot, 'artifacts', 'sharded', cancelledId, 'sharded-run.json'),
+    join(isolatedShardedRoot, cancelledId, 'sharded-run.json'),
     'utf8',
   ));
   assert.equal(cancelledLifecycle.status, 'stopped');
@@ -164,7 +167,7 @@ wait $!
   assert.equal(cancelledLifecycle.shards.filter(({ command }) => command.length > 0).length, 1);
   assert.equal(cancelledLifecycle.shards.filter(({ command }) => command.length === 0).length, 1);
   const cancelledDiagnostics = JSON.parse(await fs.readFile(
-    join(repositoryRoot, 'artifacts', 'sharded', cancelledId, 'pipeline-diagnostics.json'),
+    join(isolatedShardedRoot, cancelledId, 'pipeline-diagnostics.json'),
     'utf8',
   ));
   assert.equal(cancelledDiagnostics.source, 'coordinator');
@@ -192,7 +195,7 @@ wait $!
     new Promise((_, reject) => setTimeout(() => reject(new Error(`Timed coordinator did not exit: ${timeoutOutput.slice(-2_000)}`)), 10_000)),
   ]);
   const timeoutLifecycle = JSON.parse(await fs.readFile(
-    join(repositoryRoot, 'artifacts', 'sharded', timeoutId, 'sharded-run.json'),
+    join(isolatedShardedRoot, timeoutId, 'sharded-run.json'),
     'utf8',
   ));
   assert.equal(timeoutLifecycle.pipeline.status, 'failed');
@@ -200,8 +203,8 @@ wait $!
   assert.equal(timeoutLifecycle.performance.command.length, 0);
   assert.equal(timeoutLifecycle.merge.command.length, 0);
 
-  await fs.rm(join(repositoryRoot, 'artifacts', 'sharded', cancelledId), { recursive: true, force: true });
-  await fs.rm(join(repositoryRoot, 'artifacts', 'sharded', timeoutId), { recursive: true, force: true });
+  await fs.rm(join(isolatedShardedRoot, cancelledId), { recursive: true, force: true });
+  await fs.rm(join(isolatedShardedRoot, timeoutId), { recursive: true, force: true });
 }
 
 async function assertReleaseDefaults(repositoryRoot) {

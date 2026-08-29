@@ -33,12 +33,19 @@ const heartbeatLeaseMs = integerEnvironment('AUDIT_SHARDED_LEASE_MS', 30_000, 10
 const commandStopGraceMs = integerEnvironment('AUDIT_COMMAND_STOP_GRACE_MS', 8_000, 1_000, 60_000);
 const maximumPartialLineCharacters = 64 * 1024;
 const runId = validatedShardedRunId(process.env.AUDIT_SHARDED_RUN_ID ?? makeRunId());
+const shardedHostRoot = resolve(
+  process.env.AUDIT_SHARDED_HOST_ROOT ?? join(repositoryRoot, 'artifacts', 'sharded'),
+);
+const shardedContainerRoot = process.env.AUDIT_SHARDED_CONTAINER_ROOT ?? '/work/artifacts/sharded';
+if (!shardedContainerRoot.startsWith('/') || shardedContainerRoot.includes('\0')) {
+  throw new TypeError('AUDIT_SHARDED_CONTAINER_ROOT must be an absolute container path.');
+}
 const hostRunDirectory = await createFreshShardedRunDirectory(
-  join(repositoryRoot, 'artifacts', 'sharded'),
+  shardedHostRoot,
   runId,
 );
 const logDirectory = join(hostRunDirectory, 'logs');
-const containerRunDirectory = `/work/artifacts/sharded/${runId}`;
+const containerRunDirectory = `${shardedContainerRoot.replace(/\/+$/u, '')}/${runId}`;
 const lifecyclePath = join(hostRunDirectory, 'sharded-run.json');
 const heartbeatPath = join(hostRunDirectory, 'sharded-heartbeat.json');
 const pipelineDiagnosticsPath = join(hostRunDirectory, PIPELINE_DIAGNOSTICS_FILENAME);

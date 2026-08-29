@@ -1837,6 +1837,26 @@ test('externally launched shards are discovered while active and retained with l
   expect(logs.log).toContain('Running 10 tests');
   expect((await request.post(`/api/runs/${encodeURIComponent(id)}/stop`, { data: {} })).status()).toBe(409);
 
+  const temporarilyMissingDirectory = `${shardedRoot}-temporarily-missing-${id}`;
+  await rename(directory, temporarilyMissingDirectory);
+  await expect.poll(async () => {
+    const response = await request.get(`/api/runs/${encodeURIComponent(id)}`);
+    return response.ok() ? await response.json() : null;
+  }, { timeout: 10_000 }).toMatchObject({
+    status: 'evidence-failed',
+    pipeline: { status: 'failed', completed: false, reason: expect.stringContaining('disappeared') },
+    release: { decision: 'UNAVAILABLE' },
+    lifecycleDiagnostics: {
+      source: 'external-artifact-directory',
+      derivedStatus: 'pipeline-failed',
+    },
+  });
+  await rename(temporarilyMissingDirectory, directory);
+  await expect.poll(async () => {
+    const response = await request.get(`/api/runs/${encodeURIComponent(id)}`);
+    return response.ok() ? (await response.json()).status : null;
+  }, { timeout: 10_000 }).toBe('running');
+
   const finishedAt = new Date().toISOString();
   const release = {
     decision: 'NOT_READY',
