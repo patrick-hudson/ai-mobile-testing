@@ -34,8 +34,11 @@ const ordinaryWorkerMemoryLimit = authority === 'AUTHORITATIVE'
   ? '2g' : (process.env.AUDIT_SHARED_ORDINARY_MEMORY ?? '2g');
 const suffix = randomBytes(5).toString('hex');
 const workers = Object.freeze(['shared-worker-ordinary-a', 'shared-worker-ordinary-b']);
+const performanceWorker = 'shared-worker-performance';
 const authoritativeNanoCpus = 1_000_000_000;
 const authoritativeMemoryBytes = 2_147_483_648;
+const performanceNanoCpus = 2_000_000_000;
+const performanceMemoryBytes = 4_294_967_296;
 const commonEnvironment = {
   ...process.env,
   COMPOSE_ANSI: 'never',
@@ -230,11 +233,12 @@ function claimedButUnpublished(events) {
   return events.findLast(({ event, workItemId }) => event === 'work-item-claimed' && !published.has(workItemId));
 }
 
-function driver(project, action, runId) {
+function driver(project, action, runId, { performanceWorkItemId = null } = {}) {
   const result = compose(project, ['run', '--rm', '--no-deps',
     '-e', `AUDIT_SHARED_PROOF_ACTION=${action}`,
     '-e', `AUDIT_SHARED_PROOF_RUN_ID=${runId}`,
     '-e', `AUDIT_SHARED_PROOF_WORK_ITEMS=${workItemCount}`,
+    ...(performanceWorkItemId === null ? [] : ['-e', `AUDIT_SHARED_PROOF_PERFORMANCE_WORK_ITEM_ID=${performanceWorkItemId}`]),
     'shared-resilience-driver']);
   const event = jsonLine(result.stdout, action === 'seed' ? 'shared-resilience-fixture-seeded' : 'shared-resilience-fixture-inspected');
   if (action === 'inspect') {
@@ -244,10 +248,10 @@ function driver(project, action, runId) {
   return event;
 }
 
-async function setup(project, runId) {
+async function setup(project, runId, options = {}) {
   compose(project, ['down', '-v', '--remove-orphans'], { allowFailure: true });
   compose(project, ['run', '--rm', '--no-deps', 'single-site-volume-init']);
-  const seed = driver(project, 'seed', runId);
+  const seed = driver(project, 'seed', runId, options);
   compose(project, ['up', '-d', 'shared-coordinator']);
   return seed;
 }
@@ -256,6 +260,10 @@ function startWorkers(project, count) {
   assert([1, 2].includes(count));
   compose(project, ['up', '-d', '--no-deps', ...workers.slice(0, count)]);
   for (const service of workers.slice(0, count)) startEventFollower(project, service);
+}
+function startPerformanceWorker(project) {
+  compose(project, ['up', '-d', '--no-deps', performanceWorker]);
+  startEventFollower(project, performanceWorker);
 }
 const stopWorkerB = (project) => compose(project, ['stop', '--timeout', '90', workers[1]]);
 
@@ -266,7 +274,10 @@ function runningLease(inspected, workerId) {
   return matches[0];
 }
 
-async function containerStats(project, services) {
+async function containerStats(project, services, {
+  expectedNanoCpus = authoritativeNanoCpus,
+  expectedMemoryBytes = authoritativeMemoryBytes,
+} = {}) {
   const environment = { ...commonEnvironment, AUDIT_SHARED_VOLUME_IDENTITY: `named-volume:${project}_shared-parent-runs` };
   const composePrefix = ['compose', '-p', project, '--profile', 'shared-runner', '--profile', 'shared-proof'];
   const ids = (await executeAsync('docker', [...composePrefix, 'ps', '-q', ...services], { environment }))
@@ -281,10 +292,10 @@ async function containerStats(project, services) {
     assert(Number.isSafeInteger(memoryBytes) && memoryBytes > 0,
       `Docker returned an invalid memory limit for measured worker ${id}.`);
     if (authority === 'AUTHORITATIVE') {
-      assert.equal(nanoCpus, authoritativeNanoCpus,
-        `Authoritative measured worker ${id} must enforce exactly one CPU.`);
-      assert.equal(memoryBytes, authoritativeMemoryBytes,
-        `Authoritative measured worker ${id} must enforce exactly 2 GiB of memory.`);
+      assert.equal(nanoCpus, expectedNanoCpus,
+        `Authoritative measured worker ${id} has the wrong CPU envelope.`);
+      assert.equal(memoryBytes, expectedMemoryBytes,
+        `Authoritative measured worker ${id} has the wrong memory envelope.`);
     }
     return { nanoCpus, memoryBytes };
   }));
@@ -480,6 +491,57 @@ async function runCoordinatorKill(referenceInvariant) {
   });
 }
 
+async function runPerformanceIsolation() {
+  return withProject('performance-isolation', async (project) => {
+    const runId = 'proof-performance-isolation';
+    const performanceWorkItemId = 'proof-003';
+    await setup(project, runId, { performanceWorkItemId });
+    startWorkers(project, 1);
+    await waitFor(project, 'ordinary work before performance drain', (events) => publishedIds(events).size >= 1);
+    startPerformanceWorker(project);
+    await waitFor(project, 'isolated performance claim', (events) => events.some(({ event, workItemId, proofService }) => (
+      event === 'work-item-claimed' && workItemId === performanceWorkItemId && proofService === performanceWorker
+    )));
+    const exclusiveBoundary = driver(project, 'inspect', runId);
+    const performanceLease = runningLease(exclusiveBoundary, 'compose-worker-performance');
+    assert.equal(performanceLease.id, performanceWorkItemId);
+    assert.equal(performanceLease.capability, 'performance:lighthouse');
+    assert.equal(performanceLease.resourceClass, 'performance');
+    const runningOrdinary = exclusiveBoundary.workItems.filter(({ state, resourceClass }) => (
+      state === 'running' && resourceClass === 'ordinary'
+    ));
+    assert.equal(runningOrdinary.length, 0,
+      'the store-global performance lease must drain every active ordinary browser execution');
+    const performanceUtilization = await containerStats(project, [performanceWorker], {
+      expectedNanoCpus: performanceNanoCpus,
+      expectedMemoryBytes: performanceMemoryBytes,
+    });
+    const events = await waitFor(project, 'all work after isolated performance execution', (entries) => (
+      publishedIds(entries).size === workItemCount
+    ));
+    assert(!events.some(({ event, workItemId, proofService }) => (
+      event === 'work-item-claimed' && workItemId === performanceWorkItemId && workers.includes(proofService)
+    )), 'ordinary browser workers must never claim isolated performance work');
+    const inspected = await inspectAfterDown(project, runId);
+    const performanceResult = inspected.workItems.find(({ id }) => id === performanceWorkItemId);
+    assert.equal(performanceResult.attempts.length, 1,
+      'isolated performance work must publish once through the shared result protocol');
+    assert.equal(performanceResult.state, 'completed_pass');
+    return {
+      workItemId: performanceWorkItemId,
+      workerId: performanceLease.activeLease.workerId,
+      workerService: performanceWorker,
+      capability: performanceLease.capability,
+      resourceClass: performanceLease.resourceClass,
+      runningOrdinaryAtExclusiveBoundary: runningOrdinary.length,
+      attempts: performanceResult.attempts.length,
+      outcome: performanceResult.outcome,
+      invariantDigest: inspected.invariantDigest,
+      utilization: performanceUtilization,
+    };
+  });
+}
+
 function median(values) {
   const ordered = [...values].sort((left, right) => left - right);
   return ordered[Math.floor(ordered.length / 2)];
@@ -533,6 +595,7 @@ try {
   const transition = await runScaleTransition(referenceInvariant);
   const workerKill = await runWorkerKill(referenceInvariant);
   const coordinatorKill = await runCoordinatorKill(referenceInvariant);
+  const performanceIsolation = await runPerformanceIsolation();
   const oneTimes = recorded.filter(({ workerCount }) => workerCount === 1).map(({ wallTimeMs }) => wallTimeMs);
   const manyTimes = recorded.filter(({ workerCount }) => workerCount === 2).map(({ wallTimeMs }) => wallTimeMs);
   const oneWorkerMedianMs = median(oneTimes);
@@ -551,7 +614,8 @@ try {
     workload: { digest: recorded[0].seed.workloadDigest, workItemCount, trials, warmedTrials: true,
       cachePolicy: 'fresh named volume per trial; shared image layers warm' },
     resources: { oneWorkerPrincipals: ['ordinary-a'], manyWorkerPrincipals: ['ordinary-a', 'ordinary-b'],
-      browserConcurrencyPerWorker: 1, ordinaryWorkerCpuLimit, ordinaryWorkerMemoryLimit },
+      browserConcurrencyPerWorker: 1, ordinaryWorkerCpuLimit, ordinaryWorkerMemoryLimit,
+      performanceWorkerCpuLimit: '2.0', performanceWorkerMemoryLimit: '4g', performanceWorkerPrincipal: 'performance' },
     measurements: { oneWorkerMs: oneTimes, manyWorkerMs: manyTimes, oneWorkerMedianMs,
       manyWorkerMedianMs, oneWorkerVarianceMs2: variance(oneTimes),
       manyWorkerVarianceMs2: variance(manyTimes), throughputImprovement: oneWorkerMedianMs / manyWorkerMedianMs,
@@ -560,7 +624,8 @@ try {
       workerKillDigest: workerKill.inspected.invariantDigest, coordinatorKillDigest: coordinatorKill.inspected.invariantDigest,
       workerKillRecoveredWorkItem: workerKill.killedWorkItemId,
       coordinatorKillRecoveredWorkItem: coordinatorKill.interruptedWorkItemId,
-      productFailureAttempts: recorded[0].inspected.workItems.find(({ id }) => id === 'proof-008').attempts.length },
+      productFailureAttempts: recorded[0].inspected.workItems.find(({ id }) => id === 'proof-008').attempts.length,
+      performanceIsolation },
     durableState: 'docker compose down preserved every inspected run; down -v was used only for isolated proof cleanup',
   };
   await mkdir(path.dirname(evidencePath), { recursive: true });

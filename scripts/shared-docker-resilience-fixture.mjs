@@ -28,8 +28,12 @@ const required = (name) => {
 const action = required('AUDIT_SHARED_PROOF_ACTION');
 const runId = required('AUDIT_SHARED_PROOF_RUN_ID');
 const workItemCount = Number(process.env.AUDIT_SHARED_PROOF_WORK_ITEMS ?? 6);
+const performanceWorkItemId = process.env.AUDIT_SHARED_PROOF_PERFORMANCE_WORK_ITEM_ID ?? null;
 if (!Number.isSafeInteger(workItemCount) || workItemCount < 2 || workItemCount > 8) {
   throw new Error('AUDIT_SHARED_PROOF_WORK_ITEMS must be an integer from 2 through 8.');
+}
+if (performanceWorkItemId !== null && !/^proof-00[1-8]$/u.test(performanceWorkItemId)) {
+  throw new Error('AUDIT_SHARED_PROOF_PERFORMANCE_WORK_ITEM_ID must identify one frozen proof item.');
 }
 const storeMarker = await readTrustedStoreMarker(required('AUDIT_SHARED_STORE_MARKER_FILE'));
 const backupMarker = await readTrustedStoreMarker(required('AUDIT_SHARED_BACKUP_MARKER_FILE'), 'shared backup marker');
@@ -53,6 +57,9 @@ if (action === 'seed') {
   const targetId = SHARED_DOCKER_RESILIENCE_TARGET_ID;
   const origin = SHARED_DOCKER_RESILIENCE_ORIGIN;
   const definitions = SHARED_DOCKER_RESILIENCE_CASES.slice(0, workItemCount).map(({ auditId }) => auditId);
+  if (performanceWorkItemId !== null && Number(performanceWorkItemId.slice(-3)) > definitions.length) {
+    throw new Error('AUDIT_SHARED_PROOF_PERFORMANCE_WORK_ITEM_ID is outside the seeded workload.');
+  }
   const scope = {
     features: ['shared-runner-resilience'],
     definitions,
@@ -75,24 +82,28 @@ if (action === 'seed') {
     environmentIdentity: frozenDigest,
     certificatePolicy: 'strict',
   });
-  const descriptors = definitions.map((definitionId, index) => sealWorkExecutionDescriptor({
-    workItemId: `proof-${String(index + 1).padStart(3, '0')}`,
-    subjectCoreDigest: subjectCore.digest,
-    runnerRevision,
-    mode: 'single-site',
-    operation: 'playwright',
-    definitionId,
-    pluginId: null,
-    caseId: `${definitionId}:shared-docker-resilience`,
-    entrySpec: SHARED_DOCKER_RESILIENCE_SPEC,
-    targetId,
-    targetRole: 'preview',
-    capability: 'browser:chromium',
-    resourceClass: 'ordinary',
-    origins: { candidate: origin, production: null },
-    certificatePolicy: 'strict',
-    route: null,
-  }));
+  const descriptors = definitions.map((definitionId, index) => {
+    const workItemId = `proof-${String(index + 1).padStart(3, '0')}`;
+    const performance = workItemId === performanceWorkItemId;
+    return sealWorkExecutionDescriptor({
+      workItemId,
+      subjectCoreDigest: subjectCore.digest,
+      runnerRevision,
+      mode: 'single-site',
+      operation: 'playwright',
+      definitionId,
+      pluginId: null,
+      caseId: `${definitionId}:shared-docker-resilience`,
+      entrySpec: SHARED_DOCKER_RESILIENCE_SPEC,
+      targetId,
+      targetRole: 'preview',
+      capability: performance ? 'performance:lighthouse' : 'browser:chromium',
+      resourceClass: performance ? 'performance' : 'ordinary',
+      origins: { candidate: origin, production: null },
+      certificatePolicy: 'strict',
+      route: null,
+    });
+  });
   const executionManifest = sealExecutionManifest({
     schemaVersion: 1,
     subjectCoreDigest: subjectCore.digest,
@@ -194,6 +205,8 @@ if (action === 'seed') {
     };
     workItems.push({
       id: item.id,
+      capability: item.capability,
+      resourceClass: item.resourceClass,
       state: item.state,
       outcome: item.canonicalResult?.outcome ?? null,
       authoritative: item.canonicalResult?.authoritative ?? null,

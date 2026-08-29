@@ -22,6 +22,8 @@ const valid = {
   resources: {
     ordinaryWorkerCpuLimit: '1.0', ordinaryWorkerMemoryLimit: '2g', browserConcurrencyPerWorker: 1,
     oneWorkerPrincipals: ['ordinary-a'], manyWorkerPrincipals: ['ordinary-a', 'ordinary-b'],
+    performanceWorkerCpuLimit: '2.0', performanceWorkerMemoryLimit: '4g',
+    performanceWorkerPrincipal: 'performance',
   },
   measurements: {
     oneWorkerMs: [60, 62, 61], manyWorkerMs: [40, 42, 41],
@@ -37,6 +39,16 @@ const valid = {
   invariants: {
     digest: digest('b'), transitionDigest: digest('b'), workerKillDigest: digest('b'), coordinatorKillDigest: digest('b'),
     workerKillRecoveredWorkItem: 'proof-002', coordinatorKillRecoveredWorkItem: 'proof-002', productFailureAttempts: 1,
+    performanceIsolation: {
+      workItemId: 'proof-003', workerId: 'compose-worker-performance', workerService: 'shared-worker-performance',
+      capability: 'performance:lighthouse', resourceClass: 'performance', runningOrdinaryAtExclusiveBoundary: 0,
+      attempts: 1, outcome: 'completed_pass', invariantDigest: digest('9'),
+      utilization: [{
+        container: 'proof-performance-isolation-shared-worker-performance', cpuPercent: 75,
+        memoryPercent: 15, memoryUsage: '600MiB / 4GiB', pids: 40,
+        nanoCpus: 2_000_000_000, memoryBytes: 4_294_967_296,
+      }],
+    },
   },
 };
 
@@ -57,11 +69,18 @@ const rejected = [
   (report) => { report.measurements.utilization[0].sequence = 2; },
   (report) => { report.measurements.utilization[0].workerCount = 2; },
   (report) => { report.resources.manyWorkerPrincipals = ['ordinary-a']; },
+  (report) => { report.resources.performanceWorkerCpuLimit = '1.0'; },
+  (report) => { report.resources.performanceWorkerPrincipal = 'ordinary-a'; },
   (report) => { report.measurements.utilization[0].samples[0].cpuPercent = null; },
   (report) => { report.measurements.utilization[0].samples[0].memoryPercent = Number.NaN; },
   (report) => { report.measurements.utilization[0].samples[0].pids = -1; },
   (report) => { report.measurements.utilization[0].samples[0].nanoCpus = 2_000_000_000; },
   (report) => { report.measurements.utilization[0].samples[0].memoryBytes = 1_073_741_824; },
+  (report) => { report.invariants.performanceIsolation.workerId = 'compose-worker-ordinary-a'; },
+  (report) => { report.invariants.performanceIsolation.runningOrdinaryAtExclusiveBoundary = 1; },
+  (report) => { report.invariants.performanceIsolation.attempts = 2; },
+  (report) => { delete report.invariants.performanceIsolation.invariantDigest; },
+  (report) => { report.invariants.performanceIsolation.utilization[0].nanoCpus = 1_000_000_000; },
   (report) => { report.authority = 'DIAGNOSTIC'; },
 ];
 for (const mutate of rejected) {

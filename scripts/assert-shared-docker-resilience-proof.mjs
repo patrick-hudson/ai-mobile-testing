@@ -47,6 +47,9 @@ export function validateSharedDockerResilienceProof(report, { expectedWorkspaceR
   assert.equal(report?.resources?.browserConcurrencyPerWorker, 1);
   assert.deepEqual(report?.resources?.oneWorkerPrincipals, ['ordinary-a']);
   assert.deepEqual(report?.resources?.manyWorkerPrincipals, ['ordinary-a', 'ordinary-b']);
+  assert.equal(report?.resources?.performanceWorkerCpuLimit, '2.0');
+  assert.equal(report?.resources?.performanceWorkerMemoryLimit, '4g');
+  assert.equal(report?.resources?.performanceWorkerPrincipal, 'performance');
   assert.equal(report?.measurements?.oneWorkerMs?.length, 3);
   assert.equal(report?.measurements?.manyWorkerMs?.length, 3);
   for (const [label, values] of [
@@ -113,6 +116,29 @@ export function validateSharedDockerResilienceProof(report, { expectedWorkspaceR
   assert.match(report.invariants.workerKillRecoveredWorkItem ?? '', WORK_ITEM_ID);
   assert.match(report.invariants.coordinatorKillRecoveredWorkItem ?? '', WORK_ITEM_ID);
   assert.equal(report.invariants.productFailureAttempts, 1);
+  assert.deepEqual(report.invariants.performanceIsolation, {
+    workItemId: 'proof-003',
+    workerId: 'compose-worker-performance',
+    workerService: 'shared-worker-performance',
+    capability: 'performance:lighthouse',
+    resourceClass: 'performance',
+    runningOrdinaryAtExclusiveBoundary: 0,
+    attempts: 1,
+    outcome: 'completed_pass',
+    invariantDigest: report.invariants.performanceIsolation?.invariantDigest,
+    utilization: report.invariants.performanceIsolation?.utilization,
+  });
+  assert.match(report.invariants.performanceIsolation.invariantDigest ?? '', DIGEST);
+  assert.equal(report.invariants.performanceIsolation.utilization?.length, 1);
+  const performanceSample = report.invariants.performanceIsolation.utilization[0];
+  assert(typeof performanceSample?.container === 'string'
+    && performanceSample.container.endsWith('shared-worker-performance'));
+  finite(performanceSample.cpuPercent, 'performance cpuPercent');
+  finite(performanceSample.memoryPercent, 'performance memoryPercent');
+  assert(typeof performanceSample.memoryUsage === 'string' && performanceSample.memoryUsage.length > 0);
+  assert(Number.isSafeInteger(performanceSample.pids) && performanceSample.pids >= 0);
+  assert.equal(performanceSample.nanoCpus, 2_000_000_000);
+  assert.equal(performanceSample.memoryBytes, 4_294_967_296);
   return report;
 }
 
