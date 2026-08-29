@@ -17,6 +17,7 @@ export interface AuditTargetDefinition {
   id: string;
   label: string;
   environment: AuditEnvironment;
+  baselineTargetId: string | null;
   browserLabel: string;
   deviceClass: AuditProjectMetadata['deviceClass'];
   engine: AuditBrowserEngine;
@@ -31,7 +32,7 @@ export interface AuditTargetDefinition {
   qualification: string;
 }
 
-export interface SingleSiteAuditTargetDefinition extends Omit<AuditTargetDefinition, 'environment'> {
+export interface SingleSiteAuditTargetDefinition extends Omit<AuditTargetDefinition, 'environment' | 'baselineTargetId'> {
   sourceComparativeTargetId: string;
 }
 
@@ -91,6 +92,7 @@ export const LOCAL_AUDIT_TARGETS = [
     id: 'production-mobile-chromium',
     label: 'Production · Pixel 5 descriptor · Chromium',
     environment: 'production',
+    baselineTargetId: null,
     browserLabel: 'Chromium / Pixel 5 emulation (Android 11 UA)',
     deviceClass: 'mobile',
     engine: 'chromium',
@@ -106,6 +108,7 @@ export const LOCAL_AUDIT_TARGETS = [
     id: 'candidate-mobile-chromium',
     label: 'Candidate · Pixel 5 descriptor · Chromium',
     environment: 'candidate',
+    baselineTargetId: 'production-mobile-chromium',
     browserLabel: 'Chromium / Pixel 5 emulation (Android 11 UA)',
     deviceClass: 'mobile',
     engine: 'chromium',
@@ -121,6 +124,7 @@ export const LOCAL_AUDIT_TARGETS = [
     id: 'production-desktop-chromium',
     label: 'Production · Desktop · Chromium',
     environment: 'production',
+    baselineTargetId: null,
     browserLabel: 'Chromium / desktop',
     deviceClass: 'desktop',
     engine: 'chromium',
@@ -136,6 +140,7 @@ export const LOCAL_AUDIT_TARGETS = [
     id: 'candidate-desktop-chromium',
     label: 'Candidate · Desktop · Chromium',
     environment: 'candidate',
+    baselineTargetId: 'production-desktop-chromium',
     browserLabel: 'Chromium / desktop',
     deviceClass: 'desktop',
     engine: 'chromium',
@@ -151,6 +156,7 @@ export const LOCAL_AUDIT_TARGETS = [
     id: 'candidate-mobile-webkit',
     label: 'Candidate · iPhone 13 descriptor · WebKit',
     environment: 'candidate',
+    baselineTargetId: null,
     browserLabel: 'WebKit / iPhone 13 emulation (iOS 15 UA)',
     deviceClass: 'mobile',
     engine: 'webkit',
@@ -166,6 +172,7 @@ export const LOCAL_AUDIT_TARGETS = [
     id: 'candidate-tablet-webkit',
     label: 'Candidate · iPad Mini descriptor · WebKit',
     environment: 'candidate',
+    baselineTargetId: null,
     browserLabel: 'WebKit / iPad Mini emulation',
     deviceClass: 'tablet',
     engine: 'webkit',
@@ -181,6 +188,7 @@ export const LOCAL_AUDIT_TARGETS = [
     id: 'candidate-desktop-firefox',
     label: 'Candidate · Desktop · Firefox',
     environment: 'candidate',
+    baselineTargetId: null,
     browserLabel: 'Firefox / desktop',
     deviceClass: 'desktop',
     engine: 'firefox',
@@ -196,6 +204,7 @@ export const LOCAL_AUDIT_TARGETS = [
     id: 'candidate-mobile-webkit-iphone-17-ios18',
     label: 'Candidate · iPhone 17 / iOS 18.7 UA · WebKit emulation',
     environment: 'candidate',
+    baselineTargetId: null,
     browserLabel: 'WebKit / iPhone 17 emulation (iOS 18.7 UA)',
     deviceClass: 'mobile',
     engine: 'webkit',
@@ -211,6 +220,7 @@ export const LOCAL_AUDIT_TARGETS = [
     id: 'candidate-mobile-webkit-iphone-15-ios17',
     label: 'Candidate · iPhone 15 / iOS 17.5 UA · WebKit emulation',
     environment: 'candidate',
+    baselineTargetId: null,
     browserLabel: 'WebKit / iPhone 15 emulation (iOS 17.5 UA)',
     deviceClass: 'mobile',
     engine: 'webkit',
@@ -226,6 +236,7 @@ export const LOCAL_AUDIT_TARGETS = [
     id: 'candidate-mobile-chromium-pixel-10-android16',
     label: 'Candidate · Pixel 10 / Android 16 UA · Chromium emulation',
     environment: 'candidate',
+    baselineTargetId: null,
     browserLabel: 'Chromium / Pixel 10 emulation (Android 16 UA)',
     deviceClass: 'mobile',
     engine: 'chromium',
@@ -241,6 +252,7 @@ export const LOCAL_AUDIT_TARGETS = [
     id: 'candidate-mobile-chromium-pixel-8-android14',
     label: 'Candidate · Pixel 8 / Android 14 UA · Chromium emulation',
     environment: 'candidate',
+    baselineTargetId: null,
     browserLabel: 'Chromium / Pixel 8 emulation (Android 14 UA)',
     deviceClass: 'mobile',
     engine: 'chromium',
@@ -256,6 +268,7 @@ export const LOCAL_AUDIT_TARGETS = [
     id: 'candidate-mobile-chromium-galaxy-s24-android14',
     label: 'Candidate · Galaxy S24 / Android 14 UA · Chromium emulation',
     environment: 'candidate',
+    baselineTargetId: null,
     browserLabel: 'Chromium / Galaxy S24 emulation (Android 14 UA)',
     deviceClass: 'mobile',
     engine: 'chromium',
@@ -271,6 +284,7 @@ export const LOCAL_AUDIT_TARGETS = [
     id: 'candidate-desktop-chromium-edge-compat',
     label: 'Candidate · Edge-compatible UA · Chromium (not branded Edge)',
     environment: 'candidate',
+    baselineTargetId: null,
     browserLabel: 'Chromium / Edge-compatible desktop emulation',
     deviceClass: 'desktop',
     engine: 'chromium',
@@ -286,6 +300,7 @@ export const LOCAL_AUDIT_TARGETS = [
     id: 'candidate-desktop-chromium-msedge',
     label: 'Candidate · Microsoft Edge · branded browser',
     environment: 'candidate',
+    baselineTargetId: null,
     browserLabel: 'Microsoft Edge / desktop (branded binary)',
     deviceClass: 'desktop',
     engine: 'chromium',
@@ -319,7 +334,7 @@ const SINGLE_SITE_SOURCE_TARGET_IDS = [
 function singleSiteTargetFrom(sourceId: (typeof SINGLE_SITE_SOURCE_TARGET_IDS)[number]): SingleSiteAuditTargetDefinition {
   const source = LOCAL_AUDIT_TARGETS.find(({ id }) => id === sourceId);
   if (!source) throw new Error(`Single-site target source ${sourceId} is missing.`);
-  const { environment: _environment, ...portable } = source;
+  const { environment: _environment, baselineTargetId: _baselineTargetId, ...portable } = source;
   return {
     ...portable,
     id: `single-site-${source.id.slice('candidate-'.length)}`,
@@ -455,6 +470,9 @@ export function validateAuditTargetCatalog(
     if (!/^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/.test(target.id)) issues.push(`Invalid local target ID: ${target.id}.`);
     if (!target.label.trim() || !target.browserLabel.trim() || !target.qualification.trim()) issues.push(`${target.id} must have non-empty reviewer labels and qualification.`);
     if (!target.id.startsWith(`${target.environment}-`)) issues.push(`${target.id} does not match its ${target.environment} environment.`);
+    if (target.environment === 'production' && target.baselineTargetId !== null) {
+      issues.push(`${target.id} cannot declare another production baseline target.`);
+    }
     const descriptor = devices[target.deviceDescriptor];
     if (!descriptor) issues.push(`${target.id} references missing Playwright device descriptor "${target.deviceDescriptor}".`);
     else if (descriptor.defaultBrowserType !== target.engine) issues.push(`${target.id} uses ${target.engine} with a ${descriptor.defaultBrowserType} device descriptor.`);
@@ -480,6 +498,13 @@ export function validateAuditTargetCatalog(
   }
 
   const comparativeById = new Map(localTargets.map((target) => [target.id, target]));
+  for (const target of localTargets.filter(({ environment }) => environment === 'candidate')) {
+    if (target.baselineTargetId === null) continue;
+    const baseline = comparativeById.get(target.baselineTargetId);
+    if (!baseline || baseline.environment !== 'production') {
+      issues.push(`${target.id} must reference an existing production baseline target or null.`);
+    }
+  }
   for (const target of singleSiteTargets) {
     if (!target.id.startsWith('single-site-')) issues.push(`${target.id} must use the neutral single-site prefix.`);
     const source = comparativeById.get(target.sourceComparativeTargetId);

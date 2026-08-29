@@ -4,7 +4,14 @@ export interface ExecutionManifest {
   kind: 'execution-manifest';
   subjectCoreDigest: string;
   workItems: Array<{ id: string; definitionId: string; targetId: string; targetRole: string }>;
-  oracleExecutions: Array<{ id: string; definitionId: string; requiredWorkItemIds: string[] }>;
+  oracleExecutions: Array<{
+    id: string;
+    definitionId: string;
+    productOracleVariant: string;
+    baselinePolicy: 'not-applicable' | 'context-unless-candidate-regression-proven';
+    requiredWorkItemIds: string[];
+    workItemBindings: Array<{ workItemId: string; targetRole: string; comparisonKey: string }>;
+  }>;
   contextWorkItemIds: string[];
   digest: string;
 }
@@ -28,6 +35,9 @@ export interface OracleResult {
   subjectCoreDigest: string;
   adoptedWorkItemIds: string[];
   workItemResultDigests: string[];
+  productOracleVariant: string;
+  baselinePolicy: 'not-applicable' | 'context-unless-candidate-regression-proven';
+  workItemBindings: Array<{ workItemId: string; targetRole: string; comparisonKey: string }>;
   workItemOutcomes: Array<{ workItemId: string; outcome: WorkItemOutcome }>;
   outcome: 'completed_pass' | 'completed_product_failure' | 'incomplete';
   digest: string;

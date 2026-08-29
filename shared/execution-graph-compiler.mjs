@@ -92,11 +92,24 @@ function targetCatalog(mode, targetRegistry) {
     if (mode === 'comparative' && !['candidate', 'production'].includes(target.environment)) {
       failContract('INVALID_CONTRACT', `Comparative target ${id} must identify candidate or production environment.`);
     }
+    const baselineTargetId = target.baselineTargetId ?? null;
+    if (mode === 'comparative' && baselineTargetId !== null
+      && (target.environment !== 'candidate' || !nonEmptyString(baselineTargetId, `${id}.baselineTargetId`))) {
+      failContract('INVALID_CONTRACT', `Comparative target ${id} has an invalid production baseline binding.`);
+    }
     if (mode === 'single-site') nonEmptyString(target.sourceComparativeTargetId, `${id}.sourceComparativeTargetId`);
-    byId.set(id, target);
+    byId.set(id, mode === 'comparative' ? { ...target, baselineTargetId } : target);
   }
   const unknownFullIds = fullIds.filter((id) => !byId.has(id));
   if (unknownFullIds.length > 0) failContract('INVALID_CONTRACT', `Full target profile contains unknown IDs: ${unknownFullIds.join(', ')}.`);
+  if (mode === 'comparative') {
+    for (const target of byId.values()) {
+      if (target.environment === 'candidate' && target.baselineTargetId !== null
+        && byId.get(target.baselineTargetId)?.environment !== 'production') {
+        failContract('INVALID_CONTRACT', `Comparative target ${target.id} references an unknown production baseline target.`);
+      }
+    }
+  }
   return { byId, fullIds: sortedUnique(fullIds) };
 }
 
@@ -268,6 +281,22 @@ function durableExecutionId(prefix, identity) {
   return `${prefix}-${canonicalDigest(identity).slice('sha256:'.length)}`;
 }
 
+function manifestOracleExecution(oraclePlan, workPlans) {
+  const workById = new Map(workPlans.map((plan) => [plan.id, plan]));
+  return {
+    id: oraclePlan.id,
+    definitionId: oraclePlan.definitionId,
+    productOracleVariant: oraclePlan.productOracleVariant,
+    baselinePolicy: oraclePlan.baselinePolicy,
+    requiredWorkItemIds: oraclePlan.requiredWorkItemIds,
+    workItemBindings: oraclePlan.requiredWorkItemIds.map((workItemId) => {
+      const plan = workById.get(workItemId);
+      if (!plan) failContract('UNDECLARED_WORK_ITEM', `Oracle ${oraclePlan.id} references missing work plan ${workItemId}.`);
+      return { workItemId, targetRole: plan.targetRole, comparisonKey: plan.comparisonKey };
+    }),
+  };
+}
+
 function schedulingClass(target, auditCase) {
   if (String(auditCase.entrySpec).includes('performance')) {
     return { capability: 'performance:lighthouse', resourceClass: 'performance' };
@@ -298,6 +327,9 @@ function workPlan({ mode, definition, auditCase, target, role, inventory }) {
     applicability: auditCase.applicability,
     targetId: target.id,
     targetRole: role,
+    comparisonKey: mode === 'comparative' && role === 'candidate'
+      ? (target.baselineTargetId ?? target.id)
+      : target.id,
     capability,
     resourceClass,
     productOracleVariant: auditCase.oracleVariants[mode === 'single-site' ? 'singleSite' : 'comparative'],
@@ -500,7 +532,7 @@ export function compileCanonicalExecutionGraph({
     subjectCoreDigest: subjectCore.digest,
     workItems: [...workItemPlans, ...contextPlans]
       .map(({ id, definitionId, targetId, targetRole }) => ({ id, definitionId, targetId, targetRole })),
-    oracleExecutions: oraclePlans.map(({ id, definitionId, requiredWorkItemIds }) => ({ id, definitionId, requiredWorkItemIds })),
+    oracleExecutions: oraclePlans.map((oraclePlan) => manifestOracleExecution(oraclePlan, workItemPlans)),
     contextWorkItemIds: contextPlans.map(({ id }) => id),
   });
   const finalSubject = sealFinalReleaseSubject({
@@ -560,7 +592,7 @@ export function parseCanonicalExecutionGraph(value) {
   const plannedWork = [...value.workItemPlans, ...value.contextPlans]
     .map(({ id, definitionId, targetId, targetRole }) => ({ id, definitionId, targetId, targetRole }))
     .sort((left, right) => left.id.localeCompare(right.id));
-  const plannedOracles = value.oraclePlans.map(({ id, definitionId, requiredWorkItemIds }) => ({ id, definitionId, requiredWorkItemIds }));
+  const plannedOracles = value.oraclePlans.map((oraclePlan) => manifestOracleExecution(oraclePlan, value.workItemPlans));
   if (canonicalJson(plannedWork) !== canonicalJson(executionManifest.workItems)
     || canonicalJson(plannedOracles) !== canonicalJson(executionManifest.oracleExecutions)
     || canonicalJson(value.contextPlans.map(({ id }) => id).sort()) !== canonicalJson(executionManifest.contextWorkItemIds)) {

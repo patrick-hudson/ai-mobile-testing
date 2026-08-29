@@ -82,8 +82,8 @@ const targetRegistry = {
   schemaVersion: 1,
   defaultTargetIds: ['production-mobile', 'candidate-mobile'],
   localTargets: [
-    { id: 'production-mobile', environment: 'production', engine: 'chromium', browserProduct: 'chromium', deviceClass: 'mobile' },
-    { id: 'candidate-mobile', environment: 'candidate', engine: 'chromium', browserProduct: 'chromium', deviceClass: 'mobile' },
+    { id: 'production-mobile', environment: 'production', baselineTargetId: null, engine: 'chromium', browserProduct: 'chromium', deviceClass: 'mobile' },
+    { id: 'candidate-mobile', environment: 'candidate', baselineTargetId: 'production-mobile', engine: 'chromium', browserProduct: 'chromium', deviceClass: 'mobile' },
   ],
   singleSiteFullProfileTargetIds: ['single-mobile', 'single-desktop'],
   singleSiteTargets: [
@@ -225,6 +225,21 @@ assert.deepEqual(
 );
 assert.deepEqual([...new Set(comparative.executionManifest.workItems.map(({ targetRole }) => targetRole))].sort(), ['candidate', 'production']);
 assert.equal(comparative.oraclePlans[0].baselinePolicy, 'context-unless-candidate-regression-proven');
+assert.equal(comparative.executionManifest.oracleExecutions[0].baselinePolicy,
+  'context-unless-candidate-regression-proven',
+  'Comparative baseline policy must survive in the restart-safe sealed manifest.');
+assert.equal(comparative.executionManifest.oracleExecutions[0].productOracleVariant,
+  comparative.oraclePlans[0].productOracleVariant,
+  'The paired Product Oracle variant must survive in the sealed manifest.');
+assert.deepEqual(
+  comparative.executionManifest.oracleExecutions[0].workItemBindings
+    .map(({ targetRole, comparisonKey }) => ({ targetRole, comparisonKey })),
+  [
+    { targetRole: 'candidate', comparisonKey: 'production-mobile' },
+    { targetRole: 'production', comparisonKey: 'production-mobile' },
+  ],
+  'Candidate and production work must use an explicit registry-declared comparison pair.',
+);
 assert.equal(comparative.contextPlans.length, 1);
 assert.equal(comparative.contextPlans[0].targetRole, 'production');
 assert.equal(comparative.contextPlans[0].authority, 'non-blocking-production-baseline-context');

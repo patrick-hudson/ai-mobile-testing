@@ -120,6 +120,32 @@ assert.deepEqual(parseReleaseSubjectCore(full.subjectCore), full.subjectCore);
 assert.deepEqual(parseExecutionManifest(full.executionManifest), full.executionManifest);
 assert.deepEqual(parseFinalReleaseSubject(full.finalSubject), full.finalSubject);
 assert.deepEqual(parseWorkItemResult(full.workItemResults[0]), full.workItemResults[0]);
+const legacyManifestBody = {
+  schemaVersion: 1,
+  kind: 'execution-manifest',
+  subjectCoreDigest: full.subjectCore.digest,
+  workItems: [{ id: 'work-legacy', definitionId: 'HOME-001', targetId: 'desktop-chromium', targetRole: 'candidate' }],
+  oracleExecutions: [{ id: 'oracle-legacy', definitionId: 'HOME-001', requiredWorkItemIds: ['work-legacy'] }],
+  contextWorkItemIds: [],
+};
+const legacyManifest = { ...legacyManifestBody, digest: canonicalDigest(legacyManifestBody) };
+assert.deepEqual(parseExecutionManifest(legacyManifest), legacyManifest,
+  'Previously sealed schema-v1 manifests must remain readable without changing their digest.');
+const legacyOracleBody = {
+  schemaVersion: 1,
+  kind: 'oracle-result',
+  oracleExecutionId: 'oracle-legacy',
+  definitionId: 'HOME-001',
+  finalSubjectDigest: full.finalSubject.digest,
+  subjectCoreDigest: full.subjectCore.digest,
+  adoptedWorkItemIds: ['work-legacy'],
+  workItemResultDigests: [DIGEST_A],
+  workItemOutcomes: [{ workItemId: 'work-legacy', outcome: 'completed_pass' }],
+  outcome: 'completed_pass',
+};
+const legacyOracle = { ...legacyOracleBody, digest: canonicalDigest(legacyOracleBody) };
+assert.deepEqual(parseOracleResult(legacyOracle), legacyOracle,
+  'Previously sealed schema-v1 oracle results must remain readable without changing their digest.');
 const repeatedEvidence = sealWorkItemResult({
   schemaVersion: 1,
   workItemId: 'work-repeated-evidence',
@@ -446,7 +472,17 @@ const comparativeManifest = sealExecutionManifest({
     { id: 'work-candidate', definitionId: 'HOME-001', targetId: 'desktop-chromium', targetRole: 'candidate' },
     { id: 'work-production', definitionId: 'HOME-001', targetId: 'desktop-chromium', targetRole: 'production' },
   ],
-  oracleExecutions: [{ id: 'oracle-paired', definitionId: 'HOME-001', requiredWorkItemIds: ['work-candidate', 'work-production'] }],
+  oracleExecutions: [{
+    id: 'oracle-paired',
+    definitionId: 'HOME-001',
+    productOracleVariant: 'HOME-001:paired-shell',
+    baselinePolicy: 'context-unless-candidate-regression-proven',
+    requiredWorkItemIds: ['work-candidate', 'work-production'],
+    workItemBindings: [
+      { workItemId: 'work-candidate', targetRole: 'candidate', comparisonKey: 'desktop-chromium' },
+      { workItemId: 'work-production', targetRole: 'production', comparisonKey: 'desktop-chromium' },
+    ],
+  }],
   contextWorkItemIds: [],
 });
 const comparativeSubject = sealFinalReleaseSubject({
@@ -473,6 +509,60 @@ const comparativeOracle = sealOracleResult({
   ],
 });
 assert.deepEqual(comparativeOracle.adoptedWorkItemIds, ['work-candidate', 'work-production']);
+const productionOnlyFailureOracle = sealOracleResult({
+  schemaVersion: 1,
+  oracleExecution: comparativeManifest.oracleExecutions[0],
+  finalSubjectDigest: comparativeSubject.digest,
+  workItemResults: [
+    workResult(comparativeCore.digest, { workItemId: 'work-candidate' }),
+    workResult(comparativeCore.digest, { workItemId: 'work-production', outcome: 'completed_product_failure' }),
+  ],
+});
+assert.equal(productionOnlyFailureOracle.outcome, 'completed_pass',
+  'A production-only defect must remain baseline context.');
+const unchangedFailureOracle = sealOracleResult({
+  schemaVersion: 1,
+  oracleExecution: comparativeManifest.oracleExecutions[0],
+  finalSubjectDigest: comparativeSubject.digest,
+  workItemResults: [
+    workResult(comparativeCore.digest, { workItemId: 'work-candidate', outcome: 'completed_product_failure' }),
+    workResult(comparativeCore.digest, { workItemId: 'work-production', outcome: 'completed_product_failure' }),
+  ],
+});
+assert.equal(unchangedFailureOracle.outcome, 'completed_pass',
+  'A defect reproduced on both sides must remain baseline context absent regression proof.');
+const candidateRegressionOracle = sealOracleResult({
+  schemaVersion: 1,
+  oracleExecution: comparativeManifest.oracleExecutions[0],
+  finalSubjectDigest: comparativeSubject.digest,
+  workItemResults: [
+    workResult(comparativeCore.digest, { workItemId: 'work-candidate', outcome: 'completed_product_failure' }),
+    workResult(comparativeCore.digest, { workItemId: 'work-production' }),
+  ],
+});
+assert.equal(candidateRegressionOracle.outcome, 'completed_product_failure',
+  'A candidate failure against a passing production pair must block release.');
+const forgedPolicyOracle = sealOracleResult({
+  schemaVersion: 1,
+  oracleExecution: {
+    ...comparativeManifest.oracleExecutions[0],
+    productOracleVariant: 'forged-baseline-policy',
+  },
+  finalSubjectDigest: comparativeSubject.digest,
+  workItemResults: [
+    workResult(comparativeCore.digest, { workItemId: 'work-candidate' }),
+    workResult(comparativeCore.digest, { workItemId: 'work-production' }),
+  ],
+});
+expectCode('ORACLE_POLICY_MISMATCH', () => deriveReleaseDecision({
+  schemaVersion: 1,
+  runId: 'run-comparative-forged-policy',
+  decisionRevision: 1,
+  finalSubject: comparativeSubject,
+  executionManifest: comparativeManifest,
+  oracleResults: [forgedPolicyOracle],
+  releaseDispositions: [],
+}));
 const mixedFailureOracle = sealOracleResult({
   schemaVersion: 1,
   oracleExecution: comparativeManifest.oracleExecutions[0],
@@ -491,8 +581,9 @@ const mixedFailureDecision = deriveReleaseDecision({
   oracleResults: [mixedFailureOracle],
   releaseDispositions: [],
 });
-assert.equal(mixedFailureDecision.code, 'NOT_READY_TEST_FAILURE');
-assert.deepEqual(mixedFailureDecision.blockingReasons.map(({ class: reasonClass }) => reasonClass), ['product-failure', 'operational-incident']);
+assert.equal(mixedFailureDecision.code, 'NOT_READY_INCOMPLETE_EXECUTION');
+assert.deepEqual(mixedFailureDecision.blockingReasons.map(({ class: reasonClass }) => reasonClass), ['operational-incident'],
+  'An unavailable production pair cannot prove a candidate regression and must remain incomplete until recovery.');
 
 const envelope1 = appendPublicationEnvelope(null, {
   schemaVersion: 1,

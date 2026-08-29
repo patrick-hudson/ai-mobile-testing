@@ -271,6 +271,102 @@ try {
   assert.equal((await readCurrentEnvelope(store, 'run-failed-comparative')).decision.code,
     'NOT_READY_TEST_FAILURE', 'a canonical product failure must block the comparative release verdict');
 
+  await createParentRun(store, { runId: 'run-production-baseline-comparative', ...launch.createParentRunInput });
+  while (true) {
+    let lease;
+    try { lease = await supervisor.claim(worker); } catch (error) {
+      if (error?.code === 'NO_WORK_AVAILABLE') break;
+      throw error;
+    }
+    if (lease.runId !== 'run-production-baseline-comparative') continue;
+    const riskSourceObservationSet = sealRiskSourceObservationSet({
+      schemaVersion: 1,
+      runId: lease.runId,
+      workItemId: lease.workItemId,
+      subjectCoreDigest: lease.subjectCoreDigest,
+      attempt: lease.attempt,
+      workerId: worker.id,
+      producerStates: [
+        { producer: 'visual', status: 'NOT_APPLICABLE' },
+        { producer: 'baseline', status: lease.executionDescriptor.targetRole === 'production' ? 'COMPLETE' : 'NOT_APPLICABLE' },
+        { producer: 'evidence-pipeline', status: 'COMPLETE' },
+      ],
+      observations: [],
+    });
+    const productionFailure = lease.executionDescriptor.targetRole === 'production';
+    const inbox = await publishAttemptEvidence(store, lease.runId, lease, {
+      outcome: productionFailure ? 'completed_product_failure' : 'completed_pass',
+      reason: productionFailure ? 'known-production-defect' : null,
+      artifacts: [], riskSourceObservationSet,
+      executionDescriptorDigest: lease.executionDescriptorDigest,
+    });
+    await adoptAttemptEvidence(store, lease.runId, supervisor.coordinator(), inbox);
+  }
+  await supervisor.maintain();
+  const productionBaseline = await readCurrentEnvelope(store, 'run-production-baseline-comparative');
+  assert.equal(productionBaseline.decision.code, 'FEATURE_READY',
+    'A production-only failure must not block candidate promotion.');
+  assert(productionBaseline.riskRegister.risks.some(({ category, source }) => (
+    category === 'production-baseline-defect' && source.kind === 'oracle-execution'
+  )), 'The non-blocking production failure must remain visible as canonical baseline risk.');
+
+  const mixedBaselineLaunch = compileSharedLaunchPlan({
+    intent: { schemaVersion: 1, runContract: {
+      schemaVersion: 1,
+      mode: 'comparative',
+      candidateUrl: 'https://candidate.example.test',
+      productionUrl: 'https://production.example.test',
+      targetIds: ['candidate-desktop-chromium', 'candidate-mobile-chromium', 'production-mobile-chromium'],
+      scope: { qualifier: 'TARGETED', pluginIds: [], auditIds: ['A11Y-001'], areas: [] },
+    } },
+    pluginRegistry,
+    targetRegistry,
+    runnerRevision: digest('1'),
+    configurationRevision: digest('2'),
+    environmentRevision: digest('3'),
+    deploymentIdentity: { kind: 'target-preflight-set', value: digest('4') },
+  });
+  await createParentRun(store, { runId: 'run-mixed-baseline-comparative', ...mixedBaselineLaunch.createParentRunInput });
+  while (true) {
+    let lease;
+    try { lease = await supervisor.claim(worker); } catch (error) {
+      if (error?.code === 'NO_WORK_AVAILABLE') break;
+      throw error;
+    }
+    if (lease.runId !== 'run-mixed-baseline-comparative') continue;
+    const productionFailure = lease.executionDescriptor.targetRole === 'production';
+    const candidateOnlyFailure = lease.executionDescriptor.targetId === 'candidate-desktop-chromium';
+    const riskSourceObservationSet = sealRiskSourceObservationSet({
+      schemaVersion: 1,
+      runId: lease.runId,
+      workItemId: lease.workItemId,
+      subjectCoreDigest: lease.subjectCoreDigest,
+      attempt: lease.attempt,
+      workerId: worker.id,
+      producerStates: [
+        { producer: 'visual', status: 'NOT_APPLICABLE' },
+        { producer: 'baseline', status: productionFailure ? 'COMPLETE' : 'NOT_APPLICABLE' },
+        { producer: 'evidence-pipeline', status: 'COMPLETE' },
+      ],
+      observations: [],
+    });
+    const failed = productionFailure || candidateOnlyFailure;
+    const inbox = await publishAttemptEvidence(store, lease.runId, lease, {
+      outcome: failed ? 'completed_product_failure' : 'completed_pass',
+      reason: failed ? 'mixed-baseline-fixture' : null,
+      artifacts: [], riskSourceObservationSet,
+      executionDescriptorDigest: lease.executionDescriptorDigest,
+    });
+    await adoptAttemptEvidence(store, lease.runId, supervisor.coordinator(), inbox);
+  }
+  await supervisor.maintain();
+  const mixedBaseline = await readCurrentEnvelope(store, 'run-mixed-baseline-comparative');
+  assert.equal(mixedBaseline.decision.code, 'NOT_READY_TEST_FAILURE',
+    'An unrelated candidate-only regression must still block release.');
+  assert(mixedBaseline.riskRegister.risks.some(({ category, source }) => (
+    category === 'production-baseline-defect' && source.kind === 'oracle-execution'
+  )), 'Production baseline context must remain visible beside a separate candidate regression.');
+
   const singleLaunch = compileSharedLaunchPlan({
     intent: { schemaVersion: 1, runContract: {
       schemaVersion: 1,

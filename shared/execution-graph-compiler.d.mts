@@ -10,6 +10,7 @@ export interface CanonicalWorkItemPlan {
   applicability: string;
   targetId: string;
   targetRole: string;
+  comparisonKey: string;
   capability: string;
   resourceClass: 'ordinary' | 'performance';
   productOracleVariant: string;

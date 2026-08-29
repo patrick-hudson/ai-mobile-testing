@@ -310,6 +310,20 @@ export function assembleReleaseProjectionInputs({ state, histories }) {
     workItemResults: oracleExecution.requiredWorkItemIds.map((id) => workResults.get(id)),
   }));
   const riskSources = [];
+  for (const oracleExecution of state.executionManifest.oracleExecutions) {
+    if (oracleExecution.baselinePolicy !== 'context-unless-candidate-regression-proven') continue;
+    const productionFailures = oracleExecution.workItemBindings
+      .filter(({ targetRole, workItemId }) => targetRole === 'production'
+        && workResults.get(workItemId)?.outcome === 'completed_product_failure');
+    if (productionFailures.length === 0) continue;
+    riskSources.push(derivedRisk(state, {
+      category: 'production-baseline-defect', severity: 'high',
+      source: { kind: 'oracle-execution', id: oracleExecution.id },
+      explanation: `${productionFailures.length} production-side Product Oracle execution${productionFailures.length === 1 ? '' : 's'} failed without proving a candidate regression.`,
+      recommendedAction: 'Review the production baseline evidence separately; this context does not block candidate promotion.',
+      reviewState: 'OPEN',
+    }));
+  }
   for (const limit of state.finalSubject.grantedAuthority.scope.knownLimits) {
     if (limit === 'development-certificate-bypass') continue;
     riskSources.push(derivedRisk(state, {

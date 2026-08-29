@@ -86,6 +86,36 @@ export function deriveReleaseDecision(value) {
     || result.subjectCoreDigest !== finalSubject.subjectCoreDigest)) {
     failContract('RELEASE_SUBJECT_MISMATCH', 'An oracle result is stale or belongs to another subject.');
   }
+  const workById = new Map(manifest.workItems.map((item) => [item.id, item]));
+  const declaredOracleById = new Map(manifest.oracleExecutions.map((oracle) => [oracle.id, oracle]));
+  for (const result of oracleResults) {
+    const declared = declaredOracleById.get(result.oracleExecutionId);
+    const expectedPolicy = {
+      definitionId: declared.definitionId,
+      requiredWorkItemIds: declared.requiredWorkItemIds,
+      productOracleVariant: declared.productOracleVariant ?? `${declared.definitionId}:all-required`,
+      baselinePolicy: declared.baselinePolicy ?? 'not-applicable',
+      workItemBindings: declared.workItemBindings ?? declared.requiredWorkItemIds.map((workItemId) => ({
+        workItemId,
+        targetRole: workById.get(workItemId)?.targetRole,
+        comparisonKey: workById.get(workItemId)?.targetId,
+      })),
+    };
+    const actualPolicy = {
+      definitionId: result.definitionId,
+      requiredWorkItemIds: result.adoptedWorkItemIds,
+      productOracleVariant: result.productOracleVariant ?? `${result.definitionId}:all-required`,
+      baselinePolicy: result.baselinePolicy ?? 'not-applicable',
+      workItemBindings: result.workItemBindings ?? result.adoptedWorkItemIds.map((workItemId) => ({
+        workItemId,
+        targetRole: workById.get(workItemId)?.targetRole,
+        comparisonKey: workById.get(workItemId)?.targetId,
+      })),
+    };
+    if (JSON.stringify(actualPolicy) !== JSON.stringify(expectedPolicy)) {
+      failContract('ORACLE_POLICY_MISMATCH', `Oracle result ${result.oracleExecutionId} does not match its sealed manifest policy.`);
+    }
+  }
   if (!Array.isArray(value.releaseDispositions)) failContract('INVALID_CONTRACT', 'releaseDispositions must be an array.');
   const dispositions = value.releaseDispositions.map(parseDisposition);
   if (dispositions.some(({ executionId }) => !declaredIds.includes(executionId))) {
