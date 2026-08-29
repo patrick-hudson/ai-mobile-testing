@@ -116,6 +116,17 @@ assert.deepEqual(parseReleaseSubjectCore(full.subjectCore), full.subjectCore);
 assert.deepEqual(parseExecutionManifest(full.executionManifest), full.executionManifest);
 assert.deepEqual(parseFinalReleaseSubject(full.finalSubject), full.finalSubject);
 assert.deepEqual(parseWorkItemResult(full.workItemResults[0]), full.workItemResults[0]);
+const repeatedEvidence = sealWorkItemResult({
+  schemaVersion: 1,
+  workItemId: 'work-repeated-evidence',
+  subjectCoreDigest: full.subjectCore.digest,
+  attempt: 1,
+  authoritative: true,
+  outcome: 'completed_pass',
+  evidenceDigests: [DIGEST_A, DIGEST_A],
+});
+assert.deepEqual(repeatedEvidence.evidenceDigests, [DIGEST_A, DIGEST_A]);
+assert.deepEqual(parseWorkItemResult(repeatedEvidence), repeatedEvidence);
 assert.deepEqual(parseOracleResult(full.oracleResults[0]), full.oracleResults[0]);
 const fullDecision = deriveReleaseDecision({
   schemaVersion: 1,

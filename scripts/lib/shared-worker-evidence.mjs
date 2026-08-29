@@ -70,7 +70,6 @@ export async function collectSharedWorkerEvidence(evidenceRoot, { code, signal =
   const declarations = manifest.artifacts;
   const uploads = [];
   const names = new Set();
-  const digests = new Set();
   let totalBytes = 0;
   const realRoot = await fs.realpath(evidenceRoot);
   for (const declaration of declarations) {
@@ -103,9 +102,7 @@ export async function collectSharedWorkerEvidence(evidenceRoot, { code, signal =
     totalBytes += bytes.length;
     if (totalBytes > MAX_WORKER_EVIDENCE_BYTES) throw new Error('Executor artifacts exceed the attempt evidence byte bound.');
     const digest = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
-    if (digests.has(digest)) throw new Error(`Executor declared duplicate artifact content for ${name}.`);
     names.add(name);
-    digests.add(digest);
     uploads.push({
       name, mediaType: declaration.mediaType.toLowerCase(), sizeBytes: bytes.length,
       digest, contentBase64: bytes.toString('base64'),

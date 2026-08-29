@@ -16,10 +16,18 @@ export const WORK_ITEM_OUTCOMES = Object.freeze([
   'cancelled',
   'incomplete_unknown',
 ]);
+const MAX_WORK_ITEM_EVIDENCE_DIGESTS = 64;
 
 function positiveInteger(value, label) {
   if (!Number.isSafeInteger(value) || value < 1) failContract('INVALID_CONTRACT', `${label} must be a positive integer.`);
   return value;
+}
+
+function orderedEvidenceDigests(value) {
+  if (!Array.isArray(value) || value.length > MAX_WORK_ITEM_EVIDENCE_DIGESTS) {
+    failContract('INVALID_CONTRACT', `evidenceDigests must be an array with at most ${MAX_WORK_ITEM_EVIDENCE_DIGESTS} entries.`);
+  }
+  return value.map((digest) => assertDigest(digest, 'evidenceDigests entry'));
 }
 
 function parseWorkItem(value, index) {
@@ -117,7 +125,7 @@ export function sealWorkItemResult(value) {
     attempt: positiveInteger(value.attempt, 'attempt'),
     authoritative: value.authoritative,
     outcome: value.outcome,
-    evidenceDigests: uniqueStrings(value.evidenceDigests, 'evidenceDigests').map((digest) => assertDigest(digest, 'evidenceDigests entry')),
+    evidenceDigests: orderedEvidenceDigests(value.evidenceDigests),
   };
   return freezeContract({ ...body, digest: canonicalDigest(body) });
 }

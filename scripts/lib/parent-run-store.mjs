@@ -1294,9 +1294,6 @@ export async function publishAttemptEvidence(store, runId, lease, result) {
   if (new Set(uploads.map(({ name }) => name)).size !== uploads.length) {
     fail('STORE_SCHEMA_INVALID', 'Attempt evidence contains a duplicate artifact name.');
   }
-  if (new Set(uploads.map(({ digest }) => digest)).size !== uploads.length) {
-    fail('STORE_SCHEMA_INVALID', 'Attempt evidence contains duplicate artifact content.');
-  }
   if (uploads.reduce((total, artifact) => total + artifact.sizeBytes, 0) > MAX_ATTEMPT_EVIDENCE_BYTES) {
     fail('STORE_SCHEMA_INVALID', 'Attempt evidence exceeds the total byte bound.');
   }
@@ -1414,7 +1411,6 @@ export async function adoptAttemptEvidence(store, runId, coordinator, inbox) {
     || !WORK_OUTCOMES.has(document.outcome) || !Array.isArray(document.evidenceDigests) || !Array.isArray(document.artifacts)
     || (document.reason !== null && (typeof document.reason !== 'string' || !document.reason || document.reason.length > 256))
     || document.evidenceDigests.length > MAX_ATTEMPT_ARTIFACTS || document.artifacts.length !== document.evidenceDigests.length
-    || new Set(document.evidenceDigests).size !== document.evidenceDigests.length
     || document.evidenceDigests.some((entry) => !DIGEST_PATTERN.test(entry))
     || digest !== canonicalDigest(body) || digest !== inbox.digest) fail('STORE_CORRUPT', 'Attempt evidence inbox is corrupt.');
   if (document.coordinatorEpoch !== coordinator?.epoch) {

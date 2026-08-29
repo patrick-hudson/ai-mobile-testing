@@ -68,6 +68,17 @@ try {
   const collected = await collectSharedWorkerEvidence(executorEvidenceRoot, { code: 0, signal: null }, executorLease);
   assert.equal(collected.artifacts[0].name, 'screens/home.png');
   assert.equal(collected.artifacts[0].contentBase64, Buffer.from('executor-screen').toString('base64'));
+  await fs.writeFile(path.join(executorEvidenceRoot, 'screens', 'home-copy.png'), 'executor-screen');
+  await fs.writeFile(path.join(executorEvidenceRoot, 'result.json'), JSON.stringify(executorResult({
+    artifacts: [
+      { path: 'screens/home.png', mediaType: 'image/png' },
+      { path: 'screens/home-copy.png', mediaType: 'image/png' },
+    ],
+  })));
+  const repeatedBytes = await collectSharedWorkerEvidence(executorEvidenceRoot, { code: 0, signal: null }, executorLease);
+  assert.equal(repeatedBytes.artifacts.length, 2);
+  assert.equal(repeatedBytes.artifacts[0].digest, repeatedBytes.artifacts[1].digest,
+    'distinct logical artifacts may legitimately contain identical bytes');
   await assert.rejects(
     collectSharedWorkerEvidence(executorEvidenceRoot, { code: null, signal: null }, executorLease),
     /terminated abnormally/,
@@ -298,12 +309,13 @@ try {
     }),
     (error) => error?.code === 'STORE_SCHEMA_INVALID',
   );
-  await assert.rejects(
-    publishAttemptEvidence(store, 'evidence-boundary-run', leases[6], {
-      outcome: 'completed_pass', artifacts: [upload('copy-a.txt', 'copy'), upload('copy-b.txt', 'copy')],
-    }),
-    (error) => error?.code === 'STORE_SCHEMA_INVALID',
-  );
+  const repeatedContentInbox = await publishAttemptEvidence(store, 'evidence-boundary-run', leases[6], {
+    outcome: 'completed_pass', artifacts: [upload('copy-a.txt', 'copy'), upload('copy-b.txt', 'copy')],
+  });
+  await adoptAttemptEvidence(store, 'evidence-boundary-run', recoveryCoordinator, repeatedContentInbox);
+  const repeatedContentState = await readParentRun(store, 'evidence-boundary-run');
+  assert.deepEqual(repeatedContentState.workItems['evidence-7'].canonicalResult.evidenceDigests,
+    [upload('copy-a.txt', 'copy').digest, upload('copy-b.txt', 'copy').digest]);
   const tamperInbox = await publishAttemptEvidence(store, 'evidence-boundary-run', leases[7], {
     outcome: 'completed_pass', artifacts: [upload('screens/declared.png', 'original', 'image/png')],
   });
