@@ -7,6 +7,7 @@ import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promis
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { canonicalDigest } from '../shared/canonical-contract.mjs';
+import { sealReleaseSubjectCore } from '../shared/release-subject.mjs';
 import { openScopedCredentialAuthority } from '../portal/scoped-credential-authority.mjs';
 import {
   acquireCoordinator,
@@ -77,14 +78,41 @@ try {
     verifyStorage: false,
   });
   const sharedRunId = 'shared-op-0001';
+  const sharedSubjectCore = sealReleaseSubjectCore({
+    schemaVersion: 1,
+    deploymentIdentity: { kind: 'build', value: 'shared-portal-read-auth-fixture' },
+    targets: [{ role: 'audited', origin: 'https://beta.example.test' }],
+    mode: 'single-site',
+    requestedAuthority: {
+      qualifier: 'FULL',
+      scope: {
+        features: ['site'], definitions: ['SITE-001'], targets: ['audited-desktop'], knownLimits: [],
+      },
+    },
+    revisions: {
+      runner: `sha256:${'1'.repeat(64)}`,
+      plugins: `sha256:${'2'.repeat(64)}`,
+      targets: `sha256:${'3'.repeat(64)}`,
+      configuration: `sha256:${'4'.repeat(64)}`,
+    },
+    environmentIdentity: `sha256:${'5'.repeat(64)}`,
+    certificatePolicy: 'strict',
+  });
   await createParentRun(sharedStore, {
     runId: sharedRunId,
-    subjectCoreDigest: `sha256:${'a'.repeat(64)}`,
+    subjectCore: sharedSubjectCore,
     workItems: [{
       id: 'work-shared-op-0001', maxAttempts: 1,
       capability: 'browser:chromium', targetId: 'candidate',
     }],
   });
+  for (let index = 1; index <= 17; index += 1) {
+    await createConsoleDiscoveryFixture(
+      sharedStore,
+      sharedSubjectCore,
+      `shared-refresh-seed-${String(index).padStart(2, '0')}`,
+    );
+  }
   const sharedCoordinator = await acquireCoordinator(sharedStore, sharedRunId, {
     ownerId: 'portal-artifact-fixture', leaseMs: 1_000,
   });
@@ -189,6 +217,7 @@ try {
     AUDIT_LEGACY_AUTHORITY_FENCE_ROOT: legacyAuthorityFenceRoot,
     PORTAL_EXTERNAL_RUN_SYNC_MS: '60000',
     PORTAL_SHARED_READ_REAUTH_MS: '60000',
+    PORTAL_SINGLE_SITE_AI_REVIEW_SYNC_MS: '500',
     PORTAL_E2E_FAILURE_INJECTION: '1',
   };
   for (const name of [
@@ -197,6 +226,12 @@ try {
   ]) delete environment[name];
 
   portal = await startPortal({ environment, origin });
+
+  const viewerAllCookie = await browserLogin(origin, viewerAll.credential);
+  await waitForConsoleRun(origin, viewerAllCookie.cookie, sharedRunId);
+  const postStartupRunId = 'shared-refresh-zz-new';
+  await createConsoleDiscoveryFixture(sharedStore, sharedSubjectCore, postStartupRunId);
+  await waitForConsoleRun(origin, viewerAllCookie.cookie, postStartupRunId);
 
   const sharedOperatorCookie = await browserLogin(origin, operator.credential);
   for (const { method, pathname } of [
@@ -431,7 +466,6 @@ try {
   });
   assert.equal(deliverySharedArtifact.status, 403, 'delivery credentials may not read canonical shared evidence');
 
-  const viewerAllCookie = await browserLogin(origin, viewerAll.credential);
   const list = await fetch(`${origin}/api/runs`, { headers: { Cookie: viewerAllCookie.cookie } });
   const listBody = await list.text();
   assert.equal(list.status, 200, listBody);
@@ -536,6 +570,36 @@ async function browserLogin(origin, credential) {
   assert.equal(response.status, 200, await response.text());
   const setCookie = response.headers.get('set-cookie') ?? '';
   return { cookie: setCookie.split(';', 1)[0], setCookie };
+}
+
+async function createConsoleDiscoveryFixture(store, subjectCore, runId) {
+  await createParentRun(store, {
+    runId,
+    subjectCore,
+    workItems: [{
+      id: `work-${runId}`,
+      maxAttempts: 1,
+      capability: 'browser:chromium',
+      targetId: 'audited-desktop',
+    }],
+  });
+}
+
+async function waitForConsoleRun(origin, cookie, runId) {
+  const deadline = Date.now() + 8_000;
+  let lastBody = null;
+  while (Date.now() < deadline) {
+    const response = await fetch(`${origin}/api/console/v1/runs?mode=all&scope=all&sort=recent&limit=100`, {
+      headers: { Cookie: cookie },
+    });
+    const body = await response.text();
+    assert.equal(response.status, 200, body);
+    lastBody = JSON.parse(body);
+    const record = lastBody.data.items.find((item) => item.recordType === 'run' && item.runId === runId);
+    if (record) return;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.fail(`Shared run ${runId} did not reach the console index. ${JSON.stringify(lastBody?.limitations ?? [])}`);
 }
 
 async function startPortal({ environment, origin }) {

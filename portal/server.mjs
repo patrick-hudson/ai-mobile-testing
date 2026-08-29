@@ -27,6 +27,7 @@ import { ControlPlaneError, validateMutationDeployment } from '../shared/control
 import { assertSharedListScope, classifySharedReadRequest } from './shared-read-policy.mjs';
 import {
   ARTIFACT_READ_LEASE_MS,
+  MAX_DISCOVERED_PARENT_RUNS,
   listAdoptedAttemptArtifacts,
   listParentRunIds,
   openAdoptedAttemptArtifact,
@@ -317,6 +318,7 @@ const MAX_SINGLE_SITE_CONSOLE_STATE_BYTES = 1024 * 1024;
 const MAX_SINGLE_SITE_CONSOLE_FINALIZATION_BYTES = 64 * 1024;
 const MAX_COMPARATIVE_CONSOLE_MANIFEST_BYTES = 1024 * 1024;
 const MAX_CONSOLE_KNOWN_SINGLE_SITE_JOBS = 10_000;
+const MAX_CONSOLE_SHARED_PARENT_RUNS = MAX_DISCOVERED_PARENT_RUNS;
 
 const targetRegistry = loadPortalTargetRegistry(join(REPOSITORY_ROOT, 'audit', 'targets.generated.json'));
 const targetRegistryDocument = JSON.parse(
@@ -479,6 +481,8 @@ let consoleSingleSiteBackfillIterator = null;
 let consoleSingleSitePendingEntry = null;
 let consoleSharedParentRunIds = [];
 let consoleSharedParentRunCursor = 0;
+let consoleSharedParentRunSweepVisited = 0;
+let consoleSharedParentRunRefreshRunning = false;
 let consoleSharedParentRunBackfillRevision = null;
 let consoleSharedParentRunBackfillDone = true;
 let consoleSharedParentRunBackfillLimitation = null;
@@ -1272,6 +1276,7 @@ async function beginConsoleIndexBackfill() {
   consoleSingleSiteBackfillRecords = 0;
   consoleSharedParentRunIds = [];
   consoleSharedParentRunCursor = 0;
+  consoleSharedParentRunSweepVisited = 0;
   consoleSharedParentRunBackfillRevision = null;
   consoleSharedParentRunBackfillDone = !sharedParentRunStore;
   consoleSharedParentRunBackfillLimitation = null;
@@ -1297,9 +1302,9 @@ async function beginConsoleIndexBackfill() {
     });
     try {
       consoleSharedParentRunIds = await listParentRunIds(sharedParentRunStore, {
-        limit: MAX_CONSOLE_KNOWN_SINGLE_SITE_JOBS,
+        limit: MAX_CONSOLE_SHARED_PARENT_RUNS,
       });
-      if (consoleSharedParentRunIds.length >= MAX_CONSOLE_KNOWN_SINGLE_SITE_JOBS) {
+      if (consoleSharedParentRunIds.length >= MAX_CONSOLE_SHARED_PARENT_RUNS) {
         consoleSharedParentRunBackfillLimitation = 'source-limit';
       }
     } catch (error) {
@@ -1488,6 +1493,10 @@ async function backfillSharedParentRunConsoleIndexSlice() {
     }
   }
   consoleSharedParentRunBackfillDone = consoleSharedParentRunCursor >= consoleSharedParentRunIds.length;
+  if (consoleSharedParentRunBackfillDone) {
+    consoleSharedParentRunCursor = 0;
+    consoleSharedParentRunSweepVisited = 0;
+  }
   const complete = consoleSharedParentRunBackfillDone && consoleSharedParentRunBackfillLimitation === null;
   consoleIndex.updateBackfill(SHARED_PARENT_RUN_CONSOLE_SOURCE_ID, {
     revision: consoleSharedParentRunBackfillRevision,
@@ -1521,37 +1530,43 @@ async function runConsoleIndexMaintenanceSlice() {
 
 async function refreshSharedParentRunConsoleIndexSlice() {
   if (!sharedParentRunStore || !consoleSharedParentRunBackfillDone
-    || consoleMaintenanceAbortController?.signal.aborted) return;
-  const startedAt = performance.now();
-  let work = createConsoleReadWork();
-  let visited = 0;
-  while (visited < consoleSharedParentRunIds.length
-    && work.recordsRead < DEFAULT_CONSOLE_INDEX_BUDGET.maxRecords
-    && work.sourceFilesRead + 2 <= DEFAULT_CONSOLE_INDEX_BUDGET.maxSourceFiles
-    && performance.now() - startedAt < DEFAULT_CONSOLE_INDEX_BUDGET.maxElapsedMs) {
-    const slot = consoleSharedParentRunCursor % Math.max(1, consoleSharedParentRunIds.length);
-    const runId = consoleSharedParentRunIds[slot];
-    consoleSharedParentRunCursor = (slot + 1) % Math.max(1, consoleSharedParentRunIds.length);
-    visited += 1;
-    const consumed = consumeConsoleReadWork(work, DEFAULT_CONSOLE_INDEX_BUDGET, {
-      recordsRead: 1,
-      sourceFilesRead: 2,
-    });
-    if (!consumed.accepted) break;
-    work = consumed.work;
-    try {
-      upsertConsoleRecordSet(await sharedParentRunConsoleIndexRecord(runId), []);
-    } catch (error) {
-      if (error?.code !== 'ENOENT') {
-        console.error(`[PORTAL_CONSOLE_REFRESH_REJECTED] shared parent run ${runId}: ${redactLogValue(error.message)}`);
+    || consoleMaintenanceAbortController?.signal.aborted || consoleSharedParentRunRefreshRunning) return;
+  consoleSharedParentRunRefreshRunning = true;
+  try {
+    const startedAt = performance.now();
+    let work = createConsoleReadWork();
+    while (consoleSharedParentRunSweepVisited < consoleSharedParentRunIds.length
+      && work.recordsRead < DEFAULT_CONSOLE_INDEX_BUDGET.maxRecords
+      && work.sourceFilesRead + 2 <= DEFAULT_CONSOLE_INDEX_BUDGET.maxSourceFiles
+      && performance.now() - startedAt < DEFAULT_CONSOLE_INDEX_BUDGET.maxElapsedMs) {
+      const slot = consoleSharedParentRunCursor % Math.max(1, consoleSharedParentRunIds.length);
+      const runId = consoleSharedParentRunIds[slot];
+      const consumed = consumeConsoleReadWork(work, DEFAULT_CONSOLE_INDEX_BUDGET, {
+        recordsRead: 1,
+        sourceFilesRead: 2,
+      });
+      if (!consumed.accepted) break;
+      work = consumed.work;
+      consoleSharedParentRunCursor = (slot + 1) % Math.max(1, consoleSharedParentRunIds.length);
+      consoleSharedParentRunSweepVisited += 1;
+      try {
+        upsertConsoleRecordSet(await sharedParentRunConsoleIndexRecord(runId), []);
+      } catch (error) {
+        if (error?.code !== 'ENOENT') {
+          console.error(`[PORTAL_CONSOLE_REFRESH_REJECTED] shared parent run ${runId}: ${redactLogValue(error.message)}`);
+        }
       }
     }
-  }
-  if (consoleSharedParentRunIds.length === 0 || visited >= consoleSharedParentRunIds.length) {
-    consoleSharedParentRunIds = await listParentRunIds(sharedParentRunStore, {
-      limit: MAX_CONSOLE_KNOWN_SINGLE_SITE_JOBS,
-    });
-    consoleSharedParentRunCursor = 0;
+    if (consoleSharedParentRunIds.length === 0
+      || consoleSharedParentRunSweepVisited >= consoleSharedParentRunIds.length) {
+      consoleSharedParentRunIds = await listParentRunIds(sharedParentRunStore, {
+        limit: MAX_CONSOLE_SHARED_PARENT_RUNS,
+      });
+      consoleSharedParentRunCursor = 0;
+      consoleSharedParentRunSweepVisited = 0;
+    }
+  } finally {
+    consoleSharedParentRunRefreshRunning = false;
   }
 }
 
@@ -1675,6 +1690,8 @@ async function closeConsoleIndexMaintenance() {
   consoleKnownSingleSiteAiOptIn.clear();
   consoleSharedParentRunIds = [];
   consoleSharedParentRunCursor = 0;
+  consoleSharedParentRunSweepVisited = 0;
+  consoleSharedParentRunRefreshRunning = false;
   for (const { task } of consoleReportProjectionTasks.values()) {
     cancelConsoleReportProjectionTask(task);
   }

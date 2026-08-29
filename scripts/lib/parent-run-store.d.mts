@@ -7,6 +7,7 @@ export const RELEASE_AUTHORITY_PHASES: readonly ['SHADOW', 'DRAINING', 'ACTIVE',
 export const MAX_ATTEMPT_ARTIFACTS: 64;
 export const MAX_ATTEMPT_ARTIFACT_BYTES: number;
 export const MAX_ATTEMPT_EVIDENCE_BYTES: number;
+export const MAX_DISCOVERED_PARENT_RUNS: 2048;
 export const ARTIFACT_READ_LEASE_MS: number;
 export interface ParentRunStore { root: string; clock(): number; manifest: any; buildIdentity: string }
 export interface CoordinatorFence { ownerId: string; epoch: number; token: string; acquiredAt: string; expiresAt: string }
