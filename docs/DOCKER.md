@@ -420,7 +420,7 @@ For the shipped beta origin:
 AUDIT_PREVIEW_TLS_BYPASS_ALLOWLIST=https://beta.quitting7oh-org.pages.dev npm run portal
 ```
 
-Production-role Single-site runs always use strict TLS. The allowlist constrains which audited origin may request the exception; Playwright's browser-context bypass can still cover that run's redirects and subresources. The exception therefore does not make invalid certificates trustworthy: it records `development-certificate-bypass`, downgrades Evidence Authority to non-authoritative, and prevents the result from being presented as unqualified healthy promotion evidence. Prefer installing the correct public Netskope/development CA; use bypass only to diagnose an explicitly allowlisted Preview deployment.
+Production-role Single-site runs always use strict TLS. The allowlist constrains which audited origin may request the exception; Playwright's browser-context bypass can still cover that run's redirects and subresources. The exception therefore does not make invalid certificates trustworthy: it records `development-certificate-bypass` and downgrades Evidence Authority to non-authoritative. Passing required work may still yield a scope-qualified ready decision, but promotion policy must explicitly reject or separately handle the non-authoritative evidence; readiness alone is insufficient. Prefer installing the correct public Netskope/development CA; use bypass only to diagnose an explicitly allowlisted Preview deployment.
 
 ## Durable evidence and permissions
 

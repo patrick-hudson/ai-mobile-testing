@@ -99,7 +99,7 @@ The final report keeps these dimensions separate:
 
 | Dimension | Values | What it means |
 | --- | --- | --- |
-| **Release Decision** | `RELEASE READY`, `FEATURE READY`, `NOT READY` | Authoritative automated outcome for the exact certified scope |
+| **Release Decision** | `RELEASE READY`, `FEATURE READY`, `NOT READY` | Automated outcome for the exact certified scope; promotion also requires authoritative evidence |
 | **Scope** | `FULL`, `TARGETED` | Whether the complete versioned profile or a subset ran |
 | **Coverage** | `COMPLETE`, `GAPS`, `UNKNOWN` | Whether standalone oracles, cases, routes, and targets were available |
 | **Manual acceptance** | `NOT_REQUIRED`, `OUTSTANDING`, `FAILED_OR_BLOCKED`, `COMPLETE` | Whether human-only physical-device, assistive-technology, or design review is unnecessary, pending, unsuccessful, or complete |
@@ -377,7 +377,13 @@ confined to one origin after redirects and subresource loads.
 Single-site Preview runs have a narrow development exception. `preview-bypass`
 is accepted only when the deployment role is Preview and the exact normalized
 origin appears in `AUDIT_PREVIEW_TLS_BYPASS_ALLOWLIST`. The resulting evidence is
-always non-authoritative. Production remains strict.
+always non-authoritative. Required executions can still produce a scope-qualified
+`RELEASE READY` or `FEATURE READY` decision because the bypass is a non-blocking
+risk, but that decision is not promotion-eligible evidence. The exact-promotion
+policy must explicitly reject it before delivery; any other delivery policy must
+also reject or separately route non-authoritative evidence instead of treating a
+ready label as sufficient. A ready label alone is not a promotion instruction.
+Production remains strict.
 
 See [certificate trust details](certs/README.md) and the
 [TLS operations guide](docs/DOCKER.md#tls-trust-and-development-bypass).
@@ -561,8 +567,10 @@ For portal work, keep `PORTAL_MAX_CONCURRENT_RUNS=1` and lower `AUDIT_WORKERS`.
 
 Prefer installing the correct CA. For an explicitly confirmed Preview origin,
 add its exact normalized origin to `AUDIT_PREVIEW_TLS_BYPASS_ALLOWLIST` and request
-`preview-bypass`. The resulting evidence is diagnostic and non-authoritative.
-Comparative and Production runs cannot use the exception.
+`preview-bypass`. The resulting evidence is non-authoritative for promotion.
+Its automated decision can still be scope-qualified ready, but it cannot satisfy
+promotion evidence policy. Do not promote from it; Comparative and Production
+runs cannot use the exception.
 
 </details>
 

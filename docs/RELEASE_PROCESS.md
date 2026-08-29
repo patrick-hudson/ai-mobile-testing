@@ -10,7 +10,7 @@ A Single-site Audit examines exactly one Preview or Production deployment agains
 - **Visual Review** reports same-site baseline outcomes such as `UNCHANGED`, `CHANGED`, `REVIEWED`, absent, incompatible, or unavailable. A baseline decision or human review disposition routes visual drift; it does not erase a deterministic Finding or alter Site Health or Coverage.
 - **Pipeline Integrity** states whether collection, FFmpeg processing, immutable publication, and report generation completed safely. A pipeline failure makes the audit `INCOMPLETE`; a partial result must never be presented as healthy.
 
-Evidence Authority qualifies every result. Strict TLS using the baked public Netskope CA is the default. An exact-origin Preview exception remains clearly flagged and non-blocking; Production-role runs remain strict.
+Evidence Authority qualifies every result. Strict TLS using the baked public Netskope CA is the default. An exact-origin Preview exception remains clearly flagged and non-blocking, so passing required work may still yield a scope-qualified ready decision. The bypass simultaneously makes the evidence non-authoritative: exact promotion and any other delivery policy must explicitly reject or separately handle it rather than equating readiness with promotion eligibility. Until that gate is verified, do not promote from bypass-bearing evidence. Production-role runs remain strict.
 
 The canonical shared release head—not a legacy checklist or shadow result—controls automation. See [Shared release authority](SHARED_RELEASE_AUTHORITY.md) for topology, recovery, CI, promotion, cutover, and rollback.
 

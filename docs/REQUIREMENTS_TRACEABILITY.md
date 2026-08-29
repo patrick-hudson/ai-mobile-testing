@@ -2,6 +2,84 @@
 
 This ledger prevents requirements from disappearing as the suite evolves.
 
+## Shared release-authority closeout
+
+This section traces the [shared release decisions and Risk Register plan](plans/2026-08-28-1900-feat-shared-release-decisions-risk-register-plan.md). Commands are verification recipes for the current checkout, not claims that they ran for a particular commit. `Implemented; verify locally` means code and a focused host verifier exist. `Pending live proof` means closeout still needs fresh Docker or deployed-environment evidence. Durable proof counts only when it records and validates the source commit, built image, runtime configuration, and invocation; an older artifact or an unbound validator pass does not prove the current revision.
+
+### Requirements R1-R28
+
+| ID | Status | Implementation trace | Evidence command |
+| --- | --- | --- | --- |
+| R1 | Implemented; verify locally | Canonical Release Decision is separate from health, risks, and AI. | `npm run shared-release-contracts:self-test && npm run shared-release-projections:self-test` |
+| R2 | Implemented; verify locally | Full, targeted, and blocking decisions use stable distinct values. | `npm run shared-release-contracts:self-test` |
+| R3 | Implemented; verify locally | Empty/mismatched authority is rejected and required work is checked. | `npm run canonical-graph-compiler:self-test && npm run shared-launch-plan-compiler:self-test && npm run shared-first-publication:self-test` |
+| R4 | Implemented; verify locally | Canonical product and confirmed visual failures derive test-failure authority. | `npm run shared-release-projections:self-test && npm run single-site-visual-review:self-test` |
+| R5 | Implemented; verify locally | Exhausted operational work remains incomplete and blocks readiness. | `npm run shared-worker-pool:self-test && npm run shared-rekick-release:self-test` |
+| R6 | Implemented; verify locally | Risk metadata is independent of the decision and exit class. | `npm run shared-release-projections:self-test && npm run release-assertion-cli:self-test` |
+| R7 | Implemented; verify locally | Production-only/shared baseline defects remain risk context absent proved regression. | `npm run shared-release-projections:self-test && npm run release-truth:self-test` |
+| R8 | Implemented; verify locally | Canonical results and authorized dispositions alone affect subject-bound truth; AI stays advisory. | `npm run shared-release-contracts:self-test && npm run shared-release-projections:self-test && npm run ai-mode-aware:self-test` |
+| R9 | Implemented; verify locally | Shared risks include coverage, manual, visual, baseline, TLS, evidence, and pipeline categories. | `npm run shared-release-projections:self-test && npm run portal-console-risk:self-test` |
+| R10 | Implemented; verify locally | Risks carry typed provenance, lifecycle, actor, timestamps, effect, and action. | `npm run shared-release-contracts:self-test && npm run shared-control-plane:self-test` |
+| R11 | Partial; live surface proof pending | Portal/report projections colocate and order risks; accessible rendering still needs Docker browser proof. | `npm run portal-console-risk:self-test && npm run portal:e2e` |
+| R12 | Implemented; verify locally | Unreviewed visual change is risk; authorized defect disposition publishes blocking truth. | `npm run single-site-visual-review:self-test && npm run portal-visual-baseline-api:self-test` |
+| R13 | Implemented; verify locally | Manual work and coverage gaps stay visible without changing an otherwise ready decision. | `npm run shared-release-projections:self-test && npm run single-site-report:self-test` |
+| R14 | Partial; current Docker proof pending | Attempt/retry classification exists; worker-loss/restart needs fresh revision-bound Docker proof. | `npm run shared-worker-pool:self-test && npm run shared-docker-resilience:self-test` |
+| R15 | Partial; current Docker proof pending | Host tests keep unaffected work running; multi-container proof must be regenerated. | `npm run shared-worker-pool:self-test && npm run shared-docker-resilience:self-test` |
+| R16 | Implemented; verify locally | Incomplete-only rekick is addressed, authorized, idempotent, and bounded. | `npm run shared-rekick-release:self-test && npm run shared-control-plane:self-test` |
+| R17 | Implemented; verify locally | Rekick preserves subject/completed results and recomputes authority. | `npm run shared-rekick-release:self-test` |
+| R18 | Partial; live accessibility parity pending | Shared contracts cover both modes; keyboard/focus/announcement/non-color parity needs Docker browser proof. | `npm run shared-release-projections:self-test && npm run portal:e2e` |
+| R19 | Implemented; verify locally | Requested/granted authority and coverage are explicit; mismatches fail closed. | `npm run shared-launch-plan-compiler:self-test && npm run release-assertion-cli:self-test` |
+| R20 | Implemented; verify locally | Machine output exposes stable decision/exit, scope, revision, risk, blocker, and supersession fields. | `npm run shared-release-contracts:self-test && npm run release-assertion-cli:self-test` |
+| R21 | Implemented; verify locally | Comparative candidate/production semantics feed shared truth projections. | `npm run shared-release-projections:self-test && npm run release-truth:self-test` |
+| R22 | Implemented; verify locally | Comparison-only definitions are excluded and reported as not applicable. | `npm run canonical-graph-compiler:self-test && npm run run-compiler:self-test` |
+| R23 | Partial; live deployment binding pending | Immutable-subject and exact-artifact checks exist; promotion needs a live run for the exact deployment/artifact. | `npm run shared-release-contracts:self-test && npm run release-artifact:self-test && npm run exact-promotion:self-test` |
+| R24 | Implemented; verify locally | Mutations are scoped, authorized, protected, attributed, and audited. | `npm run shared-control-plane:self-test && npm run portal-security:self-test` |
+| R25 | Implemented; verify locally | Release mutations supersede revisions and stale consumers fail. | `npm run shared-release-projections:self-test && npm run release-assertion-cli:self-test` |
+| R26 | Implemented; verify locally | Risk availability distinguishes loading/provisional/available/partial/empty/unavailable. | `npm run shared-release-contracts:self-test && npm run portal-console-risk:self-test` |
+| R27 | Partial; promotion-policy gate pending | Preview bypass is non-blocking, so the decision may be scope-qualified ready, while Evidence Authority is non-authoritative. Promotion must reject or explicitly route it. The current exact-promotion verifier does not prove that rejection. | Run `npm run tls:check && npm run site-preflight:self-test && npm run single-site-launch:self-test`; extend and run `npm run exact-promotion:self-test` with an explicit Preview-bypass rejection case before promotion closeout. |
+| R28 | Implemented; verify locally | Same-subject product-failure reruns are diagnostic; changed subjects are rejected and canonical truth remains unchanged. | `npm run shared-diagnostic-rerun:self-test` |
+
+### Acceptance examples AE1-AE16
+
+| ID | Status | Acceptance trace | Evidence command |
+| --- | --- | --- | --- |
+| AE1 | Implemented; verify locally | Full passing Single-site work can be ready with manual risk. | `npm run shared-release-projections:self-test` |
+| AE2 | Implemented; verify locally | Targeted passing work yields enumerated feature authority only. | `npm run shared-launch-plan-compiler:self-test && npm run shared-release-projections:self-test` |
+| AE3 | Implemented; verify locally | Coverage gap remains a prominent non-blocking risk. | `npm run shared-release-projections:self-test && npm run single-site-report:self-test` |
+| AE4 | Implemented; verify locally | Pending visual review is non-blocking; disposition supersedes truth correctly. | `npm run single-site-visual-review:self-test && npm run portal-visual-baseline-api:self-test` |
+| AE5 | Partial; current Docker proof pending | Exhaustion/rekick have host coverage; live worker loss needs fresh Docker evidence. | `npm run shared-rekick-release:self-test && npm run shared-docker-resilience:self-test` |
+| AE6 | Implemented; verify locally | Production-only defect remains baseline risk. | `npm run shared-release-projections:self-test && npm run release-truth:self-test` |
+| AE7 | Implemented; verify locally | Candidate regression yields test-failure authority with production context. | `npm run shared-release-projections:self-test && npm run release-truth:self-test` |
+| AE8 | Partial; live delivery proof pending | Ready-with-risks consumption has local coverage; delivery needs a live current-head promotion. | `npm run release-assertion-cli:self-test && npm run exact-promotion:self-test` |
+| AE9 | Implemented; verify locally | Empty/mismatched requested authority fails compilation or consumption. | `npm run shared-launch-plan-compiler:self-test && npm run release-assertion-cli:self-test` |
+| AE10 | Implemented; verify locally | Late visual defect supersedes ready truth and stale consumption fails. | `npm run single-site-visual-review:self-test && npm run release-assertion-cli:self-test` |
+| AE11 | Implemented; verify locally | Rekick rejects changed deployment/configuration identity. | `npm run shared-rekick-release:self-test` |
+| AE12 | Implemented; verify locally | Delayed/failed risk data is not rendered as clean empty state. | `npm run portal-console-risk:self-test && npm run shared-release-projections:self-test` |
+| AE13 | Implemented; verify locally | Unauthorized mutation fails; authorized duplicates are idempotent/auditable. | `npm run shared-control-plane:self-test && npm run portal-security:self-test` |
+| AE14 | Partial; promotion-policy gate pending | Passing work under allowlisted Preview bypass may be ready, but evidence is non-authoritative. Readiness is not promotion eligibility. Delivery policy must explicitly reject or separately handle this state; current exact-promotion coverage does not prove that gate. | Run `npm run tls:check && npm run site-preflight:self-test && npm run single-site-launch:self-test`; add a Preview-bypass rejection case to `npm run exact-promotion:self-test`. |
+| AE15 | Implemented; verify locally | Single-site reports comparison-only definitions as not applicable. | `npm run canonical-graph-compiler:self-test && npm run run-compiler:self-test` |
+| AE16 | Implemented; verify locally | Diagnostic rerun preserves failed canonical result/decision/head and rejects changed subject. | `npm run shared-diagnostic-rerun:self-test` |
+
+### Definition of Done
+
+| DoD item | Status | Evidence command or remaining gate |
+| --- | --- | --- |
+| One shared durable architecture serves both modes. | Partial; current Docker proof pending | `npm run canonical-graph-compiler:self-test && npm run shared-worker-pool:self-test && npm run shared-docker-resilience:self-test` |
+| Scaling changes scheduling only, not canonical truth, and improves the registered workload envelope. | Pending live proof | Run `npm run shared-docker-resilience:self-test` on the release revision and retain commit/image/config-bound 1→N→1 and throughput evidence. |
+| Every required execution is terminal or blocks ready; product failures never retry into passes. | Partial; current Docker proof pending | `npm run shared-worker-pool:self-test && npm run shared-diagnostic-rerun:self-test && npm run shared-docker-resilience:self-test` |
+| Both modes share revisioned truth, operations, exports, and accessible controls. | Partial; live accessibility proof pending | `npm run shared-release-projections:self-test && npm run portal:e2e` |
+| Rekick preserves work/subject; same-subject failure reruns stay diagnostic. | Implemented; verify locally | `npm run shared-rekick-release:self-test && npm run shared-diagnostic-rerun:self-test` |
+| All mutation principals are scoped, protected, attributed, and append-only audited. | Implemented; verify locally | `npm run shared-control-plane:self-test && npm run portal-security:self-test && npm run shared-worker-pool:self-test` |
+| Full beta Single-site and beta/production Comparative Docker suites pass, including crash/restart and scale. | Pending live proof | Run live both-mode CI canaries and `npm run shared-docker-resilience:self-test`; retain revision-bound receipts. Host tests do not close this gate. |
+| CI asserts current identity/revision before promotion without legacy fallback. | Partial; live promotion proof pending | Run `npm run shared-release-ci:self-test && npm run release-assertion-cli:self-test && npm run exact-promotion:self-test`, then exercise `.github/workflows/exact-promotion.yml` against a live current head. |
+| Legacy authority is retired while history remains readable. | Implemented; cutover rehearsal pending | `npm run shared-cutover-orchestrator:self-test && npm run shared-authority-selector:self-test`; retain a production-like cutover receipt. |
+| Shadow cannot become head; rollback cannot restore legacy authority. | Implemented; cutover rehearsal pending | `npm run shadow-validation:self-test && npm run shared-cutover-orchestrator:self-test` |
+| Store identity, schema, epoch, and writer protocol fail closed; cutover/rollback are rehearsed. | Partial; rehearsal pending | `npm run durable-parent-run-store:self-test && npm run shared-cutover-admission:self-test && npm run shared-cutover-orchestrator:self-test`; retain a production-like rehearsal receipt. |
+| CI consumes a live-head-bound single-use claim for the exact subject in the pinned runtime. | Partial; live promotion proof pending | Run `npm run release-assertion-cli:self-test && npm run exact-promotion:self-test`, then run the pinned workflow against the exact audited artifact/deployment. |
+| Operator/contributor docs cover architecture, scaling, recovery, risks, codes, destructive volumes, and plugins. | Implemented; review locally | Review [Shared release authority](SHARED_RELEASE_AUTHORITY.md), [Docker operations](DOCKER.md), [Release process](RELEASE_PROCESS.md), and [Plugin contract](PLUGINS.md); validate relative links and run `git diff --check`. |
+
+## Broader product traceability
+
 | Requirement | Implementation | Verification |
 | --- | --- | --- |
 | Compare old and redesigned environments | paired environment/project metadata and production route mapping | paired smoke/release projects and checklist environment badges |

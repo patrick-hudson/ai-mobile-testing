@@ -9,6 +9,7 @@ Single-site and Comparative audits use one durable release architecture. The mod
 - Deterministic product failures and failed visual assertions block the certified scope.
 - Required work that is missing, corrupt, abandoned after bounded retry, or owned by an unrecovered worker makes that scope `NOT READY — INCOMPLETE EXECUTION`.
 - Manual checks and unresolved human-review risks remain prominent and non-blocking until a deterministic automated test fails. They never silently become passes.
+- An allowlisted `preview-bypass` is also a non-blocking risk, so passing required work may still produce a scope-qualified ready decision. Its Evidence Authority is non-authoritative: readiness describes the automated outcome, not promotion eligibility. Exact promotion and any other delivery policy must explicitly reject or separately handle that state.
 - Every mode publishes the same revisioned Release Decision, Risk Register, operation history, report, gallery, and archive projection.
 
 The portal is a control and review surface. The canonical release head lives in the shared durable store and is the only source accepted by CI. Historical legacy `READY` files and shadow-validation output are diagnostic only.
@@ -53,6 +54,11 @@ shared-release-result.json
 ```
 
 The manifest binds every relative path to its byte length and SHA-256 digest. The candidate receipt binds those bytes and source revision to the audited candidate deployment. Immediately before delivery, CI rechecks the artifact, asserts the current shared head, consumes a short-lived single-use claim for the exact subject/revisions, rechecks the bytes again, and runs the pinned Wrangler Direct Upload command. Cloudflare and delivery credentials are file-only and are removed before the non-secret receipt is uploaded.
+
+A ready decision alone is insufficient. Promotion policy must also require
+authoritative evidence and explicitly reject a ready Preview run performed with
+`preview-bypass`. Until that rejection is covered by the exact-promotion verifier,
+do not treat this workflow as closed for bypass-bearing subjects.
 
 A provider retry can create a duplicate deployment record with identical bytes because Cloudflare deployment creation has no idempotency key. The shared claim and receipt serialize authority; an operational duplicate does not create different release truth.
 
