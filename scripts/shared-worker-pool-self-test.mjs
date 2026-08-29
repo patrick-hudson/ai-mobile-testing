@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { canonicalDigest } from '../shared/canonical-contract.mjs';
 import {
   classifyExecutionFailure,
   runSharedWorkerPool,
@@ -197,7 +198,10 @@ try {
   assert.equal(capabilityState.workItems['firefox-b'].attempts.length, 1, 'product failures stay terminal and receive no retry');
   assert.equal(capabilityState.workItems['chromium-a'].attempts[0].artifacts[0].name, 'screens/home.png');
   assert.deepEqual(capabilityState.workItems['chromium-a'].canonicalResult.evidenceDigests,
-    [upload('ignored', 'chromium-home', 'image/png').digest], 'canonical evidence digests are derived from adopted bytes');
+    capabilityState.workItems['chromium-a'].attempts[0].artifacts.map(({ memberDigest }) => memberDigest),
+    'canonical evidence membership is derived from ordered logical members');
+  assert.equal(capabilityState.workItems['chromium-a'].attempts[0].artifacts[0].digest,
+    upload('ignored', 'chromium-home', 'image/png').digest, 'content integrity retains its independent byte digest');
   assert.equal(capabilityState.resourceScheduling.exclusiveLease, null);
   assert.equal(capabilityState.resourceScheduling.performanceDrain, null);
 
@@ -263,13 +267,13 @@ try {
 
   await createParentRun(store, {
     runId: 'evidence-boundary-run', subjectCoreDigest: digest('6'), runnerRevision: 'runner-u4',
-    workItems: Array.from({ length: 8 }, (_, index) => ({
+    workItems: Array.from({ length: 9 }, (_, index) => ({
       id: `evidence-${index + 1}`, maxAttempts: 1, capability: 'browser:chromium', resourceClass: 'ordinary',
       targetId: 'candidate-desktop-chromium', specAffinity: null,
     })),
   });
   const leases = [];
-  for (let index = 0; index < 8; index += 1) {
+  for (let index = 0; index < 9; index += 1) {
     leases.push(await claimWorkItem(store, 'evidence-boundary-run', recoveryCoordinator, {
       workerId: `worker-evidence-${index + 1}`, workItemId: `evidence-${index + 1}`,
       capabilities: ['browser:chromium'], resourceClasses: ['ordinary'], leaseMs: 10_000,
@@ -314,8 +318,12 @@ try {
   });
   await adoptAttemptEvidence(store, 'evidence-boundary-run', recoveryCoordinator, repeatedContentInbox);
   const repeatedContentState = await readParentRun(store, 'evidence-boundary-run');
+  const repeatedArtifacts = repeatedContentState.workItems['evidence-7'].attempts[0].artifacts;
+  assert.equal(repeatedArtifacts[0].digest, repeatedArtifacts[1].digest, 'same bytes retain the same content digest');
+  assert.notEqual(repeatedArtifacts[0].memberDigest, repeatedArtifacts[1].memberDigest,
+    'distinct logical names retain distinct canonical evidence membership');
   assert.deepEqual(repeatedContentState.workItems['evidence-7'].canonicalResult.evidenceDigests,
-    [upload('copy-a.txt', 'copy').digest, upload('copy-b.txt', 'copy').digest]);
+    repeatedArtifacts.map(({ memberDigest }) => memberDigest));
   const tamperInbox = await publishAttemptEvidence(store, 'evidence-boundary-run', leases[7], {
     outcome: 'completed_pass', artifacts: [upload('screens/declared.png', 'original', 'image/png')],
   });
@@ -325,6 +333,26 @@ try {
     adoptAttemptEvidence(store, 'evidence-boundary-run', recoveryCoordinator, tamperInbox),
     (error) => error?.code === 'ARTIFACT_DIGEST_MISMATCH',
   );
+  const legacyInbox = await publishAttemptEvidence(store, 'evidence-boundary-run', leases[8], {
+    outcome: 'completed_pass', artifacts: [upload('legacy/result.json', '{"ok":true}', 'application/json')],
+  });
+  const legacyInboxPath = path.join(root, 'runs', 'evidence-boundary-run', legacyInbox.relativePath);
+  const legacyDocument = JSON.parse(await fs.readFile(legacyInboxPath, 'utf8'));
+  legacyDocument.evidenceDigests = legacyDocument.artifacts.map(({ digest: contentDigest }) => contentDigest);
+  legacyDocument.artifacts = legacyDocument.artifacts.map(({
+    name, mediaType, sizeBytes, digest: contentDigest, relativePath,
+  }) => ({ name, mediaType, sizeBytes, digest: contentDigest, relativePath }));
+  delete legacyDocument.digest;
+  legacyDocument.digest = canonicalDigest(legacyDocument);
+  await fs.writeFile(legacyInboxPath, `${JSON.stringify(legacyDocument)}\n`);
+  await adoptAttemptEvidence(store, 'evidence-boundary-run', recoveryCoordinator, {
+    ...legacyInbox,
+    digest: legacyDocument.digest,
+  });
+  const legacyState = await readParentRun(store, 'evidence-boundary-run');
+  assert.equal(legacyState.workItems['evidence-9'].canonicalResult.evidenceDigests[0],
+    legacyState.workItems['evidence-9'].attempts[0].artifacts[0].digest,
+    'legacy durable inbox records remain adoptable with their original content-digest identity');
 
   now += 10_001;
   await requeueExpiredWork(store, 'recovery-run', recoveryCoordinator);

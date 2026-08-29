@@ -9,6 +9,7 @@ import { parseExecutionManifest, sealWorkItemResult } from '../../shared/executi
 import { parseSingleSiteInventoryBarrier } from '../../shared/execution-graph-compiler.mjs';
 import { parseFinalReleaseSubject, parseReleaseSubjectCore } from '../../shared/release-subject.mjs';
 import { parseWorkExecutionDescriptor } from '../../shared/work-execution-descriptor.mjs';
+import { sealWorkItemEvidenceMember } from '../../shared/work-item-evidence-index.mjs';
 import {
   atomicWriteJson,
   atomicWriteFile,
@@ -134,10 +135,14 @@ function artifactName(value) {
   return value;
 }
 
-function decodeArtifactUpload(value) {
+function decodeArtifactUpload(value, context) {
+  const keys = Object.keys(value ?? {});
+  const indexed = keys.length === 8
+    && ['name', 'mediaType', 'sizeBytes', 'digest', 'logicalName', 'purpose', 'memberDigest', 'contentBase64']
+      .every((key) => key in value);
   if (!value || typeof value !== 'object' || Array.isArray(value)
-    || Object.keys(value).length !== 5
-    || !['name', 'mediaType', 'sizeBytes', 'digest', 'contentBase64'].every((key) => key in value)) {
+    || (!indexed && (keys.length !== 5
+      || !['name', 'mediaType', 'sizeBytes', 'digest', 'contentBase64'].every((key) => key in value)))) {
     fail('STORE_SCHEMA_INVALID', 'Artifact upload has an invalid schema.');
   }
   const name = artifactName(value.name);
@@ -155,13 +160,39 @@ function decodeArtifactUpload(value) {
   }
   const digest = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
   if (value.digest !== digest) fail('ARTIFACT_DIGEST_MISMATCH', `Artifact ${name} digest does not match its bytes.`);
-  return { name, mediaType: value.mediaType.toLowerCase(), sizeBytes: bytes.length, digest, bytes };
+  let member;
+  try {
+    member = sealWorkItemEvidenceMember({
+      workItemId: context.workItemId,
+      executionDescriptorDigest: context.executionDescriptorDigest,
+      ordinal: context.ordinal,
+      logicalName: indexed ? value.logicalName : name,
+      purpose: indexed ? value.purpose : 'structured',
+      mediaType: value.mediaType,
+      sizeBytes: bytes.length,
+      contentDigest: digest,
+      transportPath: name,
+    });
+  } catch (error) {
+    fail('STORE_SCHEMA_INVALID', `Artifact ${name} logical evidence membership is invalid: ${error.message}`);
+  }
+  if (indexed && value.memberDigest !== member.memberDigest) {
+    fail('ARTIFACT_MEMBER_DIGEST_MISMATCH', `Artifact ${name} member digest does not match its logical identity.`);
+  }
+  return {
+    name, mediaType: member.mediaType, sizeBytes: bytes.length, digest, bytes,
+    logicalName: member.logicalName, purpose: member.purpose, memberDigest: member.memberDigest,
+  };
 }
 
 function validateArtifactRecord(value, { runId, workItemId, attempt, leaseToken }) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)
-    || Object.keys(value).length !== 5
-    || !['name', 'mediaType', 'sizeBytes', 'digest', 'relativePath'].every((key) => key in value)) {
+  const keys = Object.keys(value ?? {});
+  const indexed = keys.length === 8
+    && ['name', 'mediaType', 'sizeBytes', 'digest', 'logicalName', 'purpose', 'memberDigest', 'relativePath']
+      .every((key) => key in value);
+  const legacy = keys.length === 5
+    && ['name', 'mediaType', 'sizeBytes', 'digest', 'relativePath'].every((key) => key in value);
+  if (!value || typeof value !== 'object' || Array.isArray(value) || (!indexed && !legacy)) {
     fail('STORE_CORRUPT', 'Stored artifact record has an invalid schema.');
   }
   let name;
@@ -170,14 +201,22 @@ function validateArtifactRecord(value, { runId, workItemId, attempt, leaseToken 
   }
   if (typeof value.mediaType !== 'string' || !ARTIFACT_MEDIA_TYPE.test(value.mediaType)
     || !Number.isSafeInteger(value.sizeBytes) || value.sizeBytes < 1 || value.sizeBytes > MAX_ATTEMPT_ARTIFACT_BYTES
-    || !DIGEST_PATTERN.test(value.digest)) {
+    || !DIGEST_PATTERN.test(value.digest)
+    || (indexed && (!DIGEST_PATTERN.test(value.memberDigest)
+      || typeof value.logicalName !== 'string' || !value.logicalName || value.logicalName.length > 240
+      || !['structured', 'primary', 'diagnostic'].includes(value.purpose)))) {
     fail('STORE_CORRUPT', 'Stored artifact metadata is invalid.');
   }
   const expected = path.posix.join('evidence', workItemId, `${String(attempt).padStart(6, '0')}-${leaseToken}`, name);
   if (value.relativePath !== expected || value.relativePath.includes('\\') || value.relativePath.startsWith('/')) {
     fail('STORE_CORRUPT', `Stored artifact path escaped attempt ${runId}/${workItemId}.`);
   }
-  return value;
+  return indexed ? value : {
+    ...value,
+    logicalName: value.name,
+    purpose: 'structured',
+    memberDigest: value.digest,
+  };
 }
 
 function exactKeys(value, keys, label) {
@@ -1290,7 +1329,12 @@ export async function publishAttemptEvidence(store, runId, lease, result) {
     || result.artifacts.length > MAX_ATTEMPT_ARTIFACTS) {
     fail('STORE_SCHEMA_INVALID', 'Attempt evidence outcome or artifacts are invalid.');
   }
-  const uploads = result.artifacts.map(decodeArtifactUpload);
+  const evidenceBindingDigest = lease.executionDescriptorDigest ?? lease.subjectCoreDigest ?? state.subjectCoreDigest;
+  const uploads = result.artifacts.map((artifact, index) => decodeArtifactUpload(artifact, {
+    workItemId: lease.workItemId,
+    executionDescriptorDigest: evidenceBindingDigest,
+    ordinal: index + 1,
+  }));
   if (new Set(uploads.map(({ name }) => name)).size !== uploads.length) {
     fail('STORE_SCHEMA_INVALID', 'Attempt evidence contains a duplicate artifact name.');
   }
@@ -1320,6 +1364,9 @@ export async function publishAttemptEvidence(store, runId, lease, result) {
       mediaType: upload.mediaType,
       sizeBytes: upload.sizeBytes,
       digest: upload.digest,
+      logicalName: upload.logicalName,
+      purpose: upload.purpose,
+      memberDigest: upload.memberDigest,
       relativePath,
     });
   }
@@ -1337,7 +1384,7 @@ export async function publishAttemptEvidence(store, runId, lease, result) {
     executionDescriptorDigest: result.executionDescriptorDigest ?? lease.executionDescriptorDigest ?? null,
     outcome: result.outcome,
     reason: schedulingString(result.reason ?? null, 'Attempt evidence reason', { nullable: true, maximum: 256 }),
-    evidenceDigests: artifacts.map(({ digest }) => digest),
+    evidenceDigests: artifacts.map(({ memberDigest }) => memberDigest),
     artifacts,
     publishedAt: timestamp(store),
   };
@@ -1437,7 +1484,7 @@ export async function adoptAttemptEvidence(store, runId, coordinator, inbox) {
     const artifact = validateArtifactRecord(document.artifacts[index], {
       runId, workItemId: document.workItemId, attempt: document.attempt, leaseToken: document.leaseToken,
     });
-    if (artifactNames.has(artifact.name) || document.evidenceDigests[index] !== artifact.digest) {
+    if (artifactNames.has(artifact.name) || document.evidenceDigests[index] !== artifact.memberDigest) {
       fail('STORE_CORRUPT', 'Attempt evidence artifact declaration is duplicated or out of order.');
     }
     artifactNames.add(artifact.name);

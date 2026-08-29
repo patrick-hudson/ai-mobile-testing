@@ -3,7 +3,7 @@ import type { CoordinatorFence, ParentRunStore, WorkLease } from './parent-run-s
 export class SharedWorkerPoolError extends Error { code: string; details?: unknown }
 export interface SharedWorkerDescriptor { id: string; capabilities: string[]; resourceClasses: ['ordinary' | 'performance'] }
 export interface ExecutionFailure { kind: string; trustedPlatformSignal?: boolean }
-export interface AttemptArtifactUpload { name: string; mediaType: string; sizeBytes: number; digest: string; contentBase64: string }
+export interface AttemptArtifactUpload { name: string; mediaType: string; sizeBytes: number; digest: string; logicalName: string; purpose: 'structured' | 'primary' | 'diagnostic'; memberDigest: string; contentBase64: string }
 export function classifyExecutionFailure(value?: ExecutionFailure): { outcome: 'completed_product_failure' | 'operational_failure'; reason: string; retryable: boolean };
 export function runSharedWorkerPool(options: {
   store: ParentRunStore;

@@ -19,6 +19,10 @@ import {
   sealWorkItemResult,
 } from '../shared/execution-contract.mjs';
 import {
+  parseWorkItemEvidenceIndex,
+  sealWorkItemEvidenceIndex,
+} from '../shared/work-item-evidence-index.mjs';
+import {
   assertConsumableReleaseDecision,
   deriveReleaseDecision,
   parseReleaseDecision,
@@ -127,6 +131,25 @@ const repeatedEvidence = sealWorkItemResult({
 });
 assert.deepEqual(repeatedEvidence.evidenceDigests, [DIGEST_A, DIGEST_A]);
 assert.deepEqual(parseWorkItemResult(repeatedEvidence), repeatedEvidence);
+const logicalEvidenceIndex = sealWorkItemEvidenceIndex({
+  workItemId: 'work-repeated-evidence',
+  executionDescriptorDigest: DIGEST_B,
+  row: {
+    caseId: 'HOME-001:fixture', definitionId: 'HOME-001', entrySpec: 'tests/smoke.spec.ts',
+    targetId: 'desktop-chromium', status: 'passed',
+    evidencePolicy: { mode: 'static-screenshot', rationale: 'Capture the rendered home page for review.' },
+  },
+  members: [
+    { logicalName: 'wide-home', purpose: 'primary', mediaType: 'image/png', sizeBytes: 10, contentDigest: DIGEST_A, transportPath: 'screens/wide.png' },
+    { logicalName: 'narrow-home', purpose: 'primary', mediaType: 'image/png', sizeBytes: 10, contentDigest: DIGEST_A, transportPath: 'screens/narrow.png' },
+  ],
+});
+assert.notEqual(logicalEvidenceIndex.members[0].memberDigest, logicalEvidenceIndex.members[1].memberDigest);
+assert.deepEqual(parseWorkItemEvidenceIndex(logicalEvidenceIndex), logicalEvidenceIndex);
+expectCode('INVALID_EVIDENCE_INDEX', () => parseWorkItemEvidenceIndex({
+  ...logicalEvidenceIndex,
+  members: null,
+}));
 assert.deepEqual(parseOracleResult(full.oracleResults[0]), full.oracleResults[0]);
 const fullDecision = deriveReleaseDecision({
   schemaVersion: 1,

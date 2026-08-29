@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -8,6 +9,7 @@ import { buildLiveRouteInventory } from '../shared/live-route-inventory.mjs';
 import { preflightQuitting7ohSite } from '../shared/site-preflight.mjs';
 import { sealSharedGenericRouteExecutionPublication } from '../shared/single-site-route-plan.mjs';
 import { parseWorkExecutionDescriptor } from '../shared/work-execution-descriptor.mjs';
+import { sealWorkItemEvidenceIndex, sealWorkItemEvidenceMember } from '../shared/work-item-evidence-index.mjs';
 import { startBrowserEgressProxy } from './lib/browser-egress-proxy.mjs';
 import { collectSharedPlaywrightArtifacts } from './lib/shared-playwright-work-item.mjs';
 
@@ -55,6 +57,18 @@ async function boundedJson(file, label) {
     throw new Error(`${label} must be a bounded regular JSON file.`);
   }
   return JSON.parse(await fs.readFile(file, 'utf8'));
+}
+
+async function generatedEvidenceDescriptor(evidenceRoot, pathname, mediaType, logicalName, purpose = 'structured') {
+  const bytes = await fs.readFile(path.join(evidenceRoot, ...pathname.split('/')));
+  return {
+    path: pathname,
+    mediaType,
+    logicalName,
+    purpose,
+    sizeBytes: bytes.length,
+    contentDigest: `sha256:${createHash('sha256').update(bytes).digest('hex')}`,
+  };
 }
 
 function safeInheritedEnvironment() {
@@ -163,14 +177,67 @@ async function spawnPlaywright(descriptor, artifactRoot, signal) {
       executionDescriptorDigest: descriptor.digest,
       rows: validated.rows,
     })}\n`, { mode: 0o600 });
+    const evidenceRoot = path.dirname(artifactRoot);
+    const members = [
+      ...(genericRoutePublicationArtifact === null ? [] : [await generatedEvidenceDescriptor(
+        evidenceRoot, genericRoutePublicationArtifact.path, genericRoutePublicationArtifact.mediaType,
+        'compiler-issued-generic-route-publication',
+      )]),
+      await generatedEvidenceDescriptor(evidenceRoot, 'playwright/work-item-rows.json', 'application/json', 'work-item-rows'),
+      ...validated.artifacts,
+    ];
+    const evidenceIndex = sealWorkItemEvidenceIndex({
+      workItemId: descriptor.workItemId,
+      executionDescriptorDigest: descriptor.digest,
+      row: {
+        caseId: descriptor.caseId,
+        definitionId: descriptor.definitionId,
+        entrySpec: descriptor.entrySpec,
+        targetId: descriptor.targetId,
+        status: validated.rows[0].status,
+        evidencePolicy: validated.rows[0].evidencePolicy,
+      },
+      members: members.map((member) => ({
+        logicalName: member.logicalName,
+        purpose: member.purpose,
+        mediaType: member.mediaType,
+        sizeBytes: member.sizeBytes,
+        contentDigest: member.contentDigest,
+        transportPath: member.path,
+      })),
+    });
+    const indexPath = path.join(artifactRoot, 'work-item-evidence-index.json');
+    await fs.writeFile(indexPath, `${JSON.stringify(evidenceIndex)}\n`, { flag: 'wx', mode: 0o600 });
+    const indexedMembers = evidenceIndex.members.map((member) => ({
+      path: member.transportPath,
+      mediaType: member.mediaType,
+      logicalName: member.logicalName,
+      purpose: member.purpose,
+      sizeBytes: member.sizeBytes,
+      contentDigest: member.contentDigest,
+      memberDigest: member.memberDigest,
+    }));
+    const indexArtifact = await generatedEvidenceDescriptor(
+      evidenceRoot, 'playwright/work-item-evidence-index.json', 'application/json', 'work-item-evidence-index',
+    );
+    const sealedIndexMember = sealWorkItemEvidenceMember({
+      workItemId: descriptor.workItemId,
+      executionDescriptorDigest: descriptor.digest,
+      ordinal: members.length + 1,
+      logicalName: indexArtifact.logicalName,
+      purpose: indexArtifact.purpose,
+      mediaType: indexArtifact.mediaType,
+      sizeBytes: indexArtifact.sizeBytes,
+      contentDigest: indexArtifact.contentDigest,
+      transportPath: indexArtifact.path,
+    });
     return {
       outcome: validated.outcome,
       reason: validated.outcome === 'completed_pass' ? null : 'playwright-product-failure',
-      artifacts: [
-        ...(genericRoutePublicationArtifact === null ? [] : [genericRoutePublicationArtifact]),
-        { path: 'playwright/work-item-rows.json', mediaType: 'application/json' },
-        ...validated.artifacts,
-      ],
+      artifacts: [...indexedMembers, {
+        ...indexArtifact,
+        memberDigest: sealedIndexMember.memberDigest,
+      }],
     };
   } finally {
     await egressProxy?.close();

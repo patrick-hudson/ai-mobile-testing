@@ -6,5 +6,5 @@ export function validateSharedPlaywrightRows(document: unknown, descriptor: Work
 export function collectSharedPlaywrightArtifacts(input: { document: unknown; descriptor: WorkExecutionDescriptor; artifactRoot: string; evidenceRoot: string }): Promise<{
   outcome: 'completed_pass' | 'completed_product_failure';
   rows: ReadonlyArray<{ row: number; title: string; projectName: string; caseId: string; entrySpec: string; status: string; retry: 0; evidencePolicy: { mode: 'interaction-video' | 'static-screenshot' | 'structured-data'; rationale: string }; attachments: ReadonlyArray<{ name: string; contentType: string; path: string }> }>;
-  artifacts: ReadonlyArray<{ path: string; mediaType: string }>;
+  artifacts: ReadonlyArray<{ path: string; mediaType: string; logicalName: string; purpose: 'structured' | 'primary' | 'diagnostic'; sizeBytes: number; contentDigest: string }>;
 }>;

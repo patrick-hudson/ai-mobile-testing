@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import path from 'node:path';
+import { sealWorkItemEvidenceMember } from '../../shared/work-item-evidence-index.mjs';
 
 export const MAX_WORKER_ARTIFACTS = 64;
 export const MAX_WORKER_ARTIFACT_BYTES = 8 * 1_048_576;
@@ -73,8 +74,12 @@ export async function collectSharedWorkerEvidence(evidenceRoot, { code, signal =
   let totalBytes = 0;
   const realRoot = await fs.realpath(evidenceRoot);
   for (const declaration of declarations) {
+    const declarationKeys = Object.keys(declaration ?? {});
+    const indexed = declarationKeys.length === 7
+      && ['path', 'mediaType', 'logicalName', 'purpose', 'sizeBytes', 'contentDigest', 'memberDigest']
+        .every((key) => key in declaration);
     if (!declaration || typeof declaration !== 'object' || Array.isArray(declaration)
-      || Object.keys(declaration).length !== 2 || !('path' in declaration) || !('mediaType' in declaration)
+      || (!indexed && (declarationKeys.length !== 2 || !('path' in declaration) || !('mediaType' in declaration)))
       || typeof declaration.mediaType !== 'string' || !MEDIA_TYPE.test(declaration.mediaType)) {
       throw new Error('Executor artifact declaration has an invalid schema.');
     }
@@ -102,10 +107,26 @@ export async function collectSharedWorkerEvidence(evidenceRoot, { code, signal =
     totalBytes += bytes.length;
     if (totalBytes > MAX_WORKER_EVIDENCE_BYTES) throw new Error('Executor artifacts exceed the attempt evidence byte bound.');
     const digest = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
+    const member = sealWorkItemEvidenceMember({
+      workItemId: lease.workItemId,
+      executionDescriptorDigest: lease.executionDescriptorDigest ?? lease.subjectCoreDigest,
+      ordinal: uploads.length + 1,
+      logicalName: indexed ? declaration.logicalName : name,
+      purpose: indexed ? declaration.purpose : 'structured',
+      mediaType: declaration.mediaType,
+      sizeBytes: bytes.length,
+      contentDigest: digest,
+      transportPath: name,
+    });
+    if (indexed && (declaration.sizeBytes !== bytes.length || declaration.contentDigest !== digest
+      || declaration.memberDigest !== member.memberDigest)) {
+      throw new Error(`Executor artifact ${name} disagrees with its sealed evidence member.`);
+    }
     names.add(name);
     uploads.push({
       name, mediaType: declaration.mediaType.toLowerCase(), sizeBytes: bytes.length,
-      digest, contentBase64: bytes.toString('base64'),
+      digest, logicalName: member.logicalName, purpose: member.purpose,
+      memberDigest: member.memberDigest, contentBase64: bytes.toString('base64'),
     });
   }
   return {

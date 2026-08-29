@@ -65,7 +65,7 @@ function inlineBytes(value, index, name) {
 }
 
 function normalizedAttachments(value, index) {
-  if (!Array.isArray(value) || value.length === 0 || value.length > 64) {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 61) {
     fail('PLAYWRIGHT_ATTACHMENT_INVALID', `Playwright row ${index} attachments are invalid or unbounded.`);
   }
   return value.map((attachment, attachmentIndex) => {
@@ -88,6 +88,28 @@ function normalizedAttachments(value, index) {
       body: inlineBytes(attachment.body, index, attachment.name).toString('base64'),
     };
   });
+}
+
+function attachmentPurpose(attachment, row) {
+  if (attachment.name === 'audit-result' || attachment.name === 'audit-result-summary'
+    || attachment.contentType === 'application/json') return 'structured';
+  if (row.status === 'passed' && row.evidencePolicy.mode === 'interaction-video'
+    && attachment.contentType.startsWith('video/')) return 'primary';
+  if (row.status === 'passed' && row.evidencePolicy.mode === 'static-screenshot'
+    && attachment.contentType.startsWith('image/') && attachment.name !== 'screenshot'
+    && !/^automatic(?:-|\s)/i.test(attachment.name)) return 'primary';
+  return 'diagnostic';
+}
+
+function declaration(pathname, attachment, row, bytes) {
+  return {
+    path: pathname,
+    mediaType: attachment.contentType,
+    logicalName: attachment.name,
+    purpose: attachmentPurpose(attachment, row),
+    sizeBytes: bytes.length,
+    contentDigest: `sha256:${createHash('sha256').update(bytes).digest('hex')}`,
+  };
 }
 
 function pathIsExactAbsolute(value) {
@@ -280,9 +302,13 @@ export async function collectSharedPlaywrightArtifacts({ document, descriptor, a
         const relative = `playwright/inline/row-${rowIndex + 1}/attachment-${attachmentIndex + 1}-${fingerprint}.${suffix}`;
         const destination = path.join(evidenceRoot, ...relative.split('/'));
         await fs.mkdir(path.dirname(destination), { recursive: true });
-        await fs.writeFile(destination, bytes, { flag: 'wx', mode: 0o600 });
+        try {
+          await fs.writeFile(destination, bytes, { flag: 'wx', mode: 0o600 });
+        } catch (error) {
+          if (error?.code !== 'EEXIST' || !Buffer.from(await fs.readFile(destination)).equals(bytes)) throw error;
+        }
         paths.add(relative);
-        declarations.push({ path: relative, mediaType: attachment.contentType });
+        declarations.push(declaration(relative, attachment, row, bytes));
         publicAttachments.push({ name: attachment.name, contentType: attachment.contentType, path: relative });
         continue;
       }
@@ -299,7 +325,8 @@ export async function collectSharedPlaywrightArtifacts({ document, descriptor, a
         fail('PLAYWRIGHT_ATTACHMENT_INVALID', `Playwright row ${rowIndex} attachment path is duplicate or unpublishable.`);
       }
       paths.add(relative);
-      declarations.push({ path: relative, mediaType: attachment.contentType });
+      const bytes = await fs.readFile(candidate);
+      declarations.push(declaration(relative, attachment, row, bytes));
       publicAttachments.push({ name: attachment.name, contentType: attachment.contentType, path: relative });
       if (attachment.name === 'audit-result') {
         validateAuditRecord(await boundedAttachmentJson(candidate, `Playwright row ${rowIndex} audit result`), row, descriptor, rowIndex);
