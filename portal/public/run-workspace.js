@@ -9,7 +9,11 @@ import { createConsoleUrlState } from './console-url-state.js';
 import { createConsoleLogViewer } from './console-log-viewer.js';
 import { createRunActionController } from './run-actions.js';
 import { createRunInvalidationBus, publishRunInvalidation } from './console-invalidation.js';
-import { createSharedControlBrowserClient } from './shared-control-client.js';
+import {
+  assertSharedWorkspaceProjection,
+  createSharedControlBrowserClient,
+  orderSharedRisksForReview,
+} from './shared-control-client.js';
 
 const ACTIVE_COMPARATIVE_STATES = new Set(['queued', 'starting', 'running', 'stopping']);
 const ACTIVE_SINGLE_SITE_STATES = new Set(['queued', 'starting', 'running', 'finalizing']);
@@ -583,37 +587,6 @@ function initializeRunWorkspace(root) {
     return button;
   }
 
-  function assertSharedWorkspaceProjection(value, capture) {
-    const publication = value?.publication;
-    const executions = value?.executions;
-    const register = publication?.riskRegister;
-    if (!publication || !executions || publication.runId !== capture.runId
-      || publication.decision?.mode !== capture.mode || publication.runRevision !== executions.runRevision
-      || !Number.isSafeInteger(publication.runRevision) || publication.runRevision < 1
-      || !Number.isSafeInteger(publication.decisionRevision) || publication.decisionRevision < 1
-      || typeof publication.finalSubjectDigest !== 'string'
-      || typeof publication.decision?.label !== 'string' || typeof publication.decision?.grantedAuthority !== 'string'
-      || !['LOADING', 'PROVISIONAL', 'AVAILABLE', 'PARTIAL', 'EMPTY', 'UNAVAILABLE'].includes(register?.availability)
-      || !Array.isArray(register.risks) || !Array.isArray(executions.executions)
-      || executions.executions.some((entry) => typeof entry?.id !== 'string' || typeof entry?.state !== 'string')
-      || !Array.isArray(executions.oracleExecutions)
-      || executions.oracleExecutions.some((entry) => typeof entry?.id !== 'string')
-      || value.logs?.runId !== capture.runId || value.logs?.runRevision !== publication.runRevision
-      || !Array.isArray(value.logs?.events) || !Array.isArray(value.logs?.attemptLogs)) {
-      throw new Error('Shared release projection is unavailable or revision-incoherent.');
-    }
-    for (const risk of register.risks) {
-      if (!risk || typeof risk.identity !== 'string' || typeof risk.category !== 'string'
-        || typeof risk.severity !== 'string' || typeof risk.reviewState !== 'string'
-        || typeof risk.explanation !== 'string' || typeof risk.recommendedAction !== 'string'
-        || typeof risk.source?.kind !== 'string' || typeof risk.source?.id !== 'string'
-        || risk.releaseEffect !== 'non-blocking') {
-        throw new Error('Shared Risk Register contains an invalid bounded projection.');
-      }
-    }
-    return value;
-  }
-
   function applySharedWorkspaceAuthority() {
     const publication = sharedWorkspace.publication;
     const executions = sharedWorkspace.executions.executions;
@@ -678,7 +651,7 @@ function initializeRunWorkspace(root) {
     const riskList = document.createElement('ol');
     riskList.className = 'run-risk-list';
     const oracleExecutionIds = new Set((sharedWorkspace?.executions?.oracleExecutions ?? []).map(({ id }) => id));
-    for (const risk of register?.risks ?? []) {
+    for (const risk of orderSharedRisksForReview(register?.risks)) {
       const item = document.createElement('li');
       item.dataset.riskIdentity = risk.identity;
       item.append(
@@ -759,7 +732,10 @@ function initializeRunWorkspace(root) {
     productRiskStatus.textContent = 'Loading current revision-bound release authority…';
     try {
       const capture = captureWorkspaceIdentity();
-      const next = assertSharedWorkspaceProjection(await sharedControl.readWorkspace(capture.runId), capture);
+      const next = assertSharedWorkspaceProjection(await sharedControl.readWorkspace(capture.runId), {
+        runId: capture.runId,
+        mode: capture.mode,
+      });
       assertCurrentWorkspace(capture);
       sharedWorkspace = next;
       renderSharedWorkspace();

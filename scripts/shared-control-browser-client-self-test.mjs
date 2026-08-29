@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict';
-import { createSharedControlBrowserClient } from '../portal/public/shared-control-client.js';
+import {
+  assertSharedWorkspaceProjection,
+  createSharedControlBrowserClient,
+  orderSharedRisksForReview,
+} from '../portal/public/shared-control-client.js';
 
 const calls = [];
 let operationReads = 0;
@@ -18,9 +22,16 @@ const client = createSharedControlBrowserClient({
     }
     if (String(url).endsWith('/publication')) {
       publicationReads += 1;
-      return jsonResponse(200, { schemaVersion: 1, data: { runRevision: publicationReads === 1 ? 6 : 7, decision: { mode: 'comparative' }, riskRegister: { availability: 'PARTIAL', risks: [] } } });
+      return jsonResponse(200, { schemaVersion: 1, data: {
+        runId: 'run-1', runRevision: publicationReads === 1 ? 6 : 7, decisionRevision: 2, riskRevision: 3,
+        finalSubjectDigest: `sha256:${'b'.repeat(64)}`,
+        decision: { mode: 'comparative', label: 'FEATURE READY', grantedAuthority: 'TARGETED' },
+        riskRegister: { availability: 'PARTIAL', risks: [] },
+      } });
     }
-    if (String(url).endsWith('/executions')) return jsonResponse(200, { schemaVersion: 1, data: { runRevision: 7, executions: [{ id: 'work-incomplete', state: 'incomplete' }] } });
+    if (String(url).endsWith('/executions')) return jsonResponse(200, { schemaVersion: 1, data: {
+      runId: 'run-1', runRevision: 7, executions: [{ id: 'work-incomplete', state: 'incomplete' }], oracleExecutions: [],
+    } });
     if (String(url).includes('/logs?')) return jsonResponse(200, { schemaVersion: 1, data: { runId: 'run-1', runRevision: 7, limit: 200, truncated: false, events: [], attemptLogs: [] } });
     if (String(url).endsWith('/rekick')) return jsonResponse(202, { schemaVersion: 1, data: { operationId: 'a'.repeat(64), state: 'accepted', statusUrl: `/api/control/v1/runs/run-1/operations/${'a'.repeat(64)}` } });
     if (String(url).includes('/operations/')) {
@@ -46,6 +57,33 @@ assert.equal(workspace.executions.runRevision, 7);
 assert.equal(workspace.riskAvailability, 'PARTIAL');
 assert.equal(workspace.logs.limit, 200);
 assert.equal(publicationReads, 2);
+assert.equal(assertSharedWorkspaceProjection(workspace, { runId: 'run-1', mode: 'comparative' }), workspace);
+assert.throws(
+  () => assertSharedWorkspaceProjection(workspace, { runId: 'another-run', mode: 'comparative' }),
+  /coherent revision/i,
+);
+assert.deepEqual(orderSharedRisksForReview([
+  { identity: 'operational-medium', severity: 'medium', category: 'certificate-bypass' },
+  { identity: 'product-medium', severity: 'medium', category: 'unreviewed-visual-change' },
+  { identity: 'product-high', severity: 'high', category: 'manual-check' },
+]).map(({ identity }) => identity), ['product-high', 'product-medium', 'operational-medium']);
+assert.throws(
+  () => assertSharedWorkspaceProjection({
+    ...workspace,
+    publication: {
+      ...workspace.publication,
+      riskRegister: {
+        availability: 'UNAVAILABLE',
+        risks: [{
+          identity: 'risk-forged-unavailable', category: 'manual-check', severity: 'high', reviewState: 'OPEN',
+          explanation: 'A malformed unavailable register must not carry rows.', recommendedAction: 'Reject it.',
+          source: { kind: 'manual', id: 'manual-1' }, releaseEffect: 'non-blocking',
+        }],
+      },
+    },
+  }, { runId: 'run-1', mode: 'comparative' }),
+  /invalid bounded projection/i,
+);
 
 const accepted = await client.mutate('run-1', 'rekick', {
   expectedRunRevision: 7,

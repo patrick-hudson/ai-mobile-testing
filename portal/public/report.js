@@ -1,4 +1,10 @@
 import { createConsoleSplitter } from './console-shell.js';
+import {
+  assertSharedWorkspaceProjection,
+  createSharedControlBrowserClient,
+  orderSharedRisksForReview,
+  SharedControlBrowserError,
+} from './shared-control-client.js';
 
 const PAGE_SIZE = 25;
 const LOG_PREVIEW_BYTES = 64 * 1024;
@@ -25,6 +31,7 @@ const state = {
   activeAuditId: null,
   queryTimer: null,
   splitter: null,
+  sharedSessionReady: false,
 };
 
 const elements = Object.fromEntries([
@@ -37,7 +44,12 @@ const elements = Object.fromEntries([
   'clear-filters', 'audit-loading', 'audit-error', 'audit-list', 'audit-previous', 'audit-next', 'audit-page-label',
   'manual-summary', 'ai-card', 'ai-summary', 'ai-review-link', 'ai-review-retry', 'artifact-count', 'report-links', 'load-log', 'log-state',
   'report-log', 'log-links', 'report-announcer', 'manual-workspace-link', 'report-trust-facts',
+  'report-product-risk', 'report-product-risk-title', 'report-risk-status', 'report-shared-authority',
+  'report-shared-session', 'report-shared-session-status', 'report-shared-login',
 ].map((id) => [id.replaceAll('-', '_'), document.querySelector(`#${id}`)]));
+
+const sharedControl = createSharedControlBrowserClient();
+const sharedCredential = elements.report_shared_login?.elements.namedItem('report-control-credential');
 
 const reportConsole = document.querySelector('#report-console');
 const reportSeparator = document.querySelector('#report-separator');
@@ -76,7 +88,7 @@ async function init() {
     document.title = `Run ${requestedId} · Quitting 7-OH release report`;
   }
   bindEvents();
-  await loadReport();
+  await initializeReportAuthority();
 }
 
 function apiPath(suffix = '') {
@@ -125,6 +137,7 @@ function bindEvents() {
   });
   elements.load_log.addEventListener('click', () => void loadLog());
   elements.ai_review_retry.addEventListener('click', () => void retrySingleSiteAiReview());
+  elements.report_shared_login.addEventListener('submit', (event) => void authorizeSharedReport(event));
   window.addEventListener('pagehide', abortRequests);
 }
 
@@ -141,7 +154,67 @@ function abortRequests() {
 
 window.addEventListener('pagehide', () => state.splitter?.destroy(), { once: true });
 
-async function loadReport() {
+async function initializeReportAuthority() {
+  elements.report_shared_session.hidden = false;
+  elements.report_shared_login.hidden = false;
+  try {
+    await sharedControl.restore();
+    state.sharedSessionReady = true;
+    elements.report_shared_login.hidden = true;
+    elements.report_shared_session_status.textContent = 'Shared report session restored.';
+    await loadSharedReport();
+  } catch (error) {
+    state.sharedSessionReady = false;
+    if (sharedControlDisabled(error)) {
+      elements.report_shared_session.hidden = true;
+      await loadLegacyReport();
+      return;
+    }
+    elements.report_content.dataset.authority = 'shared';
+    elements.report_product_risk.hidden = false;
+    setMainState('content');
+    elements.report_shared_session_status.textContent = error instanceof SharedControlBrowserError && error.status === 401
+      ? 'Enter a scoped credential to view shared release authority.'
+      : `Shared report session unavailable: ${friendlyError(error)}`;
+    renderSharedReportUnavailable(error);
+  }
+}
+
+async function authorizeSharedReport(event) {
+  event.preventDefault();
+  if (!elements.report_shared_login.reportValidity()) return;
+  const button = elements.report_shared_login.querySelector('button');
+  button.disabled = true;
+  elements.report_shared_session_status.textContent = 'Authorizing report access…';
+  try {
+    await sharedControl.login(sharedCredential.value);
+    sharedCredential.value = '';
+    state.sharedSessionReady = true;
+    elements.report_shared_login.hidden = true;
+    elements.report_shared_session_status.textContent = 'Shared report session authorized. Credential discarded from the form.';
+    await loadSharedReport({ focus: true });
+  } catch (error) {
+    sharedCredential.value = '';
+    elements.report_shared_session_status.textContent = `Authorization failed: ${friendlyError(error)}`;
+    sharedCredential.focus();
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function loadReport() {
+  return state.sharedSessionReady ? loadSharedReport() : initializeReportAuthority();
+}
+
+function sharedControlDisabled(error) {
+  return error instanceof SharedControlBrowserError
+    && (error.status === 404
+      || (error.status === 503 && error.message === 'Shared control API is not enabled.'));
+}
+
+async function loadLegacyReport() {
+  elements.report_content.dataset.authority = 'legacy';
+  elements.report_product_risk.hidden = true;
   const hasKnownContent = state.run !== null && state.report !== null;
   window.clearTimeout(state.retryTimer);
   state.reportController?.abort();
@@ -205,6 +278,241 @@ async function loadReport() {
     elements.report_content.setAttribute('aria-busy', 'false');
     elements.refresh_report.disabled = false;
   }
+}
+
+async function loadSharedReport({ focus = false } = {}) {
+  window.clearTimeout(state.retryTimer);
+  state.reportController?.abort();
+  const controller = new AbortController();
+  state.reportController = controller;
+  elements.report_content.dataset.authority = 'shared';
+  elements.report_product_risk.hidden = false;
+  elements.report_product_risk.dataset.riskAvailability = 'LOADING';
+  elements.report_product_risk.setAttribute('aria-busy', 'true');
+  elements.report_risk_status.textContent = 'LOADING · Reading one revision-bound publication, execution set, and bounded log view.';
+  elements.report_shared_authority.replaceChildren();
+  setMainState('content');
+  elements.report_connection.textContent = 'Loading shared release authority…';
+  elements.refresh_report.disabled = true;
+  announce('Loading the revision-bound shared release report.');
+  try {
+    const workspace = assertSharedWorkspaceProjection(await sharedControl.readWorkspace(state.runId, {
+      signal: controller.signal,
+      logLimit: 200,
+      maxAttempts: 3,
+    }), { runId: state.runId, mode: state.mode });
+    if (controller.signal.aborted) return;
+    renderSharedReport(workspace);
+    elements.report_connection.textContent = `Shared run revision ${workspace.publication.runRevision} loaded`;
+    announce(`${workspace.publication.decision.label}. Risk Register ${workspace.riskAvailability}. Run revision ${workspace.publication.runRevision}.`);
+    if (focus) elements.report_product_risk_title.focus();
+    if (sharedWorkspaceNeedsRefresh(workspace)) {
+      state.retryTimer = window.setTimeout(() => void loadSharedReport(), REPORT_RETRY_MS);
+    }
+  } catch (error) {
+    if (controller.signal.aborted) return;
+    renderSharedReportUnavailable(error);
+  } finally {
+    if (state.reportController === controller) state.reportController = null;
+    elements.refresh_report.disabled = false;
+  }
+}
+
+function sharedWorkspaceNeedsRefresh(workspace) {
+  const terminal = new Set(['completed_pass', 'completed_product_failure', 'incomplete', 'cancelled']);
+  return ['LOADING', 'PROVISIONAL'].includes(workspace.riskAvailability)
+    || workspace.executions.executions.some(({ state: executionState }) => !terminal.has(executionState));
+}
+
+function renderSharedReportUnavailable(error) {
+  const detail = friendlyError(error);
+  elements.report_product_risk.dataset.riskAvailability = 'UNAVAILABLE';
+  elements.report_product_risk.setAttribute('aria-busy', 'false');
+  elements.report_risk_status.textContent = `UNAVAILABLE · ${detail} No no-risk or release-authority claim can be made.`;
+  const card = document.createElement('article');
+  card.className = 'report-shared-unavailable';
+  card.append(
+    textNode('h3', 'Shared release authority unavailable'),
+    textNode('p', 'This page failed closed. Historical compact reports, when available, remain readable but cannot substitute for this shared publication.'),
+  );
+  elements.report_shared_authority.replaceChildren(card);
+  elements.report_connection.textContent = 'Shared authority unavailable';
+  announce(`Shared release authority unavailable. ${detail}`);
+}
+
+function renderSharedReport(workspace) {
+  const { publication, executions, logs } = workspace;
+  const { decision, riskRegister } = publication;
+  const availability = riskRegister.availability;
+  elements.report_product_risk.dataset.riskAvailability = availability;
+  elements.report_product_risk.setAttribute('aria-busy', String(availability === 'LOADING'));
+  elements.report_risk_status.textContent = riskAvailabilityCopy(availability, riskRegister.risks.length);
+
+  const decisionCard = document.createElement('article');
+  decisionCard.className = 'report-shared-decision';
+  decisionCard.dataset.tone = decision.ready === false ? 'not-ready' : 'ready';
+  const decisionEyebrow = textNode('p', 'Release Decision');
+  decisionEyebrow.className = 'step-label';
+  const decisionTitle = textNode('h3', decision.label);
+  const decisionCode = textNode('p', `${decision.code ?? decision.label.replaceAll(' ', '_')} · ${decision.grantedAuthority} authority`);
+  decisionCode.className = 'report-decision-code';
+  const scope = document.createElement('div');
+  scope.id = 'report-certified-scope';
+  scope.className = 'report-certified-scope';
+  scope.append(textNode('h4', 'Certified scope'));
+  const scopeList = document.createElement('dl');
+  for (const [label, values] of [
+    ['Features', decision.certifiedScope?.features],
+    ['Definitions', decision.certifiedScope?.definitions],
+    ['Targets', decision.certifiedScope?.targets],
+    ['Known limits', decision.certifiedScope?.limitations],
+  ]) {
+    const row = document.createElement('div');
+    row.append(textNode('dt', label), textNode('dd', scopeValues(values, label === 'Known limits' && state.mode === 'single-site' ? 'N/A · No comparison-only limits were published.' : 'N/A')));
+    scopeList.append(row);
+  }
+  scope.append(scopeList);
+  const revisions = textNode('p', `Decision revision ${publication.decisionRevision} · Run revision ${publication.runRevision} · Risk revision ${publication.riskRevision}`);
+  revisions.id = 'report-authority-revisions';
+  const revisionState = textNode('p', decision.superseded
+    ? 'SUPERSEDED · This decision is historical and cannot be consumed as current authority.'
+    : `CURRENT · Subject ${shortDigest(publication.finalSubjectDigest)}${publication.previousEnvelopeDigest ? ` · supersedes ${shortDigest(publication.previousEnvelopeDigest)}` : ''}`);
+  revisionState.className = 'report-revision-state';
+  decisionCard.append(decisionEyebrow, decisionTitle, decisionCode, scope, revisions, revisionState);
+
+  const siteHealth = document.createElement('aside');
+  siteHealth.id = 'report-site-health';
+  siteHealth.className = 'report-site-health';
+  siteHealth.append(
+    textNode('h3', 'Site Health'),
+    textNode('p', 'Site Health remains a separate diagnostic truth. It is not inferred from, and cannot replace, the scope-qualified Release Decision.'),
+  );
+
+  const register = document.createElement('section');
+  register.id = 'report-risk-register';
+  register.className = 'report-risk-register';
+  register.append(textNode('h3', 'Risk Register'));
+  if (availability === 'EMPTY') {
+    register.append(textNode('p', 'The complete register contains no active product risks.'));
+  } else if (riskRegister.risks.length === 0) {
+    register.append(textNode('p', `${availability} risk data contains no published rows. This is not a no-risk claim.`));
+  } else {
+    register.append(renderRiskTable(orderSharedRisksForReview(riskRegister.risks)));
+  }
+
+  const operations = document.createElement('div');
+  operations.className = 'report-operation-grid';
+  operations.append(renderRecoveryState(executions.executions), renderExecutionState(executions.executions));
+
+  const pipeline = document.createElement('aside');
+  pipeline.id = 'report-pipeline-integrity';
+  pipeline.className = 'report-pipeline-integrity';
+  pipeline.append(
+    textNode('h3', 'Pipeline Integrity'),
+    textNode('p', `${logs.truncated ? 'PARTIAL' : 'Available'} · ${logs.events.length} bounded operation events and ${logs.attemptLogs.length} attempt log records loaded.`),
+    textNode('p', 'Operational completeness stays visible and subordinate to Product Risk; it does not erase published risks.'),
+  );
+
+  const action = document.createElement('a');
+  action.className = 'primary-button';
+  action.href = `/run.html?mode=${encodeURIComponent(state.mode)}&run=${encodeURIComponent(state.runId)}&view=overview`;
+  action.textContent = 'Open recovery controls';
+  const actionCopy = textNode('p', 'Risk review, visual disposition, and rekick mutations remain in the contextual run workspace so every operation retains its current revision and focus-return contract.');
+  actionCopy.className = 'muted';
+  const actions = document.createElement('div');
+  actions.className = 'report-state-actions';
+  actions.append(action);
+
+  elements.context_run_id.textContent = state.runId;
+  elements.context_profile.textContent = state.mode === 'single-site' ? 'Single-site audit' : 'Comparative audit';
+  elements.context_scope.textContent = `${decision.grantedAuthority} · ${scopeValues(decision.certifiedScope?.features, 'Bound subject scope')}`;
+  elements.context_pipeline.textContent = logs.truncated ? 'Partial bounded log projection' : 'Available bounded log projection';
+  elements.context_started.textContent = 'Bound to publication';
+  elements.context_elapsed.textContent = 'Current revision';
+  elements.context_production.closest('.context-wide').hidden = true;
+  elements.context_candidate.closest('.context-wide').hidden = true;
+  elements.report_shared_authority.replaceChildren(decisionCard, siteHealth, register, operations, pipeline, actionCopy, actions);
+}
+
+function renderRiskTable(risks) {
+  const wrapper = document.createElement('div');
+  wrapper.className = 'report-risk-table-wrap';
+  wrapper.tabIndex = 0;
+  wrapper.setAttribute('role', 'region');
+  wrapper.setAttribute('aria-label', 'Scrollable Risk Register columns');
+  const table = document.createElement('table');
+  table.className = 'report-risk-table';
+  const head = document.createElement('thead');
+  const headRow = document.createElement('tr');
+  for (const label of ['Category', 'Severity', 'Affected scope', 'Review state', 'Release effect', 'Recommended action']) headRow.append(textNode('th', label));
+  head.append(headRow);
+  const body = document.createElement('tbody');
+  for (const risk of risks.slice(0, 200)) {
+    const row = document.createElement('tr');
+    row.dataset.riskIdentity = risk.identity;
+    const category = document.createElement('td');
+    category.append(textNode('strong', humanize(risk.category)), textNode('span', risk.explanation));
+    row.append(
+      category,
+      textNode('td', risk.severity.toUpperCase()),
+      textNode('td', scopeValues(risk.affectedScope, `${risk.mode ?? state.mode} · ${risk.source.id}`)),
+      textNode('td', humanize(risk.reviewState)),
+      textNode('td', `${risk.releaseEffect} · never changes the decision`),
+      textNode('td', risk.recommendedAction),
+    );
+    body.append(row);
+  }
+  table.append(head, body);
+  wrapper.append(table);
+  return wrapper;
+}
+
+function renderRecoveryState(executions) {
+  const section = document.createElement('section');
+  section.id = 'report-recovery-state';
+  section.className = 'report-operation-card';
+  section.append(textNode('h3', 'Active recovery'));
+  const incomplete = executions.filter(({ state: executionState }) => executionState === 'incomplete');
+  if (incomplete.length === 0) section.append(textNode('p', 'No incomplete execution currently needs recovery.'));
+  for (const execution of incomplete.slice(0, 100)) section.append(textNode('p', `${execution.id} · INCOMPLETE · rekick available in the run workspace`));
+  return section;
+}
+
+function renderExecutionState(executions) {
+  const section = document.createElement('section');
+  section.id = 'report-execution-state';
+  section.className = 'report-operation-card';
+  section.append(textNode('h3', 'Execution state'));
+  const terminal = new Set(['completed_pass', 'completed_product_failure', 'incomplete', 'cancelled']);
+  const active = executions.filter(({ state: executionState }) => !terminal.has(executionState));
+  section.append(textNode('p', `${active.length} active of ${executions.length} required execution${executions.length === 1 ? '' : 's'}.`));
+  for (const execution of active.slice(0, 100)) section.append(textNode('p', `${execution.id} · ${humanize(execution.state)}`));
+  const newest = [...executions].filter(({ completedAt }) => completedAt).sort((left, right) => String(right.completedAt).localeCompare(String(left.completedAt)))[0];
+  section.append(textNode('p', `Newest completed execution: ${newest?.id ?? 'none published'}.`));
+  return section;
+}
+
+function riskAvailabilityCopy(availability, count) {
+  if (availability === 'EMPTY') return 'EMPTY · Register complete; no active product risks were published.';
+  if (availability === 'AVAILABLE') return `AVAILABLE · ${count} published risk record${count === 1 ? '' : 's'}.`;
+  if (availability === 'PROVISIONAL') return `PROVISIONAL · ${count} risk record${count === 1 ? '' : 's'} published; review may change as evidence arrives.`;
+  if (availability === 'PARTIAL') return `PARTIAL · ${count} risk record${count === 1 ? '' : 's'} published; missing rows cannot be treated as no risk.`;
+  if (availability === 'LOADING') return 'LOADING · The Risk Register is still being assembled; no no-risk claim can be made.';
+  return 'UNAVAILABLE · The Risk Register could not be read; no no-risk claim can be made.';
+}
+
+function textNode(tagName, text) {
+  const node = document.createElement(tagName);
+  node.textContent = String(text);
+  return node;
+}
+
+function scopeValues(values, fallback) {
+  return Array.isArray(values) && values.length ? values.slice(0, 100).join(', ') : fallback;
+}
+
+function shortDigest(value) {
+  return typeof value === 'string' && value.length > 20 ? `${value.slice(0, 18)}…` : String(value ?? 'unavailable');
 }
 
 function showRefreshFailure(error, { retry = false } = {}) {

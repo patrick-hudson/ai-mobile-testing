@@ -56,6 +56,14 @@
       </section>
 
       <div id="report-content" hidden>
+        <section id="report-product-risk" class="report-section report-product-risk" aria-labelledby="report-product-risk-title" data-risk-availability="LOADING" aria-busy="true" hidden>
+          <div class="report-section-heading">
+            <div><p class="step-label">AUTHORITATIVE RELEASE VIEW</p><h2 id="report-product-risk-title" tabindex="-1">Product Risk</h2></div>
+            <span id="report-risk-status" class="report-risk-status" role="status" aria-live="polite">Loading revision-bound release authority…</span>
+          </div>
+          <div id="report-shared-authority"></div>
+        </section>
+
         <section id="decision-hero" class="decision-hero">
           <div class="decision-copy">
             <p class="eyebrow">RELEASE EVIDENCE REPORT</p>
@@ -172,6 +180,16 @@
           <aside id="report-inspector" class="console-inspector" aria-label="Run report context">
             <h2>Run context</h2>
             <p class="report-inspector-note">Identity and source scope for the report currently in view.</p>
+            <section id="report-shared-session" class="report-shared-session" hidden>
+              <h3>Shared report access</h3>
+              <p id="report-shared-session-status" role="status" aria-live="polite">Checking browser authorization…</p>
+              <form id="report-shared-login">
+                <label>Scoped control credential
+                  <input name="report-control-credential" type="password" required autocomplete="off" maxlength="4096" />
+                </label>
+                <button class="console-button" type="submit">Authorize report access</button>
+              </form>
+            </section>
             <dl class="run-context-card">
               <div><dt>Run</dt><dd id="context-run-id"></dd></div>
               <div><dt>Test depth</dt><dd id="context-profile"></dd></div>

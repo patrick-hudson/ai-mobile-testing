@@ -207,6 +207,101 @@
   box-shadow: var(--shadow);
 }
 
+#report-content[data-authority="shared"] > :not(#report-product-risk) { display: none; }
+
+.report-product-risk {
+  position: relative;
+  overflow: hidden;
+  border-color: rgba(244, 186, 85, .34);
+  background:
+    linear-gradient(135deg, rgba(40, 57, 49, .98), rgba(16, 23, 20, .98)),
+    var(--panel);
+}
+
+.report-product-risk::before {
+  position: absolute;
+  inset: 0 auto auto 0;
+  width: 5px;
+  height: 100%;
+  background: var(--accent);
+  content: "";
+}
+
+.report-product-risk[data-risk-availability="UNAVAILABLE"]::before { background: var(--red); }
+.report-product-risk[data-risk-availability="LOADING"]::before,
+.report-product-risk[data-risk-availability="PROVISIONAL"]::before,
+.report-product-risk[data-risk-availability="PARTIAL"]::before { background: var(--blue); }
+.report-product-risk[data-risk-availability="AVAILABLE"]::before,
+.report-product-risk[data-risk-availability="EMPTY"]::before { background: var(--green); }
+
+.report-risk-status {
+  max-width: 42rem;
+  color: var(--muted);
+  font-size: .76rem;
+  font-weight: 800;
+  line-height: 1.5;
+  text-align: right;
+}
+
+#report-shared-authority { display: grid; gap: 16px; }
+
+.report-shared-decision,
+.report-site-health,
+.report-risk-register,
+.report-operation-card,
+.report-pipeline-integrity,
+.report-shared-unavailable {
+  min-width: 0;
+  padding: clamp(18px, 3vw, 28px);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: rgba(0, 0, 0, .18);
+}
+
+.report-shared-decision[data-tone="ready"] { border-left: 4px solid var(--green); }
+.report-shared-decision[data-tone="not-ready"] { border-left: 4px solid var(--red); }
+.report-shared-decision h3 { margin: 5px 0 8px; font-size: clamp(2.1rem, 5vw, 4.4rem); }
+.report-decision-code,
+.report-revision-state { color: var(--muted); font-size: .78rem; font-weight: 800; }
+.report-revision-state { margin-bottom: 0; }
+
+.report-certified-scope { margin: 24px 0; }
+.report-certified-scope h4 { margin-bottom: 10px; }
+.report-certified-scope dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1px; margin: 0; background: var(--line); }
+.report-certified-scope dl > div { min-width: 0; padding: 13px; background: var(--panel-strong); }
+.report-certified-scope dt { color: var(--muted); font-size: .64rem; font-weight: 900; letter-spacing: .08em; text-transform: uppercase; }
+.report-certified-scope dd { margin: 5px 0 0; overflow-wrap: anywhere; color: var(--ink); font-size: .78rem; line-height: 1.45; }
+
+.report-site-health { border-style: dashed; }
+.report-site-health h3,
+.report-risk-register h3,
+.report-operation-card h3,
+.report-pipeline-integrity h3 { margin-bottom: 10px; }
+.report-site-health p,
+.report-pipeline-integrity p,
+.report-operation-card p { color: var(--muted); font-size: .8rem; line-height: 1.5; }
+
+.report-risk-table-wrap { max-width: 100%; overflow-x: auto; border: 1px solid var(--line); border-radius: 12px; }
+.report-risk-table { width: 100%; min-width: 900px; border-collapse: collapse; font-size: .74rem; }
+.report-risk-table th,
+.report-risk-table td { padding: 12px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; line-height: 1.45; }
+.report-risk-table th { color: var(--muted); background: rgba(255, 255, 255, .035); font-size: .62rem; letter-spacing: .06em; text-transform: uppercase; }
+.report-risk-table td:first-child { min-width: 230px; }
+.report-risk-table td:first-child strong,
+.report-risk-table td:first-child span { display: block; }
+.report-risk-table td:first-child span { margin-top: 7px; color: var(--muted); }
+.report-risk-table tbody tr:last-child td { border-bottom: 0; }
+
+.report-operation-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.report-pipeline-integrity { border-left: 3px solid var(--blue); }
+
+.report-shared-session { margin: 18px 0; padding: 14px; border: 1px solid var(--line); border-radius: 12px; background: rgba(0, 0, 0, .14); }
+.report-shared-session h3 { margin: 0 0 8px; font-size: .86rem; }
+.report-shared-session p { color: var(--muted); font-size: .72rem; line-height: 1.45; }
+.report-shared-session form { display: grid; gap: 10px; }
+.report-shared-session label { display: grid; gap: 6px; color: var(--muted); font-size: .68rem; font-weight: 800; }
+.report-shared-session input { width: 100%; min-width: 0; padding: 9px; border: 1px solid var(--line); border-radius: 8px; color: var(--ink); background: rgba(0, 0, 0, .22); }
+
 .report-section-heading,
 .card-heading {
   display: flex;
@@ -633,6 +728,7 @@
   .report-page .audit-filter-bar { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .report-page .quick-link-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .report-page .report-trust-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .report-risk-status { max-width: none; text-align: left; }
 }
 
 @media (max-width: 720px) {
@@ -641,7 +737,11 @@
   .report-page .metric-grid,
   .report-page .coverage-grid,
   .report-page .split-section,
-  .report-page .quick-link-grid { grid-template-columns: 1fr; }
+  .report-page .quick-link-grid,
+  .report-certified-scope dl,
+  .report-operation-grid { grid-template-columns: 1fr; }
+  .report-product-risk .report-section-heading { align-items: flex-start; flex-direction: column; }
+  .report-risk-table { min-width: 780px; }
   .report-page .report-trust-facts { grid-template-columns: 1fr; }
   .report-page .metric-card,
   .report-page .quick-link { border-right: 0; border-bottom: 1px solid var(--console-rule); }
