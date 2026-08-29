@@ -4,15 +4,25 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 import { canonicalDigest } from '../shared/canonical-contract.mjs';
+import { sealExecutionManifest } from '../shared/execution-contract.mjs';
+import { sealFinalReleaseSubject, sealReleaseSubjectCore } from '../shared/release-subject.mjs';
+import { sealWorkExecutionDescriptor } from '../shared/work-execution-descriptor.mjs';
 import { buildPreRegisteredShadowMatrix } from '../shared/shadow-validation-fixtures.mjs';
 import { runShadowValidation } from '../shared/shadow-validation.mjs';
 import {
   PARENT_RUN_STORE_SCHEMA_VERSION,
   PARENT_RUN_WRITER_PROTOCOL,
   acceptOperation,
+  adoptAttemptEvidence,
+  applyDiagnosticRerunOperation,
+  applyRekickOperation,
   acquireStoreCoordinator,
+  claimWorkItem,
+  completeOperation,
   createParentRun,
   openParentRunStore,
+  publishAttemptEvidence,
+  readParentRun,
   readReleaseAuthoritySelector,
 } from './lib/parent-run-store.mjs';
 import {
@@ -64,6 +74,74 @@ function review() {
     reviewed: true,
     actorId: 'operator:cutover-reviewer',
     reviewedAt: new Date(now).toISOString(),
+  };
+}
+
+const digest = (character) => `sha256:${character.repeat(64)}`;
+
+function sealedRunInput(runId, workItemId) {
+  const subjectCore = sealReleaseSubjectCore({
+    schemaVersion: 1,
+    deploymentIdentity: { kind: 'target-preflight-set', value: digest('7') },
+    targets: [{ role: 'audited', origin: 'https://cutover.example.test' }],
+    mode: 'single-site',
+    requestedAuthority: {
+      qualifier: 'TARGETED',
+      scope: { features: ['navigation'], definitions: ['NAV-001'], targets: ['audited'], knownLimits: [] },
+    },
+    revisions: { runner: digest('1'), plugins: digest('2'), targets: digest('3'), configuration: digest('4') },
+    environmentIdentity: digest('5'),
+    certificatePolicy: 'strict',
+  });
+  const executionManifest = sealExecutionManifest({
+    schemaVersion: 1,
+    subjectCoreDigest: subjectCore.digest,
+    workItems: [{ id: workItemId, definitionId: 'NAV-001', targetId: 'audited', targetRole: 'audited' }],
+    oracleExecutions: [{ id: `${runId}-oracle`, definitionId: 'NAV-001', requiredWorkItemIds: [workItemId] }],
+    contextWorkItemIds: [],
+  });
+  const finalSubject = sealFinalReleaseSubject({
+    schemaVersion: 1,
+    subjectCore,
+    executionManifest,
+    grantedAuthority: subjectCore.requestedAuthority,
+    coverageBasis: { selectedDefinitions: ['NAV-001'], selectedTargets: ['audited'], excludedAsNotApplicable: [] },
+    deploymentIdentityRecheck: subjectCore.deploymentIdentity,
+  });
+  const executionDescriptor = sealWorkExecutionDescriptor({
+    workItemId,
+    subjectCoreDigest: subjectCore.digest,
+    runnerRevision: subjectCore.revisions.runner,
+    mode: 'single-site',
+    operation: 'playwright',
+    definitionId: 'NAV-001',
+    pluginId: 'navigation-search-content',
+    caseId: 'NAV-001:tests/navigation.spec.ts:audited',
+    entrySpec: 'tests/navigation.spec.ts',
+    targetId: 'audited',
+    targetRole: 'audited',
+    capability: 'browser:chromium',
+    resourceClass: 'ordinary',
+    origins: { candidate: 'https://cutover.example.test', production: null },
+    certificatePolicy: 'strict',
+    route: null,
+  });
+  return {
+    runId,
+    compilationState: 'sealed',
+    subjectCore,
+    executionManifest,
+    finalSubject,
+    runnerRevision: subjectCore.revisions.runner,
+    workItems: [{
+      id: workItemId,
+      capability: 'browser:chromium',
+      resourceClass: 'ordinary',
+      targetId: 'audited',
+      specAffinity: 'tests/navigation.spec.ts',
+      executionDescriptor,
+      maxAttempts: 1,
+    }],
   };
 }
 
@@ -281,6 +359,124 @@ try {
     const operationIdentity = `run-cutover-operation:${accepted.operationId}`;
     assert.deepEqual(observed.releaseChangingMutationIds, [operationIdentity]);
     assert.deepEqual(observed.unresolvedOperationIds, [operationIdentity]);
+  }
+
+  {
+    const {
+      directory, store, admissionGate, coordinator, launchOperationStore,
+      legacyComparativeRoot, legacySingleSiteQueueRoot,
+    } = await fixture('claim-fenced-after-observation');
+    const input = request('cutover-claim-fenced-after-observation');
+    await createParentRun(store, {
+      runId: 'run-cutover-queued', subjectCoreDigest: digest('8'),
+      workItems: [{ id: 'work-cutover-queued', maxAttempts: 1, capability: 'browser:chromium', targetId: 'candidate' }],
+    });
+    await prepareSharedAuthorityCutover({
+      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
+    });
+    const observed = await captureSharedAuthorityDrainObservation({
+      store, coordinator, admissionGate, launchOperationStore, cutoverId: input.cutoverId,
+      legacyComparativeRoot, legacySingleSiteQueueRoot, clock,
+    });
+    assert.deepEqual(observed.unfencedLegacyLeaseIds, []);
+    await expectCode('CUTOVER_WORK_CLAIMS_FENCED', () => claimWorkItem(store, 'run-cutover-queued', coordinator, {
+      workerId: 'worker-after-observation', capabilities: ['browser:chromium'],
+      resourceClasses: ['ordinary'], leaseMs: 30_000,
+    }));
+    assert.equal((await readParentRun(store, 'run-cutover-queued')).workItems['work-cutover-queued'].state, 'queued');
+  }
+
+  {
+    const {
+      directory, store, admissionGate, coordinator, launchOperationStore,
+      legacyComparativeRoot, legacySingleSiteQueueRoot,
+    } = await fixture('production-observer-applied-operation');
+    const input = request('cutover-production-observer-applied-operation');
+    const runId = 'run-cutover-applied-operation';
+    const workItemId = 'work-cutover-applied-operation';
+    await createParentRun(store, sealedRunInput(runId, workItemId));
+    const failedLease = await claimWorkItem(store, runId, coordinator, {
+      workerId: 'worker-applied-operation', capabilities: ['browser:chromium'],
+      resourceClasses: ['ordinary'], leaseMs: 30_000,
+    });
+    const failedInbox = await publishAttemptEvidence(store, runId, failedLease, {
+      outcome: 'operational_failure', reason: 'Synthetic exhaustion before cutover.', artifacts: [],
+    });
+    await adoptAttemptEvidence(store, runId, coordinator, failedInbox);
+    const exhausted = await readParentRun(store, runId);
+    const accepted = await acceptOperation(store, runId, {
+      idempotencyKey: 'cutover-applied-rekick-0001',
+      kind: 'rekick',
+      actor: { id: 'operator-cutover', kind: 'human' },
+      body: { expectedSubjectDigest: exhausted.finalSubjectDigest, workItemIds: [workItemId] },
+      expectedSubjectDigest: exhausted.finalSubjectDigest,
+    });
+    const applied = await applyRekickOperation(store, runId, coordinator, accepted.operationId, {
+      observedDeploymentIdentity: exhausted.subjectCore.deploymentIdentity,
+    });
+    assert.equal(applied.state, 'applied');
+    await prepareSharedAuthorityCutover({
+      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
+    });
+    const observed = await captureSharedAuthorityDrainObservation({
+      store, coordinator, admissionGate, launchOperationStore, cutoverId: input.cutoverId,
+      legacyComparativeRoot, legacySingleSiteQueueRoot, clock,
+    });
+    const operationIdentity = `${runId}:${accepted.operationId}`;
+    assert.deepEqual(observed.unresolvedOperationIds, [operationIdentity]);
+    assert.deepEqual(observed.releaseChangingMutationIds, [operationIdentity]);
+  }
+
+  {
+    const {
+      directory, store, admissionGate, coordinator, launchOperationStore,
+      legacyComparativeRoot, legacySingleSiteQueueRoot,
+    } = await fixture('production-observer-running-diagnostic');
+    const input = request('cutover-production-observer-running-diagnostic');
+    const runId = 'run-cutover-running-diagnostic';
+    const workItemId = 'work-cutover-running-diagnostic';
+    const runInput = sealedRunInput(runId, workItemId);
+    await createParentRun(store, runInput);
+    const failedLease = await claimWorkItem(store, runId, coordinator, {
+      workerId: 'worker-canonical-failure', capabilities: ['browser:chromium'],
+      resourceClasses: ['ordinary'], leaseMs: 30_000,
+    });
+    const failedInbox = await publishAttemptEvidence(store, runId, failedLease, {
+      outcome: 'completed_product_failure', reason: 'assertion-failed', artifacts: [],
+      executionDescriptorDigest: failedLease.executionDescriptorDigest,
+    });
+    await adoptAttemptEvidence(store, runId, coordinator, failedInbox);
+    const failed = await readParentRun(store, runId);
+    const accepted = await acceptOperation(store, runId, {
+      idempotencyKey: 'cutover-diagnostic-rerun-0001',
+      kind: 'diagnostic-rerun',
+      actor: { id: 'operator-cutover', kind: 'human' },
+      body: { expectedSubjectDigest: failed.finalSubjectDigest, workItemId },
+      expectedSubjectDigest: failed.finalSubjectDigest,
+    });
+    await applyDiagnosticRerunOperation(store, runId, coordinator, accepted.operationId, {
+      observedDeploymentIdentity: failed.subjectCore.deploymentIdentity,
+    });
+    await completeOperation(store, runId, coordinator, accepted.operationId, { status: 'succeeded' });
+    const diagnosticLease = await claimWorkItem(store, runId, coordinator, {
+      workerId: 'worker-diagnostic', capabilities: ['browser:chromium'],
+      resourceClasses: ['ordinary'], leaseMs: 30_000,
+    });
+    assert.equal(diagnosticLease.diagnosticExecutionId, accepted.operationId);
+    await prepareSharedAuthorityCutover({
+      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
+    });
+    const observed = await captureSharedAuthorityDrainObservation({
+      store, coordinator, admissionGate, launchOperationStore, cutoverId: input.cutoverId,
+      legacyComparativeRoot, legacySingleSiteQueueRoot, clock,
+    });
+    assert.deepEqual(observed.unfencedLegacyLeaseIds, [
+      `shared-preactivation:${runId}:${workItemId}:diagnostic:${accepted.operationId}:${diagnosticLease.token}`,
+    ], 'running diagnostic execution must block activation as an unfenced preactivation lease');
+    await expectCode('CUTOVER_LEASES_UNFENCED', () => activateSharedAuthorityCutover({
+      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
+      drainObservation: observed,
+    }));
   }
 
   {

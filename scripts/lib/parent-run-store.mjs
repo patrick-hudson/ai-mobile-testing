@@ -1766,6 +1766,10 @@ export async function claimStoreWorkItem(store, coordinator, input) {
   const runIds = normalizedRunIds(input?.runIds);
   return withDirectoryLock(store.storage, globalLockPath(store), async () => {
     await validateCoordinator(store, coordinator);
+    const authority = await readAuthoritySelectorUnlocked(store);
+    if (authority.phase === 'DRAINING') {
+      fail('CUTOVER_WORK_CLAIMS_FENCED', 'Work claims are fenced while shared release authority is draining for cutover.');
+    }
     const states = await schedulingStatesUnlocked(store);
     const scheduler = await reconcilePerformanceSchedulerUnlocked(store, coordinator, states);
     const wantsPerformance = worker.resourceClasses.includes('performance');

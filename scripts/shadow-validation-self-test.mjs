@@ -27,6 +27,26 @@ const matrix = await buildProductionDerivedShadowMatrix({
 });
 const registeredMatrix = buildPreRegisteredShadowMatrix();
 
+const comparisonReceipt = (caseId) => derivations.find((receipt) => receipt.caseId === caseId
+  && receipt.productionFunction === 'sealOracleResult')?.detail?.[0];
+const existingDefectComparison = comparisonReceipt('AE6');
+assert.equal(existingDefectComparison?.classification, 'reproduced-unchanged');
+assert.match(existingDefectComparison?.candidateProductFailureSignatureDigest ?? '', /^sha256:[a-f0-9]{64}$/u);
+assert.equal(
+  existingDefectComparison.candidateProductFailureSignatureDigest,
+  existingDefectComparison.productionProductFailureSignatureDigest,
+  'AE6 must carry matching valid candidate and production product-failure signatures',
+);
+const regressionComparison = comparisonReceipt('AE7');
+assert.equal(regressionComparison?.classification, 'candidate-worsened');
+assert.match(regressionComparison?.candidateProductFailureSignatureDigest ?? '', /^sha256:[a-f0-9]{64}$/u);
+assert.match(regressionComparison?.productionProductFailureSignatureDigest ?? '', /^sha256:[a-f0-9]{64}$/u);
+assert.notEqual(
+  regressionComparison.candidateProductFailureSignatureDigest,
+  regressionComparison.productionProductFailureSignatureDigest,
+  'AE7 must carry different valid candidate and production product-failure signatures',
+);
+
 assert.deepEqual(
   matrix,
   registeredMatrix,

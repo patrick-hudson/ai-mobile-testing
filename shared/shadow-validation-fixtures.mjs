@@ -21,6 +21,11 @@ export const SHADOW_CORRUPTION_CASE_IDS = Object.freeze([
   'CR16_RESTORED_STALE_SNAPSHOT',
 ]);
 
+export const SHADOW_COMPARATIVE_FAILURE_SCENARIOS = Object.freeze({
+  AE6: 'MATCHING_SIGNATURES',
+  AE7: 'DIFFERING_SIGNATURES',
+});
+
 const DEFAULT_TARGETS = Object.freeze(['candidate-mobile-chromium']);
 
 function source(kind, caseId, overrides = {}) {

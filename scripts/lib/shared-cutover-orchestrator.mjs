@@ -285,15 +285,23 @@ export async function captureSharedAuthorityDrainObservation({
   for (const runId of runIds) {
     const state = await readParentRun(store, runId);
     for (const operation of Object.values(state.operations ?? {})) {
-      if (operation.state !== 'accepted') continue;
+      if (!['accepted', 'applied'].includes(operation.state)) continue;
       const identity = `${runId}:${operation.operationId}`;
       unresolvedOperationIds.push(identity);
       if (RELEASE_CHANGING_MUTATIONS.has(operation.kind)) releaseChangingMutationIds.push(identity);
     }
     for (const item of Object.values(state.workItems ?? {})) {
-      if (item.state !== 'running' || !item.lease) continue;
-      if (item.lease.epoch === coordinator.epoch && Date.parse(item.lease.expiresAt) > clock()) {
+      if (item.state === 'running' && item.lease
+        && item.lease.epoch === coordinator.epoch && Date.parse(item.lease.expiresAt) > clock()) {
         unfencedLegacyLeaseIds.push(`shared-preactivation:${runId}:${item.id}:${item.lease.token}`);
+      }
+      for (const diagnostic of item.diagnosticExecutions ?? []) {
+        if (diagnostic.state !== 'running' || !diagnostic.lease) continue;
+        if (diagnostic.lease.epoch === coordinator.epoch && Date.parse(diagnostic.lease.expiresAt) > clock()) {
+          unfencedLegacyLeaseIds.push(
+            `shared-preactivation:${runId}:${item.id}:diagnostic:${diagnostic.diagnosticExecutionId}:${diagnostic.lease.token}`,
+          );
+        }
       }
     }
   }

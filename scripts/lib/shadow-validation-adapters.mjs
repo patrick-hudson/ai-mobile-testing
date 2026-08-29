@@ -11,6 +11,7 @@ import {
 import {
   parseExecutionManifest,
   sealOracleResult,
+  sealProductFailureSignature,
   sealWorkItemResult,
 } from '../../shared/execution-contract.mjs';
 import {
@@ -21,7 +22,10 @@ import {
 import { appendVisualDisposition, projectSharedReleaseView } from '../../shared/release-projection.mjs';
 import { sealReleaseSubjectCore } from '../../shared/release-subject.mjs';
 import { compileDefinitionCoverageManifest } from '../../shared/run-compiler.mjs';
-import { buildPreRegisteredShadowMatrix } from '../../shared/shadow-validation-fixtures.mjs';
+import {
+  SHADOW_COMPARATIVE_FAILURE_SCENARIOS,
+  buildPreRegisteredShadowMatrix,
+} from '../../shared/shadow-validation-fixtures.mjs';
 import { parsePublicationEnvelope } from '../../shared/publication-envelope.mjs';
 import { parseChecklistRelease } from './release-truth.mjs';
 import {
@@ -37,6 +41,16 @@ const FIXTURE_TIMESTAMP = '2026-08-29T12:00:00.000Z';
 const CANDIDATE_ORIGIN = 'https://beta.example.test';
 const PRODUCTION_ORIGIN = 'https://example.test';
 const DIGEST = (character) => `sha256:${character.repeat(64)}`;
+const BASELINE_FAILURE_SIGNATURE = sealProductFailureSignature({
+  schemaVersion: 1,
+  assertionIdentities: ['assertion:shadow-product-contract:baseline'],
+  findingIdentities: ['finding:shadow-product-contract:baseline'],
+});
+const CANDIDATE_FAILURE_SIGNATURE = sealProductFailureSignature({
+  schemaVersion: 1,
+  assertionIdentities: ['assertion:shadow-product-contract:candidate'],
+  findingIdentities: ['finding:shadow-product-contract:candidate'],
+});
 
 const RESULT_TO_WORK_OUTCOME = Object.freeze({
   COMPLETED_PASS: 'completed_pass',
@@ -115,6 +129,9 @@ function fixtureCatalog(source, { includeUnselected = false } = {}) {
 }
 
 function targetRegistry(source) {
+  const productionTargetId = source.mode === 'comparative'
+    ? source.selectedTargets.find((id) => id.toLowerCase().includes('production')) ?? source.selectedTargets[1]
+    : null;
   const singleSiteTargets = source.selectedTargets.map((id) => ({
     id,
     sourceComparativeTargetId: id,
@@ -127,15 +144,21 @@ function targetRegistry(source) {
     visual: true,
     fullSweep: true,
   }));
-  const localTargets = source.selectedTargets.map((id, index) => ({
-    id,
-    environment: id.toLowerCase().includes('production') || (source.mode === 'comparative' && index > 0)
+  const localTargets = source.selectedTargets.map((id, index) => {
+    const environment = id.toLowerCase().includes('production') || (source.mode === 'comparative' && index > 0)
       ? 'production'
-      : 'candidate',
-    engine: 'chromium',
-    browserProduct: 'chromium',
-    deviceClass: 'desktop',
-  }));
+      : 'candidate';
+    return {
+      id,
+      environment,
+      ...(source.mode === 'comparative' ? {
+        baselineTargetId: environment === 'candidate' ? productionTargetId : null,
+      } : {}),
+      engine: 'chromium',
+      browserProduct: 'chromium',
+      deviceClass: 'desktop',
+    };
+  });
   return {
     schemaVersion: 1,
     defaultTargetIds: [...source.selectedTargets],
@@ -310,6 +333,14 @@ function oracleClassification(oracle) {
   return 'INCOMPLETE_UNKNOWN';
 }
 
+function comparativeFailureSignature(scenario, targetRole) {
+  if (scenario === 'MATCHING_SIGNATURES') return BASELINE_FAILURE_SIGNATURE;
+  if (scenario !== 'DIFFERING_SIGNATURES') return null;
+  if (targetRole === 'candidate') return CANDIDATE_FAILURE_SIGNATURE;
+  if (targetRole === 'production') return BASELINE_FAILURE_SIGNATURE;
+  throw new Error(`Comparative failure scenario has unsupported target role ${targetRole ?? 'missing'}.`);
+}
+
 function projectedRisks(source, graph) {
   if (['EMPTY', 'UNAVAILABLE'].includes(source.riskAvailability)) return [];
   return source.riskCategories.map((category, index) => ({
@@ -337,21 +368,40 @@ function projectedSharedSource(source, graph, observe) {
   const oracleResults = graph.oraclePlans.map((oraclePlan, index) => {
     const semanticId = source.requiredExecutionIds[index];
     const classification = requestedResults.get(semanticId) ?? 'INCOMPLETE_UNKNOWN';
-    const workItemResults = oraclePlan.requiredWorkItemIds.map((workItemId, workIndex) => sealWorkItemResult({
+    const comparativeScenario = SHADOW_COMPARATIVE_FAILURE_SCENARIOS[source.caseId] ?? null;
+    const oracleExecution = graph.executionManifest.oracleExecutions.find(({ id }) => id === oraclePlan.id);
+    const bindings = new Map(oracleExecution.workItemBindings.map((binding) => [binding.workItemId, binding]));
+    const workItemResults = oraclePlan.requiredWorkItemIds.map((workItemId, workIndex) => {
+      const targetRole = bindings.get(workItemId)?.targetRole;
+      const productFailureSignature = comparativeFailureSignature(comparativeScenario, targetRole);
+      const outcome = productFailureSignature === null
+        ? workIndex === 0 ? RESULT_TO_WORK_OUTCOME[classification] : 'completed_pass'
+        : 'completed_product_failure';
+      return sealWorkItemResult({
+        schemaVersion: 1,
+        workItemId,
+        subjectCoreDigest: graph.subjectCoreDigest,
+        attempt: 1,
+        authoritative: true,
+        outcome,
+        evidenceDigests: [DIGEST('4')],
+        ...(productFailureSignature === null ? {} : { productFailureSignature }),
+      });
+    });
+    const oracle = sealOracleResult({
       schemaVersion: 1,
-      workItemId,
-      subjectCoreDigest: graph.subjectCoreDigest,
-      attempt: 1,
-      authoritative: true,
-      outcome: workIndex === 0 ? RESULT_TO_WORK_OUTCOME[classification] : 'completed_pass',
-      evidenceDigests: [DIGEST('4')],
-    }));
-    return sealOracleResult({
-      schemaVersion: 1,
-      oracleExecution: graph.executionManifest.oracleExecutions.find(({ id }) => id === oraclePlan.id),
+      oracleExecution,
       finalSubjectDigest: graph.finalSubject.digest,
       workItemResults,
     });
+    if (oracle.comparisonResults.length > 0) {
+      receipt(observe, source.caseId, 'shared', 'sealOracleResult', oracle.comparisonResults.map((comparison) => ({
+        classification: comparison.classification,
+        candidateProductFailureSignatureDigest: comparison.candidateProductFailureSignatureDigest,
+        productionProductFailureSignatureDigest: comparison.productionProductFailureSignatureDigest,
+      })));
+    }
+    return oracle;
   });
   const view = projectSharedReleaseView({
     schemaVersion: 1,
