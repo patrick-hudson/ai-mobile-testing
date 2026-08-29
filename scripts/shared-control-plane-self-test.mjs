@@ -29,7 +29,8 @@ import {
   tombstoneParentRunAuthority,
 } from './lib/parent-run-store.mjs';
 import { createSharedControlService } from './lib/shared-control-service.mjs';
-import { createSharedControlApi } from '../portal/shared-control-api.mjs';
+import { createSharedControlApi, createSharedRequestAuthorizer } from '../portal/shared-control-api.mjs';
+import { assertSharedListScope, classifySharedReadRequest } from '../portal/shared-read-policy.mjs';
 import { sealExecutionManifest, sealOracleResult, sealWorkItemResult } from '../shared/execution-contract.mjs';
 import { appendPublicationEnvelope } from '../shared/publication-envelope.mjs';
 import { projectSharedReleaseView } from '../shared/release-projection.mjs';
@@ -170,6 +171,38 @@ try {
     (error) => error?.code === 'AUTHORIZATION_DENIED');
   assert.throws(() => assertPrincipalAuthorized(administrator, CONTROL_ACTIONS.WORK_PUBLISH, { projectId: 'project-1', runId: 'run-1' }),
     (error) => error?.code === 'AUTHORIZATION_DENIED');
+
+  const requestAuthorizer = createSharedRequestAuthorizer({ authority });
+  assert.equal((await requestAuthorizer.authorize({
+    headers: { authorization: `Bearer ${viewerIssued.credential}` },
+  }, CONTROL_ACTIONS.ARTIFACT_READ, { projectId: 'project-1', runId: 'run-1' })).principal.id, viewer.id);
+  await assert.rejects(() => requestAuthorizer.authorize({
+    headers: { authorization: `Bearer ${viewerIssued.credential}` },
+  }, CONTROL_ACTIONS.ARTIFACT_READ, { projectId: 'project-1', runId: 'run-2' }),
+  (error) => error?.code === 'AUTHORIZATION_DENIED');
+  await assert.rejects(() => requestAuthorizer.authorize({
+    headers: { authorization: `Bearer ${deliveryIssued.credential}` },
+  }, CONTROL_ACTIONS.LOG_READ, { projectId: 'project-1', runId: 'run-1' }),
+  (error) => error?.code === 'AUTHORIZATION_DENIED');
+  await assert.rejects(() => requestAuthorizer.authorize({
+    headers: { authorization: `Bearer ${workerIssued.credential}` },
+  }, CONTROL_ACTIONS.RUN_VIEW, { projectId: 'project-1', runId: 'run-1' }),
+  (error) => error?.code === 'AUTHORIZATION_DENIED');
+  assert.deepEqual(classifySharedReadRequest({ method: 'GET', pathname: '/api/runs/run-1/logs' }), {
+    action: CONTROL_ACTIONS.LOG_READ, runId: 'run-1', aggregate: false,
+  });
+  assert.deepEqual(classifySharedReadRequest({ method: 'HEAD', pathname: '/artifacts/run-1/checklist/report.html' }), {
+    action: CONTROL_ACTIONS.ARCHIVE_READ, runId: 'run-1', aggregate: false,
+  });
+  assert.deepEqual(classifySharedReadRequest({ method: 'GET', pathname: '/api/console/v1/runs' }), {
+    action: CONTROL_ACTIONS.RUN_LIST, runId: null, aggregate: true,
+  });
+  assert.deepEqual(classifySharedReadRequest({ method: 'GET', pathname: '/api/single-site/visual-baselines/history' }), {
+    action: CONTROL_ACTIONS.BASELINE_READ, runId: null, aggregate: true,
+  });
+  assert.equal(classifySharedReadRequest({ method: 'POST', pathname: '/api/runs/run-1/stop' }), null);
+  assert.doesNotThrow(() => assertSharedListScope({ ...viewer, runIds: ['*'] }));
+  assert.throws(() => assertSharedListScope(viewer), (error) => error?.code === 'AUTHORIZATION_DENIED');
   assert.throws(() => assertPrincipalAuthorized(administrator, CONTROL_ACTIONS.RELEASE_ASSERT, { projectId: 'project-1', runId: 'run-1' }),
     (error) => error?.code === 'AUTHORIZATION_DENIED');
 
@@ -409,7 +442,7 @@ try {
 
   const claimStore = await openPromotionClaimStore({ root: path.join(root, 'claims'), clock });
   const api = createSharedControlApi({
-    authority, service: reopenedControl, claimStore, expectedOrigin: 'https://audit.example.test',
+    authority, service: reopenedControl, claimStore, expectedOrigin: 'https://audit.example.test', sessionCookiePath: '/',
   });
   const login = await api.handle({
     method: 'POST', url: '/api/control/v1/session',
@@ -417,7 +450,7 @@ try {
     body: { credential: sessionPrincipalIssued.credential },
   });
   assert.equal(login.status, 200);
-  assert.match(login.headers['set-cookie'], /HttpOnly; SameSite=Strict; Path=\/api\/control\/v1; Secure/u);
+  assert.match(login.headers['set-cookie'], /HttpOnly; SameSite=Strict; Path=\/; Secure/u);
   const apiCookie = login.headers['set-cookie'].split(';')[0];
   const currentSession = await api.handle({ method: 'GET', url: '/api/control/v1/session', headers: { cookie: apiCookie } });
   assert.equal(currentSession.status, 200);

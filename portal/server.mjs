@@ -19,9 +19,10 @@ import { ByteLruCache } from './byte-lru-cache.mjs';
 import { readBoundedFileTail } from './bounded-file.mjs';
 import { openContainedArtifactFile } from './safe-artifact-open.mjs';
 import { createConsoleApi, handleConsoleApiRequest } from './console-api.mjs';
-import { createSharedControlApi } from './shared-control-api.mjs';
+import { createSharedControlApi, createSharedRequestAuthorizer } from './shared-control-api.mjs';
 import { openScopedCredentialAuthority } from './scoped-credential-authority.mjs';
 import { validateMutationDeployment } from '../shared/control-plane-contract.mjs';
+import { assertSharedListScope, classifySharedReadRequest } from './shared-read-policy.mjs';
 import { createParentRun, openParentRunStore } from '../scripts/lib/parent-run-store.mjs';
 import { createSharedControlService } from '../scripts/lib/shared-control-service.mjs';
 import { openPromotionClaimStore } from '../scripts/lib/promotion-claim-store.mjs';
@@ -211,6 +212,7 @@ const MAX_SSE_REPLAY_BYTES = 512 * 1024;
 const MAX_GALLERY_SSE_REPLAY_BYTES = 64 * 1024;
 const MAX_SSE_CLIENTS_PER_RUN = parseInteger(process.env.PORTAL_MAX_SSE_CLIENTS_PER_RUN, 8, 1, 64);
 const MAX_SSE_CLIENTS_TOTAL = parseInteger(process.env.PORTAL_MAX_SSE_CLIENTS_TOTAL, 64, 1, 512);
+const SHARED_READ_REAUTH_MS = parseInteger(process.env.PORTAL_SHARED_READ_REAUTH_MS, 5_000, 250, 60_000);
 const MAX_CONSOLE_TIMELINE_RECORDS_PER_RUN = 99;
 const GALLERY_SSE_EVENT_TYPES = new Set(['gallery', 'gallery-flag', 'snapshot', 'stage', 'status']);
 const sseCapacityDiagnostics = { refused: 0, peak: 0 };
@@ -457,6 +459,8 @@ let consoleKnownSingleSiteCursor = 0;
 let consoleComparativeReportWatermark = 0;
 let consoleSingleSiteReportWatermark = 0;
 let sharedControlApi = null;
+let sharedRequestAuthorizer = null;
+let sharedProjectId = null;
 let legacyOperatorEnabled = true;
 
 const singleSiteRunnerRevision = await resolveRunnerRevision({ root: REPOSITORY_ROOT });
@@ -516,12 +520,15 @@ if (process.env.PORTAL_SHARED_CONTROL === '1') {
     root: process.env.PORTAL_SHARED_CREDENTIAL_ROOT ?? join(SECRET_ROOT, 'control-identities'),
   });
   const claimStore = await openPromotionClaimStore({ root: join(SECRET_ROOT, 'promotion-claims') });
-  const sharedProjectId = process.env.AUDIT_SHARED_PROJECT_ID ?? 'default';
+  sharedProjectId = process.env.AUDIT_SHARED_PROJECT_ID ?? 'default';
+  sharedRequestAuthorizer = createSharedRequestAuthorizer({ authority: credentialAuthority });
   sharedControlApi = createSharedControlApi({
     authority: credentialAuthority,
+    requestAuthorizer: sharedRequestAuthorizer,
     service: createSharedControlService({ store: controlStore, projectId: sharedProjectId }),
     claimStore,
     expectedOrigin: deployment.publishedOrigin,
+    sessionCookiePath: '/',
     launch: async (_principal, body) => {
       if (!body?.parentRun || !['single-site', 'comparative'].includes(body.mode)) throw httpError(400, 'Shared launch requires mode and parentRun.');
       if (body.projectId !== sharedProjectId) throw httpError(403, 'Shared launch project does not match this control service.');
@@ -638,7 +645,7 @@ const server = createServer(async (request, response) => {
         ? error.message
         : 'Internal server error.',
     };
-    if (typeof error?.code === 'string' && /^(?:AI_REVIEW|BASELINE|GALLERY|SINGLE_SITE|VISUAL_REVIEW|QUEUE)_[A-Z0-9_]+$/.test(error.code)) {
+    if (typeof error?.code === 'string' && /^(?:AI_REVIEW|AUTHENTICATION|AUTHORIZATION|BASELINE|GALLERY|READ_OBJECT|SINGLE_SITE|VISUAL_REVIEW|QUEUE)_[A-Z0-9_]+$/.test(error.code)) {
       body.code = error.code;
     }
     if (error instanceof VisualBaselineStoreError && error.details) body.details = error.details;
@@ -1549,6 +1556,7 @@ async function routeRequest(request, response) {
     if (!result.handled) throw httpError(404, 'Not found.');
     return sendJson(response, result.status, result.body, result.headers);
   }
+  await authorizeSharedLegacyRead(request, pathname);
   if (pathname === '/api/console/v1' || pathname.startsWith('/api/console/v1/')) {
     const result = await withConsoleRequest(request, response, (signal) => handleConsoleApiRequest(consoleApi, {
       method: request.method,
@@ -2436,6 +2444,22 @@ async function routeRequest(request, response) {
     return servePortalAsset(request, response, pathname);
   }
   throw httpError(404, 'Not found.');
+}
+
+async function authorizeSharedLegacyRead(request, pathname) {
+  if (!sharedRequestAuthorizer) return null;
+  const policy = classifySharedReadRequest({ method: request.method, pathname });
+  if (!policy) return null;
+  const authentication = await sharedRequestAuthorizer.authorize(request, policy.action, {
+    projectId: sharedProjectId,
+    runId: policy.runId,
+  });
+  if (policy.aggregate) assertSharedListScope(authentication.principal);
+  request.auditSharedReadGuard = () => sharedRequestAuthorizer.authorize(request, policy.action, {
+    projectId: sharedProjectId,
+    runId: policy.runId,
+  }, { renew: false });
+  return authentication;
 }
 
 async function withGalleryRequest(request, response, operation) {
@@ -4525,11 +4549,14 @@ function observeSseCapacity() {
 
 function attachSseClient(request, response, clients) {
   let cleaned = false;
+  let authorizationPending = false;
   const cleanup = () => {
     if (cleaned) return;
     cleaned = true;
     if (response.auditHeartbeat) clearInterval(response.auditHeartbeat);
+    if (response.auditAuthorizationHeartbeat) clearInterval(response.auditAuthorizationHeartbeat);
     response.auditHeartbeat = null;
+    response.auditAuthorizationHeartbeat = null;
     clients.delete(response);
   };
   request.once('close', cleanup);
@@ -4542,6 +4569,15 @@ function attachSseClient(request, response, clients) {
   response.auditHeartbeat = setInterval(() => {
     if (!response.writableNeedDrain && !response.writableEnded) response.write(': heartbeat\n\n');
   }, 15_000);
+  if (request.auditSharedReadGuard) {
+    response.auditAuthorizationHeartbeat = setInterval(() => {
+      if (authorizationPending || response.writableEnded || response.destroyed) return;
+      authorizationPending = true;
+      void request.auditSharedReadGuard()
+        .catch(() => response.destroy())
+        .finally(() => { authorizationPending = false; });
+    }, SHARED_READ_REAUTH_MS);
+  }
   clients.add(response);
   if (request.destroyed || response.destroyed || response.writableEnded) {
     cleanup();
@@ -4550,7 +4586,8 @@ function attachSseClient(request, response, clients) {
   return true;
 }
 
-function streamRunEvents(request, response, run) {
+async function streamRunEvents(request, response, run) {
+  await request.auditSharedReadGuard?.();
   assertSseCapacity(run);
   response.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -4599,7 +4636,8 @@ function streamRunEvents(request, response, run) {
   if (attachSseClient(request, response, run.clients)) observeSseCapacity();
 }
 
-function streamGalleryEvents(request, response, run) {
+async function streamGalleryEvents(request, response, run) {
+  await request.auditSharedReadGuard?.();
   assertSseCapacity(run);
   response.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -4788,11 +4826,20 @@ async function serveArtifactFromDirectory(request, response, artifactRoot, reque
     const sandboxSources = opaqueArchiveSurface
       ? `default-src 'self' data: blob:; connect-src 'self'; img-src 'self' data: blob: ${artifactOrigin}; media-src 'self' data: blob: ${artifactOrigin}; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; worker-src 'self' blob:; frame-src 'self' blob: ${artifactOrigin}; font-src 'self' data:; base-uri 'none'`
       : "default-src 'self' data: blob:; connect-src 'self'; img-src 'self' data: blob:; media-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; worker-src 'self' blob:; frame-src 'self' blob:; font-src 'self' data:; base-uri 'none'";
-    const activeContentIsolation = extname(verifiedFile).toLowerCase() === '.html'
+    const artifactExtension = extname(verifiedFile).toLowerCase();
+    const downloadOnly = Boolean(sharedRequestAuthorizer)
+      && new Set(['.htm', '.html', '.js', '.mjs', '.pdf', '.svg', '.xhtml', '.xml']).has(artifactExtension);
+    const activeContentIsolation = downloadOnly
+      ? "default-src 'none'; frame-ancestors 'none'; sandbox"
+      : artifactExtension === '.html'
       ? `sandbox allow-scripts allow-forms allow-downloads allow-popups; ${sandboxSources}${opaqueArchiveWrapper ? '' : "; frame-ancestors 'self'"}`
       : "default-src 'none'; frame-ancestors 'self'";
     const opaqueArchiveModule = /(?:^|\/)checklist\/assets\/gallery-(?:archive|core)\.js$/.test(relativeArtifactPath);
-    const transfer = sendFile(request, response, verifiedFile, activeContentIsolation, { opaqueArchiveModule, opened });
+    const transfer = sendFile(request, response, verifiedFile, activeContentIsolation, {
+      opaqueArchiveModule: opaqueArchiveModule && !downloadOnly,
+      downloadOnly,
+      opened,
+    });
     opened = null;
     return await transfer;
   } finally {
@@ -4802,6 +4849,7 @@ async function serveArtifactFromDirectory(request, response, artifactRoot, reque
 
 async function sendFile(request, response, file, contentSecurityPolicy, {
   opaqueArchiveModule = false,
+  downloadOnly = false,
   opened = null,
   contentType = null,
   etag = null,
@@ -4853,6 +4901,10 @@ async function sendFile(request, response, file, contentSecurityPolicy, {
       'X-Content-Type-Options': 'nosniff',
       'Referrer-Policy': 'no-referrer',
     };
+    if (downloadOnly) {
+      const downloadName = basename(file).replace(/["\\\r\n]/gu, '_') || 'artifact.bin';
+      headers['Content-Disposition'] = `attachment; filename="${downloadName}"`;
+    }
     if (etag) headers.ETag = etag;
     if (opaqueArchiveModule) {
       // Archive HTML intentionally has an opaque origin so it cannot inherit

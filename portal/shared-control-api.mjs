@@ -3,8 +3,25 @@ import { consumePromotionClaim, issuePromotionClaim } from '../scripts/lib/promo
 
 export const SHARED_CONTROL_API_PREFIX = '/api/control/v1';
 
-export function createSharedControlApi({ authority, service, claimStore, expectedOrigin, launch = null } = {}) {
+export function createSharedRequestAuthorizer({ authority } = {}) {
+  if (!authority) throw new TypeError('Shared request authorizer requires a credential authority.');
+  return Object.freeze({
+    authenticate: (request, options = {}) => authenticate(authority, request, options),
+    async authorize(request, action, object = {}, options = {}) {
+      const authentication = await authenticate(authority, request, options);
+      assertPrincipalAuthorized(authentication.principal, action, object);
+      return authentication;
+    },
+  });
+}
+
+export function createSharedControlApi({
+  authority, service, claimStore, expectedOrigin, launch = null,
+  requestAuthorizer = createSharedRequestAuthorizer({ authority }),
+  sessionCookiePath = SHARED_CONTROL_API_PREFIX,
+} = {}) {
   if (!authority || !service || !claimStore || !expectedOrigin) throw new TypeError('Shared control API dependencies are required.');
+  if (!/^\/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]*)$/u.test(sessionCookiePath)) throw new TypeError('Shared session cookie path is invalid.');
   return Object.freeze({
     async handle(request) {
       const url = new URL(request.url, expectedOrigin);
@@ -17,10 +34,10 @@ export function createSharedControlApi({ authority, service, claimStore, expecte
           const session = await authority.createBrowserSession(principal, {});
           const secure = new URL(expectedOrigin).protocol === 'https:' ? '; Secure' : '';
           return response(200, { schemaVersion: 1, data: { csrfToken: session.csrfToken, idleExpiresAt: session.idleExpiresAt, absoluteExpiresAt: session.absoluteExpiresAt } }, {
-            'set-cookie': `audit_session=${session.token}; HttpOnly; SameSite=Strict; Path=${SHARED_CONTROL_API_PREFIX}${secure}`,
+            'set-cookie': `audit_session=${session.token}; HttpOnly; SameSite=Strict; Path=${sessionCookiePath}${secure}`,
           });
         }
-        const authentication = await authenticate(authority, request);
+        const authentication = await requestAuthorizer.authenticate(request);
         const principal = authentication.principal;
         if (request.method === 'GET' && url.pathname === `${SHARED_CONTROL_API_PREFIX}/session`) {
           return ok({ principal, csrfToken: authentication.csrfToken, idleExpiresAt: authentication.idleExpiresAt, absoluteExpiresAt: authentication.absoluteExpiresAt });
@@ -30,7 +47,7 @@ export function createSharedControlApi({ authority, service, claimStore, expecte
           const token = sessionToken(request);
           await authority.logoutBrowserSession(token);
           return response(200, { schemaVersion: 1, data: { loggedOut: true } }, {
-            'set-cookie': `audit_session=; HttpOnly; SameSite=Strict; Path=${SHARED_CONTROL_API_PREFIX}; Max-Age=0${new URL(expectedOrigin).protocol === 'https:' ? '; Secure' : ''}`,
+            'set-cookie': `audit_session=; HttpOnly; SameSite=Strict; Path=${sessionCookiePath}; Max-Age=0${new URL(expectedOrigin).protocol === 'https:' ? '; Secure' : ''}`,
           });
         }
         const runMatch = new RegExp(`^${SHARED_CONTROL_API_PREFIX}/runs/([A-Za-z0-9._-]{1,128})(?:/(.*))?$`).exec(url.pathname);
@@ -86,12 +103,12 @@ export function createSharedControlApi({ authority, service, claimStore, expecte
   });
 }
 
-async function authenticate(authority, request) {
+async function authenticate(authority, request, { renew = true } = {}) {
   const authorization = String(request.headers?.authorization ?? '');
   if (authorization.startsWith('Bearer ')) return { principal: await authority.authenticateCredential(authorization.slice(7)), browser: false, csrfToken: null };
   const session = String(request.headers?.cookie ?? '').split(';').map((part) => part.trim()).find((part) => part.startsWith('audit_session='))?.slice(14);
   if (!session) throw new ControlPlaneError('AUTHENTICATION_REQUIRED', 'Authentication is required.', 401);
-  const authenticated = await authority.authenticateBrowserSession(session);
+  const authenticated = await authority.authenticateBrowserSession(session, { renew });
   return { ...authenticated, browser: true };
 }
 function mutation(request, auth, expectedOrigin) {
