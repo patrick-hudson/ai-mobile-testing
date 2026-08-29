@@ -1,6 +1,7 @@
 import type { CanonicalExecutionGraph } from './execution-graph-compiler.mjs';
 import type { ReleaseSubjectCore } from './release-subject.mjs';
 import type { AuditRunContract } from './run-contract.mjs';
+import type { WorkExecutionDescriptor } from './work-execution-descriptor.mjs';
 
 export interface ScheduledLaunchWorkItem {
   id: string;
@@ -9,6 +10,7 @@ export interface ScheduledLaunchWorkItem {
   resourceClass: 'ordinary' | 'performance';
   targetId: string;
   specAffinity: string | null;
+  executionDescriptor: WorkExecutionDescriptor;
 }
 
 export interface SharedLaunchPlan {
@@ -28,6 +30,7 @@ export interface SharedLaunchPlan {
     finalSubjectDigest?: string;
     compilationState: 'pending' | 'sealed';
     runnerRevision: string;
+    inventoryBarrier: unknown | null;
     workItems: ScheduledLaunchWorkItem[];
   };
   digest: string;
@@ -42,3 +45,8 @@ export function compileSharedLaunchPlan(input: {
   environmentRevision: string;
   deploymentIdentity: { kind: string; value: string };
 }): SharedLaunchPlan;
+export function scheduleCanonicalWorkItems(input: {
+  executionGraph: CanonicalExecutionGraph;
+  subjectCore: ReleaseSubjectCore;
+  runnerRevision: string;
+}): ScheduledLaunchWorkItem[];

@@ -1,7 +1,11 @@
 import type { AuditApplicability, AuditRunMode } from './types.js';
+import {
+  AUDIT_CASE_ID_ANNOTATION,
+  AUDIT_CASE_TAG_PREFIX,
+  auditCaseTag,
+} from '../shared/audit-case-identity.mjs';
 
-export const AUDIT_CASE_TAG_PREFIX = '@audit-case-' as const;
-export const AUDIT_CASE_ID_ANNOTATION = 'audit-case-id' as const;
+export { AUDIT_CASE_ID_ANNOTATION, AUDIT_CASE_TAG_PREFIX, auditCaseTag };
 
 export interface ExecutableAuditCaseSelection {
   caseId: string;
@@ -22,12 +26,6 @@ export interface ExecutableAuditCaseRegistry {
 
 function allCases(registry: ExecutableAuditCaseRegistry): ExecutableAuditCaseSelection[] {
   return registry.plugins.flatMap(({ auditCases }) => auditCases);
-}
-
-export function auditCaseTag(caseId: string): string {
-  const normalized = caseId.trim();
-  if (!normalized) throw new Error('Audit case ID must be non-empty.');
-  return `${AUDIT_CASE_TAG_PREFIX}${Buffer.from(normalized, 'utf8').toString('base64url')}`;
 }
 
 export function auditCaseVariantSuffix(caseVariant: string): string {
@@ -71,9 +69,10 @@ export function parseSelectedSingleSiteCaseIds(
   return normalized;
 }
 
-export function resolveDeclaredSingleSiteCaseId(
+export function resolveDeclaredAuditCaseId(
   registry: ExecutableAuditCaseRegistry,
   input: {
+    mode: AuditRunMode;
     auditId: string;
     applicability: AuditApplicability;
     oracleVariant?: string;
@@ -83,18 +82,26 @@ export function resolveDeclaredSingleSiteCaseId(
   const matches = allCases(registry).filter((auditCase) => (
     auditCase.auditId === input.auditId
     && auditCase.applicability === input.applicability
-    && auditCase.supportedModes.includes('single-site')
-    && (input.oracleVariant === undefined || auditCase.oracleVariants.singleSite === input.oracleVariant)
+    && auditCase.supportedModes.includes(input.mode)
+    && (input.oracleVariant === undefined || input.mode === 'comparative'
+      || auditCase.oracleVariants.singleSite === input.oracleVariant)
     && (input.caseVariant === undefined || auditCase.caseId.endsWith(auditCaseVariantSuffix(input.caseVariant)))
   ));
   if (matches.length === 0) return null;
   if (matches.length !== 1) {
     throw new Error(
-      `Single-site declaration ${input.auditId}/${input.applicability} maps to ${matches.length} executable cases; `
+      `${input.mode} declaration ${input.auditId}/${input.applicability} maps to ${matches.length} executable cases; `
       + 'bind a unique named Product Oracle variant.',
     );
   }
   return matches[0]!.caseId;
+}
+
+export function resolveDeclaredSingleSiteCaseId(
+  registry: ExecutableAuditCaseRegistry,
+  input: Omit<Parameters<typeof resolveDeclaredAuditCaseId>[1], 'mode'>,
+): string | null {
+  return resolveDeclaredAuditCaseId(registry, { ...input, mode: 'single-site' });
 }
 
 export function selectedAuditCaseGrep(caseIds: readonly string[]): RegExp {

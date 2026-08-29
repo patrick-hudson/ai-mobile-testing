@@ -6,7 +6,9 @@ import {
 } from '../../shared/canonical-contract.mjs';
 import { parsePublicationEnvelope, verifyPublicationChain } from '../../shared/publication-envelope.mjs';
 import { parseExecutionManifest, sealWorkItemResult } from '../../shared/execution-contract.mjs';
+import { parseSingleSiteInventoryBarrier } from '../../shared/execution-graph-compiler.mjs';
 import { parseFinalReleaseSubject, parseReleaseSubjectCore } from '../../shared/release-subject.mjs';
+import { parseWorkExecutionDescriptor } from '../../shared/work-execution-descriptor.mjs';
 import {
   atomicWriteJson,
   atomicWriteFile,
@@ -77,7 +79,7 @@ function schedulingString(value, label, { nullable = false, maximum = 512 } = {}
   return value;
 }
 
-function normalizeScheduledWorkItems(value) {
+function normalizeScheduledWorkItems(value, { subjectCoreDigest = null, runnerRevision = null } = {}) {
   if (!Array.isArray(value) || value.length === 0) fail('STORE_SCHEMA_INVALID', 'A parent run requires work items.');
   const workItems = {};
   for (const item of value) {
@@ -89,12 +91,27 @@ function normalizeScheduledWorkItems(value) {
     const capability = schedulingCapability(item.capability ?? 'browser:any', `Work item ${id} capability`);
     const resourceClass = item.resourceClass ?? 'ordinary';
     if (!RESOURCE_CLASSES.has(resourceClass)) fail('STORE_SCHEMA_INVALID', `Work item ${id} resourceClass is invalid.`);
+    let executionDescriptor = null;
+    if (item.executionDescriptor !== undefined && item.executionDescriptor !== null) {
+      try { executionDescriptor = parseWorkExecutionDescriptor(item.executionDescriptor); } catch (error) {
+        fail(error?.code ?? 'STORE_SCHEMA_INVALID', `Work item ${id} execution descriptor is invalid: ${error.message}`);
+      }
+      if (executionDescriptor.workItemId !== id || executionDescriptor.capability !== capability
+        || executionDescriptor.resourceClass !== resourceClass
+        || executionDescriptor.targetId !== (item.targetId ?? 'unspecified-target')
+        || executionDescriptor.entrySpec !== (item.specAffinity ?? null)
+        || (subjectCoreDigest !== null && executionDescriptor.subjectCoreDigest !== subjectCoreDigest)
+        || (runnerRevision !== null && executionDescriptor.runnerRevision !== runnerRevision)) {
+        fail('WORK_DESCRIPTOR_BINDING_MISMATCH', `Work item ${id} execution descriptor disagrees with its canonical scheduling identity.`);
+      }
+    }
     workItems[id] = {
       id,
       capability,
       resourceClass,
       targetId: schedulingString(item.targetId ?? 'unspecified-target', `Work item ${id} targetId`, { maximum: 128 }),
       specAffinity: schedulingString(item.specAffinity ?? null, `Work item ${id} specAffinity`, { nullable: true, maximum: 512 }),
+      executionDescriptor,
       state: 'queued',
       maxAttempts: item.maxAttempts,
       lease: null,
@@ -352,6 +369,7 @@ async function recoverUnlocked(store, runId, { repairCache = true } = {}) {
   const snapshot = latest.stateSnapshot;
   snapshot.authorityTombstone ??= null;
   snapshot.compilationBarrier ??= null;
+  snapshot.inventoryBarrierPlan ??= null;
   if (snapshot?.schemaVersion !== 1 || snapshot.kind !== 'durable-parent-run'
     || snapshot.runId !== runId || !Number.isSafeInteger(snapshot.runRevision)
     || !['active', 'cancelled'].includes(snapshot.status)
@@ -382,6 +400,18 @@ async function recoverUnlocked(store, runId, { repairCache = true } = {}) {
       || (item.specAffinity !== null && typeof item.specAffinity !== 'string')
       || !Number.isSafeInteger(item.manualRekicks) || item.manualRekicks < 0 || item.manualRekicks > 3) {
       fail('STORE_CORRUPT', `Parent run ${runId} has invalid work-item state.`);
+    }
+    if (item.executionDescriptor !== null && item.executionDescriptor !== undefined) {
+      let descriptor;
+      try { descriptor = parseWorkExecutionDescriptor(item.executionDescriptor); } catch {
+        fail('STORE_CORRUPT', `Parent run ${runId} has a corrupt execution descriptor.`);
+      }
+      if (descriptor.workItemId !== id || descriptor.subjectCoreDigest !== snapshot.subjectCoreDigest
+        || descriptor.runnerRevision !== snapshot.runnerRevision || descriptor.capability !== item.capability
+        || descriptor.resourceClass !== item.resourceClass || descriptor.targetId !== item.targetId
+        || descriptor.entrySpec !== item.specAffinity) {
+        fail('STORE_CORRUPT', `Parent run ${runId} has a misbound execution descriptor.`);
+      }
     }
   }
   if (snapshot.compilationBarrier !== null) {
@@ -503,7 +533,6 @@ export async function openParentRunStore({
 
 export async function createParentRun(store, input) {
   const runId = safeId(input?.runId, 'runId');
-  const scheduledWorkItems = normalizeScheduledWorkItems(input.workItems);
   const compilationState = input.compilationState ?? 'pending';
   if (!['pending', 'sealed'].includes(compilationState)) fail('STORE_SCHEMA_INVALID', 'Parent-run compilationState is invalid.');
   const subjectCore = input.subjectCore ? parseReleaseSubjectCore(input.subjectCore) : null;
@@ -513,6 +542,14 @@ export async function createParentRun(store, input) {
   const executionManifestDigest = executionManifest?.digest ?? input.executionManifestDigest ?? null;
   const finalSubjectDigest = finalSubject?.digest ?? input.finalSubjectDigest ?? null;
   const runnerRevision = schedulingString(input.runnerRevision ?? 'legacy-runner', 'runnerRevision', { maximum: 256 });
+  let inventoryBarrierPlan = null;
+  if (input.inventoryBarrier !== undefined && input.inventoryBarrier !== null) {
+    if (!subjectCore) fail('STORE_SCHEMA_INVALID', 'An inventory barrier requires the canonical release subject core.');
+    try { inventoryBarrierPlan = parseSingleSiteInventoryBarrier(input.inventoryBarrier, subjectCore); } catch (error) {
+      fail(error?.code ?? 'STORE_SCHEMA_INVALID', `Parent-run inventory barrier is invalid: ${error.message}`);
+    }
+  }
+  const scheduledWorkItems = normalizeScheduledWorkItems(input.workItems, { subjectCoreDigest, runnerRevision });
   if (!DIGEST_PATTERN.test(subjectCoreDigest)
     || (executionManifestDigest !== null && !DIGEST_PATTERN.test(executionManifestDigest))
     || (finalSubjectDigest !== null && !DIGEST_PATTERN.test(finalSubjectDigest))) {
@@ -559,6 +596,7 @@ export async function createParentRun(store, input) {
       finalSubjectDigest,
       compilationState,
       compilationBarrier: null,
+      inventoryBarrierPlan,
       runnerRevision,
       createdAt,
       updatedAt: createdAt,
@@ -654,7 +692,10 @@ export async function sealParentRunGraph(store, runId, coordinator, input) {
         || barrier.canonicalResult?.outcome !== 'completed_pass') {
         fail('INVENTORY_BARRIER_INCOMPLETE', 'Inventory must complete successfully before the parent graph can expand and seal.');
       }
-      expandedWorkItems = normalizeScheduledWorkItems(input.workItems);
+      expandedWorkItems = normalizeScheduledWorkItems(input.workItems, {
+        subjectCoreDigest,
+        runnerRevision: state.runnerRevision,
+      });
       if (canonicalJson(Object.keys(expandedWorkItems).sort()) !== canonicalJson(manifestIds)) {
         fail('SEALED_MANIFEST_MISMATCH', 'Expanded durable work items do not match the sealed execution manifest.');
       }
@@ -863,6 +904,8 @@ export async function claimWorkItem(store, runId, coordinator, input) {
       resourceClass: requested.resourceClass,
       targetId: requested.targetId,
       specAffinity: requested.specAffinity,
+      executionDescriptor: requested.executionDescriptor,
+      executionDescriptorDigest: requested.executionDescriptor?.digest ?? null,
     };
     requested.state = 'running';
     requested.lease = claimed;
@@ -1000,7 +1043,7 @@ export async function publishAttemptEvidence(store, runId, lease, result) {
   const state = await recoverUnlocked(store, runId, { repairCache: false });
   validateWorkLease(state, lease);
   if (!result || typeof result !== 'object' || Array.isArray(result)
-    || Object.keys(result).some((key) => !['outcome', 'reason', 'artifacts'].includes(key))
+    || Object.keys(result).some((key) => !['outcome', 'reason', 'artifacts', 'executionDescriptorDigest'].includes(key))
     || !WORK_OUTCOMES.has(result?.outcome) || !Array.isArray(result.artifacts)
     || result.artifacts.length > MAX_ATTEMPT_ARTIFACTS) {
     fail('STORE_SCHEMA_INVALID', 'Attempt evidence outcome or artifacts are invalid.');
@@ -1052,6 +1095,7 @@ export async function publishAttemptEvidence(store, runId, lease, result) {
     leaseToken: lease.token,
     subjectCoreDigest: lease.subjectCoreDigest ?? state.subjectCoreDigest,
     runnerRevision: lease.runnerRevision ?? state.runnerRevision,
+    executionDescriptorDigest: result.executionDescriptorDigest ?? lease.executionDescriptorDigest ?? null,
     outcome: result.outcome,
     reason: schedulingString(result.reason ?? null, 'Attempt evidence reason', { nullable: true, maximum: 256 }),
     evidenceDigests: artifacts.map(({ digest }) => digest),
@@ -1117,7 +1161,7 @@ export async function adoptAttemptEvidence(store, runId, coordinator, inbox) {
   const { digest, ...body } = document;
   exactKeys(document, [
     'schemaVersion', 'kind', 'runId', 'workItemId', 'workerId', 'attempt', 'coordinatorEpoch',
-    'leaseToken', 'subjectCoreDigest', 'runnerRevision', 'outcome', 'reason', 'evidenceDigests', 'artifacts', 'publishedAt', 'digest',
+    'leaseToken', 'subjectCoreDigest', 'runnerRevision', 'executionDescriptorDigest', 'outcome', 'reason', 'evidenceDigests', 'artifacts', 'publishedAt', 'digest',
   ], 'attempt evidence inbox');
   canonicalTimestamp(document.publishedAt, 'attempt evidence publishedAt');
   if (document.schemaVersion !== 1 || document.kind !== 'attempt-evidence-inbox' || document.runId !== runId
@@ -1144,6 +1188,10 @@ export async function adoptAttemptEvidence(store, runId, coordinator, inbox) {
   });
   if (document.subjectCoreDigest !== state.subjectCoreDigest || document.runnerRevision !== state.runnerRevision) {
     fail('WORK_RESULT_BINDING_MISMATCH', 'Attempt evidence does not match the run subject or runner revision.');
+  }
+  const expectedDescriptorDigest = state.workItems[document.workItemId]?.executionDescriptor?.digest ?? null;
+  if (document.executionDescriptorDigest !== expectedDescriptorDigest) {
+    fail('WORK_DESCRIPTOR_BINDING_MISMATCH', 'Attempt evidence does not match the compiler-issued execution descriptor.');
   }
   const artifactNames = new Set();
   let artifactBytes = 0;
@@ -1213,6 +1261,39 @@ export async function adoptAttemptEvidence(store, runId, coordinator, inbox) {
   }, { data: { workItemId: document.workItemId, digest } });
   return adopted;
   }));
+}
+
+export async function readAdoptedAttemptArtifactJson(store, runId, input) {
+  const state = await recoverUnlocked(store, runId, { repairCache: false });
+  const workItemId = safeId(input?.workItemId, 'workItemId');
+  const name = artifactName(input?.name);
+  const maximumBytes = input?.maximumBytes ?? MAX_ATTEMPT_ARTIFACT_BYTES;
+  if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 2 || maximumBytes > MAX_ATTEMPT_ARTIFACT_BYTES) {
+    fail('STORE_SCHEMA_INVALID', 'Adopted artifact JSON byte bound is invalid.');
+  }
+  const item = state.workItems[workItemId] ?? (state.compilationBarrier?.id === workItemId ? state.compilationBarrier : null);
+  const attempt = item?.attempts?.at(-1);
+  if (!item || !['completed_pass', 'completed_product_failure'].includes(item.state)
+    || !attempt || attempt.outcome !== item.state) {
+    fail('ATTEMPT_ARTIFACT_UNAVAILABLE', `Work item ${workItemId} has no adopted terminal artifact.`);
+  }
+  const artifact = attempt.artifacts.find((entry) => entry.name === name);
+  if (!artifact) fail('ATTEMPT_ARTIFACT_UNAVAILABLE', `Work item ${workItemId} did not adopt artifact ${name}.`);
+  validateArtifactRecord(artifact, {
+    runId,
+    workItemId,
+    attempt: attempt.attempt,
+    leaseToken: artifact.relativePath.split('/')[2]?.replace(/^\d{6}-/, ''),
+  });
+  const file = containedPath(runDirectory(store, runId), ...artifact.relativePath.split('/'));
+  const bytes = await readBoundedFile(store.storage, file, { label: `adopted artifact ${name}`, maximumBytes });
+  const digest = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
+  if (bytes.length !== artifact.sizeBytes || digest !== artifact.digest) {
+    fail('ARTIFACT_DIGEST_MISMATCH', `Adopted artifact ${name} no longer matches its immutable record.`);
+  }
+  try { return JSON.parse(bytes.toString('utf8')); } catch {
+    fail('STORE_CORRUPT', `Adopted artifact ${name} is not valid JSON.`);
+  }
 }
 
 export async function cancelParentRun(store, runId, coordinator, input) {

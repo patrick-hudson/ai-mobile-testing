@@ -49,6 +49,7 @@ try {
     attempt: executorLease.attempt,
     subjectCoreDigest: executorLease.subjectCoreDigest,
     runnerRevision: executorLease.runnerRevision,
+    executionDescriptorDigest: null,
     outcome: 'completed_pass',
     reason: null,
     artifacts: [],
@@ -88,7 +89,7 @@ try {
     outcome: 'completed_product_failure', reason: 'assertion-failed',
   })));
   assert.deepEqual(await collectSharedWorkerEvidence(executorEvidenceRoot, { code: 1, signal: null }, executorLease), {
-    outcome: 'completed_product_failure', reason: 'assertion-failed', artifacts: [],
+    outcome: 'completed_product_failure', reason: 'assertion-failed', executionDescriptorDigest: null, artifacts: [],
   });
   await fs.writeFile(path.join(executorEvidenceRoot, 'result.json'), JSON.stringify(executorResult()));
   assert.deepEqual((await collectSharedWorkerEvidence(executorEvidenceRoot, { code: 0, signal: null }, executorLease)).artifacts, [],
@@ -435,12 +436,13 @@ try {
   assert.deepEqual(multipleWorkers, oneWorker,
     'worker topology changes scheduling only, not canonical result identity or evidence membership');
 
-  const [playwrightConfig, compose, sharedCoordinatorSource, sharedWorkerSource, sharedEvidenceSource] = await Promise.all([
+  const [playwrightConfig, compose, sharedCoordinatorSource, sharedWorkerSource, sharedEvidenceSource, sharedDispatcherSource] = await Promise.all([
     fs.readFile(new URL('../playwright.config.ts', import.meta.url), 'utf8'),
     fs.readFile(new URL('../docker-compose.yml', import.meta.url), 'utf8'),
     fs.readFile(new URL('./run-shared-coordinator.mjs', import.meta.url), 'utf8'),
     fs.readFile(new URL('./run-shared-worker.mjs', import.meta.url), 'utf8'),
     fs.readFile(new URL('./lib/shared-worker-evidence.mjs', import.meta.url), 'utf8'),
+    fs.readFile(new URL('./lib/shared-work-dispatcher.mjs', import.meta.url), 'utf8'),
   ]);
   assert.match(playwrightConfig, /retries:\s*0,/);
   assert.match(compose, /shared-coordinator:/);
@@ -467,7 +469,10 @@ try {
     'worker A must not mount worker B credentials');
   assert.doesNotMatch(workerBBlock, /shared-worker-ordinary-a-secret:/,
     'worker B must not mount worker A credentials');
-  assert.match(sharedWorkerSource, /AUDIT_SHARED_EVIDENCE_DIR/);
+  assert.match(sharedDispatcherSource, /AUDIT_SHARED_EVIDENCE_DIR/);
+  assert.doesNotMatch(compose, /AUDIT_SHARED_(?:PERFORMANCE_)?EXECUTOR_JSON/,
+    'Compose workers must use only the fixed repository-owned dispatcher.');
+  assert.doesNotMatch(sharedWorkerSource, /AUDIT_SHARED_EXECUTOR_JSON/);
   assert.match(sharedWorkerSource, /\/v1\/heartbeat/);
   assert.match(sharedCoordinatorSource, /request\.url === '\/v1\/heartbeat'/);
   assert.match(sharedCoordinatorSource, /heartbeatWorkItem\(store, leaseRunId, body\.lease/);

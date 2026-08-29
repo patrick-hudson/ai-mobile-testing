@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { collectSharedWorkerEvidence } from './lib/shared-worker-evidence.mjs';
 import { maintainSharedWorkerLease } from './lib/shared-worker-heartbeat.mjs';
+import { createSharedWorkCommand } from './lib/shared-work-dispatcher.mjs';
 
 const required = (name) => {
   const value = process.env[name];
@@ -26,16 +27,6 @@ const capabilities = required('AUDIT_SHARED_WORKER_CAPABILITIES').split(',').map
 const pollMs = Number(process.env.AUDIT_SHARED_POLL_MS ?? 1_000);
 if (!Number.isSafeInteger(pollMs) || pollMs < 100 || pollMs > 60_000) throw new Error('AUDIT_SHARED_POLL_MS is invalid.');
 
-let executor;
-try {
-  executor = JSON.parse(required('AUDIT_SHARED_EXECUTOR_JSON'));
-} catch (error) {
-  throw new Error(`AUDIT_SHARED_EXECUTOR_JSON must be a JSON command array: ${error.message}`);
-}
-if (!Array.isArray(executor) || executor.length === 0 || executor.some((part) => typeof part !== 'string' || !part)) {
-  throw new Error('AUDIT_SHARED_EXECUTOR_JSON must be a non-empty string array.');
-}
-
 const post = async (pathname, body) => {
   const response = await fetch(new URL(pathname, coordinatorUrl), {
     method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${workerCredential}` }, body: JSON.stringify(body), signal: AbortSignal.timeout(30_000),
@@ -47,14 +38,13 @@ const wait = () => new Promise((resolve) => setTimeout(resolve, pollMs));
 const execute = async ({ lease, signal: abortSignal }) => {
   const evidenceRoot = await fs.mkdtemp(path.join(tmpdir(), 'audit-shared-evidence-'));
   try {
+    const command = createSharedWorkCommand(lease, evidenceRoot);
     const completion = await new Promise((resolve, reject) => {
-      const child = spawn(executor[0], executor.slice(1), {
+      const child = spawn(command.executable, command.args, {
+        cwd: command.cwd,
         detached: true,
         stdio: ['pipe', 'inherit', 'inherit'],
-        env: {
-          ...process.env, AUDIT_SHARED_LEASE: JSON.stringify(lease),
-          AUDIT_SHARED_EVIDENCE_DIR: evidenceRoot, CI: '1',
-        },
+        env: command.environment,
       });
       let escalation;
       const terminate = () => {

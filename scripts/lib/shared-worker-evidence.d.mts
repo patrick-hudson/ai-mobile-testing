@@ -10,5 +10,6 @@ export function collectSharedWorkerEvidence(
 ): Promise<{
   outcome: 'completed_pass' | 'completed_product_failure';
   reason: string | null;
+  executionDescriptorDigest: string | null;
   artifacts: AttemptArtifactUpload[];
 }>;

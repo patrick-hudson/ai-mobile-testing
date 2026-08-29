@@ -46,7 +46,7 @@ export async function collectSharedWorkerEvidence(evidenceRoot, { code, signal =
   }
   const resultKeys = [
     'schemaVersion', 'kind', 'runId', 'workItemId', 'attempt', 'subjectCoreDigest', 'runnerRevision',
-    'outcome', 'reason', 'artifacts',
+    'executionDescriptorDigest', 'outcome', 'reason', 'artifacts',
   ];
   if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)
     || Object.keys(manifest).length !== resultKeys.length || resultKeys.some((key) => !(key in manifest))
@@ -57,7 +57,8 @@ export async function collectSharedWorkerEvidence(evidenceRoot, { code, signal =
     throw new Error('Executor result manifest has an invalid schema.');
   }
   if (manifest.runId !== lease.runId || manifest.workItemId !== lease.workItemId || manifest.attempt !== lease.attempt
-    || manifest.subjectCoreDigest !== lease.subjectCoreDigest || manifest.runnerRevision !== lease.runnerRevision) {
+    || manifest.subjectCoreDigest !== lease.subjectCoreDigest || manifest.runnerRevision !== lease.runnerRevision
+    || manifest.executionDescriptorDigest !== (lease.executionDescriptorDigest ?? null)) {
     throw new Error('Executor result identity does not match the active work lease.');
   }
   if (signal !== null || !Number.isSafeInteger(code) || code < 0 || code > 1) {
@@ -113,6 +114,7 @@ export async function collectSharedWorkerEvidence(evidenceRoot, { code, signal =
   return {
     outcome: manifest.outcome,
     reason: manifest.reason,
+    executionDescriptorDigest: manifest.executionDescriptorDigest,
     artifacts: uploads,
   };
 }

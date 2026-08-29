@@ -5,6 +5,7 @@ export interface SharedCoordinatorStatus {
   runCount: number;
   requeued?: number;
   completedOperations?: number;
+  sealedGraphs?: number;
   errors: readonly Array<{ runId: string; code: string; message: string }>;
 }
 export interface SharedCoordinatorSupervisor {
@@ -22,5 +23,7 @@ export function createSharedCoordinatorSupervisor(input: {
   coordinatorLeaseMs?: number;
   workLeaseMs?: number;
   runLimit?: number;
+  pluginRegistry?: unknown;
+  targetRegistry?: unknown;
   onEvent?: (event: any) => void;
 }): SharedCoordinatorSupervisor;

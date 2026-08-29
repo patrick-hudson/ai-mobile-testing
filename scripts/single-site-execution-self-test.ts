@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import {
   auditCaseTag,
   parseSelectedSingleSiteCaseIds,
+  resolveDeclaredAuditCaseId,
   resolveDeclaredSingleSiteCaseId,
   selectedAuditCaseGrep,
   type ExecutableAuditCaseRegistry,
@@ -51,6 +52,12 @@ assert.equal(resolveDeclaredSingleSiteCaseId(registry, {
   auditId: 'ENV-003',
   applicability: 'candidate-desktop-chromium',
 }), null, 'Comparison-only cases must not register in a Single-site Playwright suite.');
+assert.equal(resolveDeclaredAuditCaseId(registry, {
+  mode: 'comparative',
+  auditId: 'ENV-003',
+  applicability: 'candidate-desktop-chromium',
+}), 'ENV-003:tests/contracts.spec.ts:candidate-desktop-chromium',
+'Comparison-only cases must receive the same compiler-selectable identity in Comparative mode.');
 
 const grep = selectedAuditCaseGrep([homeCase, contentCase]);
 assert(grep.test(`test title ${auditCaseTag(homeCase)}`));

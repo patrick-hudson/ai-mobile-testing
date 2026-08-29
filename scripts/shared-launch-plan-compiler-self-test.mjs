@@ -80,6 +80,7 @@ assert(!('runId' in single.createParentRunInput), 'the operation materializer, n
 assert.equal(single.createParentRunInput.workItems.length, 1);
 assert.equal(single.createParentRunInput.workItems[0].capability, 'inventory:http');
 assert.equal(single.createParentRunInput.workItems[0].resourceClass, 'ordinary');
+assert.equal(single.createParentRunInput.workItems[0].executionDescriptor.operation, 'inventory');
 assert(single.createParentRunInput.workItems[0].maxAttempts >= 1
   && single.createParentRunInput.workItems[0].maxAttempts <= 10);
 
@@ -98,6 +99,13 @@ assert.deepEqual(
 );
 assert(comparative.createParentRunInput.workItems.every(({ maxAttempts }) => (
   Number.isSafeInteger(maxAttempts) && maxAttempts >= 1 && maxAttempts <= 16
+)));
+assert(comparative.createParentRunInput.workItems.every(({ executionDescriptor, id, capability, targetId }) => (
+  executionDescriptor.workItemId === id
+  && executionDescriptor.capability === capability
+  && executionDescriptor.targetId === targetId
+  && executionDescriptor.subjectCoreDigest === comparative.subjectCore.digest
+  && executionDescriptor.runnerRevision === server.runnerRevision
 )));
 
 const comparisonOnly = compile(contract('single-site', 'TARGETED', {
@@ -176,6 +184,8 @@ try {
   const singleParent = await recoverParentRun(parentRunStore, singleOperation.runId);
   assert.equal(singleParent.compilationState, 'pending');
   assert.deepEqual(Object.values(singleParent.workItems).map(({ capability }) => capability), ['inventory:http']);
+  assert.equal(Object.values(singleParent.workItems)[0].executionDescriptor.digest,
+    single.createParentRunInput.workItems[0].executionDescriptor.digest);
 
   const comparativeOperation = await service.accept(operator, {
     requestId: 'comparative-launch-0001',
@@ -190,6 +200,7 @@ try {
     Object.keys(comparativeParent.workItems).sort(),
     comparative.executionGraph.executionManifest.workItems.map(({ id }) => id).sort(),
   );
+  assert(Object.values(comparativeParent.workItems).every(({ executionDescriptor }) => executionDescriptor?.digest));
   assert.equal((await service.accept(operator, {
     requestId: 'comparative-launch-0001',
     intent: { schemaVersion: 1, runContract: contract('comparative', 'TARGETED') },

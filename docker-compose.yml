@@ -191,7 +191,6 @@ services:
       AUDIT_SHARED_COORDINATOR_URL: http://shared-coordinator:4180
       AUDIT_SHARED_WORKER_CAPABILITIES: ${AUDIT_SHARED_ORDINARY_CAPABILITIES:-inventory:http,browser:chromium,browser:firefox,browser:webkit}
       AUDIT_SHARED_RESOURCE_CLASS: ordinary
-      AUDIT_SHARED_EXECUTOR_JSON: ${AUDIT_SHARED_EXECUTOR_JSON:-}
       AUDIT_SHARED_WORKER_TOKEN_FILE: /run/secrets/shared-worker/token
     volumes:
       - ./certs:/work/certs:ro
@@ -215,7 +214,6 @@ services:
       AUDIT_SHARED_COORDINATOR_URL: http://shared-coordinator:4180
       AUDIT_SHARED_WORKER_CAPABILITIES: ${AUDIT_SHARED_ORDINARY_CAPABILITIES:-inventory:http,browser:chromium,browser:firefox,browser:webkit}
       AUDIT_SHARED_RESOURCE_CLASS: ordinary
-      AUDIT_SHARED_EXECUTOR_JSON: ${AUDIT_SHARED_EXECUTOR_JSON:-}
       AUDIT_SHARED_WORKER_TOKEN_FILE: /run/secrets/shared-worker/token
     volumes:
       - ./certs:/work/certs:ro
@@ -241,7 +239,6 @@ services:
       AUDIT_SHARED_COORDINATOR_URL: http://shared-coordinator:4180
       AUDIT_SHARED_WORKER_CAPABILITIES: performance:lighthouse
       AUDIT_SHARED_RESOURCE_CLASS: performance
-      AUDIT_SHARED_EXECUTOR_JSON: ${AUDIT_SHARED_PERFORMANCE_EXECUTOR_JSON:-}
       AUDIT_SHARED_WORKER_TOKEN_FILE: /run/secrets/shared-worker/token
     volumes:
       - ./certs:/work/certs:ro

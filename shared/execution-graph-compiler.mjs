@@ -157,6 +157,10 @@ function parseInventoryBarrier(value, subjectCore) {
   return value;
 }
 
+export function parseSingleSiteInventoryBarrier(value, rawSubjectCore) {
+  return parseInventoryBarrier(value, parseReleaseSubjectCore(rawSubjectCore));
+}
+
 export function compileSingleSiteInventoryBarrier({ subjectCore: rawSubjectCore, pluginRegistry, targetRegistry, maxAttempts = 3 }) {
   const subjectCore = parseReleaseSubjectCore(rawSubjectCore);
   if (subjectCore.mode !== 'single-site') failContract('INVALID_CONTRACT', 'Inventory barriers exist only for Single-site graphs.');

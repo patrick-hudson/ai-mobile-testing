@@ -8,9 +8,10 @@ import {
   isRecord,
   nonEmptyString,
 } from './canonical-contract.mjs';
-import { compileCanonicalExecutionGraph, compileSingleSiteInventoryBarrier } from './execution-graph-compiler.mjs';
-import { sealReleaseSubjectCore } from './release-subject.mjs';
+import { compileCanonicalExecutionGraph, compileSingleSiteInventoryBarrier, parseCanonicalExecutionGraph } from './execution-graph-compiler.mjs';
+import { parseReleaseSubjectCore, sealReleaseSubjectCore } from './release-subject.mjs';
 import { parseRunContract } from './run-contract.mjs';
+import { sealWorkExecutionDescriptor } from './work-execution-descriptor.mjs';
 
 function sortedUnique(values) {
   return [...new Set(values)].sort((left, right) => left.localeCompare(right));
@@ -173,7 +174,37 @@ function releaseTargets(contract) {
     ];
 }
 
-function scheduledWorkItem(plan, maxAttempts) {
+function descriptorOrigins(subjectCore) {
+  const byRole = new Map(subjectCore.targets.map(({ role, origin }) => [role, origin]));
+  return subjectCore.mode === 'single-site'
+    ? { candidate: subjectCore.targets[0].origin, production: null }
+    : { candidate: byRole.get('candidate'), production: byRole.get('production') };
+}
+
+function scheduledWorkItem(plan, maxAttempts, subjectCore, runnerRevision) {
+  const inventory = plan.capability === 'inventory:http';
+  const executionDescriptor = sealWorkExecutionDescriptor({
+    workItemId: plan.id,
+    subjectCoreDigest: subjectCore.digest,
+    runnerRevision,
+    mode: subjectCore.mode,
+    operation: inventory ? 'inventory' : 'playwright',
+    definitionId: plan.definitionId,
+    pluginId: inventory ? null : plan.pluginId,
+    caseId: inventory ? null : plan.caseId,
+    entrySpec: inventory ? null : plan.entrySpec,
+    targetId: plan.targetId,
+    targetRole: plan.targetRole,
+    capability: plan.capability,
+    resourceClass: plan.resourceClass,
+    origins: descriptorOrigins(subjectCore),
+    certificatePolicy: subjectCore.certificatePolicy,
+    route: plan.routeUrl ? {
+      inventoryDigest: plan.inventoryDigest,
+      url: plan.routeUrl,
+      path: plan.routePath,
+    } : null,
+  });
   return {
     id: plan.id,
     maxAttempts,
@@ -181,7 +212,20 @@ function scheduledWorkItem(plan, maxAttempts) {
     resourceClass: plan.resourceClass,
     targetId: plan.targetId,
     specAffinity: plan.entrySpec ?? null,
+    executionDescriptor,
   };
+}
+
+export function scheduleCanonicalWorkItems({ executionGraph: rawGraph, subjectCore: rawSubjectCore, runnerRevision }) {
+  const executionGraph = parseCanonicalExecutionGraph(rawGraph);
+  const subjectCore = parseReleaseSubjectCore(rawSubjectCore);
+  runnerRevision = assertDigest(runnerRevision, 'runnerRevision');
+  if (executionGraph.subjectCoreDigest !== subjectCore.digest) {
+    failContract('RELEASE_SUBJECT_MISMATCH', 'Scheduled canonical work does not match its release subject core.');
+  }
+  return freezeContract([...executionGraph.workItemPlans, ...executionGraph.contextPlans]
+    .map((plan) => scheduledWorkItem(plan, plan.resourceClass === 'performance' ? 2 : 3, subjectCore, runnerRevision))
+    .sort((left, right) => left.id.localeCompare(right.id)));
 }
 
 export function compileSharedLaunchPlan(input) {
@@ -226,7 +270,8 @@ export function compileSharedLaunchPlan(input) {
       subjectCoreDigest: subjectCore.digest,
       compilationState: 'pending',
       runnerRevision,
-      workItems: [scheduledWorkItem(inventoryBarrier.workItem, inventoryBarrier.maxAttempts)],
+      inventoryBarrier,
+      workItems: [scheduledWorkItem(inventoryBarrier.workItem, inventoryBarrier.maxAttempts, subjectCore, runnerRevision)],
     };
   } else {
     inventoryBarrier = null;
@@ -246,9 +291,8 @@ export function compileSharedLaunchPlan(input) {
       finalSubjectDigest: executionGraph.finalSubject.digest,
       compilationState: 'sealed',
       runnerRevision,
-      workItems: [...executionGraph.workItemPlans, ...executionGraph.contextPlans]
-        .map((plan) => scheduledWorkItem(plan, plan.resourceClass === 'performance' ? 2 : 3))
-        .sort((left, right) => left.id.localeCompare(right.id)),
+      inventoryBarrier: null,
+      workItems: scheduleCanonicalWorkItems({ executionGraph, subjectCore, runnerRevision }),
     };
   }
   const body = {

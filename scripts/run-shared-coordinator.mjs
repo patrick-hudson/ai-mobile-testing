@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { readFile } from 'node:fs/promises';
 import {
   adoptAttemptEvidence,
   adoptWorkHeartbeat,
@@ -56,6 +57,10 @@ const store = await openParentRunStore({
 const controlService = createSharedControlService({ store, projectId: process.env.AUDIT_SHARED_PROJECT_ID ?? 'default' });
 const credentialAuthority = await openScopedCredentialAuthority({ root: required('AUDIT_SHARED_CREDENTIAL_ROOT') });
 const projectId = process.env.AUDIT_SHARED_PROJECT_ID ?? 'default';
+const [pluginRegistry, targetRegistry] = await Promise.all([
+  readFile(new URL('../audit/plugins.generated.json', import.meta.url), 'utf8').then(JSON.parse),
+  readFile(new URL('../audit/targets.generated.json', import.meta.url), 'utf8').then(JSON.parse),
+]);
 const supervisor = createSharedCoordinatorSupervisor({
   store,
   controlService,
@@ -63,6 +68,8 @@ const supervisor = createSharedCoordinatorSupervisor({
   ownerId: `coordinator-${process.pid}`,
   coordinatorLeaseMs,
   workLeaseMs: leaseMs,
+  pluginRegistry,
+  targetRegistry,
   onEvent: (event) => process.stdout.write(`${JSON.stringify(event)}\n`),
 });
 let maintenance = Promise.resolve();

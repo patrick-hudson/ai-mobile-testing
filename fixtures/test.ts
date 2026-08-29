@@ -7,7 +7,7 @@ import { parseAuditProjectMetadata, resolveProjectPath } from '../audit/environm
 import {
   AUDIT_CASE_ID_ANNOTATION,
   auditCaseTag,
-  resolveDeclaredSingleSiteCaseId,
+  resolveDeclaredAuditCaseId,
   type ExecutableAuditCaseRegistry,
 } from '../audit/execution-selection.js';
 import { firstBracketedAuditId } from '../audit/audit-id.js';
@@ -1241,13 +1241,15 @@ export function standaloneStaticEvidence(
 
 type InteractionBody = Parameters<typeof interactionBase>[2];
 
-function declaredSingleSiteCase(
+function declaredAuditCase(
   title: string,
   details: AuditEvidenceDetails & { oracleVariant?: string },
+  mode: 'single-site' | 'comparative',
 ): { caseId: string; tag: string } | null {
   const auditId = firstBracketedAuditId(title);
-  if (!auditId) throw new Error(`Single-site audit title must begin with a bracketed Audit ID: ${title}`);
-  const caseId = resolveDeclaredSingleSiteCaseId(executableCaseRegistry, {
+  if (!auditId) throw new Error(`Audit title must begin with a bracketed Audit ID: ${title}`);
+  const caseId = resolveDeclaredAuditCaseId(executableCaseRegistry, {
+    mode,
     auditId,
     applicability: details.applicability,
     ...(details.caseVariant ? { caseVariant: details.caseVariant } : {}),
@@ -1274,7 +1276,7 @@ export function interactionTest(
   body: InteractionBody,
 ): void {
   const runMode = activeRunMode();
-  const auditCase = runMode === 'single-site' ? declaredSingleSiteCase(title, details) : null;
+  const auditCase = declaredAuditCase(title, details, runMode);
   if (runMode === 'single-site' && !auditCase) return;
   interactionBase.describe(() => {
     interactionBase.skip(
@@ -1289,7 +1291,7 @@ type StaticBody = Parameters<typeof staticBase>[2];
 
 export function staticTest(title: string, details: AuditEvidenceDetails, body: StaticBody): void {
   const runMode = activeRunMode();
-  const auditCase = runMode === 'single-site' ? declaredSingleSiteCase(title, details) : null;
+  const auditCase = declaredAuditCase(title, details, runMode);
   if (runMode === 'single-site' && !auditCase) return;
   staticBase.describe(() => {
     staticBase.skip(
@@ -1327,7 +1329,7 @@ export function standaloneStaticTest(
   body: StaticBody,
 ): void {
   const runMode = activeRunMode();
-  const auditCase = runMode === 'single-site' ? declaredSingleSiteCase(title, details) : null;
+  const auditCase = declaredAuditCase(title, details, runMode);
   if (runMode === 'single-site' && !auditCase) {
     throw new Error(`Standalone Single-site declaration is absent from the generated executable-case registry: ${title}.`);
   }
@@ -1344,7 +1346,7 @@ type StructuredBody = Parameters<typeof structuredBase>[2];
 
 export function structuredTest(title: string, details: AuditEvidenceDetails, body: StructuredBody): void {
   const runMode = activeRunMode();
-  const auditCase = runMode === 'single-site' ? declaredSingleSiteCase(title, details) : null;
+  const auditCase = declaredAuditCase(title, details, runMode);
   if (runMode === 'single-site' && !auditCase) return;
   structuredBase.describe(() => {
     structuredBase.skip(

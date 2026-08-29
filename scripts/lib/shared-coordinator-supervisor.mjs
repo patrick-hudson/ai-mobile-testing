@@ -4,9 +4,16 @@ import {
   claimWorkItem,
   heartbeatCoordinator,
   listParentRunIds,
+  readAdoptedAttemptArtifactJson,
   recoverParentRun,
   requeueExpiredWork,
+  sealParentRunGraph,
 } from './parent-run-store.mjs';
+import {
+  completeSingleSiteInventoryBarrier,
+  compileCanonicalExecutionGraph,
+} from '../../shared/execution-graph-compiler.mjs';
+import { scheduleCanonicalWorkItems } from '../../shared/launch-plan-compiler.mjs';
 
 const CLAIM_SKIP_CODES = new Set(['NO_WORK_AVAILABLE', 'NO_COMPATIBLE_WORK']);
 const PROJECTION_PENDING_CODES = new Set(['PUBLICATION_UNAVAILABLE', 'SEALED_MANIFEST_MISSING']);
@@ -50,6 +57,8 @@ export function createSharedCoordinatorSupervisor({
   coordinatorLeaseMs = 60_000,
   workLeaseMs = 30_000,
   runLimit = 2_048,
+  pluginRegistry = null,
+  targetRegistry = null,
   onEvent = () => {},
 } = {}) {
   if (!store || !controlService || typeof ownerId !== 'string' || !ownerId
@@ -63,6 +72,56 @@ export function createSharedCoordinatorSupervisor({
   let maintenance = Promise.resolve();
   let cursor = 0;
   let latest = Object.freeze({ state: 'starting', epoch: null, runCount: 0, errors: Object.freeze([]) });
+
+  async function sealCompletedInventory(runId, state, active) {
+    if (state.compilationState !== 'pending') return false;
+    const barriers = Object.values(state.workItems).filter(({ capability }) => capability === 'inventory:http');
+    if (barriers.length !== 1 || barriers[0].state !== 'completed_pass') return false;
+    if (!pluginRegistry || !targetRegistry || !state.subjectCore || !state.inventoryBarrierPlan) {
+      fail('INVENTORY_COMPILER_UNAVAILABLE', 'The active coordinator lacks the pinned compiler inputs for a completed inventory barrier.');
+    }
+    const barrier = barriers[0];
+    const artifact = await readAdoptedAttemptArtifactJson(store, runId, {
+      workItemId: barrier.id,
+      name: 'inventory/live-route-inventory.json',
+    });
+    if (!artifact || typeof artifact !== 'object' || Array.isArray(artifact)
+      || artifact.schemaVersion !== 1 || artifact.kind !== 'shared-single-site-inventory-result'
+      || artifact.workItemId !== barrier.id
+      || artifact.executionDescriptorDigest !== barrier.executionDescriptor?.digest
+      || !artifact.deploymentIdentityRecheck || !artifact.diagnostic?.inventory
+      || artifact.preflight?.accepted !== true) {
+      fail('INVENTORY_RESULT_INVALID', 'The adopted inventory artifact is not bound to the completed compiler barrier.');
+    }
+    const completion = completeSingleSiteInventoryBarrier({
+      subjectCore: state.subjectCore,
+      barrier: state.inventoryBarrierPlan,
+      attempt: barrier.canonicalResult.attempt,
+      routeInventory: artifact.diagnostic.inventory,
+      deploymentIdentityRecheck: artifact.deploymentIdentityRecheck,
+    });
+    const graph = compileCanonicalExecutionGraph({
+      subjectCore: state.subjectCore,
+      pluginRegistry,
+      targetRegistry,
+      inventoryCompletion: completion,
+      deploymentIdentityRecheck: artifact.deploymentIdentityRecheck,
+    });
+    const workItems = scheduleCanonicalWorkItems({
+      executionGraph: graph,
+      subjectCore: state.subjectCore,
+      runnerRevision: state.runnerRevision,
+    });
+    await sealParentRunGraph(store, runId, active, {
+      subjectCore: state.subjectCore,
+      executionManifest: graph.executionManifest,
+      finalSubject: graph.finalSubject,
+      inventoryWorkItemId: barrier.id,
+      workItems,
+    });
+    onEvent({ event: 'single-site-graph-sealed', runId, workItemCount: workItems.length, graphDigest: graph.digest });
+    return true;
+  }
 
   async function ensureCoordinator() {
     if (coordinator !== null) {
@@ -96,11 +155,13 @@ export function createSharedCoordinatorSupervisor({
     const errors = [];
     let requeued = 0;
     let completedOperations = 0;
+    let sealedGraphs = 0;
     for (const runId of runIds) {
       try {
         const state = await recoverParentRun(store, runId);
         if (state.authorityTombstone !== null) continue;
         requeued += await requeueExpiredWork(store, runId, active);
+        if (await sealCompletedInventory(runId, state, active)) sealedGraphs += 1;
         const operations = await controlService.applyAcceptedOperations(active, runId);
         completedOperations += operations.length;
         try {
@@ -120,7 +181,7 @@ export function createSharedCoordinatorSupervisor({
     }
     latest = Object.freeze({
       state: 'ready', epoch: active.epoch, runCount: runIds.length, requeued,
-      completedOperations, errors: Object.freeze(errors),
+      completedOperations, sealedGraphs, errors: Object.freeze(errors),
     });
     return latest;
   }
