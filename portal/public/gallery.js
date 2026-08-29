@@ -10,7 +10,7 @@ import {
   assertSharedWorkspaceProjection,
   createSharedControlBrowserClient,
   createSharedWorkspacePoller,
-  orderSharedRisksForReview,
+  pageSharedRisksForReview,
   SharedControlBrowserError,
 } from './shared-control-client.js';
 
@@ -379,7 +379,7 @@ function renderSharedGalleryAuthority(workspace) {
   } else if (riskRegister.risks.length === 0) {
     register.append(textElement('p', `${availability} risk data contains no published rows. This is not a no-risk claim.`));
   } else {
-    register.append(renderSharedRiskTable(orderSharedRisksForReview(riskRegister.risks)));
+    register.append(renderSharedRiskTable(riskRegister.risks));
   }
 
   const operations = document.createElement('section');
@@ -413,27 +413,47 @@ function renderSharedRiskTable(risks) {
   wrapper.tabIndex = 0;
   wrapper.setAttribute('role', 'region');
   wrapper.setAttribute('aria-label', 'Bounded Product Risk register');
-  const table = document.createElement('table');
-  table.className = 'gallery-risk-table';
-  table.innerHTML = '<thead><tr><th>Risk</th><th>Severity</th><th>Scope</th><th>Review</th><th>Release effect</th><th>Recommended action</th></tr></thead>';
-  const body = document.createElement('tbody');
-  for (const risk of risks.slice(0, 200)) {
-    const row = document.createElement('tr');
-    row.dataset.riskIdentity = risk.identity;
-    const riskCell = document.createElement('td');
-    riskCell.append(textElement('strong', humanize(risk.category)), textElement('span', risk.explanation));
-    row.append(
-      riskCell,
-      textElement('td', String(risk.severity).toUpperCase()),
-      textElement('td', scopeSummary(risk.affectedScope ?? risk.scope ?? `${risk.mode ?? parsed.runMode} · ${risk.source.id}`)),
-      textElement('td', humanize(risk.reviewState)),
-      textElement('td', `${risk.releaseEffect} · never changes the decision`),
-      textElement('td', risk.recommendedAction),
-    );
-    body.append(row);
-  }
-  table.append(body);
-  wrapper.append(table);
+  let offset = 0;
+  const renderPage = () => {
+    const page = pageSharedRisksForReview(risks, { offset });
+    offset = page.offset;
+    const table = document.createElement('table');
+    table.className = 'gallery-risk-table';
+    table.innerHTML = '<thead><tr><th>Risk</th><th>Severity</th><th>Scope</th><th>Review</th><th>Source and actor</th><th>Release effect</th><th>Recommended action</th></tr></thead>';
+    const body = document.createElement('tbody');
+    for (const risk of page.items) {
+      const row = document.createElement('tr');
+      row.dataset.riskIdentity = risk.identity;
+      const riskCell = document.createElement('td');
+      riskCell.append(textElement('strong', humanize(risk.category)), textElement('span', risk.explanation));
+      row.append(
+        riskCell,
+        textElement('td', String(risk.severity).toUpperCase()),
+        textElement('td', scopeSummary(risk.scope)),
+        textElement('td', humanize(risk.reviewState)),
+        textElement('td', `${risk.source.kind}:${risk.source.id} · ${risk.actor.kind}:${risk.actor.id} · observed ${risk.observedAt} · updated ${risk.updatedAt}`),
+        textElement('td', `${risk.releaseEffect} · never changes the decision`),
+        textElement('td', risk.recommendedAction),
+      );
+      body.append(row);
+    }
+    table.append(body);
+    const controls = document.createElement('nav');
+    controls.className = 'gallery-risk-pagination';
+    controls.setAttribute('aria-label', 'Risk Register pages');
+    const previous = textElement('button', 'Previous risks');
+    previous.type = 'button';
+    previous.disabled = !page.hasPrevious;
+    previous.addEventListener('click', () => { offset -= page.limit; renderPage(); wrapper.focus(); });
+    const next = textElement('button', 'Next risks');
+    next.type = 'button';
+    next.disabled = !page.hasNext;
+    next.addEventListener('click', () => { offset += page.limit; renderPage(); wrapper.focus(); });
+    const showing = textElement('p', page.showing, 'gallery-risk-showing');
+    controls.append(previous, showing, next);
+    wrapper.replaceChildren(controls, table);
+  };
+  renderPage();
   return wrapper;
 }
 
@@ -453,7 +473,7 @@ function scopeSummary(value) {
     ...(value.features ?? []).map((entry) => `feature ${entry}`),
     ...(value.definitions ?? []).map((entry) => `definition ${entry}`),
     ...(value.targets ?? []).map((entry) => `target ${entry}`),
-    ...(value.knownLimits ?? value.limitations ?? []).map((entry) => `limit ${entry}`),
+    ...(value.knownLimits ?? []).map((entry) => `limit ${entry}`),
   ];
   return values.join(' · ') || 'No scope values published';
 }

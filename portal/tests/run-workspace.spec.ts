@@ -213,18 +213,31 @@ test.describe('run-workspace', () => {
         const revision = operationAccepted ? 8 : 7;
         if (url.pathname === `${root}/publication`) return route.fulfill({ json: { schemaVersion: 1, data: {
           runId, runRevision: revision, decisionRevision: 3, riskRevision: 2, finalSubjectDigest,
-          decision: { mode, label: 'FEATURE READY', grantedAuthority: 'TARGETED', certifiedScope: { features: ['navigation'] } },
+          decision: { mode, label: 'FEATURE READY', grantedAuthority: 'TARGETED', certifiedScope: {
+            features: ['navigation'], definitions: ['NAV-001'], targets: ['desktop'], knownLimits: ['checkout-parity-deferred'],
+          } },
           riskRegister: { availability: 'PARTIAL', risks: [
             {
               identity: 'risk-manual-1', category: 'manual-check', severity: 'high', mode,
               reviewState: 'OPEN', releaseEffect: 'non-blocking', explanation: 'Manual checkout remains outstanding.',
               recommendedAction: 'Review checkout on a physical device.', source: { kind: 'manual', id: 'manual-1' },
+              scope: { features: ['checkout'], definitions: ['CHECKOUT-001'], targets: ['desktop'], knownLimits: [] },
+              actor: { kind: 'service', id: 'runner-1' }, observedAt: '2026-08-29T14:00:00.000Z', updatedAt: '2026-08-29T14:01:00.000Z',
             },
             {
               identity: 'risk-visual-1', category: 'unreviewed-visual-change', severity: 'medium', mode,
               reviewState: 'PENDING_REVIEW', releaseEffect: 'non-blocking', explanation: 'A deterministic comparison changed.',
               recommendedAction: 'Review the bounded visual evidence.', source: { kind: 'visual-review', id: 'oracle-visual-1' },
+              scope: { features: ['navigation'], definitions: ['NAV-001'], targets: ['desktop'], knownLimits: [] },
+              actor: { kind: 'worker', id: 'visual-worker-1' }, observedAt: '2026-08-29T14:02:00.000Z', updatedAt: '2026-08-29T14:03:00.000Z',
             },
+            ...Array.from({ length: 199 }, (_, index) => ({
+              identity: `risk-resolved-${String(index).padStart(3, '0')}`, category: 'manual-check', severity: index === 198 ? 'critical' : 'low', mode,
+              reviewState: 'RESOLVED', releaseEffect: 'non-blocking', explanation: `Resolved historical risk ${index}.`,
+              recommendedAction: 'No action required.', source: { kind: 'manual', id: `resolved-${index}` },
+              scope: { features: ['history'], definitions: ['HISTORY-001'], targets: ['desktop'], knownLimits: [] },
+              actor: { kind: 'reviewer', id: 'reviewer-1' }, observedAt: '2026-08-28T14:00:00.000Z', updatedAt: '2026-08-28T15:00:00.000Z',
+            })),
           ] },
         } } });
         if (url.pathname === `${root}/executions`) return route.fulfill({ json: { schemaVersion: 1, data: {
@@ -260,6 +273,14 @@ test.describe('run-workspace', () => {
       await expect(page.locator('#run-product-risk')).toHaveAttribute('data-risk-availability', 'PARTIAL');
       await expect(page.locator('#run-product-risk')).toContainText('non-blocking');
       await expect(page.locator('#run-product-risk')).toContainText('Pipeline Integrity');
+      await expect(page.locator('.run-risk-pagination')).toContainText('Showing 1–200 of 201 risks');
+      await expect(page.locator('[data-risk-identity="risk-manual-1"]')).toContainText('manual:manual-1 · actor service:runner-1');
+      await expect(page.locator('[data-risk-identity="risk-manual-1"]')).toContainText('2026-08-29T14:00:00.000Z');
+      await expect(page.locator('[data-risk-identity="risk-resolved-197"]')).toHaveCount(0);
+      await page.getByRole('button', { name: 'Next risks' }).click();
+      await expect(page.locator('.run-risk-pagination')).toContainText('Showing 201–201 of 201 risks');
+      await expect(page.locator('[data-risk-identity="risk-resolved-197"]')).toBeVisible();
+      await page.getByRole('button', { name: 'Previous risks' }).click();
       await expect(page.getByRole('button', { name: 'Accept visual change' })).toBeVisible();
       await page.getByRole('button', { name: 'Rekick incomplete execution' }).click();
       await expect(page.locator('#run-inspector-source-revision')).toHaveText('shared-8');

@@ -409,6 +409,9 @@ export function galleryReducer(state, action) {
     case 'REQUEST_FAILED': {
       if (!requestMatches(state, action)) return state;
       let next = updateRequest(state, action.slot, { status: 'error', error: String(action.error ?? 'Request failed.') });
+      if (['head', 'query'].includes(action.slot) && !next.accepted.contentRevision && next.accepted.items.length === 0) {
+        next = { ...next, phase: 'unavailable' };
+      }
       if (action.slot === 'query' && next.pendingRevision?.applying) {
         next = { ...next, pendingRevision: { ...next.pendingRevision, applying: false } };
       }

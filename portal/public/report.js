@@ -2,7 +2,7 @@ import { createConsoleSplitter } from './console-shell.js';
 import {
   assertSharedWorkspaceProjection,
   createSharedControlBrowserClient,
-  orderSharedRisksForReview,
+  pageSharedRisksForReview,
   SharedControlBrowserError,
 } from './shared-control-client.js';
 
@@ -365,7 +365,7 @@ function renderSharedReport(workspace) {
     ['Features', decision.certifiedScope?.features],
     ['Definitions', decision.certifiedScope?.definitions],
     ['Targets', decision.certifiedScope?.targets],
-    ['Known limits', decision.certifiedScope?.limitations],
+    ['Known limits', decision.certifiedScope?.knownLimits],
   ]) {
     const row = document.createElement('div');
     row.append(textNode('dt', label), textNode('dd', scopeValues(values, label === 'Known limits' && state.mode === 'single-site' ? 'N/A · No comparison-only limits were published.' : 'N/A')));
@@ -397,7 +397,7 @@ function renderSharedReport(workspace) {
   } else if (riskRegister.risks.length === 0) {
     register.append(textNode('p', `${availability} risk data contains no published rows. This is not a no-risk claim.`));
   } else {
-    register.append(renderRiskTable(orderSharedRisksForReview(riskRegister.risks)));
+    register.append(renderRiskTable(riskRegister.risks));
   }
 
   const operations = document.createElement('div');
@@ -440,30 +440,51 @@ function renderRiskTable(risks) {
   wrapper.tabIndex = 0;
   wrapper.setAttribute('role', 'region');
   wrapper.setAttribute('aria-label', 'Scrollable Risk Register columns');
-  const table = document.createElement('table');
-  table.className = 'report-risk-table';
-  const head = document.createElement('thead');
-  const headRow = document.createElement('tr');
-  for (const label of ['Category', 'Severity', 'Affected scope', 'Review state', 'Release effect', 'Recommended action']) headRow.append(textNode('th', label));
-  head.append(headRow);
-  const body = document.createElement('tbody');
-  for (const risk of risks.slice(0, 200)) {
-    const row = document.createElement('tr');
-    row.dataset.riskIdentity = risk.identity;
-    const category = document.createElement('td');
-    category.append(textNode('strong', humanize(risk.category)), textNode('span', risk.explanation));
-    row.append(
-      category,
-      textNode('td', risk.severity.toUpperCase()),
-      textNode('td', scopeValues(risk.affectedScope, `${risk.mode ?? state.mode} · ${risk.source.id}`)),
-      textNode('td', humanize(risk.reviewState)),
-      textNode('td', `${risk.releaseEffect} · never changes the decision`),
-      textNode('td', risk.recommendedAction),
-    );
-    body.append(row);
-  }
-  table.append(head, body);
-  wrapper.append(table);
+  let offset = 0;
+  const renderPage = () => {
+    const page = pageSharedRisksForReview(risks, { offset });
+    offset = page.offset;
+    const table = document.createElement('table');
+    table.className = 'report-risk-table';
+    const head = document.createElement('thead');
+    const headRow = document.createElement('tr');
+    for (const label of ['Category', 'Severity', 'Affected scope', 'Review state', 'Source and actor', 'Release effect', 'Recommended action']) headRow.append(textNode('th', label));
+    head.append(headRow);
+    const body = document.createElement('tbody');
+    for (const risk of page.items) {
+      const row = document.createElement('tr');
+      row.dataset.riskIdentity = risk.identity;
+      const category = document.createElement('td');
+      category.append(textNode('strong', humanize(risk.category)), textNode('span', risk.explanation));
+      row.append(
+        category,
+        textNode('td', risk.severity.toUpperCase()),
+        textNode('td', scopeValues(risk.scope, 'No certified risk scope published')),
+        textNode('td', humanize(risk.reviewState)),
+        textNode('td', `${risk.source.kind}:${risk.source.id} · ${risk.actor.kind}:${risk.actor.id} · observed ${risk.observedAt} · updated ${risk.updatedAt}`),
+        textNode('td', `${risk.releaseEffect} · never changes the decision`),
+        textNode('td', risk.recommendedAction),
+      );
+      body.append(row);
+    }
+    table.append(head, body);
+    const controls = document.createElement('nav');
+    controls.className = 'report-risk-pagination';
+    controls.setAttribute('aria-label', 'Risk Register pages');
+    const previous = textNode('button', 'Previous risks');
+    previous.type = 'button';
+    previous.disabled = !page.hasPrevious;
+    previous.addEventListener('click', () => { offset -= page.limit; renderPage(); wrapper.focus(); });
+    const next = textNode('button', 'Next risks');
+    next.type = 'button';
+    next.disabled = !page.hasNext;
+    next.addEventListener('click', () => { offset += page.limit; renderPage(); wrapper.focus(); });
+    const showing = textNode('p', page.showing);
+    showing.className = 'report-risk-showing';
+    controls.append(previous, showing, next);
+    wrapper.replaceChildren(controls, table);
+  };
+  renderPage();
   return wrapper;
 }
 
@@ -795,7 +816,7 @@ function renderDecision() {
   const tone = active ? 'running' : decision === 'NOT_READY' ? 'not-ready' : reviewRequired ? 'review' : decision === 'READY' ? 'ready' : 'review';
   elements.decision_hero.dataset.tone = tone;
   elements.decision_badge.dataset.tone = tone;
-  elements.decision_badge.textContent = active ? 'In progress' : decision === 'NOT_READY' ? 'Do not release' : reviewRequired ? 'Review required' : decision === 'READY' ? 'Ready for release' : 'Decision unavailable';
+  elements.decision_badge.textContent = active ? 'In progress' : decision === 'NOT_READY' ? 'Do not release' : reviewRequired ? 'Review required' : decision === 'READY' ? 'Legacy READY result' : 'Decision unavailable';
   elements.decision_title.textContent = active
     ? 'This audit is still running'
     : decision === 'NOT_READY'
@@ -805,13 +826,15 @@ function renderDecision() {
       : reviewRequired
         ? 'This run is evidence for review, not release authority'
         : decision === 'READY'
-          ? 'The redesign is ready for release'
+          ? 'The legacy checklist reported READY'
           : 'This run needs a release decision';
   const reviewCopy = (run.reviewReasons?.length ?? 0) > 0 ? ` Additional review requirements: ${run.reviewReasons.join('; ')}.` : '';
   elements.decision_summary.textContent = `${release?.reason ?? 'No authoritative release explanation is available.'}${reviewCopy}`;
   elements.decision_basis.textContent = reviewRequired
     ? 'The checklist result is preserved, but final release authority requires a new-ID sharded run with isolated performance provenance.'
-    : release?.decisionBasis ?? 'Release decisions require completed, structured evidence for every blocking audit.';
+    : decision === 'READY'
+      ? `Legacy evidence only; this result cannot authorize promotion. ${release?.decisionBasis ?? ''}`.trim()
+      : release?.decisionBasis ?? 'Release decisions require completed, structured evidence for every blocking audit.';
   elements.context_run_id.textContent = run.id;
   elements.context_profile.textContent = humanize(run.options?.profile ?? report.run?.profile ?? 'unknown');
   const selected = run.options?.auditIds ?? [];

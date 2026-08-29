@@ -10,6 +10,8 @@ const MUTATION_PATHS = Object.freeze({
 });
 const RISK_SEVERITY_ORDER = Object.freeze({ critical: 0, high: 1, medium: 2, low: 3 });
 const OPERATIONAL_RISK_CATEGORIES = new Set(['certificate-bypass', 'evidence-pipeline-limitation']);
+const ACTIVE_RISK_STATES = new Set(['OPEN', 'ACKNOWLEDGED', 'PENDING_REVIEW']);
+export const SHARED_RISK_PAGE_SIZE = 200;
 
 export class SharedControlBrowserError extends Error {
   constructor(message, { status = 0, code = 'SHARED_CONTROL_REQUEST_FAILED', body = null } = {}) {
@@ -24,6 +26,9 @@ export class SharedControlBrowserError extends Error {
 export function orderSharedRisksForReview(risks) {
   if (!Array.isArray(risks)) return [];
   return [...risks].sort((left, right) => {
+    const active = Number(!ACTIVE_RISK_STATES.has(left?.reviewState))
+      - Number(!ACTIVE_RISK_STATES.has(right?.reviewState));
+    if (active !== 0) return active;
     const severity = (RISK_SEVERITY_ORDER[left?.severity] ?? 99) - (RISK_SEVERITY_ORDER[right?.severity] ?? 99);
     if (severity !== 0) return severity;
     const operational = Number(OPERATIONAL_RISK_CATEGORIES.has(left?.category))
@@ -33,11 +38,27 @@ export function orderSharedRisksForReview(risks) {
   });
 }
 
+export function pageSharedRisksForReview(risks, { offset = 0, limit = SHARED_RISK_PAGE_SIZE } = {}) {
+  const ordered = orderSharedRisksForReview(risks);
+  const boundedLimit = Number.isSafeInteger(limit) ? Math.max(1, Math.min(SHARED_RISK_PAGE_SIZE, limit)) : SHARED_RISK_PAGE_SIZE;
+  const maximumOffset = ordered.length === 0 ? 0 : Math.floor((ordered.length - 1) / boundedLimit) * boundedLimit;
+  const boundedOffset = Number.isSafeInteger(offset) ? Math.max(0, Math.min(maximumOffset, offset)) : 0;
+  const items = ordered.slice(boundedOffset, boundedOffset + boundedLimit);
+  const start = items.length === 0 ? 0 : boundedOffset + 1;
+  const end = boundedOffset + items.length;
+  return Object.freeze({
+    items: Object.freeze(items), total: ordered.length, offset: boundedOffset, limit: boundedLimit,
+    start, end, showing: `Showing ${start}${items.length ? `–${end}` : ''} of ${ordered.length} risks`,
+    hasPrevious: boundedOffset > 0, hasNext: end < ordered.length,
+  });
+}
+
 export function assertSharedWorkspaceProjection(value, { runId, mode } = {}) {
   const publication = value?.publication;
   const executions = value?.executions;
   const logs = value?.logs;
   const register = publication?.riskRegister;
+  const certifiedScope = publication?.decision?.certifiedScope;
   if (!publication || (runId !== undefined && publication.runId !== runId)
     || (mode !== undefined && publication.decision?.mode !== mode)
     || !Number.isSafeInteger(publication.runRevision) || publication.runRevision < 1
@@ -46,6 +67,7 @@ export function assertSharedWorkspaceProjection(value, { runId, mode } = {}) {
     || typeof publication.finalSubjectDigest !== 'string'
     || typeof publication.decision?.label !== 'string'
     || typeof publication.decision?.grantedAuthority !== 'string'
+    || !canonicalScope(certifiedScope)
     || !['LOADING', 'PROVISIONAL', 'AVAILABLE', 'PARTIAL', 'EMPTY', 'UNAVAILABLE'].includes(register?.availability)
     || !Array.isArray(register?.risks) || !Array.isArray(executions?.executions)
     || !Array.isArray(executions?.oracleExecutions)
@@ -69,6 +91,9 @@ export function assertSharedWorkspaceProjection(value, { runId, mode } = {}) {
       || typeof risk.severity !== 'string' || typeof risk.reviewState !== 'string'
       || typeof risk.explanation !== 'string' || typeof risk.recommendedAction !== 'string'
       || typeof risk.source?.kind !== 'string' || typeof risk.source?.id !== 'string'
+      || !canonicalScope(risk.scope)
+      || typeof risk.actor?.id !== 'string' || typeof risk.actor?.kind !== 'string'
+      || !canonicalTimestamp(risk.observedAt) || !canonicalTimestamp(risk.updatedAt)
       || risk.releaseEffect !== 'non-blocking') {
       throw new SharedControlBrowserError('Shared Risk Register contains an invalid bounded projection.', {
         code: 'SHARED_CONTROL_PROJECTION_INVALID',
@@ -76,6 +101,17 @@ export function assertSharedWorkspaceProjection(value, { runId, mode } = {}) {
     }
   }
   return value;
+}
+
+function canonicalScope(value) {
+  return Boolean(value && typeof value === 'object'
+    && ['features', 'definitions', 'targets', 'knownLimits'].every((key) => (
+      Array.isArray(value[key]) && value[key].every((entry) => typeof entry === 'string')
+    )));
+}
+
+function canonicalTimestamp(value) {
+  return typeof value === 'string' && Number.isFinite(Date.parse(value));
 }
 
 export function sharedWorkspaceRevisionKey(workspace) {

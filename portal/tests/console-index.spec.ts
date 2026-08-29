@@ -102,6 +102,25 @@ test.describe('bounded console index surfaces', () => {
     expect(reads).toBe(2);
   });
 
+  test('Runs automatically reconciles an active lifecycle row with current authority', async ({ page }) => {
+    let reads = 0;
+    await page.route('**/api/console/v1/runs?*', async (route) => {
+      reads += 1;
+      await route.fulfill({
+        status: 200,
+        json: response('runs', reads === 1 ? [record('run', 'stale-active-run', {
+          executionState: 'running', activityState: 'unavailable', phase: 'browser', terminal: false,
+        })] : []),
+      });
+    });
+
+    await page.goto('/runs.html');
+    await expect(page.getByRole('button', { name: 'stale-active-run' })).toBeVisible();
+    await expect.poll(() => reads, { timeout: 7_000 }).toBeGreaterThanOrEqual(2);
+    await expect(page.getByRole('button', { name: 'stale-active-run' })).toHaveCount(0);
+    await expect(page.locator('#runs-index')).toContainText('No indexed runs match these filters.');
+  });
+
   test('stale continuation cursor restarts from the first bounded page', async ({ page }) => {
     const apiUrls: string[] = [];
     let reads = 0;

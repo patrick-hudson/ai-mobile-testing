@@ -12,7 +12,7 @@ import { createRunInvalidationBus, publishRunInvalidation } from './console-inva
 import {
   assertSharedWorkspaceProjection,
   createSharedControlBrowserClient,
-  orderSharedRisksForReview,
+  pageSharedRisksForReview,
 } from './shared-control-client.js';
 
 const ACTIVE_COMPARATIVE_STATES = new Set(['queued', 'starting', 'running', 'stopping']);
@@ -577,7 +577,8 @@ function initializeRunWorkspace(root) {
 
   function scopeSummary(scope) {
     if (!scope || typeof scope !== 'object') return 'Scope unavailable';
-    const values = Object.values(scope).flatMap((value) => Array.isArray(value) ? value : []);
+    const values = ['features', 'definitions', 'targets', 'knownLimits']
+      .flatMap((key) => Array.isArray(scope[key]) ? scope[key] : []);
     return values.length ? values.slice(0, 12).join(', ') : 'Declared scope is bound to the release subject.';
   }
 
@@ -648,57 +649,81 @@ function initializeRunWorkspace(root) {
       textElement(document, 'p', `Certified scope: ${scopeSummary(decision?.certifiedScope)}`),
       textElement(document, 'p', 'Site Health remains a separate diagnostic truth. Non-blocking risks never change this decision.'),
     );
-    const riskList = document.createElement('ol');
-    riskList.className = 'run-risk-list';
+    const riskList = document.createElement('section');
+    riskList.className = 'run-risk-register';
+    riskList.setAttribute('aria-label', 'Paged Product Risk register');
     const oracleExecutionIds = new Set((sharedWorkspace?.executions?.oracleExecutions ?? []).map(({ id }) => id));
-    for (const risk of orderSharedRisksForReview(register?.risks)) {
-      const item = document.createElement('li');
-      item.dataset.riskIdentity = risk.identity;
-      item.append(
-        textElement(document, 'strong', `${risk.severity.toUpperCase()} · ${humanize(risk.category)}`),
-        textElement(document, 'span', ` ${risk.reviewState} · non-blocking`),
-        textElement(document, 'p', risk.explanation),
-        textElement(document, 'p', `Recommended action: ${risk.recommendedAction}`),
-      );
-      const controls = document.createElement('div');
-      controls.className = 'run-risk-actions';
-      const bound = { expectedSubjectDigest: publication.finalSubjectDigest, riskIdentity: risk.identity };
-      if (risk.category === 'unreviewed-visual-change' && risk.reviewState === 'PENDING_REVIEW'
-        && oracleExecutionIds.has(risk.source.id)) {
-        const rationaleLabel = textElement(document, 'label', 'Review rationale');
-        const rationale = document.createElement('textarea');
-        rationale.required = true;
-        rationale.maxLength = 2_048;
-        rationale.rows = 2;
-        rationaleLabel.append(rationale);
-        controls.append(rationaleLabel);
-        for (const [label, disposition] of [['Accept visual change', 'ACCEPTED'], ['Confirm visual defect', 'DEFECT_CONFIRMED']]) {
-          const button = textElement(document, 'button', label, { type: 'button', 'data-shared-action': 'visualDisposition' });
-          button.addEventListener('click', () => {
-            const explanation = rationale.value.trim();
-            if (!explanation) {
-              rationale.setCustomValidity('Explain the visual review decision.');
-              rationale.reportValidity();
-              return;
-            }
-            rationale.setCustomValidity('');
-            void executeSharedAction('visualDisposition', {
-              ...bound, executionId: risk.source.id, disposition, rationale: explanation,
-            }, button);
-          });
-          controls.append(button);
-        }
-      } else if (risk.reviewState === 'OPEN') {
-        controls.append(sharedActionButton('Acknowledge risk', 'riskAcknowledge', bound));
-        if (!['certificate-bypass', 'coverage-gap', 'evidence-pipeline-limitation'].includes(risk.category)) {
+    let riskOffset = 0;
+    const renderRiskPage = () => {
+      const page = pageSharedRisksForReview(register?.risks, { offset: riskOffset });
+      riskOffset = page.offset;
+      const list = document.createElement('ol');
+      list.className = 'run-risk-list';
+      for (const risk of page.items) {
+        const item = document.createElement('li');
+        item.dataset.riskIdentity = risk.identity;
+        item.append(
+          textElement(document, 'strong', `${risk.severity.toUpperCase()} · ${humanize(risk.category)}`),
+          textElement(document, 'span', ` ${risk.reviewState} · non-blocking`),
+          textElement(document, 'p', risk.explanation),
+          textElement(document, 'p', `Scope: ${scopeSummary(risk.scope)}`),
+          textElement(document, 'p', `Source ${risk.source.kind}:${risk.source.id} · actor ${risk.actor.kind}:${risk.actor.id}`),
+          textElement(document, 'p', `Observed ${risk.observedAt} · updated ${risk.updatedAt}`),
+          textElement(document, 'p', `Recommended action: ${risk.recommendedAction}`),
+        );
+        const controls = document.createElement('div');
+        controls.className = 'run-risk-actions';
+        const bound = { expectedSubjectDigest: publication.finalSubjectDigest, riskIdentity: risk.identity };
+        if (risk.category === 'unreviewed-visual-change' && risk.reviewState === 'PENDING_REVIEW'
+          && oracleExecutionIds.has(risk.source.id)) {
+          const rationaleLabel = textElement(document, 'label', 'Review rationale');
+          const rationale = document.createElement('textarea');
+          rationale.required = true;
+          rationale.maxLength = 2_048;
+          rationale.rows = 2;
+          rationaleLabel.append(rationale);
+          controls.append(rationaleLabel);
+          for (const [label, disposition] of [['Accept visual change', 'ACCEPTED'], ['Confirm visual defect', 'DEFECT_CONFIRMED']]) {
+            const button = textElement(document, 'button', label, { type: 'button', 'data-shared-action': 'visualDisposition' });
+            button.addEventListener('click', () => {
+              const explanation = rationale.value.trim();
+              if (!explanation) {
+                rationale.setCustomValidity('Explain the visual review decision.');
+                rationale.reportValidity();
+                return;
+              }
+              rationale.setCustomValidity('');
+              void executeSharedAction('visualDisposition', {
+                ...bound, executionId: risk.source.id, disposition, rationale: explanation,
+              }, button);
+            });
+            controls.append(button);
+          }
+        } else if (risk.reviewState === 'OPEN') {
+          controls.append(sharedActionButton('Acknowledge risk', 'riskAcknowledge', bound));
+          if (!['certificate-bypass', 'coverage-gap', 'evidence-pipeline-limitation'].includes(risk.category)) {
+            controls.append(sharedActionButton('Resolve risk', 'riskResolve', bound));
+          }
+        } else if (risk.reviewState === 'ACKNOWLEDGED' && !['certificate-bypass', 'coverage-gap', 'evidence-pipeline-limitation'].includes(risk.category)) {
           controls.append(sharedActionButton('Resolve risk', 'riskResolve', bound));
         }
-      } else if (risk.reviewState === 'ACKNOWLEDGED' && !['certificate-bypass', 'coverage-gap', 'evidence-pipeline-limitation'].includes(risk.category)) {
-        controls.append(sharedActionButton('Resolve risk', 'riskResolve', bound));
+        item.append(controls);
+        list.append(item);
       }
-      item.append(controls);
-      riskList.append(item);
-    }
+      const controls = document.createElement('nav');
+      controls.className = 'run-risk-pagination';
+      controls.setAttribute('aria-label', 'Risk Register pages');
+      const previous = textElement(document, 'button', 'Previous risks', { type: 'button' });
+      previous.disabled = !page.hasPrevious;
+      previous.addEventListener('click', () => { riskOffset -= page.limit; renderRiskPage(); riskList.focus(); });
+      const next = textElement(document, 'button', 'Next risks', { type: 'button' });
+      next.disabled = !page.hasNext;
+      next.addEventListener('click', () => { riskOffset += page.limit; renderRiskPage(); riskList.focus(); });
+      controls.append(previous, textElement(document, 'p', page.showing), next);
+      riskList.replaceChildren(controls, list);
+    };
+    riskList.tabIndex = -1;
+    renderRiskPage();
     const recovery = document.createElement('section');
     recovery.className = 'run-recovery';
     recovery.append(textElement(document, 'h3', 'Active recovery'));

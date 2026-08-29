@@ -12,6 +12,8 @@ async function routeSharedGallery(page: Page, mode: SharedMode, runId: string, o
   sharedDisabled?: boolean;
   sessionRestoreDelayMs?: number;
   transientPublicationFailures?: number;
+  rejectLogin?: boolean;
+  riskCount?: number;
 } = {}) {
   let authorized = options.initiallyAuthorized ?? false;
   let publicationFailures = options.transientPublicationFailures ?? 0;
@@ -23,6 +25,9 @@ async function routeSharedGallery(page: Page, mode: SharedMode, runId: string, o
       if (options.sharedDisabled) return route.fulfill({ status: 404, json: { error: { code: 'SHARED_CONTROL_DISABLED', message: 'Shared control is disabled.' } } });
       if (request.method() === 'POST') {
         expect((await request.postDataJSON()).credential).toBe('scoped-gallery-credential');
+        if (options.rejectLogin) return route.fulfill({ status: 401, json: {
+          schemaVersion: 1, error: { code: 'AUTHENTICATION_REJECTED', message: 'Credential rejected.' },
+        } });
         authorized = true;
       } else if (options.sessionRestoreDelayMs) {
         await new Promise((resolve) => setTimeout(resolve, options.sessionRestoreDelayMs));
@@ -38,6 +43,18 @@ async function routeSharedGallery(page: Page, mode: SharedMode, runId: string, o
         return route.fulfill({ status: 503, json: { error: { code: 'TEMPORARILY_UNAVAILABLE', message: 'The publication reader is restarting.' } } });
       }
       if (options.denyPublication) return route.fulfill({ status: 403, json: { error: { code: 'OBJECT_SCOPE_DENIED', message: 'This principal cannot view that run.' } } });
+      const expandedRisks = [...view.riskRegister.risks];
+      const baseRisk = view.riskRegister.risks[0];
+      if (!baseRisk && (options.riskCount ?? 0) > 0) throw new Error('The shared gallery risk fixture requires a base risk.');
+      while (expandedRisks.length < (options.riskCount ?? expandedRisks.length)) {
+        const index = expandedRisks.length;
+        expandedRisks.push({
+          ...baseRisk!, identity: `risk_resolved_${String(index).padStart(3, '0')}`,
+          severity: index === 200 ? 'critical' : 'low', reviewState: 'RESOLVED',
+          source: { kind: 'manual-obligation', id: `resolved-${index}` },
+          actor: { id: 'historical-reviewer', kind: 'reviewer' }, updatedAt: '2026-08-29T15:00:00.000Z',
+        });
+      }
       return route.fulfill({ json: { schemaVersion: 1, data: {
         runId,
         runRevision: view.revisions.run,
@@ -45,7 +62,7 @@ async function routeSharedGallery(page: Page, mode: SharedMode, runId: string, o
         riskRevision: view.revisions.risk,
         finalSubjectDigest: view.subjectDigest,
         decision: view.decision,
-        riskRegister: view.riskRegister,
+        riskRegister: { ...view.riskRegister, risks: expandedRisks },
       } } });
     }
     if (url.pathname === `${root}/executions`) return route.fulfill({ json: { schemaVersion: 1, data: {
@@ -100,6 +117,20 @@ test.describe('shared live gallery authority', () => {
     await expect(page.locator('#gallery-shared-session-status')).toContainText('authorized');
   });
 
+  test('rejected gallery login clears the secret and returns focus to the credential field', async ({ page }) => {
+    const runId = 'shared-gallery-rejected-login';
+    await routeSharedGallery(page, 'comparative', runId, { rejectLogin: true });
+    await page.goto(`/gallery.html?mode=comparative&run=${runId}`);
+    const credential = page.locator('input[name="gallery-control-credential"]');
+    await credential.fill('scoped-gallery-credential');
+    await page.getByRole('button', { name: 'Authorize gallery access' }).click();
+    await expect(page.locator('#gallery-shared-session-status')).toContainText('Credential rejected');
+    await expect(credential).toHaveValue('');
+    await expect(credential).toBeFocused();
+    expect(await page.evaluate(() => document.documentElement.innerHTML.includes('scoped-gallery-credential'))).toBe(false);
+    await expect(page.locator('#gallery-product-risk')).toHaveAttribute('data-risk-availability', 'UNAVAILABLE');
+  });
+
   for (const mode of ['comparative', 'single-site'] as const) {
     test(`${mode} shows Product Risk and the exact shared publication even without a legacy gallery`, async ({ page }) => {
       const runId = `shared-gallery-${mode}`;
@@ -115,7 +146,11 @@ test.describe('shared live gallery authority', () => {
       await expect(page.locator('#gallery-product-risk')).toHaveAttribute('data-risk-availability', 'PARTIAL');
       await expect(page.locator('#gallery-authority-revisions')).toContainText('Run revision 7');
       await expect(page.locator('#gallery-certified-scope')).toContainText('navigation');
+      if (mode === 'single-site') await expect(page.locator('#gallery-certified-scope')).toContainText('Comparison-only checkout parity');
       await expect(page.locator('#gallery-risk-register')).toContainText('Manual checkout remains outstanding');
+      await expect(page.locator('#gallery-risk-register')).toContainText('manual-obligation:physical-device-review');
+      await expect(page.locator('#gallery-risk-register')).toContainText('service:runner');
+      await expect(page.locator('#gallery-risk-register')).toContainText('2026-08-29T14:00:00.000Z');
       await expect(page.locator('#gallery-risk-register')).toContainText('Certificate validation bypass');
       await expect(page.locator('#gallery-recovery-state')).toContainText('work-incomplete');
       await expect(page.getByRole('link', { name: 'Open recovery and review controls' })).toHaveAttribute('href', `/run.html?mode=${mode}&run=${runId}&view=overview`);
@@ -130,6 +165,18 @@ test.describe('shared live gallery authority', () => {
       expect(accessibility.violations.filter(({ impact }) => impact === 'serious' || impact === 'critical')).toEqual([]);
     });
   }
+
+  test('pages 201 risks, reports the visible range truthfully, and keeps active risks ahead of resolved critical history', async ({ page }) => {
+    const runId = 'shared-gallery-risk-pagination';
+    await routeSharedGallery(page, 'comparative', runId, { initiallyAuthorized: true, riskCount: 201 });
+    await page.goto(`/gallery.html?mode=comparative&run=${runId}`);
+    await expect(page.locator('.gallery-risk-showing')).toHaveText('Showing 1–200 of 201 risks');
+    await expect(page.locator('#gallery-risk-register tbody tr').first()).toContainText('Manual checkout remains outstanding');
+    await expect(page.locator('[data-risk-identity="risk_resolved_199"]')).toHaveCount(0);
+    await page.getByRole('button', { name: 'Next risks' }).click();
+    await expect(page.locator('.gallery-risk-showing')).toHaveText('Showing 201–201 of 201 risks');
+    await expect(page.locator('[data-risk-identity="risk_resolved_199"]')).toBeVisible();
+  });
 
   for (const availability of ['LOADING', 'PROVISIONAL', 'AVAILABLE', 'PARTIAL', 'EMPTY', 'UNAVAILABLE'] as const) {
     test(`distinguishes ${availability} from an available empty Risk Register`, async ({ page }) => {

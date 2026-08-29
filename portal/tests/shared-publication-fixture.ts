@@ -15,6 +15,7 @@ export function sharedPublicationFixture(
   runId: string,
   availability: RiskAvailability = 'PARTIAL',
   runRevision = 7,
+  riskCount = 2,
 ) {
   const targets = mode === 'single-site'
     ? [{ role: 'audited', origin: 'https://beta.example.test' }]
@@ -80,7 +81,7 @@ export function sharedPublicationFixture(
     finalSubjectDigest: finalSubject.digest,
     workItemResults: results,
   });
-  const riskSources = ['LOADING', 'UNAVAILABLE', 'EMPTY'].includes(availability) ? [] : [
+  const baseRiskSources = [
     {
       schemaVersion: 1,
       category: 'manual-check',
@@ -111,7 +112,18 @@ export function sharedPublicationFixture(
       observedAt: '2026-08-29T14:00:00.000Z',
       updatedAt: '2026-08-29T14:00:00.000Z',
     },
-  ].map(parseRisk);
+  ];
+  const riskSources = ['LOADING', 'UNAVAILABLE', 'EMPTY'].includes(availability) ? [] : Array.from(
+    { length: riskCount },
+    (_, index) => parseRisk(index < baseRiskSources.length ? baseRiskSources[index] : {
+      ...baseRiskSources[index % baseRiskSources.length],
+      severity: (['low', 'critical', 'medium', 'high'] as const)[index % 4],
+      reviewState: (['RESOLVED', 'SUPERSEDED', 'OPEN', 'ACKNOWLEDGED'] as const)[index % 4],
+      source: { kind: 'generated-risk-fixture', id: `risk-${String(index + 1).padStart(4, '0')}` },
+      explanation: `Generated archive risk ${index + 1}.`,
+      recommendedAction: `Review generated archive risk ${index + 1}.`,
+    }),
+  );
   const projected = projectSharedReleaseView({
     schemaVersion: 1,
     runId,

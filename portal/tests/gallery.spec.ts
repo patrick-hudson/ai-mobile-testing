@@ -15,8 +15,9 @@ import {
   publishLiveGalleryAttempt,
   type LiveGalleryAttemptInput,
 } from '../../reporters/live-gallery-reporter.js';
-import { buildGalleryCatalog, writeGalleryArchive } from '../../reporters/gallery-model.js';
+import { buildGalleryCatalog, writeGalleryArchive as writeUnboundGalleryArchive, type WriteGalleryArchiveOptions } from '../../reporters/gallery-model.js';
 import { ARCHIVE_ASSET_DIRECTORY } from '../../reporters/archive-bundle.js';
+import { sharedPublicationFixture } from './shared-publication-fixture.js';
 import {
   GALLERY_SCALE,
   buildGalleryScaleCatalog,
@@ -28,6 +29,17 @@ import {
 import { createInitialGalleryState, galleryReducer } from '../public/gallery-core.js';
 
 test.describe.configure({ mode: 'serial' });
+const sharedPublication = sharedPublicationFixture('comparative', 'portal-gallery-spec');
+const writeGalleryArchive = (options: WriteGalleryArchiveOptions) => writeUnboundGalleryArchive({
+  ...options,
+  releasePublicationEnvelope: sharedPublication.envelope,
+  releasePublicationBinding: {
+    runId: sharedPublication.view.publication.runId, mode: 'comparative',
+    finalSubjectDigest: sharedPublication.view.subjectDigest as `sha256:${string}`,
+    runRevision: sharedPublication.view.revisions.run,
+    publicationDigest: sharedPublication.view.publication.envelopeDigest as `sha256:${string}`,
+  },
+});
 const execFileAsync = promisify(execFile);
 
 function syntheticNotReadyRelease(reason: string, decisionBasis: string) {
@@ -96,6 +108,15 @@ test('characterization: an identical gallery revision announcement cannot cancel
   });
   expect(state.pendingRevision).toBeNull();
   expect(state.descriptor).toBe(refreshedHead);
+});
+
+test('failed initial gallery bootstrap becomes unavailable instead of remaining loading', () => {
+  let state = createInitialGalleryState();
+  state = galleryReducer(state, { type: 'REQUEST_STARTED', slot: 'head', generation: 1, semanticKey: 'head' });
+  state = galleryReducer(state, {
+    type: 'REQUEST_FAILED', slot: 'head', generation: 1, semanticKey: 'head', error: 'archive descriptor rejected',
+  });
+  expect(state.phase).toBe('unavailable');
 });
 
 function galleryAttempt(

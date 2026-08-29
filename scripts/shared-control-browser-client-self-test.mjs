@@ -3,6 +3,7 @@ import {
   assertSharedWorkspaceProjection,
   createSharedControlBrowserClient,
   orderSharedRisksForReview,
+  pageSharedRisksForReview,
 } from '../portal/public/shared-control-client.js';
 
 const calls = [];
@@ -25,7 +26,10 @@ const client = createSharedControlBrowserClient({
       return jsonResponse(200, { schemaVersion: 1, data: {
         runId: 'run-1', runRevision: publicationReads === 1 ? 6 : 7, decisionRevision: 2, riskRevision: 3,
         finalSubjectDigest: `sha256:${'b'.repeat(64)}`,
-        decision: { mode: 'comparative', label: 'FEATURE READY', grantedAuthority: 'TARGETED' },
+        decision: {
+          mode: 'comparative', label: 'FEATURE READY', grantedAuthority: 'TARGETED',
+          certifiedScope: { features: ['navigation'], definitions: ['NAV-001'], targets: ['desktop'], knownLimits: [] },
+        },
         riskRegister: { availability: 'PARTIAL', risks: [] },
       } });
     }
@@ -63,10 +67,22 @@ assert.throws(
   /coherent revision/i,
 );
 assert.deepEqual(orderSharedRisksForReview([
-  { identity: 'operational-medium', severity: 'medium', category: 'certificate-bypass' },
-  { identity: 'product-medium', severity: 'medium', category: 'unreviewed-visual-change' },
-  { identity: 'product-high', severity: 'high', category: 'manual-check' },
-]).map(({ identity }) => identity), ['product-high', 'product-medium', 'operational-medium']);
+  { identity: 'resolved-critical', severity: 'critical', category: 'manual-check', reviewState: 'RESOLVED' },
+  { identity: 'operational-medium', severity: 'medium', category: 'certificate-bypass', reviewState: 'OPEN' },
+  { identity: 'product-medium', severity: 'medium', category: 'unreviewed-visual-change', reviewState: 'OPEN' },
+  { identity: 'product-high', severity: 'high', category: 'manual-check', reviewState: 'ACKNOWLEDGED' },
+]).map(({ identity }) => identity), ['product-high', 'product-medium', 'operational-medium', 'resolved-critical']);
+const riskPage = pageSharedRisksForReview(Array.from({ length: 201 }, (_, index) => ({
+  identity: `risk-${String(index).padStart(3, '0')}`,
+  severity: 'medium',
+  category: 'manual-check',
+  reviewState: index === 200 ? 'OPEN' : 'RESOLVED',
+})), { offset: 0 });
+assert.equal(riskPage.total, 201);
+assert.equal(riskPage.items.length, 200);
+assert.equal(riskPage.items[0].identity, 'risk-200', 'Active risks must appear before resolved risks.');
+assert.equal(riskPage.showing, 'Showing 1–200 of 201 risks');
+assert.equal(riskPage.hasNext, true);
 assert.throws(
   () => assertSharedWorkspaceProjection({
     ...workspace,
