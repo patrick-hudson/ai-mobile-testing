@@ -6,6 +6,7 @@ import path from 'node:path';
 import { collectSharedWorkerEvidence } from './lib/shared-worker-evidence.mjs';
 import { maintainSharedWorkerLease } from './lib/shared-worker-heartbeat.mjs';
 import { createSharedWorkCommand } from './lib/shared-work-dispatcher.mjs';
+import { SHARED_DOCKER_RESILIENCE_ENV } from '../shared/shared-docker-resilience-contract.mjs';
 
 const required = (name) => {
   const value = process.env[name];
@@ -30,6 +31,10 @@ if (!Number.isSafeInteger(pollMs) || pollMs < 100 || pollMs > 60_000) throw new 
 const uploadTimeoutMs = Number(process.env.AUDIT_SHARED_UPLOAD_TIMEOUT_MS ?? 20 * 60_000);
 if (!Number.isSafeInteger(uploadTimeoutMs) || uploadTimeoutMs < 30_000 || uploadTimeoutMs > 3_600_000) {
   throw new Error('AUDIT_SHARED_UPLOAD_TIMEOUT_MS is invalid.');
+}
+const sharedResilienceProof = process.env[SHARED_DOCKER_RESILIENCE_ENV] ?? '0';
+if (!['0', '1'].includes(sharedResilienceProof)) {
+  throw new Error(`${SHARED_DOCKER_RESILIENCE_ENV} must be exactly 0 or 1.`);
 }
 
 const post = async (pathname, body, signal = undefined, timeoutMs = 30_000) => {
@@ -175,23 +180,42 @@ while (!stopping) {
   if (!commandLog.response.ok) throw new Error(`Coordinator rejected command log: ${commandLog.value.error ?? commandLog.response.status}`);
   const leaseDurationMs = Date.parse(claimed.value.expiresAt) - Date.parse(claimed.value.claimedAt);
   const heartbeatIntervalMs = Math.max(100, Math.floor(leaseDurationMs / 3));
-  if (!Number.isSafeInteger(leaseDurationMs) || leaseDurationMs < 300 || heartbeatIntervalMs >= leaseDurationMs) {
+  if (!Number.isSafeInteger(leaseDurationMs) || leaseDurationMs < 300 || leaseDurationMs > 3_600_000
+    || heartbeatIntervalMs >= leaseDurationMs) {
     throw new Error('Coordinator returned a work lease that is too short for safe heartbeat maintenance.');
   }
-  const maintained = await maintainSharedWorkerLease({
-    lease: claimed.value,
-    intervalMs: heartbeatIntervalMs,
-    heartbeat: async (lease, signal) => {
-      const renewed = await post('/v1/heartbeat', { lease }, signal);
-      if (!renewed.response.ok) {
-        const error = new Error(`Coordinator rejected work heartbeat: ${renewed.value.error ?? renewed.response.status}`);
-        error.code = renewed.value.code ?? 'SHARED_WORK_HEARTBEAT_REJECTED';
-        throw error;
-      }
-      return renewed.value;
-    },
-    execute,
-  });
+  let maintained;
+  try {
+    maintained = await maintainSharedWorkerLease({
+      lease: claimed.value,
+      intervalMs: heartbeatIntervalMs,
+      heartbeat: async (lease, signal) => {
+        const renewed = await post('/v1/heartbeat', { lease }, signal);
+        if (!renewed.response.ok) {
+          const error = new Error(`Coordinator rejected work heartbeat: ${renewed.value.error ?? renewed.response.status}`);
+          error.code = renewed.value.code ?? 'SHARED_WORK_HEARTBEAT_REJECTED';
+          throw error;
+        }
+        return renewed.value;
+      },
+      execute,
+    });
+  } catch (error) {
+    if (error?.code !== 'SHARED_WORK_DESCRIPTOR_INVALID') throw error;
+    const recoveryLog = await post('/v1/log', {
+      lease: claimed.value,
+      sequence: 2,
+      level: 'warn',
+      message: `operational-recovery: work-descriptor-invalid; ${error.message}`,
+    }).catch(() => null);
+    if (!recoveryLog?.response.ok) {
+      process.stderr.write(`Could not publish descriptor recovery log for ${claimed.value.workItemId}.\n`);
+    }
+    process.stderr.write(`Rejected invalid work descriptor for ${claimed.value.workItemId}; lease will expire for bounded recovery.\n`);
+    const leaseExpiryDelayMs = Math.max(0, Date.parse(claimed.value.expiresAt) - Date.now() + pollMs);
+    await new Promise((resolve) => setTimeout(resolve, leaseExpiryDelayMs));
+    continue;
+  }
   const { value: published } = maintained;
   process.stdout.write(`${JSON.stringify({ event: 'work-item-published', workItemId: claimed.value.workItemId, state: published.state })}\n`);
 }

@@ -9,6 +9,10 @@ import { buildLiveRouteInventory } from '../shared/live-route-inventory.mjs';
 import { preflightQuitting7ohSite } from '../shared/site-preflight.mjs';
 import { sealSharedGenericRouteExecutionPublication } from '../shared/single-site-route-plan.mjs';
 import { parseWorkExecutionDescriptor } from '../shared/work-execution-descriptor.mjs';
+import {
+  SHARED_DOCKER_RESILIENCE_ENV,
+  validateSharedDockerResilienceBinding,
+} from '../shared/shared-docker-resilience-contract.mjs';
 import { sealWorkItemEvidenceIndex, sealWorkItemEvidenceMember } from '../shared/work-item-evidence-index.mjs';
 import { startBrowserEgressProxy } from './lib/browser-egress-proxy.mjs';
 import { collectSharedPlaywrightArtifacts } from './lib/shared-playwright-work-item.mjs';
@@ -78,6 +82,8 @@ function safeInheritedEnvironment() {
 }
 
 function playwrightEnvironment(descriptor, artifactRoot, proxyUrl = null, genericRoutePublication = null) {
+  const resilienceProof = process.env[SHARED_DOCKER_RESILIENCE_ENV] ?? '0';
+  const proofEnabled = validateSharedDockerResilienceBinding(resilienceProof, descriptor.entrySpec);
   const environment = {
     ...safeInheritedEnvironment(),
     CI: '1',
@@ -88,6 +94,7 @@ function playwrightEnvironment(descriptor, artifactRoot, proxyUrl = null, generi
     AUDIT_PROFILE: 'release',
     AUDIT_WORKERS: '1',
     PLAYWRIGHT_JSON_OUTPUT_FILE: path.join(artifactRoot, 'results.json'),
+    ...(proofEnabled ? { [SHARED_DOCKER_RESILIENCE_ENV]: '1' } : {}),
     ...(descriptor.resourceClass === 'performance' ? { AUDIT_EXCLUDE_PERFORMANCE: '0' } : { AUDIT_EXCLUDE_PERFORMANCE: '1' }),
   };
   if (descriptor.mode === 'single-site') {

@@ -6,6 +6,7 @@ import {
   createPluginRegistry,
   discoverInstalledPlugins,
 } from '../audit/plugins.js';
+import { SHARED_DOCKER_RESILIENCE_SPEC } from '../shared/shared-docker-resilience-contract.mjs';
 
 const repositoryRoot = path.resolve(process.cwd());
 const plugins = discoverInstalledPlugins(repositoryRoot, { includeDisabled: true, requireEntryFiles: true });
@@ -33,7 +34,9 @@ function findCoreSpecs(directory: string, prefix = 'tests'): string[] {
 }
 
 const allowlistedEntries = new Set(registry.plugins.flatMap((plugin) => plugin.entrySpecs));
-const missingCoreSpecs = findCoreSpecs(path.join(repositoryRoot, 'tests')).filter((entry) => !allowlistedEntries.has(entry));
+const isolatedHarnessSpecs = new Set<string>([SHARED_DOCKER_RESILIENCE_SPEC]);
+const missingCoreSpecs = findCoreSpecs(path.join(repositoryRoot, 'tests'))
+  .filter((entry) => !allowlistedEntries.has(entry) && !isolatedHarnessSpecs.has(entry));
 if (missingCoreSpecs.length > 0) {
   throw new Error(`Enabled plugins do not expose these core test specs: ${missingCoreSpecs.join(', ')}.`);
 }

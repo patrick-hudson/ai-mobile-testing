@@ -167,6 +167,22 @@ The `single-site-worker` replicas run Playwright as `pwuser` and claim durable j
 
 `AUDIT_QUEUE_POLL_MS` controls both pools' idle polling interval from 100 through 60000 milliseconds; the default is `1000`. More worker replicas improve throughput for multiple jobs. Keep `single-site-finalizer` at one replica: the current pool safely verifies/reuses immutable output after restart, but it does not claim a per-job finalization lease for active/active replicas. The finalizer is a separate service so browser work and evidence publication recover independently, not so one run is concurrently published by several containers.
 
+### Shared-runner Docker resilience gate
+
+Run the authoritative shared-runner topology and recovery proof with:
+
+```sh
+npm run shared-docker-resilience:self-test
+```
+
+The gate cannot be weakened through environment overrides: the package command selects the explicit `--authoritative` mode, which requires exactly three trials, a Compose build invocation, 1 CPU, and 2 GiB per ordinary worker. For local troubleshooting, `npm run shared-docker-resilience:diagnostic` selects the separate `--diagnostic` mode and writes `shared-docker-resilience-diagnostic.json`; reduced trials, skip-build, or resource overrides in that mode cannot replace the authoritative evidence file or satisfy `npm run shared-docker-resilience:check`.
+
+The gate builds the pinned audit image once, pre-warms each topology, and executes the same sealed eight-item workload in three recorded trials with one ordinary worker principal and with the separate ordinary A+B principals. Each worker is limited to one browser at a time, 1 CPU, and 2 GiB. Every trial uses a fresh project-scoped canonical named volume while reusing warm image layers. The report records every wall time, variance, medians, throughput improvement, Docker CPU/memory samples, workload and invariant digests, fixed resources, and recovery identities at `artifacts/self-tests/shared-docker-resilience-proof.json`.
+
+The workload includes one deterministic product assertion failure. It must publish once without an assertion retry. The gate also transitions 1→2→1, SIGKILLs the worker and coordinator Node processes so Docker restart policy recovers them, proves already-adopted evidence is unchanged, and requires only unfinished work to receive a bounded infrastructure retry. Its fixture and environment flag are isolated from normal audit selection and cannot be launched through the portal.
+
+The proof intentionally runs `docker compose down` before its final inspection to demonstrate that named-volume state survives container removal. `docker compose down -v` is destructive and is never a recovery action. The harness uses it only for exact nonce-prefixed disposable proof projects and refuses destructive cleanup outside that generated prefix. Do not use `down -v` on the portal or a retained audit project unless permanent deletion of its named-volume state is intended.
+
 ### Same-site visual baselines and Finding waivers
 
 The gallery compares only exact compatible identities: deployment role, route, target, viewport, theme, audit definition, named capture point/state, and rendering-contract fingerprint. A completed eligible screenshot can be approved; an active baseline can later be replaced, revoked, or have retained media deleted. Baselines never advance automatically.

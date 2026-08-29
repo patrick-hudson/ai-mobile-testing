@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { spawn, spawnSync } from 'node:child_process';
+import http from 'node:http';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { auditCaseTag } from '../shared/audit-case-identity.mjs';
@@ -42,6 +44,10 @@ assert.throws(() => createSharedWorkCommand({ ...lease, targetId: 'production-mo
   /does not match the active work lease/);
 assert.throws(() => createSharedWorkCommand({ ...lease, executionDescriptor: null }, '/tmp/evidence'),
   /lacks a compiler-issued execution descriptor/);
+assert.throws(() => createSharedWorkCommand(lease, '/tmp/evidence', { AUDIT_SHARED_RESILIENCE_PROOF: 'yes' }),
+  /must be exactly 0 or 1/);
+assert.throws(() => createSharedWorkCommand(lease, '/tmp/evidence', { AUDIT_SHARED_RESILIENCE_PROOF: '1' }),
+  /proof fixture must be used together/);
 const { schemaVersion: _schemaVersion, kind: _kind, digest: _descriptorDigest, ...descriptorInput } = descriptor;
 assert.throws(() => sealWorkExecutionDescriptor({ ...descriptorInput, entrySpec: '../outside.spec.ts' }), /repository-owned spec/);
 const genericDescriptorInput = {
@@ -72,6 +78,32 @@ assert.throws(() => sealWorkExecutionDescriptor({
   ...genericDescriptorInput,
   route: { ...genericDescriptorInput.route, sources: [] },
 }), /discovery provenance/);
+const proofDescriptor = sealWorkExecutionDescriptor({
+  ...descriptorInput,
+  workItemId: 'proof-001',
+  mode: 'single-site',
+  definitionId: 'U4P-001',
+  pluginId: null,
+  caseId: 'U4P-001:shared-docker-resilience',
+  entrySpec: 'tests/fixtures/shared-docker-resilience.spec.ts',
+  targetId: 'single-site-mobile-chromium',
+  targetRole: 'preview',
+  origins: { candidate: 'https://proof.invalid', production: null },
+});
+const proofLease = {
+  ...lease,
+  workItemId: proofDescriptor.workItemId,
+  subjectCoreDigest: proofDescriptor.subjectCoreDigest,
+  runnerRevision: proofDescriptor.runnerRevision,
+  targetId: proofDescriptor.targetId,
+  specAffinity: proofDescriptor.entrySpec,
+  executionDescriptor: proofDescriptor,
+  executionDescriptorDigest: proofDescriptor.digest,
+};
+assert.equal(createSharedWorkCommand(proofLease, '/tmp/evidence', {
+  AUDIT_SHARED_RESILIENCE_PROOF: '1',
+}).environment.AUDIT_SHARED_RESILIENCE_PROOF, '1');
+assert.throws(() => createSharedWorkCommand(proofLease, '/tmp/evidence'), /proof fixture must be used together/);
 
 function report(statuses, overrides = {}) {
   const artifactRoot = overrides.artifactRoot ?? '/evidence';
@@ -153,6 +185,110 @@ try {
   );
 } finally {
   await rm(evidenceRoot, { recursive: true, force: true });
+}
+
+const discoveryRoot = await mkdtemp(path.join(tmpdir(), 'shared-proof-discovery-'));
+const listTests = async (name, environment) => {
+  const outputPath = path.join(discoveryRoot, `${name}.json`);
+  const result = spawnSync(process.execPath, [
+    './node_modules/@playwright/test/cli.js', 'test', '--list', '--reporter=json',
+  ], {
+    cwd: new URL('..', import.meta.url),
+    env: { ...process.env, ...environment, PLAYWRIGHT_JSON_OUTPUT_FILE: outputPath },
+    encoding: 'utf8',
+    maxBuffer: 16 * 1_048_576,
+  });
+  assert.equal(result.status, 0, result.stderr);
+  return JSON.parse(await readFile(outputPath, 'utf8'));
+};
+const discoveredFiles = (suites) => suites.flatMap((suite) => [suite.file, ...discoveredFiles(suite.suites ?? [])]);
+const ordinaryList = await listTests('ordinary', {
+  AUDIT_RUN_MODE: 'comparative',
+  AUDIT_SHARED_RESILIENCE_PROOF: '0',
+  CANDIDATE_IGNORE_HTTPS_ERRORS: '0',
+});
+assert(!discoveredFiles(ordinaryList.suites).includes('tests/fixtures/shared-docker-resilience.spec.ts'),
+  'ordinary Comparative discovery must exclude the isolated Docker proof fixture');
+const proofList = await listTests('proof', {
+  AUDIT_RUN_MODE: 'single-site',
+  AUDIT_SHARED_RESILIENCE_PROOF: '1',
+  AUDIT_TARGET_IDS: 'single-site-mobile-chromium',
+  AUDIT_SINGLE_SITE_URL: 'https://proof.invalid',
+  AUDIT_SINGLE_SITE_ROLE: 'preview',
+  AUDIT_SINGLE_SITE_CERTIFICATE_POLICY: 'strict',
+  AUDIT_SINGLE_SITE_EGRESS_PROXY: 'http://127.0.0.1:1',
+  CANDIDATE_IGNORE_HTTPS_ERRORS: '0',
+});
+assert(discoveredFiles(proofList.suites).includes('tests/fixtures/shared-docker-resilience.spec.ts'),
+  'proof mode must retain the isolated Docker fixture');
+await rm(discoveryRoot, { recursive: true, force: true });
+
+const processRoot = await mkdtemp(path.join(tmpdir(), 'shared-worker-process-'));
+const credentialPath = path.join(processRoot, 'worker-token');
+await writeFile(credentialPath, `amt.test.${'a'.repeat(40)}\n`, { mode: 0o600 });
+let claimCount = 0;
+const receivedLogs = [];
+const server = http.createServer(async (request, response) => {
+  const chunks = [];
+  for await (const chunk of request) chunks.push(chunk);
+  const body = chunks.length === 0 ? {} : JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  response.setHeader('content-type', 'application/json');
+  if (request.url === '/v1/claim' && claimCount++ === 0) {
+    response.statusCode = 200;
+    response.end(`${JSON.stringify({
+      runId: 'run-worker-process', workItemId: 'work-invalid-binding', workerId: 'worker-process', attempt: 1,
+      epoch: 1, token: 'lease-invalid-binding', claimedAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 1_000).toISOString(), subjectCoreDigest: digest('a'), runnerRevision: digest('b'),
+      capability: 'browser:chromium', resourceClass: 'ordinary', targetId: 'candidate-mobile-chromium',
+      specAffinity: 'tests/accessibility.spec.ts', executionDescriptor: null, executionDescriptorDigest: null,
+    })}\n`);
+    return;
+  }
+  if (request.url === '/v1/log') {
+    receivedLogs.push(body);
+    response.statusCode = 202;
+    response.end('{}\n');
+    return;
+  }
+  response.statusCode = 409;
+  response.end('{"code":"NO_WORK_AVAILABLE","error":"no work"}\n');
+});
+await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+const address = server.address();
+const worker = spawn(process.execPath, ['scripts/run-shared-worker.mjs'], {
+  cwd: new URL('..', import.meta.url),
+  env: {
+    ...process.env,
+    AUDIT_SHARED_COORDINATOR_URL: `http://127.0.0.1:${address.port}`,
+    AUDIT_SHARED_WORKER_TOKEN_FILE: credentialPath,
+    AUDIT_SHARED_RESOURCE_CLASS: 'ordinary',
+    AUDIT_SHARED_WORKER_CAPABILITIES: 'browser:chromium',
+    AUDIT_SHARED_POLL_MS: '100',
+    AUDIT_SHARED_RESILIENCE_PROOF: '0',
+  },
+  stdio: ['ignore', 'pipe', 'pipe'],
+});
+let workerStderr = '';
+worker.stderr.setEncoding('utf8');
+worker.stderr.on('data', (chunk) => { workerStderr += chunk; });
+try {
+  const deadline = Date.now() + 5_000;
+  while (receivedLogs.length < 2 && worker.exitCode === null && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(worker.exitCode, null, `descriptor binding error terminated the worker: ${workerStderr}`);
+  assert.deepEqual(receivedLogs.map(({ sequence, level }) => ({ sequence, level })), [
+    { sequence: 1, level: 'info' },
+    { sequence: 2, level: 'warn' },
+  ]);
+  assert.match(receivedLogs[1].message, /operational-recovery: work-descriptor-invalid/);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(claimCount, 1, 'the worker must not claim another item before the rejected lease expires');
+} finally {
+  worker.kill('SIGTERM');
+  await new Promise((resolve) => worker.once('close', resolve));
+  await new Promise((resolve) => server.close(resolve));
+  await rm(processRoot, { recursive: true, force: true });
 }
 
 process.stdout.write('Shared work dispatcher self-test passed: fixed repository command, secret-free child environment, descriptor fencing, and exact Playwright row validation are enforced.\n');

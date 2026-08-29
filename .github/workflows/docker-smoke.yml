@@ -14,6 +14,41 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  shared-resilience:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Prove shared-runner topology and crash recovery
+        id: resilience
+        continue-on-error: true
+        run: |
+          mkdir -p artifacts/self-tests
+          set -o pipefail
+          npm run shared-docker-resilience:self-test 2>&1 | tee artifacts/self-tests/shared-docker-resilience-run.log
+
+      - name: Validate authoritative shared-runner proof contract
+        if: steps.resilience.outcome == 'success'
+        run: npm run shared-docker-resilience:check
+
+      - name: Upload shared-runner resilience evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shared-runner-resilience-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            artifacts/self-tests/shared-docker-resilience-proof.json
+            artifacts/self-tests/shared-docker-resilience-failure.json
+            artifacts/self-tests/shared-docker-resilience-run.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Propagate shared-runner proof failure
+        if: steps.resilience.outcome == 'failure'
+        run: exit 1
+
   smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 35
@@ -33,7 +68,10 @@ jobs:
         env:
           AUDIT_ARTIFACT_DIR: /work/artifacts/ci-smoke
           CANDIDATE_IGNORE_HTTPS_ERRORS: '0'
-        run: docker compose --profile audit run --rm audit-smoke
+        run: |
+          mkdir -p artifacts/ci-smoke
+          set -o pipefail
+          docker compose --profile audit run --rm audit-smoke 2>&1 | tee artifacts/ci-smoke/docker-smoke-run.log
 
       - name: Upload smoke evidence
         if: always()
@@ -41,9 +79,13 @@ jobs:
         with:
           name: docker-smoke-${{ github.run_id }}-${{ github.run_attempt }}
           path: artifacts/ci-smoke
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 14
 
       - name: Validate smoke evidence pipeline (does not certify release)
-        if: always()
+        if: steps.audit.outcome == 'success'
         run: node scripts/assert-release-decision.mjs --pipeline-only --manifest artifacts/ci-smoke/checklist/manifest.json
+
+      - name: Propagate smoke audit failure
+        if: steps.audit.outcome == 'failure'
+        run: exit 1

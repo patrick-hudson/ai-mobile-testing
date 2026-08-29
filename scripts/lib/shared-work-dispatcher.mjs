@@ -1,6 +1,10 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseWorkExecutionDescriptor } from '../../shared/work-execution-descriptor.mjs';
+import {
+  SHARED_DOCKER_RESILIENCE_ENV,
+  validateSharedDockerResilienceBinding,
+} from '../../shared/shared-docker-resilience-contract.mjs';
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const EXECUTOR = path.join(repositoryRoot, 'scripts', 'execute-shared-work-item.mjs');
@@ -8,6 +12,7 @@ const PASSTHROUGH_ENVIRONMENT = Object.freeze([
   'PATH', 'HOME', 'USER', 'LOGNAME', 'TMPDIR', 'TEMP', 'TMP', 'LANG', 'LC_ALL', 'TZ',
   'PLAYWRIGHT_BROWSERS_PATH', 'PLAYWRIGHT_FIREFOX_EXECUTABLE_PATH', 'NODE_EXTRA_CA_CERTS',
   'SSL_CERT_FILE', 'SSL_CERT_DIR', 'AUDIT_MSEDGE_AVAILABLE', 'AUDIT_PREVIEW_TLS_BYPASS_ALLOWLIST',
+  SHARED_DOCKER_RESILIENCE_ENV,
 ]);
 
 function fail(message) {
@@ -41,6 +46,12 @@ export function createSharedWorkCommand(lease, evidenceRoot, environment = proce
   for (const name of PASSTHROUGH_ENVIRONMENT) {
     if (typeof environment[name] === 'string' && environment[name].length <= 8_192) childEnvironment[name] = environment[name];
   }
+  let proofEnabled;
+  try {
+    proofEnabled = validateSharedDockerResilienceBinding(
+      childEnvironment[SHARED_DOCKER_RESILIENCE_ENV] ?? '0', descriptor.entrySpec,
+    );
+  } catch (error) { fail(error.message); }
   return Object.freeze({
     executable: process.execPath,
     args: Object.freeze([EXECUTOR]),

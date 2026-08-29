@@ -140,8 +140,10 @@ services:
       AUDIT_SHARED_STORE_ROOT: /var/lib/ai-mobile-testing/shared/canonical
       AUDIT_SHARED_EXCHANGE_ROOT: /var/lib/ai-mobile-testing/shared/exchange
       AUDIT_SHARED_DEPLOYMENT_IDENTITY: ${AUDIT_SHARED_DEPLOYMENT_IDENTITY:-compose:ai-mobile-testing}
-      AUDIT_SHARED_VOLUME_IDENTITY: named-volume:shared-parent-runs
+      AUDIT_SHARED_VOLUME_IDENTITY: ${AUDIT_SHARED_VOLUME_IDENTITY:-named-volume:shared-parent-runs}
       AUDIT_SHARED_COORDINATOR_PORT: "4180"
+      AUDIT_SHARED_LEASE_MS: ${AUDIT_SHARED_LEASE_MS:-30000}
+      AUDIT_SHARED_COORDINATOR_LEASE_MS: ${AUDIT_SHARED_COORDINATOR_LEASE_MS:-60000}
       AUDIT_SHARED_UPLOAD_TIMEOUT_MS: ${AUDIT_SHARED_UPLOAD_TIMEOUT_MS:-1200000}
       AUDIT_SHARED_CREDENTIAL_ROOT: /var/lib/ai-mobile-testing/shared/credentials
       AUDIT_SHARED_PROJECT_ID: ${AUDIT_SHARED_PROJECT_ID:-default}
@@ -174,6 +176,21 @@ services:
       - shared-worker-ordinary-b-secret:/var/lib/ai-mobile-testing/shared/secrets/ordinary-b
       - shared-worker-performance-secret:/var/lib/ai-mobile-testing/shared/secrets/performance
 
+  shared-resilience-driver:
+    <<: *audit-base
+    profiles: [shared-proof]
+    user: pwuser
+    healthcheck:
+      disable: true
+    command: ["node", "scripts/shared-docker-resilience-fixture.mjs"]
+    restart: "no"
+    environment:
+      AUDIT_SHARED_STORE_ROOT: /var/lib/ai-mobile-testing/shared/canonical
+      AUDIT_SHARED_DEPLOYMENT_IDENTITY: ${AUDIT_SHARED_DEPLOYMENT_IDENTITY:-compose:ai-mobile-testing}
+      AUDIT_SHARED_VOLUME_IDENTITY: ${AUDIT_SHARED_VOLUME_IDENTITY:-named-volume:shared-parent-runs}
+    volumes:
+      - shared-parent-runs:/var/lib/ai-mobile-testing/shared/canonical
+
   shared-worker-ordinary-a:
     <<: *audit-base
     profiles: [shared-runner]
@@ -182,7 +199,9 @@ services:
       disable: true
     command: ["node", "scripts/run-shared-worker.mjs"]
     restart: unless-stopped
-    stop_grace_period: 30s
+    stop_grace_period: 90s
+    cpus: "${AUDIT_SHARED_ORDINARY_CPUS:-1.0}"
+    mem_limit: ${AUDIT_SHARED_ORDINARY_MEMORY:-2g}
     depends_on:
       shared-coordinator:
         condition: service_started
@@ -192,6 +211,8 @@ services:
       AUDIT_SHARED_COORDINATOR_URL: http://shared-coordinator:4180
       AUDIT_SHARED_WORKER_CAPABILITIES: ${AUDIT_SHARED_ORDINARY_CAPABILITIES:-inventory:http,browser:chromium,browser:firefox,browser:webkit}
       AUDIT_SHARED_RESOURCE_CLASS: ordinary
+      AUDIT_SHARED_POLL_MS: ${AUDIT_SHARED_POLL_MS:-1000}
+      AUDIT_SHARED_RESILIENCE_PROOF: ${AUDIT_SHARED_RESILIENCE_PROOF:-0}
       AUDIT_SHARED_UPLOAD_TIMEOUT_MS: ${AUDIT_SHARED_UPLOAD_TIMEOUT_MS:-1200000}
       AUDIT_SHARED_WORKER_TOKEN_FILE: /run/secrets/shared-worker/token
     volumes:
@@ -206,7 +227,9 @@ services:
       disable: true
     command: ["node", "scripts/run-shared-worker.mjs"]
     restart: unless-stopped
-    stop_grace_period: 30s
+    stop_grace_period: 90s
+    cpus: "${AUDIT_SHARED_ORDINARY_CPUS:-1.0}"
+    mem_limit: ${AUDIT_SHARED_ORDINARY_MEMORY:-2g}
     depends_on:
       shared-coordinator:
         condition: service_started
@@ -216,6 +239,8 @@ services:
       AUDIT_SHARED_COORDINATOR_URL: http://shared-coordinator:4180
       AUDIT_SHARED_WORKER_CAPABILITIES: ${AUDIT_SHARED_ORDINARY_CAPABILITIES:-inventory:http,browser:chromium,browser:firefox,browser:webkit}
       AUDIT_SHARED_RESOURCE_CLASS: ordinary
+      AUDIT_SHARED_POLL_MS: ${AUDIT_SHARED_POLL_MS:-1000}
+      AUDIT_SHARED_RESILIENCE_PROOF: ${AUDIT_SHARED_RESILIENCE_PROOF:-0}
       AUDIT_SHARED_UPLOAD_TIMEOUT_MS: ${AUDIT_SHARED_UPLOAD_TIMEOUT_MS:-1200000}
       AUDIT_SHARED_WORKER_TOKEN_FILE: /run/secrets/shared-worker/token
     volumes:

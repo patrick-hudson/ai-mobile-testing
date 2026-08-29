@@ -32,11 +32,19 @@ import {
   parseCanonicalExecutionGraph,
   type CanonicalExecutionGraph,
 } from './shared/execution-graph-compiler.mjs';
+import {
+  SHARED_DOCKER_RESILIENCE_ENV,
+  SHARED_DOCKER_RESILIENCE_SPEC,
+} from './shared/shared-docker-resilience-contract.mjs';
 
 const ci = Boolean(process.env.CI);
 const artifactRoot = process.env.AUDIT_ARTIFACT_DIR ?? './artifacts';
 const excludePerformance = binaryEnvironmentFlag('AUDIT_EXCLUDE_PERFORMANCE', false);
 const runMode = auditRunMode(process.env.AUDIT_RUN_MODE);
+const sharedResilienceProof = binaryEnvironmentFlag(SHARED_DOCKER_RESILIENCE_ENV, false);
+if (sharedResilienceProof && runMode !== 'single-site') {
+  throw new Error('The shared Docker resilience proof requires Single-site mode.');
+}
 const candidateIgnoreHTTPSErrorsRequested = binaryEnvironmentFlag('CANDIDATE_IGNORE_HTTPS_ERRORS', false);
 if (runMode === 'single-site' && candidateIgnoreHTTPSErrorsRequested) {
   throw new Error('CANDIDATE_IGNORE_HTTPS_ERRORS belongs to comparative mode; use the Single-site certificate policy instead.');
@@ -79,7 +87,7 @@ const singleSiteRouteInventory = runMode === 'single-site'
   : null;
 const genericRouteExecutions = singleSiteRouteInventory?.genericExecutions ?? [];
 const selectedSingleSiteCaseIds = runMode === 'single-site'
-  ? parseSelectedSingleSiteCaseIds(
+  ? sharedResilienceProof ? [] : parseSelectedSingleSiteCaseIds(
       canonicalSelection ? JSON.stringify(canonicalSelection.caseIds) : process.env.AUDIT_SINGLE_SITE_CASE_IDS,
       pluginRegistry,
       selectedSingleSiteTargets!.map(({ sourceComparativeTargetId }) => sourceComparativeTargetId),
@@ -91,7 +99,7 @@ const selectedSingleSiteCases = runMode === 'single-site'
       .filter(({ caseId }) => selectedSingleSiteCaseIds.includes(caseId))
   : [];
 const executionTargets = runMode === 'single-site'
-  ? selectedSingleSiteTargets!.filter((target) => (
+  ? sharedResilienceProof ? selectedSingleSiteTargets! : selectedSingleSiteTargets!.filter((target) => (
       selectedSingleSiteCases.some((auditCase) => auditCase.supportedProjects.includes(target.sourceComparativeTargetId))
       || genericRouteExecutions.some(({ targetId }) => targetId === target.id)
     ))
@@ -99,8 +107,12 @@ const executionTargets = runMode === 'single-site'
 const enabledPluginSpecs = [...new Set(pluginRegistry.plugins.flatMap(({ entrySpecs }) => entrySpecs)
   .filter((entry) => entry.startsWith('plugins/')))].map((entry) => `**/${entry}`);
 const selectedSingleSiteSpecs = [
-  ...new Set(selectedSingleSiteCases.map(({ entrySpec }) => `**/${entrySpec}`)),
-  ...(genericRouteExecutions.length ? ['**/tests/single-site-generic-route.spec.ts'] : []),
+  ...(sharedResilienceProof
+    ? [`**/${SHARED_DOCKER_RESILIENCE_SPEC}`]
+    : [
+        ...new Set(selectedSingleSiteCases.map(({ entrySpec }) => `**/${entrySpec}`)),
+        ...(genericRouteExecutions.length ? ['**/tests/single-site-generic-route.spec.ts'] : []),
+      ]),
 ];
 const blobShardRun = Boolean(process.env.PLAYWRIGHT_BLOB_OUTPUT_FILE);
 const reporters: ReporterDescription[] = blobShardRun
@@ -172,7 +184,7 @@ function projectForTarget(target: AuditTargetDefinition | SingleSiteAuditTargetD
   return {
     name: target.id,
     ...(runMode === 'single-site'
-      ? {
+      ? sharedResilienceProof ? {} : {
           grep: selectedAuditCaseGrep([
             ...selectedSingleSiteCases
               .filter((auditCase) => auditCase.supportedProjects.includes(
@@ -324,6 +336,7 @@ export default defineConfig({
     '**/test-results/**',
     '**/plugins/_template/**',
     '**/portal/tests/**',
+    ...(sharedResilienceProof ? [] : [`**/${SHARED_DOCKER_RESILIENCE_SPEC}`]),
     ...(excludePerformance ? ['**/tests/performance.spec.ts'] : []),
   ],
   outputDir: `${artifactRoot}/raw`,
@@ -352,8 +365,8 @@ export default defineConfig({
     ignoreHTTPSErrors: false,
     locale: 'en-US',
     timezoneId: 'America/Chicago',
-    trace: 'retain-on-failure',
-    screenshot: 'only-on-failure',
+    trace: sharedResilienceProof ? 'off' : 'retain-on-failure',
+    screenshot: sharedResilienceProof ? 'off' : 'only-on-failure',
     video: 'off',
   },
   projects: executionTargets.map(projectForTarget),

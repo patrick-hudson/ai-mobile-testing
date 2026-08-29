@@ -761,6 +761,7 @@ try {
   assert.match(compose, /shared-coordinator:/);
   assert.match(compose, /shared-worker-ordinary-a:/);
   assert.match(compose, /shared-worker-ordinary-b:/);
+  assert.match(compose, /shared-resilience-driver:/);
   assert.match(compose, /shared-worker-performance:/);
   const workerABlock = compose.match(/shared-worker-ordinary-a:[\s\S]*?(?=\n  [a-z][a-z0-9-]+:|\nvolumes:)/)?.[0] ?? '';
   const workerBBlock = compose.match(/shared-worker-ordinary-b:[\s\S]*?(?=\n  [a-z][a-z0-9-]+:|\nvolumes:)/)?.[0] ?? '';
@@ -782,6 +783,17 @@ try {
     'worker A must not mount worker B credentials');
   assert.doesNotMatch(workerBBlock, /shared-worker-ordinary-a-secret:/,
     'worker B must not mount worker A credentials');
+  assert.match(workerABlock, /cpus:.*AUDIT_SHARED_ORDINARY_CPUS/);
+  assert.match(workerABlock, /mem_limit:.*AUDIT_SHARED_ORDINARY_MEMORY/);
+  assert.match(workerABlock, /AUDIT_SHARED_POLL_MS/);
+  assert.match(workerABlock, /AUDIT_SHARED_RESILIENCE_PROOF/);
+  assert.match(workerBBlock, /cpus:.*AUDIT_SHARED_ORDINARY_CPUS/);
+  assert.match(workerBBlock, /mem_limit:.*AUDIT_SHARED_ORDINARY_MEMORY/);
+  const proofDriverBlock = compose.match(/shared-resilience-driver:[\s\S]*?(?=\n  [a-z][a-z0-9-]+:|\nvolumes:)/)?.[0] ?? '';
+  assert.match(proofDriverBlock, /profiles: \[shared-proof\]/);
+  assert.match(proofDriverBlock, /shared-parent-runs:/);
+  assert.doesNotMatch(proofDriverBlock, /shared-control-identities|shared-worker-exchange|docker\.sock|PORTAL_SECRET|TOKEN_FILE/,
+    'the proof driver may read the isolated canonical volume but must not receive control credentials, exchange storage, or host control');
   assert.match(sharedDispatcherSource, /AUDIT_SHARED_EVIDENCE_DIR/);
   assert.doesNotMatch(compose, /AUDIT_SHARED_(?:PERFORMANCE_)?EXECUTOR_JSON/,
     'Compose workers must use only the fixed repository-owned dispatcher.');
