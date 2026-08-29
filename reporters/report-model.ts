@@ -17,6 +17,10 @@ import type {
   AuditProjectMetadata,
 } from '../audit/types.js';
 import { targetMatchesAuditApplicability } from '../shared/target-applicability.mjs';
+import { parsePublicationEnvelope } from '../shared/publication-envelope.mjs';
+import type { PublicationEnvelope } from '../shared/publication-envelope.mjs';
+import type { ReleaseDecision } from '../shared/release-decision.mjs';
+import type { RiskRegister } from '../shared/risk-contract.mjs';
 import {
   type SingleSiteReportInput,
   type SingleSiteReportSummary,
@@ -38,6 +42,29 @@ export type ChecklistStatus =
   | 'BLOCKED'
   | 'NOT_RUN'
   | 'MANUAL_REQUIRED';
+
+export interface SharedReleaseReportProjection {
+  subjectDigest: string;
+  decision: ReleaseDecision;
+  risks: RiskRegister;
+  riskSummary: PublicationEnvelope['riskSummary'];
+  revisions: { run: number; decision: number; risk: number };
+}
+
+export function projectSharedReleasePublication(value: unknown): SharedReleaseReportProjection {
+  const envelope = parsePublicationEnvelope(value);
+  return {
+    subjectDigest: envelope.finalSubjectDigest,
+    decision: envelope.decision,
+    risks: envelope.riskRegister,
+    riskSummary: envelope.riskSummary,
+    revisions: {
+      run: envelope.runRevision,
+      decision: envelope.decisionRevision,
+      risk: envelope.riskRevision,
+    },
+  };
+}
 
 export interface ReportAttachmentInput {
   name: string;

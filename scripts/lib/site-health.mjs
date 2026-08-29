@@ -1,10 +1,12 @@
+import { AUDIT_MODES, AUTHORITY_QUALIFIERS } from '../../shared/release-subject.mjs';
+
 export const SITE_HEALTH_SCHEMA_VERSION = 1;
 
 const EXECUTION_STATUSES = new Set([
   'queued', 'starting', 'running', 'finalizing', 'completed', 'failed', 'incomplete', 'cancelled',
 ]);
 const ROLES = new Set(['preview', 'production']);
-const QUALIFIERS = new Set(['FULL', 'TARGETED']);
+const QUALIFIERS = new Set(AUTHORITY_QUALIFIERS);
 const AUTHORITY_STATUSES = new Set(['authoritative', 'non-authoritative']);
 const VISUAL_STATUSES = new Set(['UNCHANGED', 'CHANGED', 'REVIEWED', 'absent', 'incompatible', 'unavailable']);
 
@@ -63,7 +65,7 @@ function optionalExplanation(value, label) {
 }
 
 export function parseSiteHealthInput(input) {
-  if (!isRecord(input) || input.schemaVersion !== 1 || input.mode !== 'single-site') {
+  if (!isRecord(input) || input.schemaVersion !== 1 || input.mode !== AUDIT_MODES[0]) {
     throw new TypeError('Site Health derives only from a schemaVersion 1 Single-site truth input.');
   }
   exactKeys(input, [

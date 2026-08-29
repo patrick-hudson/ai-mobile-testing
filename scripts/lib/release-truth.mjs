@@ -1,8 +1,34 @@
 import { readFile } from 'node:fs/promises';
+import { parsePublicationEnvelope } from '../../shared/publication-envelope.mjs';
+import { RELEASE_DECISION_CODES } from '../../shared/release-decision.mjs';
 
 export const RELEASE_DECISIONS = Object.freeze(['READY', 'NOT_READY']);
 export const PIPELINE_STATUSES = Object.freeze(['pending', 'running', 'completed', 'failed', 'stopped']);
 export const CHECKLIST_SCHEMA_VERSION = 1;
+
+export function parseReleasePublication(document, source = 'release/publication/current.json') {
+  const envelope = parsePublicationEnvelope(document);
+  const { decision } = envelope;
+  return {
+    decision: decision.ready ? 'READY' : 'NOT_READY',
+    decisionCode: decision.code,
+    ready: decision.ready,
+    reason: decision.label,
+    decisionBasis: 'Shared canonical oracle results and authorized release-affecting dispositions.',
+    blockingFailures: decision.blockingReasons.filter(({ class: reasonClass }) => reasonClass === 'product-failure').length,
+    blockingIncomplete: decision.blockingReasons.filter(({ class: reasonClass }) => reasonClass !== 'product-failure').length,
+    baselineIssues: envelope.riskSummary.active,
+    runIntegrityFailure: decision.code === 'NOT_READY_INCOMPLETE_EXECUTION',
+    authority: decision.grantedAuthority,
+    certifiedScope: decision.certifiedScope,
+    subjectDigest: decision.subjectDigest,
+    decisionRevision: decision.decisionRevision,
+    superseded: decision.superseded,
+    riskSummary: envelope.riskSummary,
+    source,
+    evaluatedAt: null,
+  };
+}
 
 export function pendingRelease(source = 'checklist/manifest.json') {
   return {
@@ -32,6 +58,7 @@ export function parseChecklistRelease(document, source = 'checklist/manifest.jso
   if (!document || typeof document !== 'object' || Array.isArray(document)) {
     throw new Error('Checklist manifest must be a JSON object.');
   }
+  if (document.kind === 'release-publication-envelope') return parseReleasePublication(document, source);
   if (document.schemaVersion !== CHECKLIST_SCHEMA_VERSION) {
     throw new Error(`Checklist manifest schemaVersion must be ${CHECKLIST_SCHEMA_VERSION}.`);
   }
@@ -93,17 +120,31 @@ export async function readChecklistRelease(manifestPath, source = 'checklist/man
 }
 
 export function releaseOutcome(pipelineStatus, release) {
-  if (pipelineStatus !== 'completed' || !RELEASE_DECISIONS.includes(release?.decision)) {
+  const sharedCode = RELEASE_DECISION_CODES.includes(release?.code)
+    ? release.code
+    : RELEASE_DECISION_CODES.includes(release?.decisionCode) ? release.decisionCode : null;
+  if (pipelineStatus !== 'completed'
+    || (!RELEASE_DECISIONS.includes(release?.decision) && sharedCode === null)) {
     return { status: 'pipeline-failed', exitCode: 1 };
   }
-  return release.decision === 'READY'
+  const ready = sharedCode === null ? release.decision === 'READY' : ['RELEASE_READY', 'FEATURE_READY'].includes(sharedCode);
+  return ready
     ? { status: 'ready', exitCode: 0 }
     : { status: 'not-ready', exitCode: 1 };
 }
 
 export function pipelineOnlyOutcome(pipelineStatus, release) {
-  if (pipelineStatus !== 'completed' || !RELEASE_DECISIONS.includes(release?.decision)) {
+  const sharedCode = RELEASE_DECISION_CODES.includes(release?.code)
+    ? release.code
+    : RELEASE_DECISION_CODES.includes(release?.decisionCode) ? release.decisionCode : null;
+  if (pipelineStatus !== 'completed'
+    || (!RELEASE_DECISIONS.includes(release?.decision) && sharedCode === null)) {
     return { status: 'pipeline-failed', exitCode: 1 };
+  }
+  if (sharedCode !== null) {
+    if (sharedCode === 'NOT_READY_TEST_FAILURE') return { status: 'smoke-checks-failed', exitCode: 1 };
+    if (sharedCode === 'NOT_READY_INCOMPLETE_EXECUTION') return { status: 'completed-not-ready', exitCode: 0 };
+    return { status: 'ready', exitCode: 0 };
   }
   if (release.blockingFailures === null || release.runIntegrityFailure === null) {
     return { status: 'integrity-unknown', exitCode: 1 };
