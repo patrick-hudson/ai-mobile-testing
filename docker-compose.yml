@@ -29,6 +29,10 @@ services:
       - single-site-jobs:/var/lib/ai-mobile-testing/jobs
       - shared-parent-runs:/var/lib/ai-mobile-testing/shared/canonical
       - shared-worker-exchange:/var/lib/ai-mobile-testing/shared/exchange
+      - shared-control-identities:/var/lib/ai-mobile-testing/shared/credentials
+      - shared-worker-ordinary-a-secret:/var/lib/ai-mobile-testing/shared/secrets/ordinary-a
+      - shared-worker-ordinary-b-secret:/var/lib/ai-mobile-testing/shared/secrets/ordinary-b
+      - shared-worker-performance-secret:/var/lib/ai-mobile-testing/shared/secrets/performance
 
   portal:
     <<: *audit-base
@@ -38,23 +42,28 @@ services:
     ports:
       - "127.0.0.1:${PORTAL_PORT:-4173}:4173"
     environment:
-      - PRODUCTION_URL=${PRODUCTION_URL:-https://quitting7oh.org}
-      - CANDIDATE_URL=${CANDIDATE_URL:-https://beta.quitting7oh-org.pages.dev}
-      - AUDIT_WORKERS=${AUDIT_WORKERS:-3}
-      - AUDIT_VERBOSE=${AUDIT_VERBOSE:-1}
-      - AUDIT_TARGET_IDS=${AUDIT_TARGET_IDS:-}
-      - CANDIDATE_IGNORE_HTTPS_ERRORS=${CANDIDATE_IGNORE_HTTPS_ERRORS:-0}
-      - PORTAL_MAX_CONCURRENT_RUNS=${PORTAL_MAX_CONCURRENT_RUNS:-1}
-      - PORTAL_SHARDED_ARTIFACT_ROOT=${PORTAL_SHARDED_ARTIFACT_ROOT:-/work/artifacts/sharded}
-      - PORTAL_EXTERNAL_RUN_SYNC_MS=${PORTAL_EXTERNAL_RUN_SYNC_MS:-1000}
-      - PORTAL_LOOPBACK_PUBLISHED=1
-      - PORTAL_SECRET_ROOT=/var/lib/ai-mobile-testing/secrets
-      - PORTAL_SINGLE_SITE_QUEUE_ROOT=/var/lib/ai-mobile-testing/jobs
-      - PORTAL_SINGLE_SITE_FINALIZATION_ROOT=/var/lib/ai-mobile-testing/finalizations
-      - PORTAL_VISUAL_BASELINE_ROOT=/var/lib/ai-mobile-testing/baselines
-      - AUDIT_PREVIEW_TLS_BYPASS_ALLOWLIST=${AUDIT_PREVIEW_TLS_BYPASS_ALLOWLIST:-}
-      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-claude-sonnet-5}
-      - AI_REVIEW_DRY_RUN
+      PRODUCTION_URL: ${PRODUCTION_URL:-https://quitting7oh.org}
+      CANDIDATE_URL: ${CANDIDATE_URL:-https://beta.quitting7oh-org.pages.dev}
+      AUDIT_WORKERS: ${AUDIT_WORKERS:-3}
+      AUDIT_VERBOSE: ${AUDIT_VERBOSE:-1}
+      AUDIT_TARGET_IDS: ${AUDIT_TARGET_IDS:-}
+      CANDIDATE_IGNORE_HTTPS_ERRORS: ${CANDIDATE_IGNORE_HTTPS_ERRORS:-0}
+      PORTAL_MAX_CONCURRENT_RUNS: ${PORTAL_MAX_CONCURRENT_RUNS:-1}
+      PORTAL_SHARDED_ARTIFACT_ROOT: ${PORTAL_SHARDED_ARTIFACT_ROOT:-/work/artifacts/sharded}
+      PORTAL_EXTERNAL_RUN_SYNC_MS: ${PORTAL_EXTERNAL_RUN_SYNC_MS:-1000}
+      PORTAL_LOOPBACK_PUBLISHED: "1"
+      PORTAL_SECRET_ROOT: /var/lib/ai-mobile-testing/secrets
+      PORTAL_SINGLE_SITE_QUEUE_ROOT: /var/lib/ai-mobile-testing/jobs
+      PORTAL_SINGLE_SITE_FINALIZATION_ROOT: /var/lib/ai-mobile-testing/finalizations
+      PORTAL_VISUAL_BASELINE_ROOT: /var/lib/ai-mobile-testing/baselines
+      PORTAL_SHARED_CREDENTIAL_ROOT: /var/lib/ai-mobile-testing/shared/credentials
+      AUDIT_SHARED_STORE_ROOT: /var/lib/ai-mobile-testing/shared/canonical
+      AUDIT_SHARED_DEPLOYMENT_IDENTITY: ${AUDIT_SHARED_DEPLOYMENT_IDENTITY:-compose:ai-mobile-testing}
+      AUDIT_SHARED_VOLUME_IDENTITY: named-volume:shared-parent-runs
+      AUDIT_SHARED_PROJECT_ID: ${AUDIT_SHARED_PROJECT_ID:-default}
+      AUDIT_PREVIEW_TLS_BYPASS_ALLOWLIST: ${AUDIT_PREVIEW_TLS_BYPASS_ALLOWLIST:-}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-5}
+      AI_REVIEW_DRY_RUN: ${AI_REVIEW_DRY_RUN:-}
     stop_grace_period: 15s
     volumes:
       - ./artifacts:/work/artifacts
@@ -63,6 +72,8 @@ services:
       - single-site-jobs:/var/lib/ai-mobile-testing/jobs
       - single-site-finalizations:/var/lib/ai-mobile-testing/finalizations
       - single-site-baselines:/var/lib/ai-mobile-testing/baselines
+      - shared-parent-runs:/var/lib/ai-mobile-testing/shared/canonical
+      - shared-control-identities:/var/lib/ai-mobile-testing/shared/credentials
 
   single-site-worker:
     <<: *audit-base
@@ -119,6 +130,8 @@ services:
     depends_on:
       single-site-volume-init:
         condition: service_completed_successfully
+      shared-identity-provisioner:
+        condition: service_completed_successfully
     environment:
       AUDIT_SHARED_STORE_ROOT: /var/lib/ai-mobile-testing/shared/canonical
       AUDIT_SHARED_EXCHANGE_ROOT: /var/lib/ai-mobile-testing/shared/exchange
@@ -133,7 +146,30 @@ services:
       - shared-worker-exchange:/var/lib/ai-mobile-testing/shared/exchange
       - shared-control-identities:/var/lib/ai-mobile-testing/shared/credentials
 
-  shared-worker-ordinary:
+  shared-identity-provisioner:
+    <<: *audit-base
+    profiles: [shared-runner]
+    user: pwuser
+    healthcheck:
+      disable: true
+    command: ["node", "scripts/provision-shared-worker-identities.mjs"]
+    restart: "no"
+    depends_on:
+      single-site-volume-init:
+        condition: service_completed_successfully
+    environment:
+      AUDIT_SHARED_CREDENTIAL_ROOT: /var/lib/ai-mobile-testing/shared/credentials
+      AUDIT_SHARED_PROJECT_ID: ${AUDIT_SHARED_PROJECT_ID:-default}
+      AUDIT_SHARED_WORKER_A_CREDENTIAL_FILE: /var/lib/ai-mobile-testing/shared/secrets/ordinary-a/token
+      AUDIT_SHARED_WORKER_B_CREDENTIAL_FILE: /var/lib/ai-mobile-testing/shared/secrets/ordinary-b/token
+      AUDIT_SHARED_PERFORMANCE_CREDENTIAL_FILE: /var/lib/ai-mobile-testing/shared/secrets/performance/token
+    volumes:
+      - shared-control-identities:/var/lib/ai-mobile-testing/shared/credentials
+      - shared-worker-ordinary-a-secret:/var/lib/ai-mobile-testing/shared/secrets/ordinary-a
+      - shared-worker-ordinary-b-secret:/var/lib/ai-mobile-testing/shared/secrets/ordinary-b
+      - shared-worker-performance-secret:/var/lib/ai-mobile-testing/shared/secrets/performance
+
+  shared-worker-ordinary-a:
     <<: *audit-base
     profiles: [shared-runner]
     user: pwuser
@@ -143,16 +179,43 @@ services:
     restart: unless-stopped
     stop_grace_period: 30s
     depends_on:
-      - shared-coordinator
+      shared-coordinator:
+        condition: service_started
+      shared-identity-provisioner:
+        condition: service_completed_successfully
     environment:
       AUDIT_SHARED_COORDINATOR_URL: http://shared-coordinator:4180
       AUDIT_SHARED_WORKER_CAPABILITIES: browser:chromium,browser:firefox,browser:webkit
       AUDIT_SHARED_RESOURCE_CLASS: ordinary
       AUDIT_SHARED_EXECUTOR_JSON: ${AUDIT_SHARED_EXECUTOR_JSON:-}
-      AUDIT_SHARED_WORKER_TOKEN_FILE: /run/secrets/shared-worker-token
+      AUDIT_SHARED_WORKER_TOKEN_FILE: /run/secrets/shared-worker/token
     volumes:
       - ./certs:/work/certs:ro
-      - ${AUDIT_SHARED_ORDINARY_WORKER_TOKEN_FILE:-/dev/null}:/run/secrets/shared-worker-token:ro
+      - shared-worker-ordinary-a-secret:/run/secrets/shared-worker:ro
+
+  shared-worker-ordinary-b:
+    <<: *audit-base
+    profiles: [shared-runner]
+    user: pwuser
+    healthcheck:
+      disable: true
+    command: ["node", "scripts/run-shared-worker.mjs"]
+    restart: unless-stopped
+    stop_grace_period: 30s
+    depends_on:
+      shared-coordinator:
+        condition: service_started
+      shared-identity-provisioner:
+        condition: service_completed_successfully
+    environment:
+      AUDIT_SHARED_COORDINATOR_URL: http://shared-coordinator:4180
+      AUDIT_SHARED_WORKER_CAPABILITIES: browser:chromium,browser:firefox,browser:webkit
+      AUDIT_SHARED_RESOURCE_CLASS: ordinary
+      AUDIT_SHARED_EXECUTOR_JSON: ${AUDIT_SHARED_EXECUTOR_JSON:-}
+      AUDIT_SHARED_WORKER_TOKEN_FILE: /run/secrets/shared-worker/token
+    volumes:
+      - ./certs:/work/certs:ro
+      - shared-worker-ordinary-b-secret:/run/secrets/shared-worker:ro
 
   shared-worker-performance:
     <<: *audit-base
@@ -166,16 +229,19 @@ services:
     cpus: "2.0"
     mem_limit: 4g
     depends_on:
-      - shared-coordinator
+      shared-coordinator:
+        condition: service_started
+      shared-identity-provisioner:
+        condition: service_completed_successfully
     environment:
       AUDIT_SHARED_COORDINATOR_URL: http://shared-coordinator:4180
       AUDIT_SHARED_WORKER_CAPABILITIES: performance:lighthouse
       AUDIT_SHARED_RESOURCE_CLASS: performance
       AUDIT_SHARED_EXECUTOR_JSON: ${AUDIT_SHARED_PERFORMANCE_EXECUTOR_JSON:-}
-      AUDIT_SHARED_WORKER_TOKEN_FILE: /run/secrets/shared-worker-token
+      AUDIT_SHARED_WORKER_TOKEN_FILE: /run/secrets/shared-worker/token
     volumes:
       - ./certs:/work/certs:ro
-      - ${AUDIT_SHARED_PERFORMANCE_WORKER_TOKEN_FILE:-/dev/null}:/run/secrets/shared-worker-token:ro
+      - shared-worker-performance-secret:/run/secrets/shared-worker:ro
 
   single-site-lease-load-proof:
     <<: *audit-base
@@ -335,3 +401,6 @@ volumes:
   shared-parent-runs:
   shared-worker-exchange:
   shared-control-identities:
+  shared-worker-ordinary-a-secret:
+  shared-worker-ordinary-b-secret:
+  shared-worker-performance-secret:

@@ -45,7 +45,15 @@ try {
   const controlCliSource = await readFile(new URL('./audit-control.mjs', import.meta.url), 'utf8');
   const releaseCliSource = await readFile(new URL('./assert-release-decision.mjs', import.meta.url), 'utf8');
   assert.doesNotMatch(compose, /AUDIT_SHARED_WORKER_TOKEN:/u, 'worker bearer secrets must never be Compose environment values');
-  assert.match(compose, /AUDIT_SHARED_WORKER_TOKEN_FILE: \/run\/secrets\/shared-worker-token/u);
+  assert.match(compose, /PORTAL_SHARED_CREDENTIAL_ROOT: \/var\/lib\/ai-mobile-testing\/shared\/credentials/u);
+  const portalComposeBlock = compose.match(/\n  portal:[\s\S]*?(?=\n  [a-z][a-z0-9-]+:)/u)?.[0] ?? '';
+  assert.match(portalComposeBlock, /shared-parent-runs:\/var\/lib\/ai-mobile-testing\/shared\/canonical/u);
+  assert.match(portalComposeBlock, /shared-control-identities:\/var\/lib\/ai-mobile-testing\/shared\/credentials/u);
+  assert.match(compose, /shared-worker-ordinary-a:/u);
+  assert.match(compose, /shared-worker-ordinary-b:/u);
+  assert.match(compose, /shared-worker-ordinary-a-secret:\/run\/secrets\/shared-worker:ro/u);
+  assert.match(compose, /shared-worker-ordinary-b-secret:\/run\/secrets\/shared-worker:ro/u);
+  assert.match(compose, /AUDIT_SHARED_WORKER_TOKEN_FILE: \/run\/secrets\/shared-worker\/token/u);
   assert.match(workerSource, /mode-0600 file/u);
   assert.doesNotMatch(workerSource, /console\.(?:log|error).*workerCredential/u, 'worker credentials must never enter logs');
   assert.doesNotMatch(controlCliSource, /AUDIT_CONTROL_TOKEN/u, 'control CLI credentials must not be accepted from the process environment');
@@ -65,6 +73,37 @@ try {
   assert.equal(principalCliDocument.principal.id, 'cli-worker');
   assert.match(await readFile(credentialOutput, 'utf8'), /^amt\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{32,}\n$/u);
   assert.equal((await stat(credentialOutput)).mode & 0o077, 0, 'principal credential output must be mode 0600');
+
+  const provisionRoot = path.join(root, 'compose-provision');
+  const workerCredentialFiles = {
+    AUDIT_SHARED_WORKER_A_CREDENTIAL_FILE: path.join(provisionRoot, 'ordinary-a', 'token'),
+    AUDIT_SHARED_WORKER_B_CREDENTIAL_FILE: path.join(provisionRoot, 'ordinary-b', 'token'),
+    AUDIT_SHARED_PERFORMANCE_CREDENTIAL_FILE: path.join(provisionRoot, 'performance', 'token'),
+  };
+  const provisionEnvironment = {
+    ...process.env,
+    AUDIT_SHARED_CREDENTIAL_ROOT: path.join(provisionRoot, 'authority'),
+    AUDIT_SHARED_PROJECT_ID: 'project-1',
+    ...workerCredentialFiles,
+  };
+  const firstProvision = await runCommand(process.execPath, [
+    new URL('./provision-shared-worker-identities.mjs', import.meta.url).pathname,
+  ], path.join(root, 'compose-provision-first'), { env: provisionEnvironment });
+  assert.equal(firstProvision.code, 0, firstProvision.stderr);
+  assert.deepEqual(JSON.parse(firstProvision.stdout).provisioned.map((entry) => entry.status), ['issued', 'issued', 'issued']);
+  const secondProvision = await runCommand(process.execPath, [
+    new URL('./provision-shared-worker-identities.mjs', import.meta.url).pathname,
+  ], path.join(root, 'compose-provision-second'), { env: provisionEnvironment });
+  assert.equal(secondProvision.code, 0, secondProvision.stderr);
+  assert.deepEqual(JSON.parse(secondProvision.stdout).provisioned.map((entry) => entry.status), ['reused', 'reused', 'reused']);
+  const provisionedCredentials = await Promise.all(Object.values(workerCredentialFiles).map(async (file) => {
+    assert.equal((await stat(file)).mode & 0o077, 0, `${file} must remain private`);
+    return (await readFile(file, 'utf8')).trim();
+  }));
+  assert.equal(new Set(provisionedCredentials).size, 3, 'each Compose worker slot must receive a distinct credential');
+  const provisionedAuthority = await openScopedCredentialAuthority({ root: provisionEnvironment.AUDIT_SHARED_CREDENTIAL_ROOT });
+  assert.deepEqual((await Promise.all(provisionedCredentials.map((credential) => provisionedAuthority.authenticateCredential(credential))))
+    .map((principal) => principal.id), ['compose-worker-ordinary-a', 'compose-worker-ordinary-b', 'compose-worker-performance']);
   assert.throws(() => validateMutationDeployment({
     bindHost: '0.0.0.0',
     publishedOrigin: 'http://audit.example.test',
@@ -507,7 +546,7 @@ try {
   await rm(root, { recursive: true, force: true });
 }
 
-async function runCommand(command, args, capturePrefix) {
+async function runCommand(command, args, capturePrefix, options = {}) {
   const stdoutPath = `${capturePrefix}.stdout`;
   const stderrPath = `${capturePrefix}.stderr`;
   const stdout = await open(stdoutPath, 'wx', 0o600);
@@ -515,7 +554,7 @@ async function runCommand(command, args, capturePrefix) {
   let code;
   try {
     code = await new Promise((resolve, reject) => {
-      const child = spawn(command, args, { stdio: ['ignore', stdout.fd, stderr.fd] });
+      const child = spawn(command, args, { ...options, stdio: ['ignore', stdout.fd, stderr.fd] });
       child.once('error', reject);
       child.once('close', resolve);
     });

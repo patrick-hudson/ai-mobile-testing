@@ -387,15 +387,25 @@ try {
   ]);
   assert.match(playwrightConfig, /retries:\s*0,/);
   assert.match(compose, /shared-coordinator:/);
-  assert.match(compose, /shared-worker-ordinary:/);
+  assert.match(compose, /shared-worker-ordinary-a:/);
+  assert.match(compose, /shared-worker-ordinary-b:/);
   assert.match(compose, /shared-worker-performance:/);
-  const workerBlock = compose.match(/shared-worker-ordinary:[\s\S]*?(?=\n  [a-z][a-z0-9-]+:|\nvolumes:)/)?.[0] ?? '';
-  assert.doesNotMatch(workerBlock, /shared-parent-runs:\/var\/lib\/ai-mobile-testing\/shared\/canonical/,
-    'ordinary workers must not mount the canonical parent-run store');
-  assert.doesNotMatch(workerBlock, /shared-worker-exchange/,
-    'ordinary workers publish through the lease-bound coordinator protocol and cannot browse another run inbox');
-  assert.doesNotMatch(workerBlock, /docker\.sock/);
-  assert.match(workerBlock, /user:\s*pwuser/);
+  const workerABlock = compose.match(/shared-worker-ordinary-a:[\s\S]*?(?=\n  [a-z][a-z0-9-]+:|\nvolumes:)/)?.[0] ?? '';
+  const workerBBlock = compose.match(/shared-worker-ordinary-b:[\s\S]*?(?=\n  [a-z][a-z0-9-]+:|\nvolumes:)/)?.[0] ?? '';
+  for (const workerBlock of [workerABlock, workerBBlock]) {
+    assert.doesNotMatch(workerBlock, /shared-parent-runs:\/var\/lib\/ai-mobile-testing\/shared\/canonical/,
+      'ordinary workers must not mount the canonical parent-run store');
+    assert.doesNotMatch(workerBlock, /shared-worker-exchange/,
+      'ordinary workers publish through the lease-bound coordinator protocol and cannot browse another run inbox');
+    assert.doesNotMatch(workerBlock, /docker\.sock/);
+    assert.match(workerBlock, /user:\s*pwuser/);
+  }
+  assert.match(workerABlock, /shared-worker-ordinary-a-secret:/);
+  assert.match(workerBBlock, /shared-worker-ordinary-b-secret:/);
+  assert.doesNotMatch(workerABlock, /shared-worker-ordinary-b-secret:/,
+    'worker A must not mount worker B credentials');
+  assert.doesNotMatch(workerBBlock, /shared-worker-ordinary-a-secret:/,
+    'worker B must not mount worker A credentials');
   assert.match(sharedWorkerSource, /AUDIT_SHARED_EVIDENCE_DIR/);
   assert.match(sharedWorkerSource, /\/v1\/heartbeat/);
   assert.match(sharedCoordinatorSource, /request\.url === '\/v1\/heartbeat'/);

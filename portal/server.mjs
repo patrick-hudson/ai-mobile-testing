@@ -512,7 +512,9 @@ if (process.env.PORTAL_SHARED_CONTROL === '1') {
     deploymentIdentity: process.env.AUDIT_SHARED_DEPLOYMENT_IDENTITY,
     volumeIdentity: process.env.AUDIT_SHARED_VOLUME_IDENTITY,
   });
-  const credentialAuthority = await openScopedCredentialAuthority({ root: join(SECRET_ROOT, 'control-identities') });
+  const credentialAuthority = await openScopedCredentialAuthority({
+    root: process.env.PORTAL_SHARED_CREDENTIAL_ROOT ?? join(SECRET_ROOT, 'control-identities'),
+  });
   const claimStore = await openPromotionClaimStore({ root: join(SECRET_ROOT, 'promotion-claims') });
   const sharedProjectId = process.env.AUDIT_SHARED_PROJECT_ID ?? 'default';
   sharedControlApi = createSharedControlApi({
