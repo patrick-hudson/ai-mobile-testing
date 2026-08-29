@@ -47,9 +47,9 @@ function normalizeOrigins(value, mode) {
   return { candidate, production };
 }
 
-function normalizeRoute(value) {
+function normalizeRoute(value, expectedOrigin) {
   if (value === null) return null;
-  exactKeys(value, ['inventoryDigest', 'url', 'path'], 'Execution descriptor route');
+  exactKeys(value, ['inventoryDigest', 'url', 'path', 'sources', 'productOracleVariant'], 'Execution descriptor route');
   const inventoryDigest = assertDigest(value.inventoryDigest, 'route.inventoryDigest');
   const url = bounded(value.url, 'route.url', 2_048);
   const routePath = bounded(value.path, 'route.path', 2_048);
@@ -57,10 +57,35 @@ function normalizeRoute(value) {
   try { parsed = new URL(url); } catch {
     failContract('INVALID_EXECUTION_DESCRIPTOR', 'route.url must be an HTTP(S) URL.');
   }
-  if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.pathname !== routePath) {
+  if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.hash
+    || parsed.origin !== expectedOrigin || parsed.pathname !== routePath) {
     failContract('INVALID_EXECUTION_DESCRIPTOR', 'route URL and path bindings disagree.');
   }
-  return { inventoryDigest, url, path: routePath };
+  if (!Array.isArray(value.sources) || value.sources.length < 1 || value.sources.length > 32) {
+    failContract('INVALID_EXECUTION_DESCRIPTOR', 'route.sources must retain bounded discovery provenance.');
+  }
+  const sources = value.sources.map((source, index) => {
+    exactKeys(source, ['source', 'from', 'depth'], `route.sources[${index}]`);
+    if (!Number.isSafeInteger(source.depth) || source.depth < 0 || source.depth > 1_024) {
+      failContract('INVALID_EXECUTION_DESCRIPTOR', `route.sources[${index}].depth is invalid.`);
+    }
+    return {
+      source: bounded(source.source, `route.sources[${index}].source`, 128),
+      from: nullableBounded(source.from, `route.sources[${index}].from`, 2_048),
+      depth: source.depth,
+    };
+  });
+  const sourceKeys = sources.map(({ source, from, depth }) => `${source}\0${from ?? ''}\0${depth}`);
+  if (new Set(sourceKeys).size !== sourceKeys.length) {
+    failContract('INVALID_EXECUTION_DESCRIPTOR', 'route.sources must not contain duplicate provenance rows.');
+  }
+  return {
+    inventoryDigest,
+    url,
+    path: routePath,
+    sources,
+    productOracleVariant: bounded(value.productOracleVariant, 'route.productOracleVariant', 128),
+  };
 }
 
 export function sealWorkExecutionDescriptor(input) {
@@ -99,6 +124,7 @@ export function sealWorkExecutionDescriptor(input) {
   } else if (entrySpec === null || caseId === null || !SPEC_PATH.test(entrySpec)) {
     failContract('INVALID_EXECUTION_DESCRIPTOR', 'Playwright execution requires a repository-owned spec and case ID.');
   }
+  const origins = normalizeOrigins(input.origins, mode);
   const body = {
     schemaVersion: 1,
     kind: 'shared-work-execution-descriptor',
@@ -115,12 +141,17 @@ export function sealWorkExecutionDescriptor(input) {
     targetRole: bounded(input.targetRole, 'targetRole', 128),
     capability,
     resourceClass,
-    origins: normalizeOrigins(input.origins, mode),
+    origins,
     certificatePolicy: bounded(input.certificatePolicy, 'certificatePolicy', 64),
-    route: normalizeRoute(input.route),
+    route: normalizeRoute(input.route, origins.candidate),
   };
   if (body.route !== null && body.mode !== 'single-site') {
     failContract('INVALID_EXECUTION_DESCRIPTOR', 'Only Single-site work may carry an inventoried route binding.');
+  }
+  if (body.route !== null && (body.operation !== 'playwright' || body.definitionId !== 'ENV-002'
+    || !body.caseId.startsWith('GENERIC-ROUTE-') || body.entrySpec !== 'tests/single-site-generic-route.spec.ts'
+    || body.route.productOracleVariant !== 'generic-page-inspection-v1')) {
+    failContract('INVALID_EXECUTION_DESCRIPTOR', 'Inventoried route work must bind the repository generic route Product Oracle.');
   }
   return freezeContract({ ...body, digest: canonicalDigest(body) });
 }

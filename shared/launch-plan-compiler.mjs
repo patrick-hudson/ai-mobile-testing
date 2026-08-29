@@ -203,6 +203,8 @@ function scheduledWorkItem(plan, maxAttempts, subjectCore, runnerRevision) {
       inventoryDigest: plan.inventoryDigest,
       url: plan.routeUrl,
       path: plan.routePath,
+      sources: plan.routeSources,
+      productOracleVariant: plan.productOracleVariant,
     } : null,
   });
   return {

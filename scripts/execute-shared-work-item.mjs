@@ -6,6 +6,7 @@ import { auditCaseTag } from '../shared/audit-case-identity.mjs';
 import { canonicalDigest } from '../shared/canonical-contract.mjs';
 import { buildLiveRouteInventory } from '../shared/live-route-inventory.mjs';
 import { preflightQuitting7ohSite } from '../shared/site-preflight.mjs';
+import { sealSharedGenericRouteExecutionPublication } from '../shared/single-site-route-plan.mjs';
 import { parseWorkExecutionDescriptor } from '../shared/work-execution-descriptor.mjs';
 import { startBrowserEgressProxy } from './lib/browser-egress-proxy.mjs';
 import { collectSharedPlaywrightArtifacts } from './lib/shared-playwright-work-item.mjs';
@@ -62,7 +63,7 @@ function safeInheritedEnvironment() {
   )));
 }
 
-function playwrightEnvironment(descriptor, artifactRoot, proxyUrl = null) {
+function playwrightEnvironment(descriptor, artifactRoot, proxyUrl = null, genericRoutePublication = null) {
   const environment = {
     ...safeInheritedEnvironment(),
     CI: '1',
@@ -82,6 +83,12 @@ function playwrightEnvironment(descriptor, artifactRoot, proxyUrl = null) {
       AUDIT_SINGLE_SITE_CERTIFICATE_POLICY: descriptor.certificatePolicy,
       AUDIT_SINGLE_SITE_CASE_IDS: JSON.stringify([descriptor.caseId]),
       AUDIT_SINGLE_SITE_EGRESS_PROXY: proxyUrl,
+      ...(genericRoutePublication === null ? {} : {
+        AUDIT_SINGLE_SITE_ROUTE_INVENTORY: genericRoutePublication.path,
+        AUDIT_SINGLE_SITE_GENERIC_TARGET_ID: descriptor.targetId,
+        AUDIT_SHARED_EXECUTION_DESCRIPTOR_DIGEST: descriptor.digest,
+        AUDIT_SHARED_GENERIC_ROUTE_PUBLICATION_DIGEST: genericRoutePublication.digest,
+      }),
     });
   } else {
     Object.assign(environment, {
@@ -102,15 +109,26 @@ async function spawnPlaywright(descriptor, artifactRoot, signal) {
     '--workers=1', '--retries=0', '--reporter=json',
   ];
   let egressProxy = null;
+  let genericRoutePublication = null;
+  let genericRoutePublicationArtifact = null;
   try {
     if (descriptor.mode === 'single-site') {
       egressProxy = await startBrowserEgressProxy({ logger: { emit: (event, detail) => logger(event, detail) } });
+    }
+    if (descriptor.route !== null) {
+      const relative = 'playwright/compiler-input/generic-route-publication.json';
+      const publicationPath = path.join(path.dirname(artifactRoot), ...relative.split('/'));
+      const publication = sealSharedGenericRouteExecutionPublication(descriptor);
+      await fs.mkdir(path.dirname(publicationPath), { recursive: true, mode: 0o700 });
+      await fs.writeFile(publicationPath, `${JSON.stringify(publication)}\n`, { flag: 'wx', mode: 0o600 });
+      genericRoutePublication = { path: publicationPath, digest: publication.publicationDigest };
+      genericRoutePublicationArtifact = { path: relative, mediaType: 'application/json' };
     }
     logger('fixed-command-started', { command: ['playwright', ...args], capability: descriptor.capability });
     const completion = await new Promise((resolve, reject) => {
       const child = spawn(executable, args, {
         cwd: repositoryRoot,
-        env: playwrightEnvironment(descriptor, artifactRoot, egressProxy?.url ?? null),
+        env: playwrightEnvironment(descriptor, artifactRoot, egressProxy?.url ?? null, genericRoutePublication),
         shell: false,
         stdio: ['ignore', 'inherit', 'inherit'],
       });
@@ -149,6 +167,7 @@ async function spawnPlaywright(descriptor, artifactRoot, signal) {
       outcome: validated.outcome,
       reason: validated.outcome === 'completed_pass' ? null : 'playwright-product-failure',
       artifacts: [
+        ...(genericRoutePublicationArtifact === null ? [] : [genericRoutePublicationArtifact]),
         { path: 'playwright/work-item-rows.json', mediaType: 'application/json' },
         ...validated.artifacts,
       ],

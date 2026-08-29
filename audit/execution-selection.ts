@@ -38,6 +38,7 @@ export function parseSelectedSingleSiteCaseIds(
   raw: string | undefined,
   registry: ExecutableAuditCaseRegistry,
   selectedSourceTargetIds: readonly string[],
+  allowedGenericCaseIds: readonly string[] = [],
 ): string[] {
   if (raw === undefined || raw.trim() === '') {
     throw new Error('AUDIT_SINGLE_SITE_CASE_IDS must be a JSON array copied from the compiled Definition Coverage Manifest.');
@@ -56,9 +57,15 @@ export function parseSelectedSingleSiteCaseIds(
     throw new Error('AUDIT_SINGLE_SITE_CASE_IDS must not contain duplicates.');
   }
   const caseById = new Map(allCases(registry).map((auditCase) => [auditCase.caseId, auditCase]));
+  if (new Set(allowedGenericCaseIds).size !== allowedGenericCaseIds.length
+    || allowedGenericCaseIds.some((caseId) => !/^GENERIC-ROUTE-[A-F0-9]{24}$/.test(caseId))) {
+    throw new Error('Compiler-issued generic Single-site case IDs are invalid or duplicated.');
+  }
+  const allowedGeneric = new Set(allowedGenericCaseIds);
   for (const caseId of normalized) {
     const auditCase = caseById.get(caseId);
-    if (!auditCase) throw new Error(`Compiled Single-site case ID is absent from the current plugin registry: ${caseId}.`);
+    if (!auditCase && allowedGeneric.has(caseId)) continue;
+    if (!auditCase) throw new Error(`Compiled Single-site case ID is absent from the current plugin registry or generic route publication: ${caseId}.`);
     if (!auditCase.supportedModes.includes('single-site') || !auditCase.oracleVariants.singleSite) {
       throw new Error(`Compiled case is not executable in Single-site mode: ${caseId}.`);
     }

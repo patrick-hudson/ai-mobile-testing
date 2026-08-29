@@ -16,7 +16,13 @@ export interface WorkExecutionDescriptor {
   resourceClass: 'ordinary' | 'performance';
   origins: { candidate: string; production: string | null };
   certificatePolicy: string;
-  route: null | { inventoryDigest: string; url: string; path: string };
+  route: null | {
+    inventoryDigest: string;
+    url: string;
+    path: string;
+    sources: Array<{ source: string; from: string | null; depth: number }>;
+    productOracleVariant: 'generic-page-inspection-v1';
+  };
   digest: string;
 }
 export function sealWorkExecutionDescriptor(input: Omit<WorkExecutionDescriptor, 'schemaVersion' | 'kind' | 'digest'>): WorkExecutionDescriptor;

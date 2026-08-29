@@ -44,6 +44,34 @@ assert.throws(() => createSharedWorkCommand({ ...lease, executionDescriptor: nul
   /lacks a compiler-issued execution descriptor/);
 const { schemaVersion: _schemaVersion, kind: _kind, digest: _descriptorDigest, ...descriptorInput } = descriptor;
 assert.throws(() => sealWorkExecutionDescriptor({ ...descriptorInput, entrySpec: '../outside.spec.ts' }), /repository-owned spec/);
+const genericDescriptorInput = {
+  ...descriptorInput,
+  workItemId: 'generic-route-work',
+  mode: 'single-site',
+  definitionId: 'ENV-002',
+  caseId: 'GENERIC-ROUTE-AAAAAAAAAAAAAAAAAAAAAAAA',
+  entrySpec: 'tests/single-site-generic-route.spec.ts',
+  targetId: 'single-site-mobile-chromium',
+  targetRole: 'preview',
+  origins: { candidate: 'https://beta.example.test', production: null },
+  route: {
+    inventoryDigest: digest('e'),
+    url: 'https://beta.example.test/discovered',
+    path: '/discovered',
+    sources: [{ source: 'sitemap', from: 'https://beta.example.test/sitemap.xml', depth: 0 }],
+    productOracleVariant: 'generic-page-inspection-v1',
+  },
+};
+const genericDescriptor = sealWorkExecutionDescriptor(genericDescriptorInput);
+assert.equal(genericDescriptor.route.sources[0].source, 'sitemap');
+assert.throws(() => sealWorkExecutionDescriptor({
+  ...genericDescriptorInput,
+  route: { ...genericDescriptorInput.route, url: 'https://other.example.test/discovered' },
+}), /URL and path bindings disagree/);
+assert.throws(() => sealWorkExecutionDescriptor({
+  ...genericDescriptorInput,
+  route: { ...genericDescriptorInput.route, sources: [] },
+}), /discovery provenance/);
 
 function report(statuses, overrides = {}) {
   const artifactRoot = overrides.artifactRoot ?? '/evidence';

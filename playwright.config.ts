@@ -22,7 +22,9 @@ import {
 import type { AuditProjectMetadata } from './audit/types.js';
 import { parseRunContract, type SingleSiteRunContract } from './shared/run-contract.mjs';
 import {
+  verifySharedGenericRouteExecutionPublication,
   verifySingleSiteRouteInventoryPublication,
+  type SharedGenericRouteExecutionPublication,
   type SingleSiteRouteInventoryPublication,
 } from './shared/single-site-route-plan.mjs';
 import {
@@ -72,21 +74,22 @@ const singleSiteTls = singleSiteContract
       previewBypassOrigins: parsePreviewTlsBypassAllowlist(process.env.AUDIT_PREVIEW_TLS_BYPASS_ALLOWLIST),
     })
   : null;
+const singleSiteRouteInventory = runMode === 'single-site'
+  ? loadSingleSiteRouteInventory(process.env.AUDIT_SINGLE_SITE_ROUTE_INVENTORY)
+  : null;
+const genericRouteExecutions = singleSiteRouteInventory?.genericExecutions ?? [];
 const selectedSingleSiteCaseIds = runMode === 'single-site'
   ? parseSelectedSingleSiteCaseIds(
       canonicalSelection ? JSON.stringify(canonicalSelection.caseIds) : process.env.AUDIT_SINGLE_SITE_CASE_IDS,
       pluginRegistry,
       selectedSingleSiteTargets!.map(({ sourceComparativeTargetId }) => sourceComparativeTargetId),
+      genericRouteExecutions.map(({ caseId }) => caseId),
     )
   : [];
 const selectedSingleSiteCases = runMode === 'single-site'
   ? pluginRegistry.plugins.flatMap(({ auditCases }) => auditCases)
       .filter(({ caseId }) => selectedSingleSiteCaseIds.includes(caseId))
   : [];
-const singleSiteRouteInventory = runMode === 'single-site'
-  ? loadSingleSiteRouteInventory(process.env.AUDIT_SINGLE_SITE_ROUTE_INVENTORY)
-  : null;
-const genericRouteExecutions = singleSiteRouteInventory?.genericExecutions ?? [];
 const executionTargets = runMode === 'single-site'
   ? selectedSingleSiteTargets!.filter((target) => (
       selectedSingleSiteCases.some((auditCase) => auditCase.supportedProjects.includes(target.sourceComparativeTargetId))
@@ -219,7 +222,7 @@ function singleSiteEgressProxy(): string {
   return parsed.origin;
 }
 
-function loadSingleSiteRouteInventory(value: string | undefined): SingleSiteRouteInventoryPublication | null {
+function loadSingleSiteRouteInventory(value: string | undefined): SingleSiteRouteInventoryPublication | SharedGenericRouteExecutionPublication | null {
   if (value === undefined || value === '') return null;
   let document: unknown;
   try {
@@ -227,15 +230,26 @@ function loadSingleSiteRouteInventory(value: string | undefined): SingleSiteRout
   } catch (error) {
     throw new Error(`AUDIT_SINGLE_SITE_ROUTE_INVENTORY could not be read as JSON: ${error instanceof Error ? error.message : String(error)}`);
   }
-  if (!verifySingleSiteRouteInventoryPublication(document)) {
+  const sharedDescriptorDigest = process.env.AUDIT_SHARED_EXECUTION_DESCRIPTOR_DIGEST;
+  const sharedPublicationDigest = process.env.AUDIT_SHARED_GENERIC_ROUTE_PUBLICATION_DIGEST;
+  let publication: SingleSiteRouteInventoryPublication | SharedGenericRouteExecutionPublication;
+  if (verifySingleSiteRouteInventoryPublication(document)) {
+    publication = document;
+  } else if (typeof sharedDescriptorDigest === 'string' && typeof sharedPublicationDigest === 'string'
+    && verifySharedGenericRouteExecutionPublication(document, {
+    executionDescriptorDigest: sharedDescriptorDigest,
+    publicationDigest: sharedPublicationDigest,
+  })) {
+    publication = document;
+  } else {
     throw new Error('AUDIT_SINGLE_SITE_ROUTE_INVENTORY does not contain a valid digest-bound route inventory publication.');
   }
   const expectedTarget = process.env.AUDIT_SINGLE_SITE_GENERIC_TARGET_ID;
-  if (document.genericExecutions.length > 0
-    && (!expectedTarget || document.genericExecutions.some(({ targetId }) => targetId !== expectedTarget))) {
+  if (publication.genericExecutions.length > 0
+    && (!expectedTarget || publication.genericExecutions.some(({ targetId }) => targetId !== expectedTarget))) {
     throw new Error('Generic route executions do not match the worker-selected canonical target.');
   }
-  return document;
+  return publication;
 }
 
 function loadCanonicalGraph(value: string | undefined, mode: 'comparative' | 'single-site'): CanonicalExecutionGraph | null {

@@ -41,9 +41,24 @@ export interface SingleSiteRouteInventoryPublication {
   publicationDigest: string;
 }
 
+export interface SharedGenericRouteExecutionPublication {
+  schemaVersion: 1;
+  kind: 'shared-generic-route-execution-publication';
+  mode: 'single-site';
+  workItemId: string;
+  subjectCoreDigest: string;
+  executionDescriptorDigest: string;
+  inventoryDigest: string;
+  genericExecutions: [SingleSiteGenericRouteExecution];
+  publicationDigest: string;
+}
+
 export const SINGLE_SITE_ROUTE_PLAN_SCHEMA_VERSION: 1;
 export const GENERIC_ROUTE_AUDIT_ID: 'ENV-002';
 export const GENERIC_ROUTE_ORACLE_REVISION: 'generic-page-inspection-v1';
+export const SHARED_GENERIC_ROUTE_PUBLICATION_KIND: 'shared-generic-route-execution-publication';
+export function sealSharedGenericRouteExecutionPublication(descriptor: import('./work-execution-descriptor.mjs').WorkExecutionDescriptor): SharedGenericRouteExecutionPublication;
+export function verifySharedGenericRouteExecutionPublication(value: unknown, expected?: { executionDescriptorDigest?: string; publicationDigest?: string }): value is SharedGenericRouteExecutionPublication;
 export function compileSingleSiteRouteInventoryPlan(input: {
   pluginRegistry: CompilerPluginRegistry;
   coverageManifest: DefinitionCoverageManifest;

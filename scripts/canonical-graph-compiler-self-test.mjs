@@ -13,6 +13,7 @@ import {
   nextSingleSiteInventoryAttempt,
 } from '../shared/execution-graph-compiler.mjs';
 import { compileDefinitionCoverageManifest } from '../shared/run-compiler.mjs';
+import { scheduleCanonicalWorkItems } from '../shared/launch-plan-compiler.mjs';
 import {
   acquireCoordinator,
   adoptAttemptEvidence,
@@ -193,6 +194,19 @@ const routeGraph = compileCanonicalExecutionGraph({
   deploymentIdentityRecheck: routeCore.deploymentIdentity,
 });
 assert(routeGraph.workItemPlans.some(({ caseId, routeUrl }) => caseId.startsWith('GENERIC-ROUTE-') && routeUrl === `${candidateOrigin}/discovered`));
+const scheduledGeneric = scheduleCanonicalWorkItems({
+  executionGraph: routeGraph,
+  subjectCore: routeCore,
+  runnerRevision: DIGEST('9'),
+}).find(({ executionDescriptor }) => executionDescriptor.route?.url === `${candidateOrigin}/discovered`);
+assert(scheduledGeneric, 'The canonical generic route must become schedulable shared work.');
+assert.deepEqual(scheduledGeneric.executionDescriptor.route, {
+  inventoryDigest: routeGraph.inventory.inventoryDigest,
+  url: `${candidateOrigin}/discovered`,
+  path: '/discovered',
+  sources: [{ source: 'crawl', from: candidateOrigin, depth: 1 }],
+  productOracleVariant: 'generic-page-inspection-v1',
+});
 
 const comparativeCore = subject({
   mode: 'comparative', definitions: ['ENV-003'], targets: ['production-mobile', 'candidate-mobile'], features: ['environment'],

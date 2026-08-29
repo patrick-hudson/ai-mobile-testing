@@ -1,8 +1,10 @@
 import { canonicalSha256 } from './run-compiler.mjs';
+import { parseWorkExecutionDescriptor } from './work-execution-descriptor.mjs';
 
 export const SINGLE_SITE_ROUTE_PLAN_SCHEMA_VERSION = 1;
 export const GENERIC_ROUTE_AUDIT_ID = 'ENV-002';
 export const GENERIC_ROUTE_ORACLE_REVISION = 'generic-page-inspection-v1';
+export const SHARED_GENERIC_ROUTE_PUBLICATION_KIND = 'shared-generic-route-execution-publication';
 
 const SHA256 = /^sha256:[a-f0-9]{64}$/;
 
@@ -12,6 +14,69 @@ function isRecord(value) {
 
 function fail(message) {
   throw new TypeError(message);
+}
+
+export function sealSharedGenericRouteExecutionPublication(rawDescriptor) {
+  const descriptor = parseWorkExecutionDescriptor(rawDescriptor);
+  if (descriptor.mode !== 'single-site' || descriptor.operation !== 'playwright' || descriptor.route === null
+    || descriptor.definitionId !== GENERIC_ROUTE_AUDIT_ID
+    || descriptor.route.productOracleVariant !== GENERIC_ROUTE_ORACLE_REVISION) {
+    fail('A compiler-issued generic Single-site route descriptor is required.');
+  }
+  const execution = {
+    executionId: `${descriptor.caseId}@${descriptor.targetId}`,
+    caseId: descriptor.caseId,
+    auditId: GENERIC_ROUTE_AUDIT_ID,
+    targetId: descriptor.targetId,
+    url: descriptor.route.url,
+    path: descriptor.route.path,
+    sources: structuredClone(descriptor.route.sources),
+    productOracleVariant: GENERIC_ROUTE_ORACLE_REVISION,
+  };
+  const body = {
+    schemaVersion: SINGLE_SITE_ROUTE_PLAN_SCHEMA_VERSION,
+    kind: SHARED_GENERIC_ROUTE_PUBLICATION_KIND,
+    mode: 'single-site',
+    workItemId: descriptor.workItemId,
+    subjectCoreDigest: descriptor.subjectCoreDigest,
+    executionDescriptorDigest: descriptor.digest,
+    inventoryDigest: descriptor.route.inventoryDigest,
+    genericExecutions: [execution],
+  };
+  return Object.freeze({ ...body, publicationDigest: canonicalSha256(body) });
+}
+
+export function verifySharedGenericRouteExecutionPublication(value, expected = {}) {
+  if (!isRecord(value) || value.schemaVersion !== SINGLE_SITE_ROUTE_PLAN_SCHEMA_VERSION
+    || value.kind !== SHARED_GENERIC_ROUTE_PUBLICATION_KIND || value.mode !== 'single-site'
+    || typeof value.workItemId !== 'string' || !value.workItemId
+    || !SHA256.test(value.subjectCoreDigest ?? '') || !SHA256.test(value.executionDescriptorDigest ?? '')
+    || !SHA256.test(value.inventoryDigest ?? '') || !SHA256.test(value.publicationDigest ?? '')
+    || !Array.isArray(value.genericExecutions) || value.genericExecutions.length !== 1) return false;
+  const { publicationDigest, ...body } = value;
+  if (canonicalSha256(body) !== publicationDigest) return false;
+  if (expected.publicationDigest !== undefined && value.publicationDigest !== expected.publicationDigest) return false;
+  if (expected.executionDescriptorDigest !== undefined
+    && value.executionDescriptorDigest !== expected.executionDescriptorDigest) return false;
+  const [execution] = value.genericExecutions;
+  if (!isRecord(execution) || execution.auditId !== GENERIC_ROUTE_AUDIT_ID
+    || typeof execution.caseId !== 'string' || !execution.caseId.startsWith('GENERIC-ROUTE-')
+    || execution.executionId !== `${execution.caseId}@${execution.targetId}`
+    || typeof execution.targetId !== 'string' || !execution.targetId
+    || execution.productOracleVariant !== GENERIC_ROUTE_ORACLE_REVISION
+    || typeof execution.url !== 'string' || typeof execution.path !== 'string'
+    || !Array.isArray(execution.sources) || execution.sources.length < 1 || execution.sources.length > 32) return false;
+  let parsed;
+  try { parsed = new URL(execution.url); } catch { return false; }
+  if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.hash
+    || normalizedRoutePath(parsed.pathname) !== execution.path) return false;
+  const sourceKeys = execution.sources.map((source) => isRecord(source)
+    ? `${source.source}\0${source.from ?? ''}\0${source.depth}` : '');
+  if (new Set(sourceKeys).size !== sourceKeys.length) return false;
+  return execution.sources.every((source) => isRecord(source) && typeof source.source === 'string'
+    && source.source.length > 0 && source.source.length <= 128
+    && (source.from === null || typeof source.from === 'string')
+    && Number.isSafeInteger(source.depth) && source.depth >= 0 && source.depth <= 1_024);
 }
 
 function pathFromDefinition(definition) {

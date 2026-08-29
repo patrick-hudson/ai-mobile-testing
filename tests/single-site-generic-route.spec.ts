@@ -4,11 +4,13 @@ import { ALL_AUDIT_BY_ID } from '../audit/definitions.js';
 import { expect, inventoriedStaticTest, staticEvidence, test } from '../fixtures/test.js';
 import {
   GENERIC_ROUTE_AUDIT_ID,
+  verifySharedGenericRouteExecutionPublication,
   verifySingleSiteRouteInventoryPublication,
+  type SharedGenericRouteExecutionPublication,
   type SingleSiteRouteInventoryPublication,
 } from '../shared/single-site-route-plan.mjs';
 
-function loadPublication(): SingleSiteRouteInventoryPublication | null {
+function loadPublication(): SingleSiteRouteInventoryPublication | SharedGenericRouteExecutionPublication | null {
   if (process.env.AUDIT_RUN_MODE !== 'single-site') return null;
   const publicationPath = process.env.AUDIT_SINGLE_SITE_ROUTE_INVENTORY;
   if (!publicationPath) return null;
@@ -18,7 +20,14 @@ function loadPublication(): SingleSiteRouteInventoryPublication | null {
   } catch (error) {
     throw new Error(`Generic route inventory could not be loaded: ${error instanceof Error ? error.message : String(error)}`);
   }
-  if (!verifySingleSiteRouteInventoryPublication(parsed)) {
+  const sharedDescriptorDigest = process.env.AUDIT_SHARED_EXECUTION_DESCRIPTOR_DIGEST;
+  const sharedPublicationDigest = process.env.AUDIT_SHARED_GENERIC_ROUTE_PUBLICATION_DIGEST;
+  if (!verifySingleSiteRouteInventoryPublication(parsed)
+    && !(typeof sharedDescriptorDigest === 'string' && typeof sharedPublicationDigest === 'string'
+      && verifySharedGenericRouteExecutionPublication(parsed, {
+        executionDescriptorDigest: sharedDescriptorDigest,
+        publicationDigest: sharedPublicationDigest,
+      }))) {
     throw new Error('Generic route inventory failed its digest and schema validation.');
   }
   return parsed;

@@ -4,61 +4,39 @@ import * as fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { canonicalSha256 } from '../shared/run-compiler.mjs';
-import { reconcileSingleSiteRouteInventory } from '../shared/single-site-route-plan.mjs';
+import { sealWorkExecutionDescriptor } from '../shared/work-execution-descriptor.mjs';
+import {
+  sealSharedGenericRouteExecutionPublication,
+  verifySharedGenericRouteExecutionPublication,
+} from '../shared/single-site-route-plan.mjs';
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'single-site-generic-registration-'));
 try {
-  const coverageManifestDigest = `sha256:${'b'.repeat(64)}`;
-  const planBody = {
-    schemaVersion: 1,
-    kind: 'single-site-route-inventory-plan',
-    coverageManifestDigest,
-    required: true,
-    reason: 'Fixture route coverage requires discovery.',
-    reviewedRoutes: [],
-    entryPoints: ['/'],
-    canonicalTargetId: 'single-site-desktop-chromium',
-  };
-  const plan = { ...planBody, planDigest: canonicalSha256(planBody) };
   const origin = 'https://beta.example.test';
-  const diagnostic = {
-    schemaVersion: 1,
-    kind: 'live-route-inventory-diagnostic',
-    origin,
-    capabilities: { scriptExecution: false, browserRendering: false, formSubmission: false, productOracleDerivation: false, findingDerivation: false },
-    limits: {},
-    sources: {},
-    fetchEvidence: [],
-    failures: [],
-    exclusions: [],
-    limitations: [],
-    inventory: {
-      schemaVersion: 1,
-      origin,
-      limits: {},
-      sources: [],
-      routes: [{
-        url: `${origin}/new-route`, path: '/new-route', query: '', disposition: 'included',
-        sources: [{ source: 'sitemap', from: `${origin}/sitemap.xml`, depth: 0 }],
-      }],
-      exclusions: [],
-      failures: [],
-      limitations: [],
-      responses: [{ url: `${origin}/new-route`, depth: 0, status: 200, contentType: 'text/html', bytes: 100 }],
-      redirects: [],
-      bounds: [],
-      summary: { routes: 1, exclusions: 0, failures: 0, limitations: 0, responses: 1, redirects: 0, htmlBytesConsumed: 100 },
+  const descriptor = sealWorkExecutionDescriptor({
+    workItemId: 'generic-route-work', subjectCoreDigest: `sha256:${'a'.repeat(64)}`,
+    runnerRevision: `sha256:${'b'.repeat(64)}`, mode: 'single-site', operation: 'playwright',
+    definitionId: 'ENV-002', pluginId: 'platform-routes', caseId: 'GENERIC-ROUTE-AAAAAAAAAAAAAAAAAAAAAAAA',
+    entrySpec: 'tests/single-site-generic-route.spec.ts', targetId: 'single-site-desktop-chromium',
+    targetRole: 'preview', capability: 'browser:chromium', resourceClass: 'ordinary',
+    origins: { candidate: origin, production: null }, certificatePolicy: 'strict',
+    route: {
+      inventoryDigest: `sha256:${'c'.repeat(64)}`, url: `${origin}/new-route`, path: '/new-route',
+      sources: [{ source: 'sitemap', from: `${origin}/sitemap.xml`, depth: 0 }],
+      productOracleVariant: 'generic-page-inspection-v1',
     },
-  };
-  const publication = reconcileSingleSiteRouteInventory({
-    jobId: 'job-registration-fixture',
-    attemptId: 'attempt-registration-fixture',
-    coverageManifestDigest,
-    plan,
-    diagnostic,
   });
+  const publication = sealSharedGenericRouteExecutionPublication(descriptor);
+  assert(verifySharedGenericRouteExecutionPublication(publication, {
+    executionDescriptorDigest: descriptor.digest,
+    publicationDigest: publication.publicationDigest,
+  }));
+  assert.equal(verifySharedGenericRouteExecutionPublication({
+    ...publication,
+    genericExecutions: [{ ...publication.genericExecutions[0], path: '/tampered' }],
+  }, { executionDescriptorDigest: descriptor.digest, publicationDigest: publication.publicationDigest }), false,
+  'route tampering must invalidate the compiler-issued publication');
   const publicationPath = path.join(temporaryRoot, 'route-inventory.json');
   await fs.writeFile(publicationPath, `${JSON.stringify(publication)}\n`);
   const executable = path.join(repositoryRoot, 'node_modules', '.bin', process.platform === 'win32' ? 'playwright.cmd' : 'playwright');
@@ -79,9 +57,11 @@ try {
           AUDIT_SINGLE_SITE_ROLE: 'preview',
           AUDIT_SINGLE_SITE_CERTIFICATE_POLICY: 'strict',
           AUDIT_TARGET_IDS: 'single-site-desktop-chromium',
-          AUDIT_SINGLE_SITE_CASE_IDS: '["ENV-002:tests/contracts.spec.ts:candidate-desktop-chromium"]',
+          AUDIT_SINGLE_SITE_CASE_IDS: JSON.stringify([descriptor.caseId]),
           AUDIT_SINGLE_SITE_ROUTE_INVENTORY: publicationPath,
           AUDIT_SINGLE_SITE_GENERIC_TARGET_ID: 'single-site-desktop-chromium',
+          AUDIT_SHARED_EXECUTION_DESCRIPTOR_DIGEST: descriptor.digest,
+          AUDIT_SHARED_GENERIC_ROUTE_PUBLICATION_DIGEST: publication.publicationDigest,
           AUDIT_SINGLE_SITE_EGRESS_PROXY: 'http://127.0.0.1:1',
           AUDIT_ARTIFACT_DIR: path.join(temporaryRoot, 'artifacts'),
         },
@@ -100,12 +80,10 @@ try {
   };
   assert.equal(result.signal, null);
   assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
-  assert.match(result.stdout, /\[ENV-002\] every declared candidate route serves HTML with its expected canonical/);
   assert.match(result.stdout, /generic inspection of \/new-route/);
-  assert.match(result.stdout, /generic inventoried routes: 1/);
   const listedTotal = /Total: (\d+) tests? in \d+ files?/.exec(result.stdout);
   assert(listedTotal, 'Playwright must report the listed execution count.');
-  assert.equal(Number(listedTotal[1]), 2, 'The reviewed ENV-002 case and one generic inventoried route must both register.');
+  assert.equal(Number(listedTotal[1]), 1, 'A compiler-issued generic work item must register exactly its one dynamic route row.');
   process.stdout.write('Single-site generic route registration self-test passed: immutable inventory adds exactly one canonical-target Playwright execution.\n');
 } finally {
   await fs.rm(temporaryRoot, { recursive: true, force: true });
