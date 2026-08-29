@@ -379,6 +379,13 @@ const firstEnvelope = envelope(1, null, {
   decisions: histories.decision.length + 1,
   risks: histories.risk.length,
 });
+await assert.rejects(
+  publishCurrentEnvelope(store, 'run-main', coordinatorB, firstEnvelope, {
+    afterEnvelopePersist: () => { throw new Error('synthetic crash before first head swap'); },
+  }),
+  /synthetic crash/,
+);
+await expectCode('PUBLICATION_UNAVAILABLE', () => readCurrentEnvelope(store, 'run-main'));
 await publishCurrentEnvelope(store, 'run-main', coordinatorB, firstEnvelope);
 histories = await readRunHistories(store, 'run-main');
 const secondEnvelope = envelope(2, firstEnvelope, {

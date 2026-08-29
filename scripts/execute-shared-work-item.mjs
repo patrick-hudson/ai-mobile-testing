@@ -322,6 +322,22 @@ export async function executeSharedWorkItem({ descriptor, identity, evidenceRoot
     ...identity,
     outcome: result.outcome,
     reason: result.reason,
+    riskSourceOutput: {
+      producerStates: [
+        {
+          producer: 'visual',
+          status: descriptor.operation === 'playwright' && descriptor.entrySpec?.includes('visual-regression')
+            ? 'COMPLETE' : 'NOT_APPLICABLE',
+        },
+        {
+          producer: 'baseline',
+          status: descriptor.mode === 'comparative' && descriptor.targetRole === 'production'
+            ? 'COMPLETE' : 'NOT_APPLICABLE',
+        },
+        { producer: 'evidence-pipeline', status: 'COMPLETE' },
+      ],
+      observations: result.riskSourceObservations ?? [],
+    },
     artifacts: result.artifacts,
   };
   await fs.writeFile(path.join(evidenceRoot, 'result.json'), `${JSON.stringify(manifest)}\n`, { mode: 0o600 });

@@ -3,6 +3,8 @@ import { canonicalJson } from '../../shared/canonical-contract.mjs';
 import { sealOracleResult, sealWorkItemResult } from '../../shared/execution-contract.mjs';
 import { appendPublicationEnvelope } from '../../shared/publication-envelope.mjs';
 import { appendVisualDisposition, projectSharedReleaseView } from '../../shared/release-projection.mjs';
+import { parseRisk } from '../../shared/risk-contract.mjs';
+import { parseRiskSourceObservationSet } from '../../shared/risk-source-observation.mjs';
 import {
   assertPrincipalAuthorized,
   CONTROL_ACTIONS,
@@ -213,44 +215,43 @@ export function createSharedControlService({ store, projectId = 'default' } = {}
 async function publishProjection(store, runId, coordinator) {
   const [state, histories] = await Promise.all([readParentRun(store, runId), readRunHistories(store, runId)]);
   if (!state.finalSubject || !state.executionManifest || state.authorityTombstone) return null;
-  let current;
+  let current = null;
   try { current = await readCurrentEnvelope(store, runId); } catch (error) {
-    if (error?.code === 'PUBLICATION_UNAVAILABLE') return null;
-    throw error;
+    if (error?.code === 'PUBLICATION_UNAVAILABLE') current = null;
+    else throw error;
   }
-  const workResults = new Map(Object.values(state.workItems).map((item) => [item.id, item.canonicalResult ?? sealWorkItemResult({
-    schemaVersion: 1, workItemId: item.id, subjectCoreDigest: state.subjectCoreDigest,
-    attempt: Math.max(1, item.attempts.length), authoritative: true,
-    outcome: item.state === 'cancelled' ? 'cancelled' : 'incomplete_unknown', evidenceDigests: [],
-  })]));
-  const oracleResults = state.executionManifest.oracleExecutions.map((oracleExecution) => sealOracleResult({
-    schemaVersion: 1, oracleExecution, finalSubjectDigest: state.finalSubject.digest,
-    workItemResults: oracleExecution.requiredWorkItemIds.map((id) => workResults.get(id)),
-  }));
-  const riskLifecycleEvents = histories.risk.map((event) => ({
-    riskIdentity: event.data.riskIdentity, action: event.data.to, actor: event.actor, at: event.occurredAt,
-  }));
-  let visualDispositions = [];
-  for (const event of histories.mutation.filter(({ type }) => type === 'visual-disposition')) {
-    visualDispositions = appendVisualDisposition(visualDispositions, {
-      schemaVersion: 1, expectedReviewRevision: visualDispositions.length, runId, mode: state.finalSubject.mode,
-      subjectDigest: state.finalSubject.digest, executionId: event.data.executionId,
-      riskIdentity: event.data.riskIdentity, disposition: event.data.disposition,
-      actor: event.actor, rationale: event.data.rationale, at: event.occurredAt,
-    });
-  }
-  const baseDecisionRevision = Math.max(1, current.decisionRevision - visualDispositions.length);
-  const baseRiskRevision = Math.max(1, current.riskRevision - riskLifecycleEvents.length - visualDispositions.length);
-  const projection = projectSharedReleaseView({
+  const assembled = assembleReleaseProjectionInputs({ state, histories });
+  const project = (baseDecisionRevision, baseRiskRevision) => projectSharedReleaseView({
     schemaVersion: 1, runId, baseDecisionRevision, baseRiskRevision,
-    finalSubject: state.finalSubject, executionManifest: state.executionManifest, oracleResults,
-    riskAvailability: current.riskRegister.availability, riskSources: current.riskRegister.risks,
-    riskLifecycleEvents, visualDispositions,
+    finalSubject: state.finalSubject, executionManifest: state.executionManifest,
+    oracleResults: assembled.oracleResults, riskAvailability: assembled.riskAvailability,
+    riskSources: assembled.riskSources, riskLifecycleEvents: assembled.riskLifecycleEvents,
+    visualDispositions: assembled.visualDispositions,
   });
-  if (projection.decision.digest === current.decision.digest
+  let baseDecisionRevision = current
+    ? Math.max(1, current.decisionRevision - assembled.visualDispositions.length)
+    : 1;
+  let baseRiskRevision = current
+    ? Math.max(1, current.riskRevision - assembled.riskLifecycleEvents.length - assembled.visualDispositions.length)
+    : 1;
+  let projection = project(baseDecisionRevision, baseRiskRevision);
+  if (current) {
+    const { decisionRevision: _nextRevision, digest: _nextDigest, ...nextDecisionMeaning } = projection.decision;
+    const { decisionRevision: _currentRevision, digest: _currentDigest, ...currentDecisionMeaning } = current.decision;
+    if (canonicalJson(nextDecisionMeaning) !== canonicalJson(currentDecisionMeaning)
+      && projection.decisionRevision <= current.decisionRevision) {
+      baseDecisionRevision += current.decisionRevision - projection.decisionRevision + 1;
+    }
+    if (canonicalJson(projection.riskRegister) !== canonicalJson(current.riskRegister)
+      && projection.riskRevision <= current.riskRevision) {
+      baseRiskRevision += current.riskRevision - projection.riskRevision + 1;
+    }
+    projection = project(baseDecisionRevision, baseRiskRevision);
+  }
+  if (current && projection.decision.digest === current.decision.digest
     && canonicalJson(projection.riskRegister) === canonicalJson(current.riskRegister)) return current;
   const next = appendPublicationEnvelope(current, {
-    schemaVersion: 1, runId, runRevision: current.runRevision + 1,
+    schemaVersion: 1, runId, runRevision: current ? current.runRevision + 1 : 1,
     decisionRevision: projection.decisionRevision, riskRevision: projection.riskRevision,
     ledgerSequences: {
       observations: state.ledgerSequences.mutation,
@@ -260,4 +261,125 @@ async function publishProjection(store, runId, coordinator) {
     finalSubjectDigest: state.finalSubject.digest, decision: projection.decision, riskRegister: projection.riskRegister,
   });
   return publishCurrentEnvelope(store, runId, coordinator, next);
+}
+
+function derivedRisk(state, input) {
+  return parseRisk({
+    schemaVersion: 1,
+    identity: undefined,
+    mode: state.finalSubject.mode,
+    scope: state.finalSubject.grantedAuthority.scope,
+    releaseEffect: 'non-blocking',
+    actor: input.actor ?? { id: 'shared-compiler', kind: 'service' },
+    observedAt: input.observedAt ?? state.createdAt,
+    updatedAt: input.observedAt ?? state.createdAt,
+    ...input,
+  });
+}
+
+export function assembleReleaseProjectionInputs({ state, histories }) {
+  if (!state?.finalSubject || !state?.executionManifest || !state?.subjectCore) {
+    fail('SEALED_MANIFEST_MISSING', 'Release projection inputs require a sealed parent-run graph.', 409);
+  }
+  const workItems = Object.values(state.workItems);
+  const workResults = new Map(workItems.map((item) => [item.id, item.canonicalResult ?? sealWorkItemResult({
+    schemaVersion: 1, workItemId: item.id, subjectCoreDigest: state.subjectCoreDigest,
+    attempt: Math.max(1, item.attempts.length), authoritative: true,
+    outcome: item.state === 'cancelled' ? 'cancelled' : 'incomplete_unknown', evidenceDigests: [],
+  })]));
+  const oracleResults = state.executionManifest.oracleExecutions.map((oracleExecution) => sealOracleResult({
+    schemaVersion: 1, oracleExecution, finalSubjectDigest: state.finalSubject.digest,
+    workItemResults: oracleExecution.requiredWorkItemIds.map((id) => workResults.get(id)),
+  }));
+  const riskSources = [];
+  for (const limit of state.finalSubject.grantedAuthority.scope.knownLimits) {
+    if (limit === 'development-certificate-bypass') continue;
+    riskSources.push(derivedRisk(state, {
+      category: 'coverage-gap', severity: 'medium',
+      source: { kind: 'coverage', id: `known-limit:${limit}` },
+      explanation: `The certified scope retains the known limitation: ${limit}.`,
+      recommendedAction: 'Review the limitation before broadening this release decision.',
+      reviewState: 'OPEN',
+    }));
+  }
+  for (const obligation of state.sealedCompileRiskInputs?.manualObligations ?? []) {
+    riskSources.push(derivedRisk(state, {
+      category: 'manual-check', severity: obligation.severity,
+      source: { kind: 'manual-obligation', id: obligation.id },
+      explanation: obligation.explanation,
+      recommendedAction: obligation.recommendedAction,
+      reviewState: 'OPEN',
+    }));
+  }
+  if (state.subjectCore.certificatePolicy !== 'strict') {
+    riskSources.push(derivedRisk(state, {
+      category: 'certificate-bypass', severity: 'high',
+      source: { kind: 'configuration', id: `certificate-policy:${state.subjectCore.certificatePolicy}` },
+      explanation: `Certificate validation policy ${state.subjectCore.certificatePolicy} was explicitly enabled for this audited subject.`,
+      recommendedAction: 'Restore strict certificate validation before using this configuration outside its development target.',
+      reviewState: 'OPEN',
+    }));
+  }
+  let providedSets = 0;
+  let completeSets = 0;
+  for (const item of workItems) {
+    if (!item.canonicalRiskSourceObservationSet) continue;
+    const set = parseRiskSourceObservationSet(item.canonicalRiskSourceObservationSet);
+    providedSets += 1;
+    const canonicalAttempt = item.attempts.find((attempt) => attempt.attempt === set.attempt
+      && attempt.workerId === set.workerId && attempt.canonicalResultDigest === item.canonicalResult?.digest);
+    if (!canonicalAttempt || set.runId !== state.runId || set.workItemId !== item.id
+      || set.subjectCoreDigest !== state.subjectCoreDigest) {
+      fail('WORK_RESULT_BINDING_MISMATCH', `Canonical risk observations for ${item.id} do not match their adopted work-item result (${canonicalAttempt ? 'attempt-ok' : 'attempt-missing'}, ${set.runId === state.runId ? 'run-ok' : 'run-wrong'}, ${set.workItemId === item.id ? 'work-ok' : 'work-wrong'}, ${set.subjectCoreDigest === state.subjectCoreDigest ? 'subject-ok' : 'subject-wrong'}).`, 409);
+    }
+    const unavailable = set.producerStates.filter(({ status }) => status === 'UNAVAILABLE');
+    if (unavailable.length === 0) completeSets += 1;
+    for (const observation of set.observations) {
+      riskSources.push(derivedRisk(state, {
+        category: observation.category,
+        severity: observation.severity,
+        source: observation.source,
+        explanation: observation.explanation,
+        recommendedAction: observation.recommendedAction,
+        reviewState: observation.reviewState,
+        actor: { id: set.workerId, kind: 'worker' },
+        observedAt: observation.observedAt,
+      }));
+    }
+    for (const { producer } of unavailable) {
+      riskSources.push(derivedRisk(state, {
+        category: 'evidence-pipeline-limitation', severity: 'high',
+        source: { kind: 'evidence-pipeline', id: `${item.id}:${producer}-unavailable` },
+        explanation: `The ${producer} risk producer was unavailable for ${item.id}; no clean-risk claim is inferred.`,
+        recommendedAction: `Re-run or inspect the ${producer} evidence producer for this work item.`,
+        reviewState: 'OPEN',
+        actor: { id: set.workerId, kind: 'worker' },
+        observedAt: canonicalAttempt.completedAt,
+      }));
+    }
+  }
+  const allSetsComplete = workItems.length > 0 && providedSets === workItems.length && completeSets === workItems.length;
+  let riskAvailability;
+  if (allSetsComplete) riskAvailability = riskSources.length === 0 ? 'EMPTY' : 'AVAILABLE';
+  else if (providedSets === 0 && riskSources.length === 0) riskAvailability = 'UNAVAILABLE';
+  else riskAvailability = 'PARTIAL';
+  const riskLifecycleEvents = histories.risk.map((event) => ({
+    riskIdentity: event.data.riskIdentity, action: event.data.to, actor: event.actor, at: event.occurredAt,
+  }));
+  let visualDispositions = [];
+  for (const event of histories.mutation.filter(({ type }) => type === 'visual-disposition')) {
+    visualDispositions = appendVisualDisposition(visualDispositions, {
+      schemaVersion: 1, expectedReviewRevision: visualDispositions.length, runId: state.runId,
+      mode: state.finalSubject.mode, subjectDigest: state.finalSubject.digest, executionId: event.data.executionId,
+      riskIdentity: event.data.riskIdentity, disposition: event.data.disposition,
+      actor: event.actor, rationale: event.data.rationale, at: event.occurredAt,
+    });
+  }
+  return Object.freeze({
+    oracleResults: Object.freeze(oracleResults),
+    riskAvailability,
+    riskSources: Object.freeze(riskSources),
+    riskLifecycleEvents: Object.freeze(riskLifecycleEvents),
+    visualDispositions,
+  });
 }

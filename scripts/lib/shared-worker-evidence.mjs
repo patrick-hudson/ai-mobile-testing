@@ -3,6 +3,7 @@ import { constants as fsConstants } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import path from 'node:path';
 import { sealWorkItemEvidenceMember } from '../../shared/work-item-evidence-index.mjs';
+import { sealRiskSourceObservationSet } from '../../shared/risk-source-observation.mjs';
 
 export const MAX_WORKER_ARTIFACTS = 64;
 export const MAX_WORKER_ARTIFACT_BYTES = 512 * 1_048_576;
@@ -49,14 +50,39 @@ export async function collectSharedWorkerEvidence(evidenceRoot, { code, signal =
     'schemaVersion', 'kind', 'runId', 'workItemId', 'attempt', 'subjectCoreDigest', 'runnerRevision',
     'executionDescriptorDigest', 'outcome', 'reason', 'artifacts',
   ];
+  const hasRiskSourceOutput = Object.prototype.hasOwnProperty.call(manifest ?? {}, 'riskSourceOutput');
   if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)
-    || Object.keys(manifest).length !== resultKeys.length || resultKeys.some((key) => !(key in manifest))
+    || Object.keys(manifest).length !== resultKeys.length + (hasRiskSourceOutput ? 1 : 0)
+    || resultKeys.some((key) => !(key in manifest))
     || manifest.schemaVersion !== 1 || manifest.kind !== 'shared-worker-result'
     || !['completed_pass', 'completed_product_failure'].includes(manifest.outcome)
     || (manifest.reason !== null && (typeof manifest.reason !== 'string' || !manifest.reason || manifest.reason.length > 256))
     || !Array.isArray(manifest.artifacts) || manifest.artifacts.length > MAX_WORKER_ARTIFACTS) {
     throw new Error('Executor result manifest has an invalid schema.');
   }
+  const riskSourceOutput = hasRiskSourceOutput ? manifest.riskSourceOutput : {
+    producerStates: [
+      { producer: 'visual', status: 'UNAVAILABLE' },
+      { producer: 'baseline', status: 'UNAVAILABLE' },
+      { producer: 'evidence-pipeline', status: 'UNAVAILABLE' },
+    ],
+    observations: [],
+  };
+  if (!riskSourceOutput || typeof riskSourceOutput !== 'object' || Array.isArray(riskSourceOutput)
+    || Object.keys(riskSourceOutput).length !== 2
+    || !Array.isArray(riskSourceOutput.producerStates) || !Array.isArray(riskSourceOutput.observations)) {
+    throw new Error('Executor risk source output has an invalid schema.');
+  }
+  const riskSourceObservationSet = sealRiskSourceObservationSet({
+    schemaVersion: 1,
+    runId: lease.runId,
+    workItemId: lease.workItemId,
+    subjectCoreDigest: lease.subjectCoreDigest,
+    attempt: lease.attempt,
+    workerId: lease.workerId,
+    producerStates: riskSourceOutput.producerStates,
+    observations: riskSourceOutput.observations,
+  });
   if (manifest.runId !== lease.runId || manifest.workItemId !== lease.workItemId || manifest.attempt !== lease.attempt
     || manifest.subjectCoreDigest !== lease.subjectCoreDigest || manifest.runnerRevision !== lease.runnerRevision
     || manifest.executionDescriptorDigest !== (lease.executionDescriptorDigest ?? null)) {
@@ -142,6 +168,7 @@ export async function collectSharedWorkerEvidence(evidenceRoot, { code, signal =
     outcome: manifest.outcome,
     reason: manifest.reason,
     executionDescriptorDigest: manifest.executionDescriptorDigest,
+    riskSourceObservationSet,
     artifacts: uploads,
   };
 }

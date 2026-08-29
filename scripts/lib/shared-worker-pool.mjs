@@ -57,13 +57,14 @@ export function classifyExecutionFailure(value = {}) {
 
 function validateSuccessfulExecution(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || !TERMINAL_OUTCOMES.has(value.outcome)
-    || Object.keys(value).some((key) => !['outcome', 'reason', 'artifacts'].includes(key))
+    || Object.keys(value).some((key) => !['outcome', 'reason', 'artifacts', 'riskSourceObservationSet'].includes(key))
     || !Array.isArray(value.artifacts)) {
     fail('SHARED_WORKER_RESULT_INVALID', 'Worker execution must return one completed outcome and artifact uploads.');
   }
   return {
     outcome: value.outcome,
     reason: value.reason ?? null,
+    ...(value.riskSourceObservationSet ? { riskSourceObservationSet: value.riskSourceObservationSet } : {}),
     artifacts: [...value.artifacts],
   };
 }

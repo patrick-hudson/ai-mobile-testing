@@ -38,6 +38,7 @@ import { projectSharedReleaseView } from '../shared/release-projection.mjs';
 import { sealFinalReleaseSubject, sealReleaseSubjectCore } from '../shared/release-subject.mjs';
 import { CONTROL_EXIT_CODES, controlExitCode } from '../shared/control-client-contract.mjs';
 import { canonicalDigest } from '../shared/canonical-contract.mjs';
+import { sealCompileRiskInputs, sealRiskSourceObservationSet } from '../shared/risk-source-observation.mjs';
 import {
   openSharedLaunchOperationStore,
 } from './lib/shared-launch-operation-store.mjs';
@@ -438,12 +439,30 @@ try {
   await createParentRun(reopenedStore, {
     runId: 'run-projection', subjectCore: projection.core, executionManifest: projection.manifest,
     finalSubject: projection.finalSubject, compilationState: 'sealed',
+    sealedCompileRiskInputs: projection.compileRiskInputs,
     workItems: [{ id: 'work-visual', maxAttempts: 1, capability: 'browser:chromium', targetId: 'candidate' }],
   });
   const projectionLease = await claimWorkItem(reopenedStore, 'run-projection', coordinator, {
     workerId: 'projection-worker', capabilities: ['browser:chromium'], resourceClasses: ['ordinary'], leaseMs: 30_000,
   });
-  const projectionInbox = await publishAttemptEvidence(reopenedStore, 'run-projection', projectionLease, { outcome: 'completed_pass', artifacts: [] });
+  const projectionInbox = await publishAttemptEvidence(reopenedStore, 'run-projection', projectionLease, {
+    outcome: 'completed_pass', artifacts: [], riskSourceObservationSet: sealRiskSourceObservationSet({
+      schemaVersion: 1, runId: 'run-projection', workItemId: 'work-visual',
+      subjectCoreDigest: projection.core.digest, attempt: 1, workerId: 'projection-worker',
+      producerStates: [
+        { producer: 'visual', status: 'COMPLETE' },
+        { producer: 'baseline', status: 'NOT_APPLICABLE' },
+        { producer: 'evidence-pipeline', status: 'COMPLETE' },
+      ],
+      observations: [{
+        producer: 'visual', category: 'unreviewed-visual-change', severity: 'high',
+        source: { kind: 'visual-result', id: 'work-visual:hero-change' },
+        explanation: projection.visualRisk.explanation,
+        recommendedAction: projection.visualRisk.recommendedAction,
+        reviewState: 'PENDING_REVIEW', observedAt: projection.visualRisk.observedAt,
+      }],
+    }),
+  });
   await adoptAttemptEvidence(reopenedStore, 'run-projection', coordinator, projectionInbox);
   const projectionView = projectSharedReleaseView({
     schemaVersion: 1, runId: 'run-projection', baseDecisionRevision: 1, baseRiskRevision: 1,
@@ -984,7 +1003,7 @@ function releaseFixture() {
   });
   const visualRisk = {
     schemaVersion: 1, category: 'unreviewed-visual-change', severity: 'high', mode: 'single-site',
-    scope: finalSubject.grantedAuthority.scope, source: { kind: 'visual-result', id: 'hero-change' },
+    scope: finalSubject.grantedAuthority.scope, source: { kind: 'visual-result', id: 'work-visual:hero-change' },
     explanation: 'The hero changed and needs human review.', recommendedAction: 'Review the visual comparison.',
     reviewState: 'PENDING_REVIEW', releaseEffect: 'non-blocking', actor: { id: 'runner', kind: 'service' },
     observedAt: '2026-08-28T20:00:00.000Z', updatedAt: '2026-08-28T20:00:00.000Z',
@@ -996,5 +1015,12 @@ function releaseFixture() {
     reviewState: 'OPEN', releaseEffect: 'non-blocking', actor: { id: 'runner', kind: 'service' },
     observedAt: '2026-08-28T20:00:00.000Z', updatedAt: '2026-08-28T20:00:00.000Z',
   };
-  return { core, manifest, finalSubject, oracle, visualRisk, manualRisk };
+  const compileRiskInputs = sealCompileRiskInputs({
+    schemaVersion: 1, subjectCoreDigest: core.digest,
+    manualObligations: [{
+      id: 'editorial-review', severity: 'medium', explanation: manualRisk.explanation,
+      recommendedAction: manualRisk.recommendedAction,
+    }],
+  });
+  return { core, manifest, finalSubject, oracle, visualRisk, manualRisk, compileRiskInputs };
 }

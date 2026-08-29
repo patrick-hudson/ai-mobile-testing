@@ -1,6 +1,7 @@
 import type { CanonicalExecutionGraph } from './execution-graph-compiler.mjs';
 import type { ReleaseSubjectCore } from './release-subject.mjs';
 import type { AuditRunContract } from './run-contract.mjs';
+import type { CompileRiskInputs } from './risk-source-observation.mjs';
 import type { WorkExecutionDescriptor } from './work-execution-descriptor.mjs';
 
 export interface ScheduledLaunchWorkItem {
@@ -30,6 +31,7 @@ export interface SharedLaunchPlan {
     finalSubjectDigest?: string;
     compilationState: 'pending' | 'sealed';
     runnerRevision: string;
+    sealedCompileRiskInputs: CompileRiskInputs;
     inventoryBarrier: unknown | null;
     workItems: ScheduledLaunchWorkItem[];
   };

@@ -9,6 +9,11 @@ import { parsePublicationEnvelope, verifyPublicationChain } from '../../shared/p
 import { parseExecutionManifest, sealWorkItemResult } from '../../shared/execution-contract.mjs';
 import { parseSingleSiteInventoryBarrier } from '../../shared/execution-graph-compiler.mjs';
 import { parseFinalReleaseSubject, parseReleaseSubjectCore } from '../../shared/release-subject.mjs';
+import {
+  parseCompileRiskInputs,
+  parseRiskSourceObservationSet,
+  sealRiskSourceObservationSet,
+} from '../../shared/risk-source-observation.mjs';
 import { parseWorkExecutionDescriptor } from '../../shared/work-execution-descriptor.mjs';
 import { sealWorkItemEvidenceMember } from '../../shared/work-item-evidence-index.mjs';
 import { openContainedArtifactFile } from '../../portal/safe-artifact-open.mjs';
@@ -127,6 +132,7 @@ function normalizeScheduledWorkItems(value, { subjectCoreDigest = null, runnerRe
       attempts: [],
       manualRekicks: 0,
       canonicalResult: null,
+      canonicalRiskSourceObservationSet: null,
     };
   }
   return workItems;
@@ -413,6 +419,33 @@ function clone(value) {
   return JSON.parse(canonicalJson(value));
 }
 
+function normalizedRiskSourceObservationSet(value, identity) {
+  const source = value ?? sealRiskSourceObservationSet({
+    schemaVersion: 1,
+    runId: identity.runId,
+    workItemId: identity.workItemId,
+    subjectCoreDigest: identity.subjectCoreDigest,
+    attempt: identity.attempt,
+    workerId: identity.workerId,
+    producerStates: [
+      { producer: 'visual', status: 'UNAVAILABLE' },
+      { producer: 'baseline', status: 'UNAVAILABLE' },
+      { producer: 'evidence-pipeline', status: 'UNAVAILABLE' },
+    ],
+    observations: [],
+  });
+  let parsed;
+  try { parsed = parseRiskSourceObservationSet(source); } catch (error) {
+    fail(error?.code ?? 'STORE_SCHEMA_INVALID', `Risk source observation set is invalid: ${error.message}`);
+  }
+  if (parsed.runId !== identity.runId || parsed.workItemId !== identity.workItemId
+    || parsed.subjectCoreDigest !== identity.subjectCoreDigest || parsed.attempt !== identity.attempt
+    || parsed.workerId !== identity.workerId) {
+    fail('WORK_RESULT_BINDING_MISMATCH', 'Risk source observations do not match the fenced work-item attempt.');
+  }
+  return parsed;
+}
+
 async function readGlobalCoordinator(store) {
   let value;
   try { value = await readBoundedJson(store.storage, globalCoordinatorPath(store), { label: 'global coordinator lease' }); } catch (error) {
@@ -570,6 +603,7 @@ async function recoverUnlocked(store, runId, { repairCache = true } = {}) {
   snapshot.authorityTombstone ??= null;
   snapshot.compilationBarrier ??= null;
   snapshot.inventoryBarrierPlan ??= null;
+  snapshot.sealedCompileRiskInputs ??= null;
   if (snapshot?.schemaVersion !== 1 || snapshot.kind !== 'durable-parent-run'
     || snapshot.runId !== runId || !Number.isSafeInteger(snapshot.runRevision)
     || !['active', 'cancelled'].includes(snapshot.status)
@@ -589,6 +623,15 @@ async function recoverUnlocked(store, runId, { repairCache = true } = {}) {
     || typeof snapshot.authorityTombstone.reason !== 'string'
     || !snapshot.authorityTombstone.reason
   )) fail('STORE_CORRUPT', `Parent run ${runId} has an invalid authority tombstone.`);
+  if (snapshot.sealedCompileRiskInputs !== null) {
+    let compileInputs;
+    try { compileInputs = parseCompileRiskInputs(snapshot.sealedCompileRiskInputs); } catch {
+      fail('STORE_CORRUPT', `Parent run ${runId} has corrupt sealed compile risk inputs.`);
+    }
+    if (compileInputs.subjectCoreDigest !== snapshot.subjectCoreDigest) {
+      fail('STORE_CORRUPT', `Parent run ${runId} has misbound sealed compile risk inputs.`);
+    }
+  }
   for (const [id, item] of Object.entries(snapshot.workItems)) {
     item.manualRekicks ??= 0;
     if (item?.id !== id || !SAFE_ID.test(id) || !Number.isSafeInteger(item.maxAttempts) || item.maxAttempts < 1
@@ -611,6 +654,17 @@ async function recoverUnlocked(store, runId, { repairCache = true } = {}) {
         || descriptor.resourceClass !== item.resourceClass || descriptor.targetId !== item.targetId
         || descriptor.entrySpec !== item.specAffinity) {
         fail('STORE_CORRUPT', `Parent run ${runId} has a misbound execution descriptor.`);
+      }
+    }
+    if (item.canonicalRiskSourceObservationSet !== null && item.canonicalRiskSourceObservationSet !== undefined) {
+      let observationSet;
+      try { observationSet = parseRiskSourceObservationSet(item.canonicalRiskSourceObservationSet); } catch {
+        fail('STORE_CORRUPT', `Parent run ${runId} has a corrupt canonical risk source observation set.`);
+      }
+      if (observationSet.runId !== runId || observationSet.workItemId !== id
+        || observationSet.subjectCoreDigest !== snapshot.subjectCoreDigest
+        || item.canonicalResult === null || observationSet.attempt !== item.canonicalResult.attempt) {
+        fail('STORE_CORRUPT', `Parent run ${runId} has a misbound canonical risk source observation set.`);
       }
     }
   }
@@ -760,6 +814,9 @@ export async function createParentRun(store, input) {
   const subjectCore = input.subjectCore ? parseReleaseSubjectCore(input.subjectCore) : null;
   const executionManifest = input.executionManifest ? parseExecutionManifest(input.executionManifest) : null;
   const finalSubject = input.finalSubject ? parseFinalReleaseSubject(input.finalSubject) : null;
+  const sealedCompileRiskInputs = input.sealedCompileRiskInputs
+    ? parseCompileRiskInputs(input.sealedCompileRiskInputs)
+    : null;
   const subjectCoreDigest = subjectCore?.digest ?? input.subjectCoreDigest;
   const executionManifestDigest = executionManifest?.digest ?? input.executionManifestDigest ?? null;
   const finalSubjectDigest = finalSubject?.digest ?? input.finalSubjectDigest ?? null;
@@ -779,6 +836,9 @@ export async function createParentRun(store, input) {
   }
   if (executionManifest && executionManifest.subjectCoreDigest !== subjectCoreDigest) {
     fail('RELEASE_SUBJECT_MISMATCH', 'Execution manifest does not match the parent-run subject core.');
+  }
+  if (sealedCompileRiskInputs && sealedCompileRiskInputs.subjectCoreDigest !== subjectCoreDigest) {
+    fail('RELEASE_SUBJECT_MISMATCH', 'Sealed compile risk inputs do not match the parent-run subject core.');
   }
   if (finalSubject && (finalSubject.subjectCoreDigest !== subjectCoreDigest
     || finalSubject.executionManifestDigest !== executionManifestDigest)) {
@@ -819,6 +879,7 @@ export async function createParentRun(store, input) {
       compilationState,
       compilationBarrier: null,
       inventoryBarrierPlan,
+      sealedCompileRiskInputs,
       runnerRevision,
       createdAt,
       updatedAt: createdAt,
@@ -1447,7 +1508,7 @@ export async function publishAttemptEvidence(store, runId, lease, result) {
   const state = await recoverUnlocked(store, runId, { repairCache: false });
   validateWorkLease(state, lease);
   if (!result || typeof result !== 'object' || Array.isArray(result)
-    || Object.keys(result).some((key) => !['outcome', 'reason', 'artifacts', 'executionDescriptorDigest'].includes(key))
+    || Object.keys(result).some((key) => !['outcome', 'reason', 'artifacts', 'executionDescriptorDigest', 'riskSourceObservationSet'].includes(key))
     || !WORK_OUTCOMES.has(result?.outcome) || !Array.isArray(result.artifacts)
     || result.artifacts.length > MAX_ATTEMPT_ARTIFACTS) {
     fail('STORE_SCHEMA_INVALID', 'Attempt evidence outcome or artifacts are invalid.');
@@ -1507,6 +1568,13 @@ export async function publishAttemptEvidence(store, runId, lease, result) {
     executionDescriptorDigest: result.executionDescriptorDigest ?? lease.executionDescriptorDigest ?? null,
     outcome: result.outcome,
     reason: schedulingString(result.reason ?? null, 'Attempt evidence reason', { nullable: true, maximum: 256 }),
+    riskSourceObservationSet: normalizedRiskSourceObservationSet(result.riskSourceObservationSet, {
+      runId,
+      workItemId: lease.workItemId,
+      subjectCoreDigest: lease.subjectCoreDigest ?? state.subjectCoreDigest,
+      attempt: lease.attempt,
+      workerId: lease.workerId,
+    }),
     evidenceDigests: artifacts.map(({ memberDigest }) => memberDigest),
     artifacts,
     publishedAt: timestamp(store),
@@ -1546,7 +1614,7 @@ async function readAttemptEvidenceUploadIntent(store, runId, binding) {
   exactKeys(document, [
     'schemaVersion', 'kind', 'runId', 'workItemId', 'workerId', 'attempt', 'coordinatorEpoch',
     'leaseToken', 'subjectCoreDigest', 'runnerRevision', 'executionDescriptorDigest', 'outcome', 'reason',
-    'artifacts', 'createdAt', 'digest',
+    'riskSourceObservationSet', 'artifacts', 'createdAt', 'digest',
   ], 'attempt evidence upload intent');
   if (document.schemaVersion !== 1 || document.kind !== 'attempt-evidence-upload-intent'
     || document.runId !== runId || document.workItemId !== binding.workItemId
@@ -1566,6 +1634,13 @@ async function readAttemptEvidenceUploadIntent(store, runId, binding) {
     fail('STORE_CORRUPT', 'Attempt evidence upload intent metadata is invalid.');
   }
   canonicalTimestamp(document.createdAt, 'attempt evidence upload intent createdAt');
+  normalizedRiskSourceObservationSet(document.riskSourceObservationSet, {
+    runId,
+    workItemId: document.workItemId,
+    subjectCoreDigest: document.subjectCoreDigest,
+    attempt: document.attempt,
+    workerId: document.workerId,
+  });
   const evidenceBindingDigest = document.executionDescriptorDigest ?? document.subjectCoreDigest;
   let normalizedArtifacts;
   try {
@@ -1589,7 +1664,7 @@ export async function createAttemptEvidenceUploadIntent(store, runId, lease, res
   const state = await recoverUnlocked(store, runId, { repairCache: false });
   validateWorkLease(state, lease);
   if (!result || typeof result !== 'object' || Array.isArray(result)
-    || Object.keys(result).some((key) => !['outcome', 'reason', 'artifacts', 'executionDescriptorDigest'].includes(key))
+    || Object.keys(result).some((key) => !['outcome', 'reason', 'artifacts', 'executionDescriptorDigest', 'riskSourceObservationSet'].includes(key))
     || !['completed_pass', 'completed_product_failure'].includes(result.outcome)
     || !Array.isArray(result.artifacts) || result.artifacts.length > MAX_ATTEMPT_ARTIFACTS) {
     fail('STORE_SCHEMA_INVALID', 'Attempt evidence upload intent has an invalid result schema.');
@@ -1622,6 +1697,13 @@ export async function createAttemptEvidenceUploadIntent(store, runId, lease, res
     executionDescriptorDigest: expectedDescriptorDigest,
     outcome: result.outcome,
     reason: schedulingString(result.reason ?? null, 'Attempt evidence reason', { nullable: true, maximum: 256 }),
+    riskSourceObservationSet: normalizedRiskSourceObservationSet(result.riskSourceObservationSet, {
+      runId,
+      workItemId: lease.workItemId,
+      subjectCoreDigest: lease.subjectCoreDigest ?? state.subjectCoreDigest,
+      attempt: lease.attempt,
+      workerId: lease.workerId,
+    }),
     artifacts,
     createdAt: timestamp(store),
   };
@@ -1800,6 +1882,7 @@ export async function finalizeAttemptEvidenceUpload(store, runId, binding) {
     uploadIntentDigest: intent.digest,
     outcome: intent.outcome,
     reason: intent.reason,
+    riskSourceObservationSet: intent.riskSourceObservationSet,
     evidenceDigests: artifacts.map(({ memberDigest }) => memberDigest),
     artifacts,
     publishedAt: timestamp(store),
@@ -1872,7 +1955,7 @@ export async function adoptAttemptEvidence(store, runId, coordinator, inbox) {
   const { digest, ...body } = document;
   const inboxKeys = [
     'schemaVersion', 'kind', 'runId', 'workItemId', 'workerId', 'attempt', 'coordinatorEpoch',
-    'leaseToken', 'subjectCoreDigest', 'runnerRevision', 'executionDescriptorDigest', 'outcome', 'reason', 'evidenceDigests', 'artifacts', 'publishedAt', 'digest',
+    'leaseToken', 'subjectCoreDigest', 'runnerRevision', 'executionDescriptorDigest', 'outcome', 'reason', 'riskSourceObservationSet', 'evidenceDigests', 'artifacts', 'publishedAt', 'digest',
   ];
   const streamedUpload = 'uploadIntentDigest' in document;
   exactKeys(document, streamedUpload ? [...inboxKeys, 'uploadIntentDigest'] : inboxKeys, 'attempt evidence inbox');
@@ -1891,6 +1974,13 @@ export async function adoptAttemptEvidence(store, runId, coordinator, inbox) {
   if (document.subjectCoreDigest !== state.subjectCoreDigest || document.runnerRevision !== state.runnerRevision) {
     fail('WORK_RESULT_BINDING_MISMATCH', 'Attempt evidence does not match the run subject or runner revision.');
   }
+  const riskSourceObservationSet = normalizedRiskSourceObservationSet(document.riskSourceObservationSet, {
+    runId,
+    workItemId: document.workItemId,
+    subjectCoreDigest: document.subjectCoreDigest,
+    attempt: document.attempt,
+    workerId: document.workerId,
+  });
   const expectedDescriptorDigest = state.workItems[document.workItemId]?.executionDescriptor?.digest ?? null;
   if (document.executionDescriptorDigest !== expectedDescriptorDigest) {
     fail('WORK_DESCRIPTOR_BINDING_MISMATCH', 'Attempt evidence does not match the compiler-issued execution descriptor.');
@@ -1956,12 +2046,14 @@ export async function adoptAttemptEvidence(store, runId, coordinator, inbox) {
       inboxDigest: digest,
       ...(streamedUpload ? { uploadIntentDigest: document.uploadIntentDigest } : {}),
       canonicalResultDigest: canonicalResult.digest,
+      riskSourceObservationSet,
     };
     item.attempts.push(attempt);
     item.lease = null;
     if (document.outcome === 'completed_pass' || document.outcome === 'completed_product_failure') {
       item.state = document.outcome;
       item.canonicalResult = canonicalResult;
+      item.canonicalRiskSourceObservationSet = riskSourceObservationSet;
     } else if (document.outcome === 'operational_failure' && item.attempts.length < item.maxAttempts) {
       item.state = 'queued';
     } else {

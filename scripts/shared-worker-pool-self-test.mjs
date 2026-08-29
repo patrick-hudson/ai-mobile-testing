@@ -110,9 +110,15 @@ try {
   await fs.writeFile(path.join(executorEvidenceRoot, 'result.json'), JSON.stringify(executorResult({
     outcome: 'completed_product_failure', reason: 'assertion-failed',
   })));
-  assert.deepEqual(await collectSharedWorkerEvidence(executorEvidenceRoot, { code: 1, signal: null }, executorLease), {
+  const failedCollection = await collectSharedWorkerEvidence(executorEvidenceRoot, { code: 1, signal: null }, executorLease);
+  assert.deepEqual({
+    outcome: failedCollection.outcome, reason: failedCollection.reason,
+    executionDescriptorDigest: failedCollection.executionDescriptorDigest, artifacts: failedCollection.artifacts,
+  }, {
     outcome: 'completed_product_failure', reason: 'assertion-failed', executionDescriptorDigest: null, artifacts: [],
   });
+  assert(failedCollection.riskSourceObservationSet.producerStates.every(({ status }) => status === 'UNAVAILABLE'),
+    'legacy executor manifests fail closed instead of implying a complete empty risk register');
   await fs.writeFile(path.join(executorEvidenceRoot, 'result.json'), JSON.stringify(executorResult()));
   assert.deepEqual((await collectSharedWorkerEvidence(executorEvidenceRoot, { code: 0, signal: null }, executorLease)).artifacts, [],
     'files not declared by the executor manifest are never uploaded');

@@ -103,6 +103,7 @@
     "shared-streaming-evidence-http:self-test": "node scripts/shared-streaming-evidence-http-self-test.mjs",
     "shared-work-dispatcher:self-test": "node scripts/shared-work-dispatcher-self-test.mjs",
     "shared-coordinator-supervisor:self-test": "node scripts/shared-coordinator-supervisor-self-test.mjs",
+    "shared-first-publication:self-test": "node scripts/shared-first-publication-self-test.mjs",
     "shared-global-performance-scheduler:self-test": "node scripts/shared-global-performance-scheduler-self-test.mjs",
     "site-health:self-test": "node scripts/site-health-self-test.mjs",
     "single-site-report:self-test": "node --import tsx scripts/single-site-report-self-test.ts",

@@ -11,6 +11,7 @@ import {
 import { compileCanonicalExecutionGraph, compileSingleSiteInventoryBarrier, parseCanonicalExecutionGraph } from './execution-graph-compiler.mjs';
 import { parseReleaseSubjectCore, sealReleaseSubjectCore } from './release-subject.mjs';
 import { parseRunContract } from './run-contract.mjs';
+import { sealCompileRiskInputs } from './risk-source-observation.mjs';
 import { sealWorkExecutionDescriptor } from './work-execution-descriptor.mjs';
 
 function sortedUnique(values) {
@@ -165,6 +166,26 @@ function resolveAuthority(contract, plugins, targets) {
   };
 }
 
+function compileRiskInputs(contract, plugins, subjectCore) {
+  const severity = (value) => ({ P0: 'critical', P1: 'high', P2: 'medium', P3: 'low' }[value] ?? 'medium');
+  const manualObligations = [...plugins.definitions.values()]
+    .filter((definition) => definition.manual === true)
+    .filter((definition) => selectedByFilters(definition, contract.scope))
+    .filter((definition) => contract.mode === 'comparative'
+      || definition.singleSiteClassification !== 'comparison-only')
+    .map((definition) => ({
+      id: definition.id,
+      severity: severity(definition.severity),
+      explanation: nonEmptyString(definition.expected, `${definition.id}.expected`),
+      recommendedAction: `Complete the manual ${nonEmptyString(definition.title, `${definition.id}.title`)} check and retain its evidence.`,
+    }));
+  return sealCompileRiskInputs({
+    schemaVersion: 1,
+    subjectCoreDigest: subjectCore.digest,
+    manualObligations,
+  });
+}
+
 function releaseTargets(contract) {
   return contract.mode === 'single-site'
     ? [{ role: contract.deploymentRole, origin: contract.url }]
@@ -257,6 +278,7 @@ export function compileSharedLaunchPlan(input) {
     environmentIdentity: environmentRevision,
     certificatePolicy: contract.mode === 'single-site' ? contract.certificatePolicy : 'strict',
   });
+  const sealedCompileRiskInputs = compileRiskInputs(contract, plugins, subjectCore);
   let state;
   let executionGraph;
   let inventoryBarrier;
@@ -272,6 +294,7 @@ export function compileSharedLaunchPlan(input) {
       subjectCoreDigest: subjectCore.digest,
       compilationState: 'pending',
       runnerRevision,
+      sealedCompileRiskInputs,
       inventoryBarrier,
       workItems: [scheduledWorkItem(inventoryBarrier.workItem, inventoryBarrier.maxAttempts, subjectCore, runnerRevision)],
     };
@@ -293,6 +316,7 @@ export function compileSharedLaunchPlan(input) {
       finalSubjectDigest: executionGraph.finalSubject.digest,
       compilationState: 'sealed',
       runnerRevision,
+      sealedCompileRiskInputs,
       inventoryBarrier: null,
       workItems: scheduleCanonicalWorkItems({ executionGraph, subjectCore, runnerRevision }),
     };
