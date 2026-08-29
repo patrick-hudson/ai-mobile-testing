@@ -103,6 +103,35 @@ try {
 
   portal = await startPortal({ environment, origin });
 
+  const sharedOperatorCookie = await browserLogin(origin, operator.credential);
+  for (const { method, pathname } of [
+    { method: 'POST', pathname: '/api/runs' },
+    { method: 'POST', pathname: '/api/single-site/runs' },
+    { method: 'POST', pathname: `/api/runs/${sharedRunId}/stop` },
+    { method: 'POST', pathname: `/api/single-site/runs/${sharedRunId}/cancel` },
+    { method: 'DELETE', pathname: `/api/runs/${sharedRunId}` },
+    { method: 'DELETE', pathname: `/api/single-site/runs/${sharedRunId}` },
+    { method: 'POST', pathname: `/api/runs/${sharedRunId}/manual-evidence` },
+    { method: 'POST', pathname: `/api/runs/${sharedRunId}/manual-uploads` },
+    { method: 'POST', pathname: `/api/runs/${sharedRunId}/gallery/flags` },
+    { method: 'POST', pathname: `/api/runs/${sharedRunId}/gallery/flags/gflag_0000000000000000/transitions` },
+    { method: 'POST', pathname: `/api/single-site/runs/${sharedRunId}/gallery/items/gitem_0000000000000000/review` },
+  ]) {
+    const retired = await fetch(`${origin}${pathname}`, {
+      method,
+      headers: {
+        Cookie: sharedOperatorCookie.cookie,
+        Origin: origin,
+        'Sec-Fetch-Site': 'same-origin',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ hostileClientActor: 'must-not-be-consumed' }),
+    });
+    const retiredBody = await retired.json();
+    assert.equal(retired.status, 410, `${method} ${pathname} must be retired before legacy state lookup`);
+    assert.equal(retiredBody.code, 'SHARED_LEGACY_MUTATION_RETIRED');
+  }
+
   for (const [url, options = {}] of [
     [`${origin}/api/runs/run-a-0001`, {}],
     [`${origin}/api/runs/run-a-0001/events`, {}],

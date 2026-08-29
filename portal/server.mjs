@@ -20,6 +20,7 @@ import { readBoundedFileTail } from './bounded-file.mjs';
 import { openContainedArtifactFile } from './safe-artifact-open.mjs';
 import { createConsoleApi, handleConsoleApiRequest } from './console-api.mjs';
 import { createSharedControlApi, createSharedRequestAuthorizer } from './shared-control-api.mjs';
+import { rejectRetiredLegacyMutation } from './shared-legacy-mutation-policy.mjs';
 import { openScopedCredentialAuthority } from './scoped-credential-authority.mjs';
 import { validateMutationDeployment } from '../shared/control-plane-contract.mjs';
 import { assertSharedListScope, classifySharedReadRequest } from './shared-read-policy.mjs';
@@ -645,7 +646,7 @@ const server = createServer(async (request, response) => {
         ? error.message
         : 'Internal server error.',
     };
-    if (typeof error?.code === 'string' && /^(?:AI_REVIEW|AUTHENTICATION|AUTHORIZATION|BASELINE|GALLERY|READ_OBJECT|SINGLE_SITE|VISUAL_REVIEW|QUEUE)_[A-Z0-9_]+$/.test(error.code)) {
+    if (typeof error?.code === 'string' && /^(?:AI_REVIEW|AUTHENTICATION|AUTHORIZATION|BASELINE|GALLERY|READ_OBJECT|SHARED|SINGLE_SITE|VISUAL_REVIEW|QUEUE)_[A-Z0-9_]+$/.test(error.code)) {
       body.code = error.code;
     }
     if (error instanceof VisualBaselineStoreError && error.details) body.details = error.details;
@@ -1556,6 +1557,7 @@ async function routeRequest(request, response) {
     if (!result.handled) throw httpError(404, 'Not found.');
     return sendJson(response, result.status, result.body, result.headers);
   }
+  if (sharedRequestAuthorizer) rejectRetiredLegacyMutation({ method: request.method, pathname });
   await authorizeSharedLegacyRead(request, pathname);
   if (pathname === '/api/console/v1' || pathname.startsWith('/api/console/v1/')) {
     const result = await withConsoleRequest(request, response, (signal) => handleConsoleApiRequest(consoleApi, {

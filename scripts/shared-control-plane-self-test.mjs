@@ -31,6 +31,7 @@ import {
 import { createSharedControlService } from './lib/shared-control-service.mjs';
 import { createSharedControlApi, createSharedRequestAuthorizer } from '../portal/shared-control-api.mjs';
 import { assertSharedListScope, classifySharedReadRequest } from '../portal/shared-read-policy.mjs';
+import { classifyRetiredLegacyMutation } from '../portal/shared-legacy-mutation-policy.mjs';
 import { sealExecutionManifest, sealOracleResult, sealWorkItemResult } from '../shared/execution-contract.mjs';
 import { appendPublicationEnvelope } from '../shared/publication-envelope.mjs';
 import { projectSharedReleaseView } from '../shared/release-projection.mjs';
@@ -228,6 +229,13 @@ try {
     action: CONTROL_ACTIONS.BASELINE_READ, runId: null, aggregate: true,
   });
   assert.equal(classifySharedReadRequest({ method: 'POST', pathname: '/api/runs/run-1/stop' }), null);
+  assert.equal(classifyRetiredLegacyMutation({ method: 'POST', pathname: '/api/runs' }), 'comparative-launch');
+  assert.equal(classifyRetiredLegacyMutation({ method: 'POST', pathname: '/api/runs/run-1/manual-evidence' }), 'manual-evidence');
+  assert.equal(classifyRetiredLegacyMutation({ method: 'POST', pathname: '/api/single-site/runs/run-1/gallery/items/item-1/review' }), 'single-site-visual-review');
+  assert.equal(classifyRetiredLegacyMutation({ method: 'GET', pathname: '/api/runs/run-1/manual-evidence' }), null,
+    'legacy evidence reads remain available through object-authorized compatibility projections');
+  assert.equal(classifyRetiredLegacyMutation({ method: 'POST', pathname: '/api/single-site/preflight' }), null,
+    'side-effect-free preflight remains available during shared migration');
   assert.doesNotThrow(() => assertSharedListScope({ ...viewer, runIds: ['*'] }));
   assert.throws(() => assertSharedListScope(viewer), (error) => error?.code === 'AUTHORIZATION_DENIED');
   assert.throws(() => assertPrincipalAuthorized(administrator, CONTROL_ACTIONS.RELEASE_ASSERT, { projectId: 'project-1', runId: 'run-1' }),
