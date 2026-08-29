@@ -1,6 +1,8 @@
 import { expect, test, type Page, type Route } from '@playwright/test';
 import { AxeBuilder } from '@axe-core/playwright';
 import { sharedPublicationFixture, type RiskAvailability, type SharedMode } from './shared-publication-fixture.js';
+// @ts-expect-error shared-control-client is the browser-native module exercised by this portal test.
+import { createSharedWorkspacePoller } from '../public/shared-control-client.js';
 
 async function routeSharedGallery(page: Page, mode: SharedMode, runId: string, options: {
   availability?: RiskAvailability;
@@ -8,8 +10,11 @@ async function routeSharedGallery(page: Page, mode: SharedMode, runId: string, o
   revisionMismatch?: boolean;
   denyPublication?: boolean;
   sharedDisabled?: boolean;
+  sessionRestoreDelayMs?: number;
+  transientPublicationFailures?: number;
 } = {}) {
   let authorized = options.initiallyAuthorized ?? false;
+  let publicationFailures = options.transientPublicationFailures ?? 0;
   const { view } = sharedPublicationFixture(mode, runId, options.availability ?? 'PARTIAL');
   await page.route('**/api/**', async (route: Route) => {
     const request = route.request();
@@ -19,6 +24,8 @@ async function routeSharedGallery(page: Page, mode: SharedMode, runId: string, o
       if (request.method() === 'POST') {
         expect((await request.postDataJSON()).credential).toBe('scoped-gallery-credential');
         authorized = true;
+      } else if (options.sessionRestoreDelayMs) {
+        await new Promise((resolve) => setTimeout(resolve, options.sessionRestoreDelayMs));
       }
       return route.fulfill({ status: authorized ? 200 : 401, json: authorized
         ? { schemaVersion: 1, data: { csrfToken: 'csrf-gallery', principal: { id: 'gallery-reviewer' } } }
@@ -26,6 +33,10 @@ async function routeSharedGallery(page: Page, mode: SharedMode, runId: string, o
     }
     const root = `/api/control/v1/runs/${runId}`;
     if (url.pathname === `${root}/publication`) {
+      if (publicationFailures > 0) {
+        publicationFailures -= 1;
+        return route.fulfill({ status: 503, json: { error: { code: 'TEMPORARILY_UNAVAILABLE', message: 'The publication reader is restarting.' } } });
+      }
       if (options.denyPublication) return route.fulfill({ status: 403, json: { error: { code: 'OBJECT_SCOPE_DENIED', message: 'This principal cannot view that run.' } } });
       return route.fulfill({ json: { schemaVersion: 1, data: {
         runId,
@@ -60,6 +71,35 @@ async function routeSharedGallery(page: Page, mode: SharedMode, runId: string, o
 }
 
 test.describe('shared live gallery authority', () => {
+  test('starts comparative evidence loading without waiting for session restoration', async ({ page }) => {
+    const runId = 'shared-gallery-independent-evidence';
+    let galleryRequestedAt = 0;
+    let restoreFinishedAt = 0;
+    await routeSharedGallery(page, 'comparative', runId, { sessionRestoreDelayMs: 1_500 });
+    await page.route(`**/api/runs/${runId}/gallery`, async (route) => {
+      galleryRequestedAt = Date.now();
+      await route.fulfill({ status: 404, json: { error: { code: 'GALLERY_NOT_FOUND', message: 'No legacy gallery exists.' } } });
+    });
+    page.on('response', (response) => {
+      if (new URL(response.url()).pathname === '/api/control/v1/session') restoreFinishedAt = Date.now();
+    });
+
+    await page.goto(`/gallery.html?mode=comparative&run=${runId}`);
+    await expect.poll(() => galleryRequestedAt).toBeGreaterThan(0);
+    expect(restoreFinishedAt).toBe(0);
+  });
+
+  test('keeps the latest login attempt when a slower restore finishes afterward', async ({ page }) => {
+    const runId = 'shared-gallery-auth-race';
+    await routeSharedGallery(page, 'comparative', runId, { sessionRestoreDelayMs: 800 });
+    await page.goto(`/gallery.html?mode=comparative&run=${runId}`);
+    await page.locator('input[name="gallery-control-credential"]').fill('scoped-gallery-credential');
+    await page.getByRole('button', { name: 'Authorize gallery access' }).click();
+    await expect(page.locator('#gallery-shared-session-status')).toContainText('authorized');
+    await page.waitForTimeout(1_000);
+    await expect(page.locator('#gallery-shared-session-status')).toContainText('authorized');
+  });
+
   for (const mode of ['comparative', 'single-site'] as const) {
     test(`${mode} shows Product Risk and the exact shared publication even without a legacy gallery`, async ({ page }) => {
       const runId = `shared-gallery-${mode}`;
@@ -118,6 +158,76 @@ test.describe('shared live gallery authority', () => {
     await expect(page.getByRole('heading', { name: 'FEATURE READY' })).toHaveCount(0);
   });
 
+  test('recovers automatically after a transient shared-publication failure', async ({ page }) => {
+    const runId = 'shared-gallery-transient-retry';
+    await routeSharedGallery(page, 'comparative', runId, {
+      initiallyAuthorized: true,
+      transientPublicationFailures: 1,
+    });
+    await page.goto(`/gallery.html?mode=comparative&run=${runId}`);
+    await expect(page.locator('#gallery-product-risk')).toHaveAttribute('data-risk-availability', 'UNAVAILABLE');
+    await expect(page.getByRole('heading', { name: 'FEATURE READY' })).toBeVisible({ timeout: 8_000 });
+  });
+
+  test('pauses shared polling while hidden and preserves the unchanged authority DOM, focus, and scroll', async ({ page }) => {
+    const runId = 'shared-gallery-visibility';
+    let workspaceReads = 0;
+    await routeSharedGallery(page, 'comparative', runId, { initiallyAuthorized: true });
+    page.on('request', (request) => {
+      if (new URL(request.url()).pathname.startsWith(`/api/control/v1/runs/${runId}/`)) workspaceReads += 1;
+    });
+    await page.goto(`/gallery.html?mode=comparative&run=${runId}`);
+    const action = page.getByRole('link', { name: 'Open recovery and review controls' });
+    await expect(action).toBeVisible();
+    await action.focus();
+    await page.locator('#gallery-risk-register').evaluate((node) => {
+      node.setAttribute('data-stability-probe', 'preserve-me');
+      node.scrollTop = 17;
+      Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' });
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    const readsBeforeHiddenWait = workspaceReads;
+    await page.waitForTimeout(5_500);
+    expect(workspaceReads).toBe(readsBeforeHiddenWait);
+    await expect(action).toBeFocused();
+
+    await page.evaluate(() => {
+      Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'visible' });
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    await expect.poll(() => workspaceReads).toBeGreaterThan(readsBeforeHiddenWait);
+    await expect(page.locator('#gallery-risk-register')).toHaveAttribute('data-stability-probe', 'preserve-me');
+    await expect(action).toBeFocused();
+  });
+
+  test('purge invalidation aborts an authority read and cannot resurrect the gallery', async ({ page }) => {
+    const runId = 'shared-gallery-purge-race';
+    await routeSharedGallery(page, 'single-site', runId, {
+      initiallyAuthorized: true,
+      sessionRestoreDelayMs: 500,
+    });
+    await page.goto(`/gallery.html?mode=single-site&run=${runId}`);
+    await page.evaluate(({ runId: id }) => window.dispatchEvent(new CustomEvent('audit-console:run-invalidated', {
+      detail: { schemaVersion: 1, mode: 'single-site', runId: id, reason: 'purged', occurredAt: new Date().toISOString() },
+    })), { runId });
+    await expect(page.locator('#gallery-fatal-title')).toContainText('purged');
+    await page.waitForTimeout(800);
+    await expect(page.getByRole('heading', { name: 'FEATURE READY' })).toHaveCount(0);
+    await expect(page.locator('#gallery-fatal-title')).toContainText('purged');
+  });
+
+  test('pagehide aborts pending authorization and authority work', async ({ page }) => {
+    const runId = 'shared-gallery-pagehide-race';
+    await routeSharedGallery(page, 'comparative', runId, {
+      initiallyAuthorized: true,
+      sessionRestoreDelayMs: 500,
+    });
+    await page.goto(`/gallery.html?mode=comparative&run=${runId}`);
+    await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pagehide')));
+    await page.waitForTimeout(800);
+    await expect(page.getByRole('heading', { name: 'FEATURE READY' })).toHaveCount(0);
+  });
+
   test('keeps historical gallery evidence readable when shared control is disabled', async ({ page }) => {
     const runId = 'legacy-gallery-shared-disabled';
     await routeSharedGallery(page, 'comparative', runId, { sharedDisabled: true });
@@ -127,4 +237,43 @@ test.describe('shared live gallery authority', () => {
     await expect(page.locator('#gallery-fatal')).toBeVisible();
     await expect(page.locator('#gallery-fatal-title')).toContainText('could not be loaded');
   });
+});
+
+test('shared workspace poller keeps terminal snapshots fresh with a slower cadence and marks async failure unavailable', async () => {
+  const timers: Array<{ delay: number; callback: () => void }> = [];
+  const unavailable: string[] = [];
+  const poller = createSharedWorkspacePoller({
+    load: async () => { throw new Error('archive publication could not be rendered'); },
+    onSnapshot() { throw new Error('unexpected snapshot'); },
+    onUnavailable(error: Error) { unavailable.push(error.message); },
+    isTerminal: () => true,
+    setTimer(callback: () => void, delay: number) {
+      timers.push({ callback, delay });
+      return timers.length;
+    },
+    clearTimer() {},
+    activeRefreshMs: 5_000,
+    terminalRefreshMs: 30_000,
+  });
+  await poller.refresh();
+  expect(unavailable).toEqual(['archive publication could not be rendered']);
+
+  poller.destroy();
+  const terminalTimers: Array<{ delay: number; callback: () => void }> = [];
+  const terminalPoller = createSharedWorkspacePoller({
+    load: async () => ({ publication: { runRevision: 7, decisionRevision: 3, riskRevision: 2, finalSubjectDigest: 'subject' } }),
+    onSnapshot() {},
+    onUnavailable() {},
+    isTerminal: () => true,
+    setTimer(callback: () => void, delay: number) {
+      terminalTimers.push({ callback, delay });
+      return terminalTimers.length;
+    },
+    clearTimer() {},
+    activeRefreshMs: 5_000,
+    terminalRefreshMs: 30_000,
+  });
+  await terminalPoller.refresh();
+  expect(terminalTimers.at(-1)?.delay).toBe(30_000);
+  terminalPoller.destroy();
 });

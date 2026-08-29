@@ -78,12 +78,139 @@ export function assertSharedWorkspaceProjection(value, { runId, mode } = {}) {
   return value;
 }
 
+export function sharedWorkspaceRevisionKey(workspace) {
+  const publication = workspace?.publication;
+  if (!publication || !Number.isSafeInteger(publication.runRevision)
+    || !Number.isSafeInteger(publication.decisionRevision)
+    || !Number.isSafeInteger(publication.riskRevision)
+    || typeof publication.finalSubjectDigest !== 'string') return null;
+  return [
+    publication.runRevision,
+    publication.decisionRevision,
+    publication.riskRevision,
+    publication.finalSubjectDigest,
+  ].join('\u0000');
+}
+
+export function isRetryableSharedControlError(error) {
+  const status = Number(error?.status ?? 0);
+  return status === 0 || status === 408 || status === 425 || status === 429 || status >= 500
+    || error?.code === 'SHARED_CONTROL_REVISION_RACE';
+}
+
+export function createSharedWorkspacePoller({
+  load,
+  onSnapshot,
+  onConfirmed = () => {},
+  onUnavailable,
+  onStale = onUnavailable,
+  isTerminal,
+  isRetryable = isRetryableSharedControlError,
+  activeRefreshMs = 5_000,
+  terminalRefreshMs = 30_000,
+  maximumRetryMs = 30_000,
+  setTimer = globalThis.setTimeout?.bind(globalThis),
+  clearTimer = globalThis.clearTimeout?.bind(globalThis),
+} = {}) {
+  if (typeof load !== 'function' || typeof onSnapshot !== 'function'
+    || typeof onUnavailable !== 'function' || typeof isTerminal !== 'function'
+    || typeof setTimer !== 'function' || typeof clearTimer !== 'function') {
+    throw new TypeError('Shared workspace poller requires load, render, terminal, and timer functions.');
+  }
+  for (const [name, value] of Object.entries({ activeRefreshMs, terminalRefreshMs, maximumRetryMs })) {
+    if (!Number.isSafeInteger(value) || value < 1) throw new TypeError(`${name} must be a positive integer.`);
+  }
+
+  let controller = null;
+  let timer = null;
+  let generation = 0;
+  let visible = true;
+  let destroyed = false;
+  let retryAttempt = 0;
+  let revisionKey = null;
+  let lastSnapshot = null;
+
+  const cancelTimer = () => {
+    if (timer !== null) clearTimer(timer);
+    timer = null;
+  };
+  const current = (requestGeneration, requestController) => !destroyed && visible
+    && generation === requestGeneration && controller === requestController && !requestController.signal.aborted;
+  const schedule = (delay) => {
+    cancelTimer();
+    if (destroyed || !visible) return;
+    timer = setTimer(() => {
+      timer = null;
+      void refresh();
+    }, delay);
+  };
+
+  async function refresh(options = {}) {
+    if (destroyed || !visible) return false;
+    cancelTimer();
+    controller?.abort();
+    const requestController = new AbortController();
+    controller = requestController;
+    const requestGeneration = ++generation;
+    try {
+      const snapshot = await load({ signal: requestController.signal });
+      if (!current(requestGeneration, requestController)) return false;
+      const nextRevisionKey = sharedWorkspaceRevisionKey(snapshot);
+      const changed = nextRevisionKey === null || nextRevisionKey !== revisionKey;
+      revisionKey = nextRevisionKey;
+      lastSnapshot = snapshot;
+      retryAttempt = 0;
+      if (changed) onSnapshot(snapshot, options);
+      else onConfirmed(snapshot, options);
+      schedule(isTerminal(snapshot) ? terminalRefreshMs : activeRefreshMs);
+      return true;
+    } catch (error) {
+      if (!current(requestGeneration, requestController) || error?.name === 'AbortError') return false;
+      if (!isRetryable(error)) {
+        onUnavailable(error, { retrying: false, snapshot: lastSnapshot });
+        return false;
+      }
+      const retryMs = Math.min(maximumRetryMs, activeRefreshMs * (2 ** Math.min(retryAttempt, 8)));
+      retryAttempt += 1;
+      if (lastSnapshot) onStale(error, { retrying: true, retryMs, snapshot: lastSnapshot });
+      else onUnavailable(error, { retrying: true, retryMs, snapshot: null });
+      schedule(retryMs);
+      return false;
+    } finally {
+      if (controller === requestController) controller = null;
+    }
+  }
+
+  return Object.freeze({
+    refresh,
+    setVisible(nextVisible) {
+      const next = Boolean(nextVisible);
+      if (visible === next || destroyed) return;
+      visible = next;
+      cancelTimer();
+      controller?.abort();
+      controller = null;
+      generation += 1;
+      if (visible) void refresh();
+    },
+    destroy() {
+      if (destroyed) return;
+      destroyed = true;
+      cancelTimer();
+      controller?.abort();
+      controller = null;
+      generation += 1;
+    },
+  });
+}
+
 export function createSharedControlBrowserClient({
   fetchImpl = globalThis.fetch?.bind(globalThis),
   wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
 } = {}) {
   if (typeof fetchImpl !== 'function') throw new TypeError('Shared control client requires fetch.');
   let session = null;
+  let authenticationAttempt = 0;
 
   async function request(path, { method = 'GET', body, idempotencyKey, signal } = {}) {
     const headers = { Accept: 'application/json' };
@@ -109,17 +236,24 @@ export function createSharedControlBrowserClient({
     get session() { return session ? Object.freeze({ ...session }) : null; },
     async login(credential, { signal } = {}) {
       if (typeof credential !== 'string' || !credential.trim()) throw new TypeError('A control credential is required.');
+      const attempt = ++authenticationAttempt;
       const result = await request(`${PREFIX}/session`, { method: 'POST', body: { credential }, signal });
+      if (attempt !== authenticationAttempt) throw supersededAuthenticationError();
       session = Object.freeze({ ...result.data });
       return session;
     },
     async restore({ signal } = {}) {
+      const attempt = ++authenticationAttempt;
       const result = await request(`${PREFIX}/session`, { signal });
+      if (attempt !== authenticationAttempt) throw supersededAuthenticationError();
       session = Object.freeze({ ...result.data });
       return session;
     },
     async logout({ signal } = {}) {
-      try { await request(`${PREFIX}/session`, { method: 'DELETE', body: {}, signal }); } finally { session = null; }
+      const attempt = ++authenticationAttempt;
+      try { await request(`${PREFIX}/session`, { method: 'DELETE', body: {}, signal }); } finally {
+        if (attempt === authenticationAttempt) session = null;
+      }
     },
     async readWorkspace(runId, { signal, logLimit = 200, maxAttempts = 3 } = {}) {
       const root = `${PREFIX}/runs/${encodeURIComponent(runId)}`;
@@ -168,4 +302,12 @@ export function createSharedControlBrowserClient({
       throw new SharedControlBrowserError('The durable operation did not finish within the bounded polling window.', { code: 'CONTROL_OPERATION_PENDING' });
     },
   });
+}
+
+function supersededAuthenticationError() {
+  const error = new SharedControlBrowserError('A newer browser authorization attempt superseded this request.', {
+    code: 'SHARED_CONTROL_AUTH_SUPERSEDED',
+  });
+  error.name = 'AbortError';
+  return error;
 }

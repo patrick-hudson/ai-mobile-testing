@@ -9,6 +9,7 @@ import { createConsoleUrlState } from './console-url-state.js';
 import {
   assertSharedWorkspaceProjection,
   createSharedControlBrowserClient,
+  createSharedWorkspacePoller,
   orderSharedRisksForReview,
   SharedControlBrowserError,
 } from './shared-control-client.js';
@@ -38,7 +39,8 @@ const ACTIVITY_CHARACTER_LIMIT = 64 * 1024;
 const DELTA_PAGE_LIMIT = 100;
 const DELTA_ROW_LIMIT = 25_000;
 const REVIEWER_KEY = 'quitting7oh.gallery.reviewer-label.v1';
-const SHARED_REFRESH_MS = 5_000;
+const SHARED_ACTIVE_REFRESH_MS = 5_000;
+const SHARED_TERMINAL_REFRESH_MS = 30_000;
 const TERMINAL_SHARED_EXECUTIONS = new Set(['completed_pass', 'completed_product_failure', 'incomplete', 'cancelled']);
 
 const elements = Object.fromEntries([
@@ -115,8 +117,9 @@ const state = {
   urlSearch: galleryUrlState.current.search,
   sharedSessionReady: false,
   sharedWorkspace: null,
-  sharedController: null,
-  sharedRefreshTimer: null,
+  sharedPoller: null,
+  sharedAuthController: null,
+  sharedAuthGeneration: 0,
 };
 
 state.invalidation = createRunInvalidationBus({
@@ -133,7 +136,7 @@ init().catch((error) => showFatal(error));
 async function init() {
   if (!state.runId) throw new PortalGalleryError(400, 'INVALID_GALLERY_URL', 'Choose a valid run from the release audit console.');
   bindSharedAuthorityEvents();
-  await initializeGalleryAuthority();
+  void initializeGalleryAuthority();
   if (parsed.runMode === 'single-site') return initSingleSiteGallery();
   const encodedRun = encodeURIComponent(state.runId);
   elements.gallery_run_id.textContent = state.runId;
@@ -173,19 +176,29 @@ async function init() {
 
 function bindSharedAuthorityEvents() {
   elements.gallery_shared_login.addEventListener('submit', (event) => void authorizeSharedGallery(event));
+  document.addEventListener('visibilitychange', () => {
+    state.sharedPoller?.setVisible(document.visibilityState !== 'hidden');
+  });
 }
 
 async function initializeGalleryAuthority() {
+  const generation = ++state.sharedAuthGeneration;
+  state.sharedAuthController?.abort();
+  const controller = new AbortController();
+  state.sharedAuthController = controller;
   elements.gallery_product_risk.hidden = false;
   elements.gallery_shared_session.hidden = false;
   elements.gallery_shared_login.hidden = false;
   try {
-    await sharedControl.restore();
+    await sharedControl.restore({ signal: controller.signal });
+    if (!sharedAuthCurrent(generation, controller)) return;
     state.sharedSessionReady = true;
     elements.gallery_shared_login.hidden = true;
     elements.gallery_shared_session_status.textContent = 'Shared gallery session restored.';
     await loadSharedGalleryAuthority();
+    if (sharedAuthCurrent(generation, controller)) await retryGalleryEvidenceAfterAuthorization();
   } catch (error) {
+    if (!sharedAuthCurrent(generation, controller) || error?.name === 'AbortError') return;
     state.sharedSessionReady = false;
     if (sharedControlDisabled(error)) {
       elements.gallery_product_risk.hidden = true;
@@ -196,6 +209,8 @@ async function initializeGalleryAuthority() {
       ? 'Enter a scoped credential to view shared release authority.'
       : `Shared gallery session unavailable: ${friendlyError(error)}`;
     renderSharedGalleryUnavailable(error);
+  } finally {
+    if (state.sharedAuthController === controller) state.sharedAuthController = null;
   }
 }
 
@@ -203,10 +218,15 @@ async function authorizeSharedGallery(event) {
   event.preventDefault();
   if (!elements.gallery_shared_login.reportValidity()) return;
   const button = elements.gallery_shared_login.querySelector('button');
+  const generation = ++state.sharedAuthGeneration;
+  state.sharedAuthController?.abort();
+  const controller = new AbortController();
+  state.sharedAuthController = controller;
   button.disabled = true;
   elements.gallery_shared_session_status.textContent = 'Authorizing gallery access…';
   try {
-    await sharedControl.login(sharedCredential.value);
+    await sharedControl.login(sharedCredential.value, { signal: controller.signal });
+    if (!sharedAuthCurrent(generation, controller)) return;
     sharedCredential.value = '';
     state.sharedSessionReady = true;
     elements.gallery_shared_login.hidden = true;
@@ -214,12 +234,19 @@ async function authorizeSharedGallery(event) {
     await loadSharedGalleryAuthority({ focus: true });
     await retryGalleryEvidenceAfterAuthorization();
   } catch (error) {
+    if (!sharedAuthCurrent(generation, controller) || error?.name === 'AbortError') return;
     sharedCredential.value = '';
     elements.gallery_shared_session_status.textContent = `Authorization failed: ${friendlyError(error)}`;
     sharedCredential.focus();
   } finally {
-    button.disabled = false;
+    if (state.sharedAuthController === controller) state.sharedAuthController = null;
+    if (generation === state.sharedAuthGeneration && !state.destroyed && !state.purged) button.disabled = false;
   }
+}
+
+function sharedAuthCurrent(generation, controller) {
+  return generation === state.sharedAuthGeneration && state.sharedAuthController === controller
+    && !controller.signal.aborted && !state.destroyed && !state.purged;
 }
 
 async function retryGalleryEvidenceAfterAuthorization() {
@@ -237,38 +264,67 @@ function sharedControlDisabled(error) {
 }
 
 async function loadSharedGalleryAuthority({ focus = false } = {}) {
-  window.clearTimeout(state.sharedRefreshTimer);
-  state.sharedController?.abort();
-  const controller = new AbortController();
-  state.sharedController = controller;
+  if (state.destroyed || state.purged) return false;
+  if (!state.sharedPoller) {
+    state.sharedPoller = createSharedGalleryPoller();
+    state.sharedPoller.setVisible(document.visibilityState !== 'hidden');
+  }
   elements.gallery_product_risk.hidden = false;
   elements.gallery_product_risk.dataset.riskAvailability = 'LOADING';
   elements.gallery_product_risk.setAttribute('aria-busy', 'true');
   elements.gallery_risk_status.textContent = 'LOADING · Reading one revision-bound publication, execution set, and bounded log view.';
-  try {
-    const workspace = assertSharedWorkspaceProjection(await sharedControl.readWorkspace(state.runId, {
-      signal: controller.signal,
-      logLimit: 200,
-    }), { runId: state.runId, mode: parsed.runMode });
-    if (controller.signal.aborted) return;
-    state.sharedWorkspace = workspace;
-    renderSharedGalleryAuthority(workspace);
-    if (focus) elements.gallery_product_risk_title.focus();
-    if (sharedGalleryNeedsRefresh(workspace)) {
-      state.sharedRefreshTimer = window.setTimeout(() => void loadSharedGalleryAuthority(), SHARED_REFRESH_MS);
-    }
-  } catch (error) {
-    if (controller.signal.aborted) return;
-    state.sharedWorkspace = null;
-    renderSharedGalleryUnavailable(error);
-  } finally {
-    if (state.sharedController === controller) state.sharedController = null;
-  }
+  return state.sharedPoller.refresh({ focus });
 }
 
-function sharedGalleryNeedsRefresh(workspace) {
-  return ['LOADING', 'PROVISIONAL'].includes(workspace.riskAvailability)
-    || workspace.executions.executions.some(({ state: executionState }) => !TERMINAL_SHARED_EXECUTIONS.has(executionState));
+function createSharedGalleryPoller() {
+  return createSharedWorkspacePoller({
+    async load({ signal }) {
+      return assertSharedWorkspaceProjection(await sharedControl.readWorkspace(state.runId, {
+        signal,
+        logLimit: 200,
+      }), { runId: state.runId, mode: parsed.runMode });
+    },
+    onSnapshot(workspace, { focus = false } = {}) {
+      if (state.destroyed || state.purged) return;
+      state.sharedWorkspace = workspace;
+      renderSharedGalleryAuthority(workspace);
+      if (focus) elements.gallery_product_risk_title.focus();
+    },
+    onConfirmed(workspace, { focus = false } = {}) {
+      if (state.destroyed || state.purged) return;
+      state.sharedWorkspace = workspace;
+      elements.gallery_product_risk.dataset.riskAvailability = workspace.riskAvailability;
+      elements.gallery_product_risk.setAttribute('aria-busy', String(workspace.riskAvailability === 'LOADING'));
+      elements.gallery_risk_status.textContent = sharedRiskAvailabilityCopy(
+        workspace.riskAvailability,
+        workspace.publication.riskRegister.risks.length,
+      );
+      const freshness = document.querySelector('#gallery-authority-freshness');
+      if (freshness) freshness.textContent = workspace.publication.decision.superseded
+        ? 'SUPERSEDED · This historical revision cannot authorize release.'
+        : 'CURRENT · Bound to the displayed immutable release subject and certified scope.';
+      if (focus) elements.gallery_product_risk_title.focus();
+    },
+    onUnavailable(error) {
+      if (state.destroyed || state.purged) return;
+      state.sharedWorkspace = null;
+      renderSharedGalleryUnavailable(error);
+    },
+    onStale(error, { retryMs }) {
+      if (state.destroyed || state.purged || !state.sharedWorkspace) return;
+      elements.gallery_product_risk.setAttribute('aria-busy', 'false');
+      elements.gallery_risk_status.textContent = `STALE · The last confirmed shared publication remains displayed. Refresh retry in ${Math.ceil(retryMs / 1_000)} seconds: ${friendlyError(error)}`;
+      const freshness = document.querySelector('#gallery-authority-freshness');
+      if (freshness) freshness.textContent = 'STALE · This snapshot is not currently confirmed and cannot be treated as current release authority.';
+      announce(`Shared release authority refresh delayed. Retrying in ${Math.ceil(retryMs / 1_000)} seconds.`);
+    },
+    isTerminal(workspace) {
+      return !['LOADING', 'PROVISIONAL'].includes(workspace.riskAvailability)
+        && workspace.executions.executions.every(({ state: executionState }) => TERMINAL_SHARED_EXECUTIONS.has(executionState));
+    },
+    activeRefreshMs: SHARED_ACTIVE_REFRESH_MS,
+    terminalRefreshMs: SHARED_TERMINAL_REFRESH_MS,
+  });
 }
 
 function renderSharedGalleryUnavailable(error) {
@@ -301,15 +357,17 @@ function renderSharedGalleryAuthority(workspace) {
   scope.id = 'gallery-certified-scope';
   const revisions = textElement('p', `Decision revision ${publication.decisionRevision} · Run revision ${publication.runRevision} · Risk revision ${publication.riskRevision}`);
   revisions.id = 'gallery-authority-revisions';
+  const freshness = textElement('p', decision.superseded
+    ? 'SUPERSEDED · This historical revision cannot authorize release.'
+    : 'CURRENT · Bound to the displayed immutable release subject and certified scope.');
+  freshness.id = 'gallery-authority-freshness';
   decisionCard.append(
     textElement('p', 'Release Decision', 'gallery-authority-eyebrow'),
     decisionTitle,
     textElement('p', `${decision.code ?? decision.label.replaceAll(' ', '_')} · ${decision.grantedAuthority} authority`),
     scope,
     revisions,
-    textElement('p', decision.superseded
-      ? 'SUPERSEDED · This historical revision cannot authorize release.'
-      : 'CURRENT · Bound to the displayed immutable release subject and certified scope.'),
+    freshness,
   );
 
   const register = document.createElement('section');
@@ -1602,12 +1660,17 @@ function showEvidenceUnavailable(error) {
 function terminatePurged(message, { publish = true } = {}) {
   if (state.purged) return;
   state.purged = true;
+  state.sharedAuthGeneration += 1;
   state.terminalGeneration += 1;
   state.deltaGeneration += 1;
   state.flagGeneration += 1;
   state.flagMutationGeneration += 1;
   state.singleSiteMutationController?.abort();
   state.singleSiteReviewController?.abort();
+  state.sharedAuthController?.abort();
+  state.sharedAuthController = null;
+  state.sharedPoller?.destroy();
+  state.sharedPoller = null;
   state.flagController?.abort();
   state.flagMutationController?.abort();
   state.deltaController?.abort();
@@ -1637,11 +1700,14 @@ function terminatePurged(message, { publish = true } = {}) {
 
 function destroy() {
   state.destroyed = true;
+  state.sharedAuthGeneration += 1;
   state.terminalGeneration += 1;
   state.singleSiteMutationController?.abort();
   state.singleSiteReviewController?.abort();
-  state.sharedController?.abort();
-  window.clearTimeout(state.sharedRefreshTimer);
+  state.sharedAuthController?.abort();
+  state.sharedAuthController = null;
+  state.sharedPoller?.destroy();
+  state.sharedPoller = null;
   state.singleSite?.destroy?.();
   cancelFlagMutation();
   state.flagController?.abort();
