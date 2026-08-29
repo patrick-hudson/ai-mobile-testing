@@ -117,10 +117,13 @@ export function createSharedReleaseHttpClient({
       const document = await boundedJson(response, maximumResponseBytes);
       if (!response.ok || document.error) {
         const serverCode = typeof document.error?.code === 'string' ? document.error.code : 'REQUEST_FAILED';
+        let message = String(document.error?.message ?? `Control request failed with HTTP ${response.status}.`);
+        for (const sensitive of [token, body?.token]) {
+          if (typeof sensitive === 'string' && sensitive) message = message.replaceAll(sensitive, '[REDACTED]');
+        }
         throw new SharedReleaseCiError(
           `CI_HTTP_${serverCode}`,
-          String(document.error?.message ?? `Control request failed with HTTP ${response.status}.`)
-            .replaceAll(token, '[REDACTED]').slice(0, 1_024),
+          message.slice(0, 1_024),
           undefined,
           { status: response.status, serverCode },
         );
@@ -144,11 +147,31 @@ export function createSharedReleaseHttpClient({
     throw last;
   }
 
+  async function mutate(pathname, input) {
+    let last;
+    for (let attempt = 1; attempt <= maximumLaunchAttempts; attempt += 1) {
+      try { return await once('POST', pathname, { requestId: input.requestId, body: input.body }); }
+      catch (error) {
+        last = error;
+        if (error?.code !== 'CI_HTTP_TRANSPORT_FAILED' || attempt === maximumLaunchAttempts) throw error;
+      }
+    }
+    throw last;
+  }
+
   return Object.freeze({
     launch,
     readLaunchOperation: ({ operationId }) => once('GET', `/api/control/v1/launch-operations/${encodeURIComponent(operationId)}`),
     readRun: ({ runId }) => once('GET', `/api/control/v1/runs/${encodeURIComponent(runId)}`),
     readPublication: ({ runId }) => once('GET', `/api/control/v1/runs/${encodeURIComponent(runId)}/publication`),
+    assertRelease: ({ runId, expected, ttlMs, requestId }) => mutate(
+      `/api/control/v1/runs/${encodeURIComponent(runId)}/release/assert`,
+      { requestId, body: { expected, ttlMs } },
+    ),
+    consumePromotion: ({ runId, token: claimToken, expectedSubjectDigest, requestId }) => mutate(
+      `/api/control/v1/runs/${encodeURIComponent(runId)}/promotion/consume`,
+      { requestId, body: { token: claimToken, expectedSubjectDigest } },
+    ),
     async reprobeTargetIdentity({ targets }) {
       if (!launchIntent) fail('CI_TARGET_REPROBE_FAILED', 'Target reprobe cannot run before a launch intent is bound.');
       const contract = launchIntent.runContract;

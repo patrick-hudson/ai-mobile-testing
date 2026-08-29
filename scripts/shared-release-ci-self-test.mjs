@@ -483,7 +483,10 @@ try {
   assert.equal((await stat(resultFile)).mode & 0o777, 0o600);
   assert.doesNotMatch(resultText, /amt\.integration-token/u);
   assert.doesNotMatch(output.join(''), /amt\.integration-token/u);
-  assert.equal(JSON.parse(resultText).runId, happy.run.runId);
+  const persistedResult = JSON.parse(resultText);
+  assert.equal(persistedResult.runId, happy.run.runId);
+  assert.deepEqual(persistedResult.finalSubject, happy.run.finalSubject,
+    'delivery must retain the non-secret immutable target and deployment identity contract');
 } finally {
   await new Promise((resolve) => commandApi.server.close(resolve));
 }

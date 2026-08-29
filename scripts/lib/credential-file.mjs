@@ -18,6 +18,26 @@ export async function readCredentialFile(file, { label = 'credential' } = {}) {
   return credential;
 }
 
+export async function readPrivateSecretFile(file, { label = 'secret', minimumBytes = 20, maximumBytes = 4_096 } = {}) {
+  if (typeof file !== 'string' || !file) throw new Error(`${label} file is required.`);
+  if (!Number.isSafeInteger(minimumBytes) || minimumBytes < 1
+    || !Number.isSafeInteger(maximumBytes) || maximumBytes < minimumBytes) {
+    throw new TypeError('Private secret file bounds are invalid.');
+  }
+  const resolved = path.resolve(file);
+  const metadata = await lstat(resolved);
+  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size < minimumBytes || metadata.size > maximumBytes
+    || (metadata.mode & 0o777) !== 0o600) {
+    throw new Error(`${label} file must be a bounded, regular mode-0600 file.`);
+  }
+  const value = (await readFile(resolved, 'utf8')).trim();
+  if (Buffer.byteLength(value) < minimumBytes || Buffer.byteLength(value) > maximumBytes
+    || /[\u0000-\u001f\u007f]/u.test(value)) {
+    throw new Error(`${label} file contains an invalid secret.`);
+  }
+  return value;
+}
+
 export async function openCredentialOutput(file) {
   if (typeof file !== 'string' || !file) throw new Error('--credential-out is required for create and rotate.');
   const resolved = path.resolve(file);

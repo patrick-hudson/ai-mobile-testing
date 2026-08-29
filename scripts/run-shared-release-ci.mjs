@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { canonicalDigest } from '../shared/canonical-contract.mjs';
 import { CONTROL_EXIT_CODES, controlExitCode } from '../shared/control-client-contract.mjs';
+import { parseFinalReleaseSubject } from '../shared/release-subject.mjs';
 import { parseRunContract } from '../shared/run-contract.mjs';
 import { readCredentialFile } from './lib/credential-file.mjs';
 import { createSharedReleaseHttpClient, runSharedReleaseCi } from './lib/shared-release-ci.mjs';
@@ -82,6 +83,7 @@ function stableRequestId(intent) {
 
 function safeResult(requestId, result) {
   const decision = result.publication.decision;
+  const finalSubject = parseFinalReleaseSubject(result.run.finalSubject);
   return Object.freeze({
     schemaVersion: 1,
     kind: 'shared-release-ci-result',
@@ -92,6 +94,7 @@ function safeResult(requestId, result) {
     publicationDigest: result.publication.digest,
     subjectDigest: result.publication.finalSubjectDigest,
     executionSetDigest: decision.executionManifestDigest,
+    finalSubject,
     decision: Object.freeze({
       code: decision.code,
       ready: decision.ready,
