@@ -1,6 +1,7 @@
 import { assertPrincipalAuthorized, CONTROL_ACTIONS, ControlPlaneError, validateMutationRequest } from '../shared/control-plane-contract.mjs';
 import { createReleaseAssertionResult } from '../shared/control-client-contract.mjs';
 import { consumePromotionClaim, issuePromotionClaim } from '../scripts/lib/promotion-claim-store.mjs';
+import { parseRunContract } from '../shared/run-contract.mjs';
 
 export const SHARED_CONTROL_API_PREFIX = '/api/control/v1';
 
@@ -17,7 +18,7 @@ export function createSharedRequestAuthorizer({ authority } = {}) {
 }
 
 export function createSharedControlApi({
-  authority, service, claimStore, expectedOrigin, launch = null,
+  authority, service, claimStore, expectedOrigin, launch = null, readLaunchOperation = null,
   requestAuthorizer = createSharedRequestAuthorizer({ authority }),
   sessionCookiePath = SHARED_CONTROL_API_PREFIX,
 } = {}) {
@@ -54,10 +55,22 @@ export function createSharedControlApi({
         const runMatch = new RegExp(`^${SHARED_CONTROL_API_PREFIX}/runs/([A-Za-z0-9._-]{1,128})(?:/(.*))?$`).exec(url.pathname);
         if (request.method === 'POST' && url.pathname === `${SHARED_CONTROL_API_PREFIX}/runs`) {
           mutation(request, authentication, expectedOrigin);
-          recordBody(request.body);
-          assertPrincipalAuthorized(principal, CONTROL_ACTIONS.RUN_LAUNCH, { projectId: request.body.projectId, runId: request.body.parentRun?.runId });
+          const intent = parseLaunchIntent(recordBody(request.body));
+          assertPrincipalAuthorized(principal, CONTROL_ACTIONS.RUN_LAUNCH, { projectId: service.projectId });
           if (typeof launch !== 'function') throw new ControlPlaneError('LAUNCH_UNAVAILABLE', 'Shared launch is unavailable.', 503);
-          return accepted(await launch(principal, request.body));
+          const operation = await launch(principal, {
+            requestId: requireIdempotencyKey(request),
+            intent,
+          });
+          const statusUrl = `${SHARED_CONTROL_API_PREFIX}/launch-operations/${operation.operationId}`;
+          return accepted({ ...operation, statusUrl }, { location: statusUrl });
+        }
+        const launchOperationMatch = new RegExp(`^${SHARED_CONTROL_API_PREFIX}/launch-operations/([a-f0-9]{64})$`).exec(url.pathname);
+        if (request.method === 'GET' && launchOperationMatch) {
+          if (typeof readLaunchOperation !== 'function') {
+            throw new ControlPlaneError('LAUNCH_UNAVAILABLE', 'Shared launch operation reads are unavailable.', 503);
+          }
+          return ok(await readLaunchOperation(principal, launchOperationMatch[1]));
         }
         if (!runMatch) return error('CONTROL_ROUTE_NOT_FOUND', 'Control route was not found.', 404);
         const [, runId, suffix = ''] = runMatch;
@@ -141,6 +154,27 @@ function recordBody(value) {
 function requireString(value, label) {
   if (typeof value !== 'string' || !value || value.length > 4_096) throw new ControlPlaneError('CONTROL_BODY_INVALID', `${label} is invalid.`, 400);
   return value;
+}
+function requireIdempotencyKey(request) {
+  const value = request.headers?.['idempotency-key'];
+  if (typeof value !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{15,127}$/u.test(value)) {
+    throw new ControlPlaneError('IDEMPOTENCY_KEY_INVALID', 'Launch requires a 16-128 character Idempotency-Key header.', 400);
+  }
+  return value;
+}
+function parseLaunchIntent(value) {
+  if (Object.keys(value).length !== 2 || value.schemaVersion !== 1 || !('runContract' in value)) {
+    throw new ControlPlaneError(
+      'LAUNCH_INTENT_INVALID',
+      'Launch accepts only schemaVersion and runContract; run IDs, subjects, work items, projects, and actors are server-derived.',
+      400,
+    );
+  }
+  try {
+    return Object.freeze({ schemaVersion: 1, runContract: parseRunContract(value.runContract) });
+  } catch (error) {
+    throw new ControlPlaneError('LAUNCH_INTENT_INVALID', error instanceof Error ? error.message : String(error), 400);
+  }
 }
 function sessionToken(request) {
   return String(request.headers?.cookie ?? '').split(';').map((part) => part.trim()).find((part) => part.startsWith('audit_session='))?.slice(14) ?? '';

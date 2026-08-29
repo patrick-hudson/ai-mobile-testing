@@ -37,6 +37,11 @@ import { appendPublicationEnvelope } from '../shared/publication-envelope.mjs';
 import { projectSharedReleaseView } from '../shared/release-projection.mjs';
 import { sealFinalReleaseSubject, sealReleaseSubjectCore } from '../shared/release-subject.mjs';
 import { CONTROL_EXIT_CODES, controlExitCode } from '../shared/control-client-contract.mjs';
+import {
+  acceptSharedLaunchOperation,
+  getSharedLaunchOperation,
+  openSharedLaunchOperationStore,
+} from './lib/shared-launch-operation-store.mjs';
 
 const root = await mkdtemp(path.join(tmpdir(), 'shared-control-plane-'));
 let now = Date.parse('2026-08-28T20:00:00.000Z');
@@ -516,9 +521,117 @@ try {
   assert.equal(purgedLineage.authorityTombstone.finalSubjectDigest, projection.finalSubject.digest);
 
   const claimStore = await openPromotionClaimStore({ root: path.join(root, 'claims'), clock });
+  const launchOperationRoot = path.join(root, 'launch-operations');
+  const launchOperationStore = await openSharedLaunchOperationStore({ root: launchOperationRoot, clock });
+  const launchIntent = {
+    schemaVersion: 1,
+    runContract: {
+      schemaVersion: 1,
+      mode: 'single-site',
+      url: 'https://beta.example.test',
+      deploymentRole: 'preview',
+      certificatePolicy: 'strict',
+      targetIds: ['single-mobile'],
+      scope: { qualifier: 'FULL', pluginIds: [], auditIds: [], areas: [] },
+    },
+  };
+  const launch = async (principal, request) => acceptSharedLaunchOperation(launchOperationStore, {
+    principal,
+    projectId: 'project-1',
+    requestId: request.requestId,
+    intent: request.intent,
+  });
+  const readLaunchOperation = async (principal, operationId) => {
+    const operation = await getSharedLaunchOperation(launchOperationStore, operationId);
+    assertPrincipalAuthorized(principal, CONTROL_ACTIONS.OPERATION_READ, { projectId: operation.projectId });
+    return operation;
+  };
   const api = createSharedControlApi({
     authority, service: reopenedControl, claimStore, expectedOrigin: 'https://audit.example.test', sessionCookiePath: '/',
+    launch, readLaunchOperation,
   });
+  const callerAuthoredAuthority = await api.handle({
+    method: 'POST', url: '/api/control/v1/runs',
+    headers: {
+      authorization: `Bearer ${operatorIssued.credential}`,
+      'content-type': 'application/json',
+      'idempotency-key': 'launch-request-0001',
+    },
+    body: { ...launchIntent, parentRun: { runId: 'caller-selected', subjectCore: { mode: 'single-site' } } },
+  });
+  assert.equal(callerAuthoredAuthority.status, 400, 'launch must reject caller-authored run IDs and release authority');
+  const missingLaunchKey = await api.handle({
+    method: 'POST', url: '/api/control/v1/runs',
+    headers: { authorization: `Bearer ${operatorIssued.credential}`, 'content-type': 'application/json' },
+    body: launchIntent,
+  });
+  assert.equal(missingLaunchKey.status, 400, 'launch must require an idempotency key');
+  const acceptedLaunch = await api.handle({
+    method: 'POST', url: '/api/control/v1/runs',
+    headers: {
+      authorization: `Bearer ${operatorIssued.credential}`,
+      'content-type': 'application/json',
+      'idempotency-key': 'launch-request-0001',
+    },
+    body: launchIntent,
+  });
+  assert.equal(acceptedLaunch.status, 202);
+  assert.match(acceptedLaunch.body.data.operationId, /^[a-f0-9]{64}$/u);
+  assert.equal(acceptedLaunch.body.data.runId, null, 'the run ID does not exist until the durable launch operation materializes it');
+  assert.equal(acceptedLaunch.body.data.statusUrl,
+    `/api/control/v1/launch-operations/${acceptedLaunch.body.data.operationId}`);
+  assert.equal(acceptedLaunch.headers.location, acceptedLaunch.body.data.statusUrl);
+  const duplicateLaunch = await api.handle({
+    method: 'POST', url: '/api/control/v1/runs',
+    headers: {
+      authorization: `Bearer ${operatorIssued.credential}`,
+      'content-type': 'application/json',
+      'idempotency-key': 'launch-request-0001',
+    },
+    body: launchIntent,
+  });
+  assert.deepEqual(duplicateLaunch.body.data, acceptedLaunch.body.data,
+    'an exact launch retry must return the same durable operation');
+  const conflictingLaunch = await api.handle({
+    method: 'POST', url: '/api/control/v1/runs',
+    headers: {
+      authorization: `Bearer ${operatorIssued.credential}`,
+      'content-type': 'application/json',
+      'idempotency-key': 'launch-request-0001',
+    },
+    body: { ...launchIntent, runContract: { ...launchIntent.runContract, url: 'https://changed.example.test' } },
+  });
+  assert.equal(conflictingLaunch.status, 409);
+  assert.equal(conflictingLaunch.body.error.code, 'IDEMPOTENCY_CONFLICT');
+  const reopenedLaunchStore = await openSharedLaunchOperationStore({ root: launchOperationRoot, clock });
+  const restartApi = createSharedControlApi({
+    authority, service: reopenedControl, claimStore, expectedOrigin: 'https://audit.example.test',
+    launch: async (principal, request) => acceptSharedLaunchOperation(reopenedLaunchStore, {
+      principal, projectId: 'project-1', requestId: request.requestId, intent: request.intent,
+    }),
+    readLaunchOperation: async (principal, operationId) => {
+      const operation = await getSharedLaunchOperation(reopenedLaunchStore, operationId);
+      assertPrincipalAuthorized(principal, CONTROL_ACTIONS.OPERATION_READ, { projectId: operation.projectId });
+      return operation;
+    },
+  });
+  const recoveredLaunch = await restartApi.handle({
+    method: 'GET', url: acceptedLaunch.body.data.statusUrl,
+    headers: { authorization: `Bearer ${operatorIssued.credential}` },
+  });
+  assert.equal(recoveredLaunch.status, 200);
+  assert.equal(recoveredLaunch.body.data.operationId, acceptedLaunch.body.data.operationId,
+    'accepted launch operation must remain retrievable after portal/service restart');
+  const viewerLaunch = await restartApi.handle({
+    method: 'POST', url: '/api/control/v1/runs',
+    headers: {
+      authorization: `Bearer ${viewerIssued.credential}`,
+      'content-type': 'application/json',
+      'idempotency-key': 'viewer-launch-0001',
+    },
+    body: launchIntent,
+  });
+  assert.equal(viewerLaunch.status, 403, 'view-only principals cannot launch runs');
   const login = await api.handle({
     method: 'POST', url: '/api/control/v1/session',
     headers: { origin: 'https://audit.example.test', 'sec-fetch-site': 'same-origin', 'content-type': 'application/json' },

@@ -22,11 +22,16 @@ import { createConsoleApi, handleConsoleApiRequest } from './console-api.mjs';
 import { createSharedControlApi, createSharedRequestAuthorizer } from './shared-control-api.mjs';
 import { rejectRetiredLegacyMutation } from './shared-legacy-mutation-policy.mjs';
 import { openScopedCredentialAuthority } from './scoped-credential-authority.mjs';
-import { validateMutationDeployment } from '../shared/control-plane-contract.mjs';
+import { assertPrincipalAuthorized, CONTROL_ACTIONS, validateMutationDeployment } from '../shared/control-plane-contract.mjs';
 import { assertSharedListScope, classifySharedReadRequest } from './shared-read-policy.mjs';
-import { createParentRun, openParentRunStore } from '../scripts/lib/parent-run-store.mjs';
+import { openParentRunStore } from '../scripts/lib/parent-run-store.mjs';
 import { createSharedControlService } from '../scripts/lib/shared-control-service.mjs';
 import { openPromotionClaimStore } from '../scripts/lib/promotion-claim-store.mjs';
+import {
+  acceptSharedLaunchOperation,
+  getSharedLaunchOperation,
+  openSharedLaunchOperationStore,
+} from '../scripts/lib/shared-launch-operation-store.mjs';
 import {
   getConsoleCapabilities,
   resolveConsoleActionAvailability,
@@ -521,6 +526,9 @@ if (process.env.PORTAL_SHARED_CONTROL === '1') {
     root: process.env.PORTAL_SHARED_CREDENTIAL_ROOT ?? join(SECRET_ROOT, 'control-identities'),
   });
   const claimStore = await openPromotionClaimStore({ root: join(SECRET_ROOT, 'promotion-claims') });
+  const launchOperationStore = await openSharedLaunchOperationStore({
+    root: join(controlStore.root, 'launch-operations'),
+  });
   sharedProjectId = process.env.AUDIT_SHARED_PROJECT_ID ?? 'default';
   sharedRequestAuthorizer = createSharedRequestAuthorizer({ authority: credentialAuthority });
   sharedControlApi = createSharedControlApi({
@@ -530,11 +538,16 @@ if (process.env.PORTAL_SHARED_CONTROL === '1') {
     claimStore,
     expectedOrigin: deployment.publishedOrigin,
     sessionCookiePath: '/',
-    launch: async (_principal, body) => {
-      if (!body?.parentRun || !['single-site', 'comparative'].includes(body.mode)) throw httpError(400, 'Shared launch requires mode and parentRun.');
-      if (body.projectId !== sharedProjectId) throw httpError(403, 'Shared launch project does not match this control service.');
-      if (body.parentRun.subjectCore?.mode && body.parentRun.subjectCore.mode !== body.mode) throw httpError(409, 'Shared launch mode disagrees with the release subject.');
-      return createParentRun(controlStore, body.parentRun);
+    launch: (principal, request) => acceptSharedLaunchOperation(launchOperationStore, {
+      principal,
+      projectId: sharedProjectId,
+      requestId: request.requestId,
+      intent: request.intent,
+    }),
+    readLaunchOperation: async (principal, operationId) => {
+      const operation = await getSharedLaunchOperation(launchOperationStore, operationId);
+      assertPrincipalAuthorized(principal, CONTROL_ACTIONS.OPERATION_READ, { projectId: operation.projectId });
+      return operation;
     },
   });
 }
