@@ -95,6 +95,23 @@ pre { max-height: 24rem; overflow: auto; margin: .5rem 0 0; padding: .7rem; bord
 .empty { padding: 1rem; border: 1px dashed var(--line); border-radius: .5rem; color: var(--muted); }
 .run-diagnostics, .ai-review-summary { margin-top: 2rem; padding: 1rem; border: 1px solid var(--line); border-radius: .7rem; background: var(--panel); }
 .ai-review-summary { border-left: .45rem solid var(--review); }
+.archive-product-risk { margin: 0 0 1rem; padding: 1rem; border: 1px solid var(--line); border-left: .45rem solid var(--accent); border-radius: .35rem; background: var(--panel); }
+.archive-product-risk .eyebrow { color: var(--muted); }
+.archive-authority-heading { display: flex; align-items: end; justify-content: space-between; gap: 1rem; padding-bottom: .75rem; border-bottom: 1px solid var(--line); }
+.archive-authority-heading h2 { margin: .1rem 0 0; }
+.archive-authority-heading > span { max-width: 44rem; color: var(--muted); text-align: right; }
+#archive-authority-content { display: grid; grid-template-columns: minmax(17rem, .8fr) minmax(34rem, 2fr); gap: .8rem; padding-top: .8rem; }
+.archive-authority-decision, .archive-risk-register, .archive-operation-context { min-width: 0; padding: .85rem; border: 1px solid var(--line); background: var(--panel-strong); }
+.archive-authority-decision h3, .archive-risk-register h3, .archive-operation-context h3 { margin: 0 0 .5rem; }
+.archive-authority-decision p, .archive-risk-register p, .archive-operation-context p { margin: .35rem 0; }
+.archive-authority-eyebrow { color: var(--muted); font-size: .72rem; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; }
+.archive-operation-context { grid-column: 1 / -1; }
+.archive-risk-table-wrap { max-height: 28rem; overflow: auto; border: 1px solid var(--line); }
+.archive-risk-table { width: 100%; border-collapse: collapse; font-size: .8rem; }
+.archive-risk-table th, .archive-risk-table td { padding: .55rem; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+.archive-risk-table th { position: sticky; z-index: 1; top: 0; background: var(--panel-strong); }
+.archive-risk-table td:first-child { min-width: 13rem; }
+.archive-risk-table td:first-child span { display: block; margin-top: .25rem; color: var(--muted); }
 .visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 [hidden] { display: none !important; }
 
@@ -107,6 +124,10 @@ pre { max-height: 24rem; overflow: auto; margin: .5rem 0 0; padding: .7rem; bord
   .audit-intent { grid-template-columns: 1fr; }
   .audit-body { padding-left: 1rem; }
   .controls { position: static; }
+  .archive-authority-heading { align-items: start; flex-direction: column; }
+  .archive-authority-heading > span { text-align: left; }
+  #archive-authority-content { grid-template-columns: 1fr; }
+  .archive-operation-context { grid-column: auto; }
 }
 
 @media (prefers-color-scheme: dark) {

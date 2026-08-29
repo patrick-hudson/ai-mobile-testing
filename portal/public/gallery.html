@@ -37,6 +37,22 @@
         </header>
         <div class="console-workspace-body gallery-workspace-body">
           <main id="gallery-main" class="console-main gallery-page-shell" aria-labelledby="gallery-title">
+      <section id="gallery-product-risk" class="gallery-product-risk" aria-labelledby="gallery-product-risk-title" data-risk-availability="LOADING" aria-busy="true" hidden>
+        <div class="gallery-authority-heading">
+          <div><p class="step-label">AUTHORITATIVE RELEASE VIEW</p><h2 id="gallery-product-risk-title" tabindex="-1">Product Risk</h2></div>
+          <span id="gallery-risk-status" role="status" aria-live="polite">Loading revision-bound release authority…</span>
+        </div>
+        <section id="gallery-shared-session" class="gallery-shared-session" aria-label="Shared release authorization" hidden>
+          <p id="gallery-shared-session-status" role="status" aria-live="polite">Checking browser authorization…</p>
+          <form id="gallery-shared-login">
+            <label>Scoped control credential
+              <input name="gallery-control-credential" type="password" required autocomplete="off" maxlength="4096" />
+            </label>
+            <button class="primary-button" type="submit">Authorize gallery access</button>
+          </form>
+        </section>
+        <div id="gallery-shared-authority"></div>
+      </section>
       <section class="gallery-run-state" aria-labelledby="gallery-run-state-title">
         <div>
           <p class="eyebrow">RUN VISUAL EVIDENCE</p>

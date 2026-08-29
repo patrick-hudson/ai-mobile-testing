@@ -1,7 +1,8 @@
-(() => {
+(async () => {
   'use strict';
 
   let manifest;
+  let sharedRelease = null;
   try {
     manifest = JSON.parse(document.getElementById('audit-manifest').textContent);
     const galleryDescriptor = JSON.parse(document.getElementById('gallery-archive-head').textContent);
@@ -12,6 +13,10 @@
       galleryDescriptor.archiveBundle ?? null,
       galleryDescriptor.schemaVersion,
     );
+    if (document.getElementById('shared-release-publication')) {
+      if (!globalThis.Quitting7ohArchiveRelease?.render) throw new TypeError('The pinned release-authority renderer is unavailable.');
+      sharedRelease = await globalThis.Quitting7ohArchiveRelease.render(document);
+    }
   } catch (error) {
     const fatal = document.getElementById('archive-runtime-fatal');
     if (fatal) fatal.hidden = false;
@@ -203,8 +208,24 @@
     const run = manifest.run;
     document.getElementById('run-context').textContent = `${run.profile} profile · ${run.source} · generated ${new Date(manifest.generatedAt).toLocaleString()} · ${formatDuration(run.durationMs)}`;
     const decision = document.getElementById('release-decision');
-    decision.innerHTML = `<strong>${text(manifest.release.decision.replace('_', ' '))}</strong><span>${text(manifest.release.reason)}</span><small>${text(manifest.release.decisionBasis)}</small>`;
-    decision.dataset.ready = String(manifest.release.ready);
+    const headerRelease = sharedRelease?.unavailable ? {
+      label: 'RELEASE AUTHORITY UNAVAILABLE',
+      reason: 'The sealed shared publication failed validation.',
+      basis: 'Legacy checklist evidence remains readable but cannot authorize release.',
+      ready: false,
+    } : sharedRelease ? {
+      label: sharedRelease.decision.label,
+      reason: `${sharedRelease.decision.code} · ${sharedRelease.decision.grantedAuthority} authority`,
+      basis: `Shared publication run revision ${sharedRelease.revisions.run}; Site Health and checklist diagnostics remain separate.`,
+      ready: sharedRelease.decision.ready,
+    } : {
+      label: manifest.release.decision.replace('_', ' '),
+      reason: manifest.release.reason,
+      basis: manifest.release.decisionBasis,
+      ready: manifest.release.ready,
+    };
+    decision.innerHTML = `<strong>${text(headerRelease.label)}</strong><span>${text(headerRelease.reason)}</span><small>${text(headerRelease.basis)}</small>`;
+    decision.dataset.ready = String(headerRelease.ready);
     const cards = [
       [manifest.summary.total, 'catalog checks'],
       [manifest.summary.executed, 'checks executed'],

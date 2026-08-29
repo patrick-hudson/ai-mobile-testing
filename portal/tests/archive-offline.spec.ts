@@ -9,6 +9,7 @@ import {
   ARCHIVE_BUNDLE_VERSION,
   ARCHIVE_RUNTIME_VERSION,
 } from '../../reporters/archive-bundle.js';
+import { sharedPublicationFixture } from './shared-publication-fixture.js';
 
 async function expectNoSeriousAxeViolations(page: Page) {
   const analysis = await new AxeBuilder({ page }).analyze();
@@ -16,15 +17,26 @@ async function expectNoSeriousAxeViolations(page: Page) {
   expect(blocking, JSON.stringify(blocking, null, 2)).toEqual([]);
 }
 
+function mutateEmbeddedJson(source: string, id: string, mutate: (value: any) => void): string {
+  const expression = new RegExp(`(<script id="${id}" type="application/json">)([^<]+)(</script>)`);
+  return source.replace(expression, (_match, opening: string, encoded: string, closing: string) => {
+    const value = JSON.parse(encoded);
+    mutate(value);
+    return `${opening}${JSON.stringify(value)}${closing}`;
+  });
+}
+
 test.describe.serial('archive-offline generated report', () => {
   let temporaryRoot: string;
   let reportDirectory: string;
+  const publication = sharedPublicationFixture('comparative', 'archive-shared-release');
 
   test.beforeAll(async () => {
     temporaryRoot = await mkdtemp(path.join(tmpdir(), 'quitting7oh-archive-offline-'));
     reportDirectory = path.join(temporaryRoot, 'checklist');
     await writeAuditReport({
       outputDir: reportDirectory,
+      releasePublicationEnvelope: publication.envelope,
       tests: [],
       run: {
         status: 'passed',
@@ -52,12 +64,26 @@ test.describe.serial('archive-offline generated report', () => {
     await expect(page.locator('#archive-runtime-fatal')).toBeHidden();
     await expect(page.locator('#result-count')).toContainText('audit checks');
     await expect(page.locator('#ai-review-state')).toContainText('No AI advisory is packaged');
+    await expect(page.getByRole('heading', { name: 'Product Risk' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'FEATURE READY' })).toBeVisible();
+    await expect(page.locator('#archive-product-risk')).toHaveAttribute('data-risk-availability', 'PARTIAL');
+    await expect(page.locator('#archive-authority-revisions')).toContainText('Run revision 7');
+    await expect(page.locator('#archive-risk-register')).toContainText('Manual checkout remains outstanding');
+    await expect(page.locator('#archive-risk-register')).toContainText('Certificate validation bypass');
+    await expect(page.locator('#archive-product-risk').evaluate((node) => Boolean(node.compareDocumentPosition(document.querySelector('.gallery-callout')!) & Node.DOCUMENT_POSITION_FOLLOWING))).resolves.toBe(true);
 
     const embeddedBundle = await page.locator('#archive-bundle').evaluate((node) => JSON.parse(node.textContent ?? '{}'));
     expect(embeddedBundle).toMatchObject({
       bundleVersion: ARCHIVE_BUNDLE_VERSION,
       runtimeVersion: ARCHIVE_RUNTIME_VERSION,
       assetBase: `assets/archive-v${ARCHIVE_BUNDLE_VERSION}`,
+    });
+    const embeddedPublication = await page.locator('#shared-release-publication').evaluate((node) => JSON.parse(node.textContent ?? '{}'));
+    expect(embeddedPublication).toMatchObject({
+      publication: { runId: 'archive-shared-release', envelopeDigest: publication.view.publication.envelopeDigest },
+      revisions: publication.view.revisions,
+      decision: { certifiedScope: publication.view.decision.certifiedScope },
+      riskRegister: { availability: 'PARTIAL' },
     });
 
     await page.locator('#search').fill('__no_audit_should_match__');
@@ -90,6 +116,10 @@ test.describe.serial('archive-offline generated report', () => {
     await expect(page.locator('#gallery-loading')).toBeHidden();
     await expect(page.locator('#gallery-fatal')).toBeHidden();
     await expect(page.locator('#gallery-workbench')).not.toBeEmpty();
+    await expect(page.getByRole('heading', { name: 'Product Risk' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'FEATURE READY' })).toBeVisible();
+    await expect(page.locator('#archive-product-risk')).toHaveAttribute('data-risk-availability', 'PARTIAL');
+    await expect(page.locator('#archive-authority-revisions')).toContainText('Run revision 7');
     await expect(page.locator('.gallery-context')).toContainText('This run has no eligible visual evidence');
     await expect(page.locator('.gallery-context .gallery-loader')).toHaveCount(0);
     await expect(page.getByRole('region', { name: 'Nearby visual evidence' })).toBeVisible();
@@ -133,5 +163,29 @@ test.describe.serial('archive-offline generated report', () => {
     await expect(page.locator('#archive-runtime-fatal-message')).toContainText(/archive bundle|does not match/i);
     await expect(page.locator('.masthead')).toBeHidden();
     await expect(page.locator('main')).toBeHidden();
+  });
+
+  test('decision, risk, and revision tampering fail the embedded publication digest closed', async ({ context, page }) => {
+    const reportPath = path.join(reportDirectory, 'index.html');
+    const source = await readFile(reportPath, 'utf8');
+    await context.setOffline(true);
+    const mutations = [
+      ['decision', (value: any) => { value.decision.label = 'TAMPERED READY'; }],
+      ['risk', (value: any) => { value.riskRegister.risks[0].explanation = 'Tampered risk explanation.'; }],
+      ['revision', (value: any) => { value.revisions.run += 1; }],
+    ] as const;
+    for (const [name, mutate] of mutations) {
+      const invalidPath = path.join(reportDirectory, `invalid-release-${name}.html`);
+      const invalid = mutateEmbeddedJson(source, 'shared-release-publication', mutate);
+      expect(invalid).not.toEqual(source);
+      await writeFile(invalidPath, invalid, 'utf8');
+      await page.goto(pathToFileURL(invalidPath).href);
+      await expect(page.locator('#archive-runtime-fatal')).toBeHidden();
+      await expect(page.locator('#archive-product-risk')).toHaveAttribute('data-risk-availability', 'UNAVAILABLE');
+      await expect(page.locator('#archive-risk-status')).toContainText('digest check');
+      await expect(page.locator('#release-decision')).toContainText('RELEASE AUTHORITY UNAVAILABLE');
+      await expect(page.locator('#release-decision')).not.toContainText('TAMPERED READY');
+      await expect(page.locator('#audit-list')).toBeVisible();
+    }
   });
 });

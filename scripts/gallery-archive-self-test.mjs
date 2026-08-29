@@ -10,21 +10,21 @@ import { createGalleryWorkbench as portalCreateGalleryWorkbench } from '../porta
 await import('../reporters/assets/archive-runtime.js');
 
 const archiveRuntime = globalThis.Quitting7ohArchiveRuntime;
-assert.equal(archiveRuntime.CURRENT_RUNTIME_VERSION, 2);
+assert.equal(archiveRuntime.CURRENT_RUNTIME_VERSION, 3);
 assert.equal(archiveRuntime.validateBundleContract(null, null, 1).bundleVersion, 1,
   'Runtime N must retain legacy bundle N-1 support when metadata is absent.');
 const currentBundle = {
   schemaVersion: 1,
-  bundleVersion: 2,
-  runtimeVersion: 2,
+  bundleVersion: 3,
+  runtimeVersion: 3,
   minimumReaderVersion: 1,
   dataSchemaVersion: 1,
-  assetBase: 'assets/archive-v2',
-  manifestHref: 'assets/archive-v2/bundle.json',
+  assetBase: 'assets/archive-v3',
+  manifestHref: 'assets/archive-v3/bundle.json',
 };
 assert.equal(
   archiveRuntime.validateBundleContract(currentBundle, currentBundle, 1).bundleVersion,
-  2,
+  3,
   'Runtime N must accept the current generated bundle.',
 );
 assert.throws(
@@ -38,8 +38,8 @@ assert.throws(
 );
 assert.throws(
   () => archiveRuntime.validateBundleContract(
-    { ...currentBundle, bundleVersion: 3, runtimeVersion: 3, assetBase: 'assets/archive-v3', manifestHref: 'assets/archive-v3/bundle.json' },
-    { ...currentBundle, bundleVersion: 3, runtimeVersion: 3, assetBase: 'assets/archive-v3', manifestHref: 'assets/archive-v3/bundle.json' },
+    { ...currentBundle, bundleVersion: 4, runtimeVersion: 4, assetBase: 'assets/archive-v4', manifestHref: 'assets/archive-v4/bundle.json' },
+    { ...currentBundle, bundleVersion: 4, runtimeVersion: 4, assetBase: 'assets/archive-v4', manifestHref: 'assets/archive-v4/bundle.json' },
     1,
   ),
   /not compatible/i,

@@ -347,6 +347,8 @@ export interface GenerateReportOptions {
   definitionCatalog?: readonly AuditDefinition[];
   /** Complete resolved Playwright project selection, including projects that emitted no test rows. */
   selectedProjects?: readonly ReportProjectInput[];
+  /** Exact shared publication envelope selected for report and gallery export. */
+  releasePublicationEnvelope?: unknown;
 }
 
 const STATUS_ORDER: ChecklistStatus[] = [
@@ -1135,9 +1137,15 @@ export async function writeAuditReport(options: GenerateReportOptions): Promise<
     outputDir,
     catalog: galleryCatalog,
     exportedAt: manifest.generatedAt,
+    ...(options.releasePublicationEnvelope === undefined ? {} : {
+      releasePublicationEnvelope: options.releasePublicationEnvelope,
+    }),
   });
+  const releasePublication = options.releasePublicationEnvelope === undefined
+    ? null
+    : projectPublicationView(options.releasePublicationEnvelope);
   await writeFile(path.join(outputDir, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
-  await writeFile(path.join(outputDir, 'index.html'), reportHtml(manifest, galleryDescriptor), 'utf8');
+  await writeFile(path.join(outputDir, 'index.html'), reportHtml(manifest, galleryDescriptor, releasePublication), 'utf8');
   await writePortalReportData(outputDir, manifest);
   return manifest;
 }
@@ -1836,7 +1844,11 @@ function inlineJson(value: unknown): string {
     .replaceAll('\u2029', '\\u2029');
 }
 
-function reportHtml(manifest: AuditManifest, galleryDescriptor: GalleryArchiveDescriptor): string {
+function reportHtml(
+  manifest: AuditManifest,
+  galleryDescriptor: GalleryArchiveDescriptor,
+  releasePublication: PublicationView | null,
+): string {
   const bundle = galleryDescriptor.archiveBundle;
   if (!bundle) throw new Error('Generated report requires a pinned archive runtime bundle.');
   return `<!doctype html>
@@ -1863,6 +1875,10 @@ function reportHtml(manifest: AuditManifest, galleryDescriptor: GalleryArchiveDe
     <div id="release-decision" class="release-decision"></div>
   </header>
   <main>
+    ${releasePublication ? `<section id="archive-product-risk" class="archive-product-risk" aria-labelledby="archive-product-risk-title" data-risk-availability="LOADING" aria-busy="true">
+      <div class="archive-authority-heading"><div><p class="eyebrow">AUTHORITATIVE RELEASE VIEW</p><h2 id="archive-product-risk-title">Product Risk</h2></div><span id="archive-risk-status" role="status" aria-live="polite">Loading sealed release authority…</span></div>
+      <div id="archive-authority-content"></div>
+    </section>` : ''}
     <section class="gallery-callout" aria-labelledby="visual-gallery-heading">
       <div>
         <p class="eyebrow">Review without link-by-link hunting</p>
@@ -1898,7 +1914,9 @@ function reportHtml(manifest: AuditManifest, galleryDescriptor: GalleryArchiveDe
   <script id="archive-bundle" type="application/json">${inlineJson(bundle)}</script>
   <script id="audit-manifest" type="application/json">${inlineJson(manifest)}</script>
   <script id="gallery-archive-head" type="application/json">${inlineJson(galleryDescriptor)}</script>
+  ${releasePublication ? `<script id="shared-release-publication" type="application/json">${inlineJson(releasePublication)}</script>` : ''}
   <script src="${bundle.assetBase}/archive-runtime.js"></script>
+  ${releasePublication ? `<script src="${bundle.assetBase}/release-authority.js"></script>` : ''}
   <script src="${bundle.assetBase}/report.js"></script>
 </body>
 </html>`;

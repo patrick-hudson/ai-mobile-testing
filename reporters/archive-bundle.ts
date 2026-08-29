@@ -8,8 +8,8 @@ export function projectArchiveReleasePublication(value: unknown): PublicationVie
   return projectPublicationView(value);
 }
 
-export const ARCHIVE_BUNDLE_VERSION = 2 as const;
-export const ARCHIVE_RUNTIME_VERSION = 2 as const;
+export const ARCHIVE_BUNDLE_VERSION = 3 as const;
+export const ARCHIVE_RUNTIME_VERSION = 3 as const;
 export const ARCHIVE_MINIMUM_READER_VERSION = 1 as const;
 export const ARCHIVE_DATA_SCHEMA_VERSION = 1 as const;
 export const ARCHIVE_ASSET_DIRECTORY = `archive-v${ARCHIVE_BUNDLE_VERSION}` as const;
@@ -34,6 +34,7 @@ const ASSET_SOURCES = Object.freeze([
   ['archive-runtime.js', path.join(REPORTERS_DIR, 'assets', 'archive-runtime.js')],
   ['report.css', path.join(REPORTERS_DIR, 'assets', 'report.css')],
   ['report.js', path.join(REPORTERS_DIR, 'assets', 'report.js')],
+  ['release-authority.js', path.join(REPORTERS_DIR, 'assets', 'release-authority.js')],
   ['gallery-archive.css', path.join(REPORTERS_DIR, 'assets', 'gallery-archive.css')],
   ['gallery-archive.js', path.join(REPORTERS_DIR, 'assets', 'gallery-archive.js')],
   ['gallery-loader.js', path.join(REPORTERS_DIR, 'assets', 'gallery-loader.js')],

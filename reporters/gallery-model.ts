@@ -66,6 +66,9 @@ import type {
   ReportResultInput,
   ReportTestInput,
 } from './report-model.js';
+import { projectPublicationView } from '../shared/release-projection.mjs';
+import type { PublicationView } from '../shared/release-projection.mjs';
+import { canonicalDigest } from '../shared/canonical-contract.mjs';
 import {
   archiveBundleContract,
   ensureArchiveRuntimeBundle,
@@ -125,6 +128,8 @@ export interface WriteGalleryArchiveOptions {
   maxRowsPerChunk?: number;
   maxBytesPerChunk?: number;
   cwd?: string;
+  /** Exact shared publication envelope selected for this sealed export. */
+  releasePublicationEnvelope?: unknown;
 }
 
 export interface PreparedGalleryArchive {
@@ -136,6 +141,7 @@ export interface PreparedGalleryArchive {
   expectedExportRevision: string | null;
   expectedFlagRevision: string;
   flagHistoryPath: string;
+  releasePublication: PublicationView | null;
 }
 
 const execFileAsync = promisify(execFile);
@@ -1677,12 +1683,19 @@ export async function prepareGalleryArchive(options: WriteGalleryArchiveOptions)
     ? new Date(options.exportedAt).toISOString()
     : new Date().toISOString();
   const archiveBundle = archiveBundleContract();
+  const releasePublication = options.releasePublicationEnvelope === undefined
+    ? null
+    : projectPublicationView(options.releasePublicationEnvelope);
+  const releasePublicationDigest = releasePublication === null
+    ? null
+    : canonicalDigest(releasePublication) as `sha256:${string}`;
   const exportRevision = `export_${stableGalleryKey({
     contentRevision,
     flagRevision,
     orderRevision,
     exportedAt,
     archiveBundle,
+    releasePublicationDigest,
   })}`;
   const revisionHref = `gallery/revisions/${exportRevision}`;
   const finalDir = path.join(galleryRoot, 'revisions', exportRevision);
@@ -1757,6 +1770,7 @@ export async function prepareGalleryArchive(options: WriteGalleryArchiveOptions)
     exportRevision,
     exportedAt,
     archiveBundle,
+    ...(releasePublicationDigest === null ? {} : { releasePublicationDigest }),
     primaryCounts: options.catalog.primaryCounts,
     facets: {
       kinds: facet(queryRows.map(({ kind }) => kind)),
@@ -1804,12 +1818,18 @@ export async function prepareGalleryArchive(options: WriteGalleryArchiveOptions)
     expectedExportRevision: current?.exportRevision ?? null,
     expectedFlagRevision: flagRevision,
     flagHistoryPath,
+    releasePublication,
   };
 }
 
 export async function publishPreparedGalleryArchive(prepared: PreparedGalleryArchive): Promise<GalleryArchiveDescriptor> {
   const requestPath = path.join(prepared.galleryRoot, `.publish-${prepared.descriptor.exportRevision}-${randomUUID()}.json`);
-  const surfacePagePath = await stageGalleryArchiveSurface(prepared.outputDir, prepared.galleryRoot, prepared.descriptor);
+  const surfacePagePath = await stageGalleryArchiveSurface(
+    prepared.outputDir,
+    prepared.galleryRoot,
+    prepared.descriptor,
+    prepared.releasePublication,
+  );
   const helper = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'scripts', 'gallery-publish.mjs');
   try {
     await writeFile(requestPath, `${JSON.stringify({
@@ -1862,7 +1882,11 @@ function inlineArchiveJson(value: unknown): string {
     .replaceAll('\u2029', '\\u2029');
 }
 
-function galleryArchiveHtml(descriptor: GalleryArchiveDescriptor, inlineModule: string): string {
+function galleryArchiveHtml(
+  descriptor: GalleryArchiveDescriptor,
+  inlineModule: string,
+  releasePublication: PublicationView | null,
+): string {
   const bundle = descriptor.archiveBundle ?? archiveBundleContract();
   return `<!doctype html>
 <html lang="en">
@@ -1890,6 +1914,10 @@ function galleryArchiveHtml(descriptor: GalleryArchiveDescriptor, inlineModule: 
     </dl>
   </header>
   <main class="gallery-archive-main">
+    ${releasePublication ? `<section id="archive-product-risk" class="archive-product-risk" aria-labelledby="archive-product-risk-title" data-risk-availability="LOADING" aria-busy="true">
+      <div class="archive-authority-heading"><div><p class="gallery-archive-eyebrow">AUTHORITATIVE RELEASE VIEW</p><h2 id="archive-product-risk-title">Product Risk</h2></div><span id="archive-risk-status" role="status" aria-live="polite">Loading sealed release authority…</span></div>
+      <div id="archive-authority-content"></div>
+    </section>` : ''}
     <div id="gallery-loading" class="gallery-archive-loading" role="status" aria-live="polite">Opening the pinned evidence index…</div>
     <section id="gallery-fatal" class="gallery-archive-error" hidden aria-labelledby="gallery-fatal-title">
       <h2 id="gallery-fatal-title">The archive gallery could not open</h2>
@@ -1919,7 +1947,9 @@ function galleryArchiveHtml(descriptor: GalleryArchiveDescriptor, inlineModule: 
   <p id="gallery-announcer" class="gallery-archive-visually-hidden" role="status" aria-live="polite" aria-atomic="true"></p>
   <script id="archive-bundle" type="application/json">${inlineArchiveJson(bundle)}</script>
   <script id="gallery-archive-head" type="application/json">${inlineArchiveJson(descriptor)}</script>
+  ${releasePublication ? `<script id="shared-release-publication" type="application/json">${inlineArchiveJson(releasePublication)}</script>` : ''}
   <script src="${bundle.assetBase}/archive-runtime.js"></script>
+  ${releasePublication ? `<script src="${bundle.assetBase}/release-authority.js"></script><script>void globalThis.Quitting7ohArchiveRelease.render(document)</script>` : ''}
   <script src="${bundle.assetBase}/gallery-loader.js"></script>
   <script type="module">${inlineModule}</script>
 </body>
@@ -1945,6 +1975,7 @@ async function stageGalleryArchiveSurface(
   outputDir: string,
   galleryRoot: string,
   descriptor: GalleryArchiveDescriptor,
+  releasePublication: PublicationView | null,
 ): Promise<string> {
   const bundle = await ensureArchiveRuntimeBundle(outputDir);
   if (JSON.stringify(descriptor.archiveBundle) !== JSON.stringify(bundle)) {
@@ -1958,7 +1989,7 @@ async function stageGalleryArchiveSurface(
   const surfacePagePath = path.join(galleryRoot, `.surface-${descriptor.exportRevision}-${randomUUID()}.html`);
   await writeFile(
     surfacePagePath,
-    galleryArchiveHtml(descriptor, archiveInlineModule(coreSource, adapterSource)),
+    galleryArchiveHtml(descriptor, archiveInlineModule(coreSource, adapterSource), releasePublication),
     'utf8',
   );
   return surfacePagePath;

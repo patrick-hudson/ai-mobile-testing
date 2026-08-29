@@ -1022,7 +1022,13 @@ export function createGalleryWorkbench(root, options = {}) {
     } catch (error) {
       if (controller.signal.aborted || error?.name === 'AbortError') return null;
       if (error?.status === 410 || error?.code === 'GALLERY_RUN_PURGED') dispatch({ type: 'PURGED' });
-      else dispatch({ type: 'REQUEST_FAILED', slot, generation, semanticKey, error: error?.message ?? error });
+      else dispatch({
+        type: 'REQUEST_FAILED',
+        slot,
+        generation,
+        semanticKey,
+        error: error?.message ?? error?.error?.message ?? error?.detail ?? error,
+      });
       return null;
     } finally {
       if (controllers.get(slot)?.generation === generation) controllers.delete(slot);

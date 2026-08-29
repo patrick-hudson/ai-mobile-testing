@@ -35,6 +35,7 @@ import {
 } from '../reporters/report-model.js';
 import {
   ARCHIVE_ASSET_DIRECTORY,
+  ARCHIVE_BUNDLE_VERSION,
   archiveBundleAssetContents,
   archiveBundleContract,
 } from '../reporters/archive-bundle.js';
@@ -502,6 +503,7 @@ try {
     orderRevision: firstDescriptor.orderRevision,
     exportedAt: firstDescriptor.exportedAt,
     archiveBundle: firstDescriptor.archiveBundle,
+    releasePublicationDigest: null,
   })}`, 'The immutable export revision must bind the archive bundle contract.');
   assert.equal(firstDescriptor.phase, 'sealed');
   assert.equal(firstDescriptor.primaryCounts.total, catalog.primaryCounts.total);
@@ -511,7 +513,7 @@ try {
   assert.match(archivePageAtFirstExport, /Visual Evidence Gallery/);
   assert.match(archivePageAtFirstExport, /Read-only snapshot/);
   assert.match(archivePageAtFirstExport, new RegExp(firstDescriptor.exportRevision));
-  assert.match(archivePageAtFirstExport, /assets\/archive-v2\/archive-runtime\.js/);
+  assert.match(archivePageAtFirstExport, /assets\/archive-v3\/archive-runtime\.js/);
   assert.match(archivePageAtFirstExport, /id="archive-bundle"/);
   assert.doesNotMatch(archivePageAtFirstExport, /audit-manifest|manifest\.json/);
   const stagedArchiveAssets = await archiveBundleAssetContents();
@@ -537,7 +539,7 @@ try {
     bundleVersion: number;
     assets: Record<string, { bytes: number; sha256: string }>;
   };
-  assert.equal(bundleManifest.bundleVersion, 2);
+  assert.equal(bundleManifest.bundleVersion, ARCHIVE_BUNDLE_VERSION);
   assert.deepEqual(Object.keys(bundleManifest.assets).sort(), stagedArchiveAssets.map(({ name }) => name).sort());
   const canonicalCoreSource = stagedArchiveAssets.find(({ name }) => name === 'gallery-core.js')?.bytes.toString('utf8');
   assert(canonicalCoreSource, 'The archive bundle must contain the bounded canonical gallery core.');

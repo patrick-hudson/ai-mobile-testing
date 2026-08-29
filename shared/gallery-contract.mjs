@@ -229,12 +229,16 @@ export function assertGalleryArchiveDescriptor(value) {
   if (value.archiveBundle !== undefined) {
     const bundle = value.archiveBundle;
     if (!bundle || typeof bundle !== 'object' || Array.isArray(bundle)
-      || bundle.schemaVersion !== 1 || bundle.bundleVersion !== 2 || bundle.runtimeVersion !== 2
+      || bundle.schemaVersion !== 1 || ![2, 3].includes(bundle.bundleVersion) || bundle.runtimeVersion !== bundle.bundleVersion
       || bundle.minimumReaderVersion !== 1 || bundle.dataSchemaVersion !== GALLERY_SCHEMA_VERSION
-      || bundle.assetBase !== 'assets/archive-v2'
-      || bundle.manifestHref !== 'assets/archive-v2/bundle.json') {
+      || bundle.assetBase !== `assets/archive-v${bundle.bundleVersion}`
+      || bundle.manifestHref !== `assets/archive-v${bundle.bundleVersion}/bundle.json`) {
       throw new TypeError('Gallery archive descriptor has an invalid runtime bundle contract.');
     }
+  }
+  if (value.releasePublicationDigest !== undefined
+    && (typeof value.releasePublicationDigest !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(value.releasePublicationDigest))) {
+    throw new TypeError('Gallery archive descriptor has an invalid shared release publication digest.');
   }
   if (!value.query || !Array.isArray(value.query.chunks) || !Number.isInteger(value.query.rows) || value.query.rows < 0) {
     throw new TypeError('Gallery archive descriptor has an invalid query index.');

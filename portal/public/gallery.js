@@ -6,6 +6,12 @@ import { createLiveGalleryDataSource } from './gallery-data-source.js';
 import { parseConsoleUrlState, serializeConsoleUrlState } from '/console-contracts.mjs';
 import { createRunInvalidationBus, publishRunInvalidation } from './console-invalidation.js';
 import { createConsoleUrlState } from './console-url-state.js';
+import {
+  assertSharedWorkspaceProjection,
+  createSharedControlBrowserClient,
+  orderSharedRisksForReview,
+  SharedControlBrowserError,
+} from './shared-control-client.js';
 
 const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{2,159}$/;
 const ITEM_ID = /^gitem_[a-f0-9]{16}$/;
@@ -32,6 +38,8 @@ const ACTIVITY_CHARACTER_LIMIT = 64 * 1024;
 const DELTA_PAGE_LIMIT = 100;
 const DELTA_ROW_LIMIT = 25_000;
 const REVIEWER_KEY = 'quitting7oh.gallery.reviewer-label.v1';
+const SHARED_REFRESH_MS = 5_000;
+const TERMINAL_SHARED_EXECUTIONS = new Set(['completed_pass', 'completed_product_failure', 'incomplete', 'cancelled']);
 
 const elements = Object.fromEntries([
   'gallery-back', 'gallery-connection', 'gallery-refresh', 'gallery-run-id', 'gallery-phase', 'gallery-counts',
@@ -47,7 +55,12 @@ const elements = Object.fromEntries([
   'visual-review-dialog', 'visual-review-form', 'visual-review-dialog-title', 'visual-review-close',
   'visual-review-cancel', 'visual-review-identity', 'visual-review-disposition', 'visual-review-rationale',
   'visual-review-confirmation-copy', 'visual-review-confirmation', 'visual-review-dialog-state', 'visual-review-submit',
+  'gallery-product-risk', 'gallery-product-risk-title', 'gallery-risk-status', 'gallery-shared-session',
+  'gallery-shared-session-status', 'gallery-shared-login', 'gallery-shared-authority',
 ].map((id) => [id.replaceAll('-', '_'), document.querySelector(`#${id}`)]));
+
+const sharedControl = createSharedControlBrowserClient();
+const sharedCredential = elements.gallery_shared_login?.elements.namedItem('gallery-control-credential');
 
 const galleryUrlState = createConsoleUrlState({
   window,
@@ -100,6 +113,10 @@ const state = {
   purged: false,
   terminalGeneration: 0,
   urlSearch: galleryUrlState.current.search,
+  sharedSessionReady: false,
+  sharedWorkspace: null,
+  sharedController: null,
+  sharedRefreshTimer: null,
 };
 
 state.invalidation = createRunInvalidationBus({
@@ -115,6 +132,8 @@ init().catch((error) => showFatal(error));
 
 async function init() {
   if (!state.runId) throw new PortalGalleryError(400, 'INVALID_GALLERY_URL', 'Choose a valid run from the release audit console.');
+  bindSharedAuthorityEvents();
+  await initializeGalleryAuthority();
   if (parsed.runMode === 'single-site') return initSingleSiteGallery();
   const encodedRun = encodeURIComponent(state.runId);
   elements.gallery_run_id.textContent = state.runId;
@@ -152,6 +171,242 @@ async function init() {
   if (elements.raw_drawer.open) await loadRawFiles();
 }
 
+function bindSharedAuthorityEvents() {
+  elements.gallery_shared_login.addEventListener('submit', (event) => void authorizeSharedGallery(event));
+}
+
+async function initializeGalleryAuthority() {
+  elements.gallery_product_risk.hidden = false;
+  elements.gallery_shared_session.hidden = false;
+  elements.gallery_shared_login.hidden = false;
+  try {
+    await sharedControl.restore();
+    state.sharedSessionReady = true;
+    elements.gallery_shared_login.hidden = true;
+    elements.gallery_shared_session_status.textContent = 'Shared gallery session restored.';
+    await loadSharedGalleryAuthority();
+  } catch (error) {
+    state.sharedSessionReady = false;
+    if (sharedControlDisabled(error)) {
+      elements.gallery_product_risk.hidden = true;
+      elements.gallery_shared_session.hidden = true;
+      return;
+    }
+    elements.gallery_shared_session_status.textContent = error instanceof SharedControlBrowserError && error.status === 401
+      ? 'Enter a scoped credential to view shared release authority.'
+      : `Shared gallery session unavailable: ${friendlyError(error)}`;
+    renderSharedGalleryUnavailable(error);
+  }
+}
+
+async function authorizeSharedGallery(event) {
+  event.preventDefault();
+  if (!elements.gallery_shared_login.reportValidity()) return;
+  const button = elements.gallery_shared_login.querySelector('button');
+  button.disabled = true;
+  elements.gallery_shared_session_status.textContent = 'Authorizing gallery access…';
+  try {
+    await sharedControl.login(sharedCredential.value);
+    sharedCredential.value = '';
+    state.sharedSessionReady = true;
+    elements.gallery_shared_login.hidden = true;
+    elements.gallery_shared_session_status.textContent = 'Shared gallery session authorized. Credential discarded from the form.';
+    await loadSharedGalleryAuthority({ focus: true });
+    await retryGalleryEvidenceAfterAuthorization();
+  } catch (error) {
+    sharedCredential.value = '';
+    elements.gallery_shared_session_status.textContent = `Authorization failed: ${friendlyError(error)}`;
+    sharedCredential.focus();
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function retryGalleryEvidenceAfterAuthorization() {
+  if (parsed.runMode === 'single-site') {
+    await state.singleSite?.load();
+    return;
+  }
+  if (state.workbench) await refreshHead({ initial: !state.head });
+}
+
+function sharedControlDisabled(error) {
+  return error instanceof SharedControlBrowserError
+    && (error.status === 404
+      || (error.status === 503 && error.message === 'Shared control API is not enabled.'));
+}
+
+async function loadSharedGalleryAuthority({ focus = false } = {}) {
+  window.clearTimeout(state.sharedRefreshTimer);
+  state.sharedController?.abort();
+  const controller = new AbortController();
+  state.sharedController = controller;
+  elements.gallery_product_risk.hidden = false;
+  elements.gallery_product_risk.dataset.riskAvailability = 'LOADING';
+  elements.gallery_product_risk.setAttribute('aria-busy', 'true');
+  elements.gallery_risk_status.textContent = 'LOADING · Reading one revision-bound publication, execution set, and bounded log view.';
+  try {
+    const workspace = assertSharedWorkspaceProjection(await sharedControl.readWorkspace(state.runId, {
+      signal: controller.signal,
+      logLimit: 200,
+    }), { runId: state.runId, mode: parsed.runMode });
+    if (controller.signal.aborted) return;
+    state.sharedWorkspace = workspace;
+    renderSharedGalleryAuthority(workspace);
+    if (focus) elements.gallery_product_risk_title.focus();
+    if (sharedGalleryNeedsRefresh(workspace)) {
+      state.sharedRefreshTimer = window.setTimeout(() => void loadSharedGalleryAuthority(), SHARED_REFRESH_MS);
+    }
+  } catch (error) {
+    if (controller.signal.aborted) return;
+    state.sharedWorkspace = null;
+    renderSharedGalleryUnavailable(error);
+  } finally {
+    if (state.sharedController === controller) state.sharedController = null;
+  }
+}
+
+function sharedGalleryNeedsRefresh(workspace) {
+  return ['LOADING', 'PROVISIONAL'].includes(workspace.riskAvailability)
+    || workspace.executions.executions.some(({ state: executionState }) => !TERMINAL_SHARED_EXECUTIONS.has(executionState));
+}
+
+function renderSharedGalleryUnavailable(error) {
+  const detail = friendlyError(error);
+  elements.gallery_product_risk.dataset.riskAvailability = 'UNAVAILABLE';
+  elements.gallery_product_risk.setAttribute('aria-busy', 'false');
+  elements.gallery_risk_status.textContent = `UNAVAILABLE · ${detail} No no-risk or release-authority claim can be made.`;
+  const card = document.createElement('section');
+  card.className = 'gallery-authority-unavailable';
+  card.append(
+    textElement('h3', 'Shared release authority unavailable'),
+    textElement('p', 'Historical gallery evidence may remain readable, but it cannot substitute for the current shared publication.'),
+  );
+  elements.gallery_shared_authority.replaceChildren(card);
+  announce(`Shared release authority unavailable. ${detail}`);
+}
+
+function renderSharedGalleryAuthority(workspace) {
+  const { publication, executions, logs } = workspace;
+  const { decision, riskRegister } = publication;
+  const availability = riskRegister.availability;
+  elements.gallery_product_risk.dataset.riskAvailability = availability;
+  elements.gallery_product_risk.setAttribute('aria-busy', String(availability === 'LOADING'));
+  elements.gallery_risk_status.textContent = sharedRiskAvailabilityCopy(availability, riskRegister.risks.length);
+
+  const decisionCard = document.createElement('section');
+  decisionCard.className = 'gallery-authority-decision';
+  const decisionTitle = textElement('h3', decision.label);
+  const scope = textElement('p', scopeSummary(decision.certifiedScope));
+  scope.id = 'gallery-certified-scope';
+  const revisions = textElement('p', `Decision revision ${publication.decisionRevision} · Run revision ${publication.runRevision} · Risk revision ${publication.riskRevision}`);
+  revisions.id = 'gallery-authority-revisions';
+  decisionCard.append(
+    textElement('p', 'Release Decision', 'gallery-authority-eyebrow'),
+    decisionTitle,
+    textElement('p', `${decision.code ?? decision.label.replaceAll(' ', '_')} · ${decision.grantedAuthority} authority`),
+    scope,
+    revisions,
+    textElement('p', decision.superseded
+      ? 'SUPERSEDED · This historical revision cannot authorize release.'
+      : 'CURRENT · Bound to the displayed immutable release subject and certified scope.'),
+  );
+
+  const register = document.createElement('section');
+  register.id = 'gallery-risk-register';
+  register.className = 'gallery-risk-register';
+  register.append(textElement('h3', 'Risk Register'));
+  if (availability === 'EMPTY') {
+    register.append(textElement('p', 'The complete register contains no active product risks.'));
+  } else if (riskRegister.risks.length === 0) {
+    register.append(textElement('p', `${availability} risk data contains no published rows. This is not a no-risk claim.`));
+  } else {
+    register.append(renderSharedRiskTable(orderSharedRisksForReview(riskRegister.risks)));
+  }
+
+  const operations = document.createElement('section');
+  operations.className = 'gallery-operation-context';
+  operations.append(textElement('h3', 'Live execution and recovery'));
+  const active = executions.executions.filter(({ state: executionState }) => !TERMINAL_SHARED_EXECUTIONS.has(executionState));
+  const incomplete = executions.executions.filter(({ state: executionState }) => executionState === 'incomplete');
+  const executionState = textElement('p', `${active.length} active execution${active.length === 1 ? '' : 's'} · ${incomplete.length} incomplete`);
+  executionState.id = 'gallery-execution-state';
+  const recovery = textElement('p', incomplete.length > 0
+    ? `${incomplete.slice(0, 20).map(({ id }) => id).join(', ')} · incomplete-only rekick available in the run workspace`
+    : 'No incomplete executions require rekick.');
+  recovery.id = 'gallery-recovery-state';
+  const logSummary = textElement('p', `${logs.events.length} bounded operation event${logs.events.length === 1 ? '' : 's'} · ${logs.attemptLogs.length} bounded attempt log row${logs.attemptLogs.length === 1 ? '' : 's'}`);
+  operations.append(executionState, recovery, logSummary);
+
+  const actions = document.createElement('div');
+  actions.className = 'gallery-authority-actions';
+  const workspaceLink = document.createElement('a');
+  workspaceLink.href = `/run.html?mode=${encodeURIComponent(parsed.runMode)}&run=${encodeURIComponent(state.runId)}&view=overview`;
+  workspaceLink.textContent = 'Open recovery and review controls';
+  workspaceLink.className = 'primary-button';
+  actions.append(workspaceLink);
+  elements.gallery_shared_authority.replaceChildren(decisionCard, register, operations, actions);
+  announce(`${decision.label}. Risk Register ${availability}. Run revision ${publication.runRevision}.`);
+}
+
+function renderSharedRiskTable(risks) {
+  const wrapper = document.createElement('div');
+  wrapper.className = 'gallery-risk-table-wrap';
+  wrapper.tabIndex = 0;
+  wrapper.setAttribute('role', 'region');
+  wrapper.setAttribute('aria-label', 'Bounded Product Risk register');
+  const table = document.createElement('table');
+  table.className = 'gallery-risk-table';
+  table.innerHTML = '<thead><tr><th>Risk</th><th>Severity</th><th>Scope</th><th>Review</th><th>Release effect</th><th>Recommended action</th></tr></thead>';
+  const body = document.createElement('tbody');
+  for (const risk of risks.slice(0, 200)) {
+    const row = document.createElement('tr');
+    row.dataset.riskIdentity = risk.identity;
+    const riskCell = document.createElement('td');
+    riskCell.append(textElement('strong', humanize(risk.category)), textElement('span', risk.explanation));
+    row.append(
+      riskCell,
+      textElement('td', String(risk.severity).toUpperCase()),
+      textElement('td', scopeSummary(risk.affectedScope ?? risk.scope ?? `${risk.mode ?? parsed.runMode} · ${risk.source.id}`)),
+      textElement('td', humanize(risk.reviewState)),
+      textElement('td', `${risk.releaseEffect} · never changes the decision`),
+      textElement('td', risk.recommendedAction),
+    );
+    body.append(row);
+  }
+  table.append(body);
+  wrapper.append(table);
+  return wrapper;
+}
+
+function sharedRiskAvailabilityCopy(availability, count) {
+  if (availability === 'EMPTY') return 'EMPTY · Register complete; no active product risks were published.';
+  if (availability === 'AVAILABLE') return `AVAILABLE · ${count} published risk record${count === 1 ? '' : 's'}.`;
+  if (availability === 'PROVISIONAL') return `PROVISIONAL · ${count} risk record${count === 1 ? '' : 's'} published; review may change as evidence arrives.`;
+  if (availability === 'PARTIAL') return `PARTIAL · ${count} risk record${count === 1 ? '' : 's'} published; missing rows cannot be treated as no risk.`;
+  if (availability === 'LOADING') return 'LOADING · The Risk Register is still being assembled; no no-risk claim can be made.';
+  return 'UNAVAILABLE · The Risk Register could not be read; no no-risk claim can be made.';
+}
+
+function scopeSummary(value) {
+  if (Array.isArray(value)) return value.join(', ') || 'No scope values published';
+  if (!value || typeof value !== 'object') return String(value ?? 'No certified scope published');
+  const values = [
+    ...(value.features ?? []).map((entry) => `feature ${entry}`),
+    ...(value.definitions ?? []).map((entry) => `definition ${entry}`),
+    ...(value.targets ?? []).map((entry) => `target ${entry}`),
+    ...(value.knownLimits ?? value.limitations ?? []).map((entry) => `limit ${entry}`),
+  ];
+  return values.join(' · ') || 'No scope values published';
+}
+
+function textElement(tag, value, className = '') {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  node.textContent = String(value ?? '');
+  return node;
+}
+
 function bindPageEvents() {
   elements.gallery_refresh.addEventListener('click', () => void refreshHead());
   elements.gallery_retry.addEventListener('click', () => void refreshHead());
@@ -184,7 +439,11 @@ async function refreshHead({ initial = false } = {}) {
     if (!head) {
       elements.gallery_loading.hidden = true;
       elements.gallery_loading.setAttribute('aria-busy', 'false');
-      elements.gallery_connection.textContent = state.workbench.getState().purged ? 'Run removed' : 'Gallery needs attention';
+      const workbenchState = state.workbench.getState();
+      const headError = new Error(workbenchState.requests?.head?.error ?? 'The visual evidence descriptor is unavailable.');
+      if (state.sharedWorkspace && !workbenchState.purged) showEvidenceUnavailable(headError);
+      else if (!workbenchState.purged) showFatal(headError);
+      else elements.gallery_connection.textContent = 'Run removed';
       return false;
     }
     state.head = head;
@@ -207,6 +466,7 @@ async function refreshHead({ initial = false } = {}) {
     return true;
   } catch (error) {
     if (error?.status === 410 || error?.code === 'GALLERY_RUN_PURGED') terminatePurged(friendlyError(error));
+    else if (initial && state.sharedWorkspace && error?.status === 404) showEvidenceUnavailable(error);
     else if (initial) showFatal(error); else announce(`Gallery refresh failed. ${friendlyError(error)}`);
     return false;
   } finally {
@@ -426,7 +686,12 @@ async function loggedJson(url, options = {}) {
     let value = null;
     try { value = text ? JSON.parse(text) : null; } catch { /* handled as a structured response error below */ }
     activity('HTTP', `${method} ${activityPath} · ${response.status} · ${Math.round(performance.now() - started)} ms · ${text.length} bytes${options.rowCount ? ` · ${Number(options.rowCount(value) ?? 0)} rows` : ''}`);
-    if (!response.ok) throw new PortalGalleryError(response.status, value?.code ?? 'GALLERY_REQUEST_FAILED', value?.error ?? value?.message ?? `Request failed with ${response.status}.`, value);
+    if (!response.ok) throw new PortalGalleryError(
+      response.status,
+      value?.code ?? value?.error?.code ?? 'GALLERY_REQUEST_FAILED',
+      value?.error?.message ?? value?.error ?? value?.message ?? `Request failed with ${response.status}.`,
+      value,
+    );
     if (value === null) throw new PortalGalleryError(502, 'INVALID_GALLERY_RESPONSE', 'The portal returned an invalid JSON response.');
     return value;
   } catch (error) {
@@ -920,6 +1185,7 @@ async function initSingleSiteGallery() {
     },
     onFatal(error) {
       if (error?.status === 410 || error?.code === 'GALLERY_RUN_PURGED') terminatePurged(friendlyError(error));
+      else if (state.sharedWorkspace) showEvidenceUnavailable(error);
       else showFatal(error);
     },
     resolveMediaUrl: ({ value, item, view }) => safeSingleSiteMediaUrl(value, item, view, endpoints),
@@ -930,7 +1196,14 @@ async function initSingleSiteGallery() {
       isActive: () => Boolean(document.fullscreenElement),
     },
     onBaselineIntent: ({ operation, item, opener }) => openSingleSiteBaselineDialog(operation, item, opener),
-    onVisualReviewIntent: ({ item, opener }) => openSingleSiteVisualReviewDialog(item, opener),
+    onVisualReviewIntent: ({ item, opener }) => {
+      if (state.sharedSessionReady) {
+        announce('Release-changing visual dispositions are available in the revision-bound run workspace.');
+        elements.gallery_shared_authority.querySelector('a')?.focus();
+        return;
+      }
+      openSingleSiteVisualReviewDialog(item, opener);
+    },
   });
   state.singleSite = controller;
   elements.gallery_refresh.addEventListener('click', () => void controller.load());
@@ -1318,6 +1591,14 @@ function showFatal(error) {
   announce(`${elements.gallery_fatal_title.textContent}. ${elements.gallery_fatal_message.textContent}`);
 }
 
+function showEvidenceUnavailable(error) {
+  elements.gallery_loading.hidden = true;
+  elements.gallery_fatal.hidden = true;
+  elements.gallery_connection.textContent = 'Evidence unavailable';
+  elements.gallery_lifecycle.textContent = `The current shared release authority is available, but legacy visual evidence is not: ${friendlyError(error)}`;
+  announce(`Product Risk remains available. Visual evidence is unavailable. ${friendlyError(error)}`);
+}
+
 function terminatePurged(message, { publish = true } = {}) {
   if (state.purged) return;
   state.purged = true;
@@ -1359,6 +1640,8 @@ function destroy() {
   state.terminalGeneration += 1;
   state.singleSiteMutationController?.abort();
   state.singleSiteReviewController?.abort();
+  state.sharedController?.abort();
+  window.clearTimeout(state.sharedRefreshTimer);
   state.singleSite?.destroy?.();
   cancelFlagMutation();
   state.flagController?.abort();

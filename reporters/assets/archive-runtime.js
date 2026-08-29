@@ -1,8 +1,8 @@
 (() => {
   'use strict';
 
-  const CURRENT_RUNTIME_VERSION = 2;
-  const CURRENT_BUNDLE_VERSION = 2;
+  const CURRENT_RUNTIME_VERSION = 3;
+  const CURRENT_BUNDLE_VERSION = 3;
   const MINIMUM_BUNDLE_VERSION = 1;
   const DATA_SCHEMA_VERSION = 1;
 

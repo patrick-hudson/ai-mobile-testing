@@ -218,13 +218,15 @@ export interface GalleryArchiveDescriptor {
   /** Missing only on retained bundle-v1 exports. New exports always publish this contract. */
   archiveBundle?: {
     schemaVersion: 1;
-    bundleVersion: 2;
-    runtimeVersion: 2;
+    bundleVersion: 2 | 3;
+    runtimeVersion: 2 | 3;
     minimumReaderVersion: 1;
     dataSchemaVersion: 1;
-    assetBase: 'assets/archive-v2';
-    manifestHref: 'assets/archive-v2/bundle.json';
+    assetBase: 'assets/archive-v2' | 'assets/archive-v3';
+    manifestHref: 'assets/archive-v2/bundle.json' | 'assets/archive-v3/bundle.json';
   };
+  /** Digest of the canonical shared release projection embedded in this sealed surface. */
+  releasePublicationDigest?: `sha256:${string}`;
   primaryCounts: GalleryCatalog['primaryCounts'];
   facets: {
     kinds: string[];
