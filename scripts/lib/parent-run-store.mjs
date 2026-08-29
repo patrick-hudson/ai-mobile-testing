@@ -9,11 +9,13 @@ import { parseExecutionManifest, sealWorkItemResult } from '../../shared/executi
 import { parseFinalReleaseSubject, parseReleaseSubjectCore } from '../../shared/release-subject.mjs';
 import {
   atomicWriteJson,
+  atomicWriteFile,
   containedPath,
   fsyncDirectory,
   openAtomicStorage,
   pathExists,
   readBoundedJson,
+  readBoundedFile,
   withDirectoryLock,
 } from './atomic-filesystem.mjs';
 import {
@@ -31,6 +33,12 @@ const WORK_OUTCOMES = new Set([
   'completed_pass', 'completed_product_failure', 'operational_failure', 'cancelled', 'incomplete_unknown',
 ]);
 const DIGEST_PATTERN = /^sha256:[a-f0-9]{64}$/;
+const CAPABILITY_PATTERN = /^[a-z][a-z0-9.-]*:[a-z][a-z0-9.-]*$/;
+const RESOURCE_CLASSES = new Set(['ordinary', 'performance']);
+export const MAX_ATTEMPT_ARTIFACTS = 64;
+export const MAX_ATTEMPT_ARTIFACT_BYTES = 8 * 1_048_576;
+export const MAX_ATTEMPT_EVIDENCE_BYTES = 16 * 1_048_576;
+const ARTIFACT_MEDIA_TYPE = /^[a-z0-9][a-z0-9.+-]{0,126}\/[a-z0-9][a-z0-9.+-]{0,126}$/i;
 
 export class ParentRunStoreError extends Error {
   constructor(code, message, details = undefined) {
@@ -47,6 +55,78 @@ function fail(code, message, details) {
 
 function safeId(value, label) {
   if (typeof value !== 'string' || !SAFE_ID.test(value)) fail('STORE_SCHEMA_INVALID', `${label} is invalid.`);
+  return value;
+}
+
+function schedulingCapability(value, label = 'capability') {
+  if (typeof value !== 'string' || !CAPABILITY_PATTERN.test(value) || value.length > 128) {
+    fail('STORE_SCHEMA_INVALID', `${label} is invalid.`);
+  }
+  return value;
+}
+
+function schedulingString(value, label, { nullable = false, maximum = 512 } = {}) {
+  if (nullable && value === null) return null;
+  if (typeof value !== 'string' || !value.trim() || value.length > maximum || value.includes('\0')) {
+    fail('STORE_SCHEMA_INVALID', `${label} is invalid.`);
+  }
+  return value;
+}
+
+function artifactName(value) {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 240 || value.includes('\\') || value.includes('\0')) {
+    fail('STORE_SCHEMA_INVALID', 'Artifact name is invalid.');
+  }
+  const segments = value.split('/');
+  if (value.startsWith('/') || segments.some((segment) => !segment || segment === '.' || segment === '..')) {
+    fail('STORE_SCHEMA_INVALID', 'Artifact name must be a normalized relative path.');
+  }
+  return value;
+}
+
+function decodeArtifactUpload(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || Object.keys(value).length !== 5
+    || !['name', 'mediaType', 'sizeBytes', 'digest', 'contentBase64'].every((key) => key in value)) {
+    fail('STORE_SCHEMA_INVALID', 'Artifact upload has an invalid schema.');
+  }
+  const name = artifactName(value.name);
+  if (typeof value.mediaType !== 'string' || !ARTIFACT_MEDIA_TYPE.test(value.mediaType)) {
+    fail('STORE_SCHEMA_INVALID', 'Artifact media type is invalid.');
+  }
+  if (!Number.isSafeInteger(value.sizeBytes) || value.sizeBytes < 1 || value.sizeBytes > MAX_ATTEMPT_ARTIFACT_BYTES
+    || typeof value.contentBase64 !== 'string' || value.contentBase64.length === 0
+    || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value.contentBase64)) {
+    fail('STORE_SCHEMA_INVALID', 'Artifact upload size or encoding is invalid.');
+  }
+  const bytes = Buffer.from(value.contentBase64, 'base64');
+  if (bytes.length !== value.sizeBytes || bytes.toString('base64') !== value.contentBase64) {
+    fail('STORE_SCHEMA_INVALID', 'Artifact upload size does not match its canonical base64 content.');
+  }
+  const digest = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
+  if (value.digest !== digest) fail('ARTIFACT_DIGEST_MISMATCH', `Artifact ${name} digest does not match its bytes.`);
+  return { name, mediaType: value.mediaType.toLowerCase(), sizeBytes: bytes.length, digest, bytes };
+}
+
+function validateArtifactRecord(value, { runId, workItemId, attempt, leaseToken }) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || Object.keys(value).length !== 5
+    || !['name', 'mediaType', 'sizeBytes', 'digest', 'relativePath'].every((key) => key in value)) {
+    fail('STORE_CORRUPT', 'Stored artifact record has an invalid schema.');
+  }
+  let name;
+  try { name = artifactName(value.name); } catch {
+    fail('STORE_CORRUPT', 'Stored artifact name is invalid.');
+  }
+  if (typeof value.mediaType !== 'string' || !ARTIFACT_MEDIA_TYPE.test(value.mediaType)
+    || !Number.isSafeInteger(value.sizeBytes) || value.sizeBytes < 1 || value.sizeBytes > MAX_ATTEMPT_ARTIFACT_BYTES
+    || !DIGEST_PATTERN.test(value.digest)) {
+    fail('STORE_CORRUPT', 'Stored artifact metadata is invalid.');
+  }
+  const expected = path.posix.join('evidence', workItemId, `${String(attempt).padStart(6, '0')}-${leaseToken}`, name);
+  if (value.relativePath !== expected || value.relativePath.includes('\\') || value.relativePath.startsWith('/')) {
+    fail('STORE_CORRUPT', `Stored artifact path escaped attempt ${runId}/${workItemId}.`);
+  }
   return value;
 }
 
@@ -219,7 +299,18 @@ async function recoverUnlocked(store, runId, { repairCache = true } = {}) {
   for (const [id, item] of Object.entries(snapshot.workItems)) {
     if (item?.id !== id || !SAFE_ID.test(id) || !Number.isSafeInteger(item.maxAttempts) || item.maxAttempts < 1
       || !['queued', 'running', 'completed_pass', 'completed_product_failure', 'cancelled', 'incomplete'].includes(item.state)
-      || !Array.isArray(item.attempts)) fail('STORE_CORRUPT', `Parent run ${runId} has invalid work-item state.`);
+      || !Array.isArray(item.attempts)
+      || !CAPABILITY_PATTERN.test(item.capability)
+      || !RESOURCE_CLASSES.has(item.resourceClass)
+      || typeof item.targetId !== 'string'
+      || (item.specAffinity !== null && typeof item.specAffinity !== 'string')) {
+      fail('STORE_CORRUPT', `Parent run ${runId} has invalid work-item state.`);
+    }
+  }
+  if (typeof snapshot.runnerRevision !== 'string' || !snapshot.runnerRevision
+    || !snapshot.resourceScheduling || typeof snapshot.resourceScheduling !== 'object'
+    || !('performanceDrain' in snapshot.resourceScheduling) || !('exclusiveLease' in snapshot.resourceScheduling)) {
+    fail('STORE_CORRUPT', `Parent run ${runId} has invalid shared-worker scheduling state.`);
   }
   if (snapshot.runRevision !== latest.runRevision) {
     fail('STORE_CORRUPT', `Parent run ${runId} has an invalid recovery snapshot.`);
@@ -327,6 +418,7 @@ export async function createParentRun(store, input) {
   const subjectCoreDigest = subjectCore?.digest ?? input.subjectCoreDigest;
   const executionManifestDigest = executionManifest?.digest ?? input.executionManifestDigest ?? null;
   const finalSubjectDigest = finalSubject?.digest ?? input.finalSubjectDigest ?? null;
+  const runnerRevision = schedulingString(input.runnerRevision ?? 'legacy-runner', 'runnerRevision', { maximum: 256 });
   if (!DIGEST_PATTERN.test(subjectCoreDigest)
     || (executionManifestDigest !== null && !DIGEST_PATTERN.test(executionManifestDigest))
     || (finalSubjectDigest !== null && !DIGEST_PATTERN.test(finalSubjectDigest))) {
@@ -358,8 +450,15 @@ export async function createParentRun(store, input) {
       if (!Number.isSafeInteger(item.maxAttempts) || item.maxAttempts < 1 || item.maxAttempts > 16) {
         fail('STORE_SCHEMA_INVALID', `Work item ${id} maxAttempts must be from 1 through 16.`);
       }
+      const capability = schedulingCapability(item.capability ?? 'browser:any', `Work item ${id} capability`);
+      const resourceClass = item.resourceClass ?? 'ordinary';
+      if (!RESOURCE_CLASSES.has(resourceClass)) fail('STORE_SCHEMA_INVALID', `Work item ${id} resourceClass is invalid.`);
       workItems[id] = {
         id,
+        capability,
+        resourceClass,
+        targetId: schedulingString(item.targetId ?? 'unspecified-target', `Work item ${id} targetId`, { maximum: 128 }),
+        specAffinity: schedulingString(item.specAffinity ?? null, `Work item ${id} specAffinity`, { nullable: true, maximum: 512 }),
         state: 'queued',
         maxAttempts: item.maxAttempts,
         lease: null,
@@ -380,10 +479,15 @@ export async function createParentRun(store, input) {
       finalSubject,
       finalSubjectDigest,
       compilationState,
+      runnerRevision,
       createdAt,
       updatedAt: createdAt,
       coordinator: null,
       workItems,
+      resourceScheduling: {
+        performanceDrain: null,
+        exclusiveLease: null,
+      },
       operations: {},
       currentPublicationDigest: null,
       ledgerSequences: { decision: 0, risk: 0, mutation: 1, operation: 0 },
@@ -503,39 +607,145 @@ export async function heartbeatCoordinator(store, coordinator, { leaseMs }) {
   });
 }
 
+function validatedWorkerScheduling(input) {
+  const workerId = safeId(input?.workerId, 'workerId');
+  const capabilities = input.capabilities ?? ['browser:any'];
+  const resourceClasses = input.resourceClasses ?? ['ordinary'];
+  if (!Array.isArray(capabilities) || capabilities.length === 0 || capabilities.length > 32) {
+    fail('STORE_SCHEMA_INVALID', 'Worker capabilities must be a bounded non-empty array.');
+  }
+  if (!Array.isArray(resourceClasses) || resourceClasses.length !== 1
+    || resourceClasses.some((entry) => !RESOURCE_CLASSES.has(entry))) {
+    fail('STORE_SCHEMA_INVALID', 'A worker must declare exactly one resource class.');
+  }
+  const normalizedCapabilities = [...new Set(capabilities.map((entry) => schedulingCapability(entry, 'worker capability')))].sort();
+  const normalizedResourceClasses = [...new Set(resourceClasses)].sort();
+  return { workerId, capabilities: normalizedCapabilities, resourceClasses: normalizedResourceClasses };
+}
+
+function workerCanRun(item, worker) {
+  return worker.resourceClasses.includes(item.resourceClass)
+    && (item.capability === 'browser:any'
+      || worker.capabilities.includes('browser:any')
+      || worker.capabilities.includes(item.capability));
+}
+
+export async function requestPerformanceDrain(store, runId, coordinator, input) {
+  const worker = validatedWorkerScheduling({
+    workerId: input?.workerId,
+    capabilities: ['performance:lighthouse'],
+    resourceClasses: ['performance'],
+  });
+  const leaseMs = input?.leaseMs ?? 30_000;
+  if (!Number.isSafeInteger(leaseMs) || leaseMs < 1_000 || leaseMs > 3_600_000) {
+    fail('STORE_SCHEMA_INVALID', 'Performance drain leaseMs must be an integer from 1000 through 3600000.');
+  }
+  return withDirectoryLock(store.storage, globalLockPath(store), () => withDirectoryLock(store.storage, lockPath(store, runId), async () => {
+    const state = await recoverUnlocked(store, runId);
+    await validateCoordinator(store, coordinator);
+    const existing = state.resourceScheduling.performanceDrain;
+    if (existing && Date.parse(existing.expiresAt) > store.clock()) {
+      if (existing.workerId !== worker.workerId || existing.coordinatorEpoch !== coordinator.epoch) {
+        fail('PERFORMANCE_DRAIN_HELD', 'Another worker already holds the active performance drain.');
+      }
+      return clone(existing);
+    }
+    if (state.resourceScheduling.exclusiveLease) fail('PERFORMANCE_LEASE_HELD', 'A performance resource lease is already active.');
+    const eligible = Object.values(state.workItems).some((item) => item.resourceClass === 'performance' && item.state === 'queued');
+    if (!eligible) fail('NO_PERFORMANCE_WORK', 'No queued performance work item is available.');
+    const drain = {
+      workerId: worker.workerId,
+      requestedAt: timestamp(store),
+      expiresAt: new Date(store.clock() + leaseMs).toISOString(),
+      coordinatorEpoch: coordinator.epoch,
+    };
+    await appendMutationUnlocked(store, state, 'mutation', 'performance-drain-requested', (next) => {
+      next.resourceScheduling.performanceDrain = drain;
+    }, { data: { workerId: worker.workerId } });
+    return clone(drain);
+  }));
+}
+
 export async function claimWorkItem(store, runId, coordinator, input) {
   if (!Number.isSafeInteger(input?.leaseMs) || input.leaseMs < 100 || input.leaseMs > 3_600_000) {
     fail('STORE_SCHEMA_INVALID', 'Work-item leaseMs must be an integer from 100 through 3600000.');
   }
+  const worker = validatedWorkerScheduling(input);
   let claimed;
-  await mutate(store, runId, { coordinator, type: 'work-item-claimed', data: { workerId: input.workerId } }, (state) => {
+  await mutate(store, runId, { coordinator, type: 'work-item-claimed', data: { workerId: worker.workerId } }, (state) => {
     if (state.status === 'cancelled') fail('RUN_CANCELLED', `Parent run ${runId} is cancelled.`);
-    const requested = input.workItemId ? state.workItems[input.workItemId] : Object.values(state.workItems).find(({ state: workState }) => workState === 'queued');
-    if (!requested) fail('NO_WORK_AVAILABLE', 'No queued work item is available.');
+    let drain = state.resourceScheduling.performanceDrain;
+    if (drain && Date.parse(drain.expiresAt) <= store.clock()) {
+      state.resourceScheduling.performanceDrain = null;
+      drain = null;
+    }
+    const wantsPerformance = worker.resourceClasses.includes('performance');
+    if (drain && !wantsPerformance) fail('PERFORMANCE_DRAINING', 'Ordinary claims are paused for an exclusive performance execution.');
+    if (wantsPerformance && !drain) fail('PERFORMANCE_DRAIN_REQUIRED', 'Performance work requires an active coordinator drain.');
+    if (drain && Object.values(state.workItems).some((item) => item.resourceClass === 'ordinary' && item.state === 'running')) {
+      fail('PERFORMANCE_DRAIN_PENDING', 'Performance work is waiting for active ordinary browser work to drain.');
+    }
+    if (state.resourceScheduling.exclusiveLease) fail('PERFORMANCE_LEASE_HELD', 'A performance resource lease is already active.');
+    const requested = input.workItemId
+      ? state.workItems[input.workItemId]
+      : Object.values(state.workItems).find((item) => item.state === 'queued' && workerCanRun(item, worker));
+    if (!requested) {
+      const queued = Object.values(state.workItems).some(({ state: workState }) => workState === 'queued');
+      fail(queued ? 'NO_COMPATIBLE_WORK' : 'NO_WORK_AVAILABLE', queued
+        ? 'No queued work item matches this worker capability.'
+        : 'No queued work item is available.');
+    }
     if (input.workItemId && requested.state !== 'queued') {
       if (['completed_pass', 'completed_product_failure', 'cancelled', 'incomplete'].includes(requested.state)) {
         fail('WORK_ITEM_TERMINAL', `Work item ${requested.id} is terminal.`);
       }
       fail('WORK_ITEM_LEASE_HELD', `Work item ${requested.id} already has an active lease.`);
     }
+    if (!workerCanRun(requested, worker)) fail('WORKER_CAPABILITY_MISMATCH', `Worker cannot execute ${requested.id}.`);
+    if (requested.resourceClass === 'performance' && !drain) {
+      fail('PERFORMANCE_DRAIN_REQUIRED', 'Performance work requires an active coordinator drain.');
+    }
+    if (requested.resourceClass === 'ordinary' && drain) {
+      fail('PERFORMANCE_DRAINING', 'Ordinary claims are paused for an exclusive performance execution.');
+    }
     const attempt = requested.attempts.length + 1;
     claimed = {
       runId,
       workItemId: requested.id,
-      workerId: safeId(input.workerId, 'workerId'),
+      workerId: worker.workerId,
       attempt,
       epoch: coordinator.epoch,
       token: store.storage.nonce(),
       claimedAt: timestamp(store),
       expiresAt: new Date(store.clock() + input.leaseMs).toISOString(),
+      subjectCoreDigest: state.subjectCoreDigest,
+      runnerRevision: state.runnerRevision,
+      capability: requested.capability,
+      resourceClass: requested.resourceClass,
+      targetId: requested.targetId,
+      specAffinity: requested.specAffinity,
     };
     requested.state = 'running';
     requested.lease = claimed;
+    if (requested.resourceClass === 'performance') {
+      state.resourceScheduling.exclusiveLease = {
+        workItemId: requested.id,
+        workerId: worker.workerId,
+        attempt,
+        leaseToken: claimed.token,
+        coordinatorEpoch: coordinator.epoch,
+        acquiredAt: claimed.claimedAt,
+        expiresAt: claimed.expiresAt,
+      };
+    }
   });
   return clone(claimed);
 }
 
 function validateWorkLease(state, lease) {
+  if (lease?.runId !== undefined && lease.runId !== state.runId) {
+    fail('WORK_RESULT_BINDING_MISMATCH', 'Work-item lease belongs to a different parent run.');
+  }
   const item = state.workItems[lease?.workItemId];
   if (!item || item.state !== 'running' || !item.lease
     || item.lease.token !== lease.token || item.lease.workerId !== lease.workerId
@@ -606,32 +816,88 @@ export async function adoptWorkHeartbeat(store, runId, coordinator, receipt) {
 }
 
 export async function requeueExpiredWork(store, runId, coordinator) {
-  let count = 0;
-  await mutate(store, runId, { coordinator, type: 'expired-work-requeued' }, (state) => {
-    for (const item of Object.values(state.workItems)) {
-      if (item.state !== 'running' || Date.parse(item.lease.expiresAt) > store.clock()) continue;
-      item.attempts.push({
-        attempt: item.lease.attempt,
-        outcome: 'operational_failure',
-        evidenceDigests: [],
-        workerId: item.lease.workerId,
-        completedAt: timestamp(store),
-        reason: 'lease-expired',
-      });
-      item.lease = null;
-      item.state = item.attempts.length >= item.maxAttempts ? 'incomplete' : 'queued';
-      count += 1;
-    }
-  });
-  return count;
+  return withDirectoryLock(store.storage, globalLockPath(store), () => withDirectoryLock(store.storage, lockPath(store, runId), async () => {
+    const state = await recoverUnlocked(store, runId);
+    await validateCoordinator(store, coordinator);
+    const expiredIds = Object.values(state.workItems)
+      .filter((item) => item.state === 'running' && Date.parse(item.lease.expiresAt) <= store.clock())
+      .map((item) => item.id);
+    const drainExpired = state.resourceScheduling.performanceDrain
+      && Date.parse(state.resourceScheduling.performanceDrain.expiresAt) <= store.clock();
+    const exclusiveExpired = state.resourceScheduling.exclusiveLease
+      && Date.parse(state.resourceScheduling.exclusiveLease.expiresAt) <= store.clock();
+    if (expiredIds.length === 0 && !drainExpired && !exclusiveExpired) return 0;
+    await appendMutationUnlocked(store, state, 'mutation', 'expired-work-requeued', (next) => {
+      for (const id of expiredIds) {
+        const item = next.workItems[id];
+        item.attempts.push({
+          attempt: item.lease.attempt,
+          outcome: 'operational_failure',
+          evidenceDigests: [],
+          artifacts: [],
+          workerId: item.lease.workerId,
+          completedAt: timestamp(store),
+          reason: 'lease-expired',
+        });
+        item.lease = null;
+        item.state = item.attempts.length >= item.maxAttempts ? 'incomplete' : 'queued';
+      }
+      if (exclusiveExpired || expiredIds.some((id) => next.workItems[id].resourceClass === 'performance')) {
+        next.resourceScheduling.exclusiveLease = null;
+      }
+      if (drainExpired || expiredIds.some((id) => next.workItems[id].resourceClass === 'performance'
+        && next.workItems[id].state === 'incomplete')) {
+        next.resourceScheduling.performanceDrain = null;
+      }
+    });
+    return expiredIds.length;
+  }));
 }
 
 export async function publishAttemptEvidence(store, runId, lease, result) {
   const state = await recoverUnlocked(store, runId, { repairCache: false });
   validateWorkLease(state, lease);
-  if (!WORK_OUTCOMES.has(result?.outcome) || !Array.isArray(result.evidenceDigests)
-    || result.evidenceDigests.some((digest) => !/^sha256:[a-f0-9]{64}$/.test(digest))) {
-    fail('STORE_SCHEMA_INVALID', 'Attempt evidence outcome or digests are invalid.');
+  if (!result || typeof result !== 'object' || Array.isArray(result)
+    || Object.keys(result).some((key) => !['outcome', 'reason', 'artifacts'].includes(key))
+    || !WORK_OUTCOMES.has(result?.outcome) || !Array.isArray(result.artifacts)
+    || result.artifacts.length > MAX_ATTEMPT_ARTIFACTS) {
+    fail('STORE_SCHEMA_INVALID', 'Attempt evidence outcome or artifacts are invalid.');
+  }
+  const uploads = result.artifacts.map(decodeArtifactUpload);
+  if (new Set(uploads.map(({ name }) => name)).size !== uploads.length) {
+    fail('STORE_SCHEMA_INVALID', 'Attempt evidence contains a duplicate artifact name.');
+  }
+  if (new Set(uploads.map(({ digest }) => digest)).size !== uploads.length) {
+    fail('STORE_SCHEMA_INVALID', 'Attempt evidence contains duplicate artifact content.');
+  }
+  if (uploads.reduce((total, artifact) => total + artifact.sizeBytes, 0) > MAX_ATTEMPT_EVIDENCE_BYTES) {
+    fail('STORE_SCHEMA_INVALID', 'Attempt evidence exceeds the total byte bound.');
+  }
+  const attemptDirectory = path.posix.join('evidence', lease.workItemId,
+    `${String(lease.attempt).padStart(6, '0')}-${lease.token}`);
+  const artifacts = [];
+  for (const upload of uploads) {
+    const relativePath = path.posix.join(attemptDirectory, upload.name);
+    const artifactPath = containedPath(runDirectory(store, runId), ...relativePath.split('/'));
+    try {
+      await atomicWriteFile(store.storage, artifactPath, upload.bytes, { exclusive: true });
+    } catch (error) {
+      if (error?.code !== 'ATOMIC_ALREADY_EXISTS') throw error;
+      const existing = await readBoundedFile(store.storage, artifactPath, {
+        label: `attempt artifact ${upload.name}`, maximumBytes: MAX_ATTEMPT_ARTIFACT_BYTES,
+      });
+      const existingDigest = `sha256:${createHash('sha256').update(existing).digest('hex')}`;
+      if (existing.length !== upload.sizeBytes || existingDigest !== upload.digest) {
+        fail('STORE_CORRUPT', `Immutable attempt artifact ${upload.name} was replaced with different bytes.`);
+      }
+    }
+    artifacts.push({
+      name: upload.name,
+      mediaType: upload.mediaType,
+      sizeBytes: upload.sizeBytes,
+      digest: upload.digest,
+      relativePath,
+    });
   }
   const body = {
     schemaVersion: 1,
@@ -642,14 +908,33 @@ export async function publishAttemptEvidence(store, runId, lease, result) {
     attempt: lease.attempt,
     coordinatorEpoch: lease.epoch,
     leaseToken: lease.token,
+    subjectCoreDigest: lease.subjectCoreDigest ?? state.subjectCoreDigest,
+    runnerRevision: lease.runnerRevision ?? state.runnerRevision,
     outcome: result.outcome,
-    evidenceDigests: [...result.evidenceDigests],
+    reason: schedulingString(result.reason ?? null, 'Attempt evidence reason', { nullable: true, maximum: 256 }),
+    evidenceDigests: artifacts.map(({ digest }) => digest),
+    artifacts,
     publishedAt: timestamp(store),
   };
   const document = { ...body, digest: canonicalDigest(body) };
   const relativePath = path.join('inboxes', lease.workItemId, `${String(lease.attempt).padStart(6, '0')}-${lease.token}.json`);
-  await atomicWriteJson(store.storage, path.join(runDirectory(store, runId), relativePath), document, { exclusive: true });
-  return { runId, workItemId: lease.workItemId, attempt: lease.attempt, leaseToken: lease.token, relativePath, digest: document.digest };
+  const inboxPath = path.join(runDirectory(store, runId), relativePath);
+  let inboxDigest = document.digest;
+  try {
+    await atomicWriteJson(store.storage, inboxPath, document, { exclusive: true });
+  } catch (error) {
+    if (error?.code !== 'ATOMIC_ALREADY_EXISTS') throw error;
+    const existing = await readBoundedJson(store.storage, inboxPath, { label: 'attempt evidence inbox' });
+    const { digest: existingDigest, publishedAt: existingPublishedAt, ...existingStable } = existing;
+    const desiredStable = { ...body };
+    delete desiredStable.publishedAt;
+    if (!DIGEST_PATTERN.test(existingDigest) || canonicalDigest({ ...existingStable, publishedAt: existingPublishedAt }) !== existingDigest
+      || canonicalJson(existingStable) !== canonicalJson(desiredStable)) {
+      fail('STORE_CORRUPT', 'Immutable attempt evidence inbox was replaced with different content.');
+    }
+    inboxDigest = existingDigest;
+  }
+  return { runId, workItemId: lease.workItemId, attempt: lease.attempt, leaseToken: lease.token, relativePath, digest: inboxDigest };
 }
 
 export async function appendAttemptLog(store, runId, lease, entry) {
@@ -682,12 +967,15 @@ export async function appendAttemptLog(store, runId, lease, entry) {
 }
 
 export async function adoptAttemptEvidence(store, runId, coordinator, inbox) {
+  return withDirectoryLock(store.storage, globalLockPath(store), () => withDirectoryLock(store.storage, lockPath(store, runId), async () => {
+  const state = await recoverUnlocked(store, runId);
+  await validateCoordinator(store, coordinator);
   const file = containedPath(runDirectory(store, runId), inbox.relativePath);
   const document = await readBoundedJson(store.storage, file, { label: 'attempt evidence inbox' });
   const { digest, ...body } = document;
   exactKeys(document, [
     'schemaVersion', 'kind', 'runId', 'workItemId', 'workerId', 'attempt', 'coordinatorEpoch',
-    'leaseToken', 'outcome', 'evidenceDigests', 'publishedAt', 'digest',
+    'leaseToken', 'subjectCoreDigest', 'runnerRevision', 'outcome', 'reason', 'evidenceDigests', 'artifacts', 'publishedAt', 'digest',
   ], 'attempt evidence inbox');
   canonicalTimestamp(document.publishedAt, 'attempt evidence publishedAt');
   if (document.schemaVersion !== 1 || document.kind !== 'attempt-evidence-inbox' || document.runId !== runId
@@ -695,12 +983,47 @@ export async function adoptAttemptEvidence(store, runId, coordinator, inbox) {
     || document.leaseToken !== inbox.leaseToken || !SAFE_ID.test(document.workItemId) || !SAFE_ID.test(document.workerId)
     || !Number.isSafeInteger(document.attempt) || document.attempt < 1
     || !Number.isSafeInteger(document.coordinatorEpoch) || document.coordinatorEpoch < 1
-    || !WORK_OUTCOMES.has(document.outcome) || !Array.isArray(document.evidenceDigests)
+    || !WORK_OUTCOMES.has(document.outcome) || !Array.isArray(document.evidenceDigests) || !Array.isArray(document.artifacts)
+    || (document.reason !== null && (typeof document.reason !== 'string' || !document.reason || document.reason.length > 256))
+    || document.evidenceDigests.length > MAX_ATTEMPT_ARTIFACTS || document.artifacts.length !== document.evidenceDigests.length
+    || new Set(document.evidenceDigests).size !== document.evidenceDigests.length
     || document.evidenceDigests.some((entry) => !DIGEST_PATTERN.test(entry))
     || digest !== canonicalDigest(body) || digest !== inbox.digest) fail('STORE_CORRUPT', 'Attempt evidence inbox is corrupt.');
+  validateWorkLease(state, {
+    runId,
+    workItemId: document.workItemId,
+    workerId: document.workerId,
+    attempt: document.attempt,
+    epoch: document.coordinatorEpoch,
+    token: document.leaseToken,
+  });
+  if (document.subjectCoreDigest !== state.subjectCoreDigest || document.runnerRevision !== state.runnerRevision) {
+    fail('WORK_RESULT_BINDING_MISMATCH', 'Attempt evidence does not match the run subject or runner revision.');
+  }
+  const artifactNames = new Set();
+  let artifactBytes = 0;
+  for (let index = 0; index < document.artifacts.length; index += 1) {
+    const artifact = validateArtifactRecord(document.artifacts[index], {
+      runId, workItemId: document.workItemId, attempt: document.attempt, leaseToken: document.leaseToken,
+    });
+    if (artifactNames.has(artifact.name) || document.evidenceDigests[index] !== artifact.digest) {
+      fail('STORE_CORRUPT', 'Attempt evidence artifact declaration is duplicated or out of order.');
+    }
+    artifactNames.add(artifact.name);
+    artifactBytes += artifact.sizeBytes;
+    if (artifactBytes > MAX_ATTEMPT_EVIDENCE_BYTES) fail('STORE_CORRUPT', 'Stored attempt evidence exceeds its total byte bound.');
+    const bytes = await readBoundedFile(store.storage,
+      containedPath(runDirectory(store, runId), ...artifact.relativePath.split('/')),
+      { label: `attempt artifact ${artifact.name}`, maximumBytes: MAX_ATTEMPT_ARTIFACT_BYTES });
+    const actualDigest = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
+    if (bytes.length !== artifact.sizeBytes || actualDigest !== artifact.digest) {
+      fail('ARTIFACT_DIGEST_MISMATCH', `Stored attempt artifact ${artifact.name} does not match its manifest.`);
+    }
+  }
   let adopted;
-  await mutate(store, runId, { coordinator, type: 'attempt-evidence-adopted', data: { workItemId: document.workItemId, digest } }, (state) => {
-    const item = validateWorkLease(state, {
+  await appendMutationUnlocked(store, state, 'mutation', 'attempt-evidence-adopted', (next) => {
+    const item = validateWorkLease(next, {
+      runId,
       workItemId: document.workItemId,
       workerId: document.workerId,
       attempt: document.attempt,
@@ -710,7 +1033,7 @@ export async function adoptAttemptEvidence(store, runId, coordinator, inbox) {
     const canonicalResult = sealWorkItemResult({
       schemaVersion: 1,
       workItemId: document.workItemId,
-      subjectCoreDigest: state.subjectCoreDigest,
+      subjectCoreDigest: next.subjectCoreDigest,
       attempt: document.attempt,
       authoritative: true,
       outcome: document.outcome,
@@ -720,9 +1043,10 @@ export async function adoptAttemptEvidence(store, runId, coordinator, inbox) {
       attempt: document.attempt,
       outcome: document.outcome,
       evidenceDigests: document.evidenceDigests,
+      artifacts: document.artifacts,
       workerId: document.workerId,
       completedAt: timestamp(store),
-      reason: null,
+      reason: document.reason,
       inboxDigest: digest,
       canonicalResultDigest: canonicalResult.digest,
     };
@@ -736,9 +1060,14 @@ export async function adoptAttemptEvidence(store, runId, coordinator, inbox) {
     } else {
       item.state = document.outcome === 'cancelled' ? 'cancelled' : 'incomplete';
     }
+    if (item.resourceClass === 'performance') {
+      next.resourceScheduling.exclusiveLease = null;
+      if (item.state !== 'queued') next.resourceScheduling.performanceDrain = null;
+    }
     adopted = clone(item);
-  });
+  }, { data: { workItemId: document.workItemId, digest } });
   return adopted;
+  }));
 }
 
 export async function cancelParentRun(store, runId, coordinator, input) {
@@ -757,6 +1086,8 @@ export async function cancelParentRun(store, runId, coordinator, input) {
           item.lease = null;
         }
       }
+      next.resourceScheduling.performanceDrain = null;
+      next.resourceScheduling.exclusiveLease = null;
     }, { actor: input.actor, data: { reason: input.reason } });
   }));
 }

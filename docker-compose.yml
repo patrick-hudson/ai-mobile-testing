@@ -27,6 +27,8 @@ services:
     restart: "no"
     volumes:
       - single-site-jobs:/var/lib/ai-mobile-testing/jobs
+      - shared-parent-runs:/var/lib/ai-mobile-testing/shared/canonical
+      - shared-worker-exchange:/var/lib/ai-mobile-testing/shared/exchange
 
   portal:
     <<: *audit-base
@@ -104,6 +106,69 @@ services:
       - single-site-jobs:/var/lib/ai-mobile-testing/jobs
       - single-site-finalizations:/var/lib/ai-mobile-testing/finalizations
       - single-site-baselines:/var/lib/ai-mobile-testing/baselines
+
+  shared-coordinator:
+    <<: *audit-base
+    profiles: [shared-runner]
+    user: pwuser
+    healthcheck:
+      disable: true
+    command: ["node", "scripts/run-shared-coordinator.mjs"]
+    restart: unless-stopped
+    stop_grace_period: 30s
+    depends_on:
+      single-site-volume-init:
+        condition: service_completed_successfully
+    environment:
+      AUDIT_SHARED_STORE_ROOT: /var/lib/ai-mobile-testing/shared/canonical
+      AUDIT_SHARED_EXCHANGE_ROOT: /var/lib/ai-mobile-testing/shared/exchange
+      AUDIT_SHARED_DEPLOYMENT_IDENTITY: ${AUDIT_SHARED_DEPLOYMENT_IDENTITY:-compose:ai-mobile-testing}
+      AUDIT_SHARED_VOLUME_IDENTITY: named-volume:shared-parent-runs
+      AUDIT_SHARED_RUN_ID: ${AUDIT_SHARED_RUN_ID:-}
+      AUDIT_SHARED_COORDINATOR_PORT: "4180"
+    volumes:
+      - shared-parent-runs:/var/lib/ai-mobile-testing/shared/canonical
+      - shared-worker-exchange:/var/lib/ai-mobile-testing/shared/exchange
+
+  shared-worker-ordinary:
+    <<: *audit-base
+    profiles: [shared-runner]
+    user: pwuser
+    healthcheck:
+      disable: true
+    command: ["node", "scripts/run-shared-worker.mjs"]
+    restart: unless-stopped
+    stop_grace_period: 30s
+    depends_on:
+      - shared-coordinator
+    environment:
+      AUDIT_SHARED_COORDINATOR_URL: http://shared-coordinator:4180
+      AUDIT_SHARED_WORKER_CAPABILITIES: browser:chromium,browser:firefox,browser:webkit
+      AUDIT_SHARED_RESOURCE_CLASS: ordinary
+      AUDIT_SHARED_EXECUTOR_JSON: ${AUDIT_SHARED_EXECUTOR_JSON:-}
+    volumes:
+      - ./certs:/work/certs:ro
+
+  shared-worker-performance:
+    <<: *audit-base
+    profiles: [shared-runner]
+    user: pwuser
+    healthcheck:
+      disable: true
+    command: ["node", "scripts/run-shared-worker.mjs"]
+    restart: unless-stopped
+    stop_grace_period: 30s
+    cpus: "2.0"
+    mem_limit: 4g
+    depends_on:
+      - shared-coordinator
+    environment:
+      AUDIT_SHARED_COORDINATOR_URL: http://shared-coordinator:4180
+      AUDIT_SHARED_WORKER_CAPABILITIES: performance:lighthouse
+      AUDIT_SHARED_RESOURCE_CLASS: performance
+      AUDIT_SHARED_EXECUTOR_JSON: ${AUDIT_SHARED_PERFORMANCE_EXECUTOR_JSON:-}
+    volumes:
+      - ./certs:/work/certs:ro
 
   single-site-lease-load-proof:
     <<: *audit-base
@@ -260,3 +325,5 @@ volumes:
   single-site-jobs:
   single-site-finalizations:
   single-site-baselines:
+  shared-parent-runs:
+  shared-worker-exchange:

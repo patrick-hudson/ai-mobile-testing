@@ -2,9 +2,13 @@ import type { PublicationEnvelope } from '../../shared/publication-envelope.mjs'
 export class ParentRunStoreError extends Error { code: string; details?: unknown }
 export const PARENT_RUN_STORE_SCHEMA_VERSION: 1;
 export const PARENT_RUN_WRITER_PROTOCOL: 'single-coordinator-fenced-v1';
+export const MAX_ATTEMPT_ARTIFACTS: 64;
+export const MAX_ATTEMPT_ARTIFACT_BYTES: number;
+export const MAX_ATTEMPT_EVIDENCE_BYTES: number;
 export interface ParentRunStore { root: string; clock(): number; manifest: any }
 export interface CoordinatorFence { ownerId: string; epoch: number; token: string; acquiredAt: string; expiresAt: string }
-export interface WorkLease { runId: string; workItemId: string; workerId: string; attempt: number; epoch: number; token: string; claimedAt: string; expiresAt: string }
+export interface WorkLease { runId: string; workItemId: string; workerId: string; attempt: number; epoch: number; token: string; claimedAt: string; expiresAt: string; subjectCoreDigest: string; runnerRevision: string; capability: string; resourceClass: 'ordinary' | 'performance'; targetId: string; specAffinity: string | null }
+export interface WorkHeartbeatReceipt { relativePath: string; digest: string; workItemId: string; leaseToken: string }
 export function openParentRunStore(options: any): Promise<ParentRunStore>;
 export function createParentRun(store: ParentRunStore, input: any): Promise<any>;
 export function recoverParentRun(store: ParentRunStore, runId: string): Promise<any>;
@@ -13,9 +17,10 @@ export function sealParentRunGraph(store: ParentRunStore, runId: string, coordin
 export function acquireCoordinator(store: ParentRunStore, runId: string, input: { ownerId: string; leaseMs: number }): Promise<CoordinatorFence>;
 export function takeOverCoordinator(store: ParentRunStore, runId: string, input: { ownerId: string; leaseMs: number }): Promise<CoordinatorFence>;
 export function heartbeatCoordinator(store: ParentRunStore, coordinator: CoordinatorFence, input: { leaseMs: number }): Promise<CoordinatorFence>;
-export function claimWorkItem(store: ParentRunStore, runId: string, coordinator: CoordinatorFence, input: { workerId: string; workItemId?: string; leaseMs: number }): Promise<WorkLease>;
-export function heartbeatWorkItem(store: ParentRunStore, runId: string, lease: WorkLease, options?: { leaseMs?: number }): Promise<WorkLease>;
-export function adoptWorkHeartbeat(store: ParentRunStore, runId: string, coordinator: CoordinatorFence, receipt: any): Promise<WorkLease>;
+export function requestPerformanceDrain(store: ParentRunStore, runId: string, coordinator: CoordinatorFence, input: { workerId: string; leaseMs?: number }): Promise<{ workerId: string; requestedAt: string; expiresAt: string; coordinatorEpoch: number }>;
+export function claimWorkItem(store: ParentRunStore, runId: string, coordinator: CoordinatorFence, input: { workerId: string; workItemId?: string; capabilities?: string[]; resourceClasses?: Array<'ordinary' | 'performance'>; leaseMs: number }): Promise<WorkLease>;
+export function heartbeatWorkItem(store: ParentRunStore, runId: string, lease: WorkLease, options?: { leaseMs?: number }): Promise<WorkHeartbeatReceipt>;
+export function adoptWorkHeartbeat(store: ParentRunStore, runId: string, coordinator: CoordinatorFence, receipt: WorkHeartbeatReceipt): Promise<WorkLease>;
 export function requeueExpiredWork(store: ParentRunStore, runId: string, coordinator: CoordinatorFence): Promise<number>;
 export function publishAttemptEvidence(store: ParentRunStore, runId: string, lease: WorkLease, result: any): Promise<any>;
 export function appendAttemptLog(store: ParentRunStore, runId: string, lease: WorkLease, entry: { sequence: number; level: 'debug' | 'info' | 'warn' | 'error'; message: string }): Promise<any>;

@@ -316,7 +316,10 @@ export default defineConfig({
   snapshotPathTemplate: AUDIT_SNAPSHOT_PATH_TEMPLATE,
   fullyParallel: true,
   forbidOnly: ci,
-  retries: ci ? 1 : 0,
+  // Authoritative work-item retries belong to the fenced parent-run scheduler.
+  // A Playwright retry could turn a completed product failure into a pass inside
+  // one canonical attempt, so diagnostics must launch a separate run lineage.
+  retries: 0,
   workers: process.env.AUDIT_WORKERS ? Number(process.env.AUDIT_WORKERS) : ci ? 4 : 3,
   timeout: 60_000,
   expect: {

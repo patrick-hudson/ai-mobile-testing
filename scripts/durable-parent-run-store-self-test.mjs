@@ -247,10 +247,10 @@ const freshLease = await claimWorkItem(store, 'run-main', coordinatorA, {
 });
 await expectCode('STALE_WORK_LEASE', () => heartbeatWorkItem(store, 'run-main', staleLease));
 await expectCode('STALE_WORK_LEASE', () => publishAttemptEvidence(store, 'run-main', staleLease, {
-  outcome: 'completed_pass', evidenceDigests: [DIGEST],
+  outcome: 'completed_pass', artifacts: [],
 }));
 const inbox = await publishAttemptEvidence(store, 'run-main', freshLease, {
-  outcome: 'completed_pass', evidenceDigests: [DIGEST],
+  outcome: 'completed_pass', artifacts: [],
 });
 await adoptAttemptEvidence(store, 'run-main', coordinatorA, inbox);
 
@@ -265,10 +265,10 @@ failureLease = await adoptWorkHeartbeat(store, 'run-main', coordinatorA, heartbe
 assert.equal((await readParentRun(store, 'run-main')).runRevision, revisionBeforeWorkerHeartbeat + 1);
 await appendAttemptLog(store, 'run-main', failureLease, { sequence: 1, level: 'info', message: 'assertion completed' });
 await expectCode('STORE_SCHEMA_INVALID', () => publishAttemptEvidence(store, 'run-main', failureLease, {
-  outcome: 'completed_product_failure', evidenceDigests: ['not-a-digest'],
+  outcome: 'completed_product_failure', artifacts: [{ name: '../escape', mediaType: 'image/png', sizeBytes: 1, digest: DIGEST, contentBase64: 'YQ==' }],
 }));
 const failureInbox = await publishAttemptEvidence(store, 'run-main', failureLease, {
-  outcome: 'completed_product_failure', evidenceDigests: [DIGEST],
+  outcome: 'completed_product_failure', artifacts: [],
 });
 await adoptAttemptEvidence(store, 'run-main', coordinatorA, failureInbox);
 assert.equal((await recoverParentRun(reopened, 'run-main')).workItems['work-failure'].state, 'completed_product_failure');

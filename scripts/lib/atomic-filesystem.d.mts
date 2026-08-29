@@ -10,6 +10,8 @@ export function pathExists(filesystem: AtomicStorage['fs'], candidate: string): 
 export function fsyncDirectory(filesystem: AtomicStorage['fs'], directory: string): Promise<void>;
 export function ensureDirectory(filesystem: AtomicStorage['fs'], directory: string, options?: { mode?: number }): Promise<void>;
 export function atomicWriteJson(storage: AtomicStorage, file: string, value: unknown, options?: { exclusive?: boolean; mode?: number }): Promise<void>;
+export function atomicWriteFile(storage: AtomicStorage, file: string, value: Uint8Array, options?: { exclusive?: boolean; mode?: number }): Promise<void>;
+export function readBoundedFile(storage: AtomicStorage, file: string, options?: { label?: string; maximumBytes?: number }): Promise<Buffer>;
 export function readBoundedJson(storage: AtomicStorage, file: string, options?: { label?: string; maximumBytes?: number }): Promise<any>;
 export function withDirectoryLock<T>(storage: AtomicStorage, lockPath: string, operation: () => Promise<T>, options?: { retries?: number; retryMs?: number }): Promise<T>;
 export function verifyLocalAtomicStorage(storage: AtomicStorage): Promise<NonNullable<AtomicStorage['semantics']>>;

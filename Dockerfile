@@ -58,14 +58,14 @@ RUN case "$INSTALL_MSEDGE" in \
 
 COPY . .
 RUN node scripts/write-runner-revision.mjs /work/.audit-runner-revision
-RUN mkdir -p /work/artifacts/runs /var/lib/ai-mobile-testing/secrets /var/lib/ai-mobile-testing/jobs /var/lib/ai-mobile-testing/finalizations /var/lib/ai-mobile-testing/baselines \
+RUN mkdir -p /work/artifacts/runs /var/lib/ai-mobile-testing/secrets /var/lib/ai-mobile-testing/jobs /var/lib/ai-mobile-testing/finalizations /var/lib/ai-mobile-testing/baselines /var/lib/ai-mobile-testing/shared/canonical /var/lib/ai-mobile-testing/shared/exchange \
     && chmod 700 /var/lib/ai-mobile-testing/secrets \
-    && chown pwuser:pwuser /var/lib/ai-mobile-testing/jobs \
-    && chmod 700 /var/lib/ai-mobile-testing/jobs /var/lib/ai-mobile-testing/finalizations /var/lib/ai-mobile-testing/baselines \
+    && chown pwuser:pwuser /var/lib/ai-mobile-testing/jobs /var/lib/ai-mobile-testing/shared/canonical /var/lib/ai-mobile-testing/shared/exchange \
+    && chmod 700 /var/lib/ai-mobile-testing/jobs /var/lib/ai-mobile-testing/finalizations /var/lib/ai-mobile-testing/baselines /var/lib/ai-mobile-testing/shared/canonical /var/lib/ai-mobile-testing/shared/exchange \
     && chmod 755 /work/docker/entrypoint.sh /work/docker/firefox-with-ca.sh /work/docker/init-single-site-volumes.sh
 
 EXPOSE 4173
-VOLUME ["/work/artifacts", "/var/lib/ai-mobile-testing/secrets", "/var/lib/ai-mobile-testing/jobs", "/var/lib/ai-mobile-testing/finalizations", "/var/lib/ai-mobile-testing/baselines"]
+VOLUME ["/work/artifacts", "/var/lib/ai-mobile-testing/secrets", "/var/lib/ai-mobile-testing/jobs", "/var/lib/ai-mobile-testing/finalizations", "/var/lib/ai-mobile-testing/baselines", "/var/lib/ai-mobile-testing/shared/canonical", "/var/lib/ai-mobile-testing/shared/exchange"]
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 CMD ["node", "-e", "fetch('http://127.0.0.1:4173/healthz').then(response => { if (!response.ok) process.exit(1) }).catch(() => process.exit(1))"]
 
 ENTRYPOINT ["/work/docker/entrypoint.sh"]

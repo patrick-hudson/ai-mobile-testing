@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import * as nativeFs from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { canonicalJson } from '../../shared/canonical-contract.mjs';
@@ -88,6 +89,54 @@ export async function atomicWriteJson(storage, file, value, { exclusive = false,
   } finally {
     await handle?.close();
     await storage.fs.rm(temporary, { force: true });
+  }
+}
+
+export async function atomicWriteFile(storage, file, value, { exclusive = false, mode = 0o660 } = {}) {
+  const bytes = Buffer.isBuffer(value) ? value : Buffer.from(value);
+  const directory = path.dirname(file);
+  await ensureDirectory(storage.fs, directory);
+  const temporary = path.join(directory, `.${path.basename(file)}.${process.pid}.${storage.nonce()}.tmp`);
+  let handle;
+  try {
+    handle = await storage.fs.open(temporary, 'wx', mode);
+    await handle.writeFile(bytes);
+    await handle.sync();
+    await handle.close();
+    handle = null;
+    if (exclusive) {
+      try {
+        await storage.fs.link(temporary, file);
+      } catch (error) {
+        if (error?.code === 'EEXIST') fail('ATOMIC_ALREADY_EXISTS', `${file} already exists.`);
+        throw error;
+      }
+      await storage.fs.unlink(temporary);
+    } else {
+      await storage.fs.rename(temporary, file);
+    }
+    await fsyncDirectory(storage.fs, directory);
+  } finally {
+    await handle?.close();
+    await storage.fs.rm(temporary, { force: true });
+  }
+}
+
+export async function readBoundedFile(storage, file, { label = 'file', maximumBytes = 4 * 1_048_576 } = {}) {
+  let handle;
+  try {
+    handle = await storage.fs.open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.size > maximumBytes) {
+      fail('ATOMIC_CORRUPT', `${label} must be a bounded regular file.`);
+    }
+    return await handle.readFile();
+  } catch (error) {
+    if (error?.code === 'ENOENT') fail('ATOMIC_NOT_FOUND', `${label} was not found.`);
+    if (error instanceof AtomicFilesystemError) throw error;
+    throw error;
+  } finally {
+    await handle?.close();
   }
 }
 
