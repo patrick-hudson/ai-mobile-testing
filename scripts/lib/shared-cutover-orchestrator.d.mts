@@ -42,7 +42,16 @@ export interface SharedCutoverInput {
     backupMarker: string;
   };
   shadowReport: unknown;
-  operatorReview: { reviewed: true; actorId: string; reviewedAt: string };
+  operatorReview: {
+    reviewed: true;
+    actorId: string;
+    reviewedAt: string;
+    shadowValidationDigest: string;
+    shadowMatrixDigest: string;
+    buildIdentity: string;
+    expectedStoreDigest: string;
+    configurationDigest: string;
+  };
 }
 
 export interface CutoverDrainObservation {

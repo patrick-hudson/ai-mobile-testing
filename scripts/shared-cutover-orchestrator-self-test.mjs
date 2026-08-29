@@ -7,7 +7,11 @@ import { canonicalDigest } from '../shared/canonical-contract.mjs';
 import { sealExecutionManifest } from '../shared/execution-contract.mjs';
 import { sealFinalReleaseSubject, sealReleaseSubjectCore } from '../shared/release-subject.mjs';
 import { sealWorkExecutionDescriptor } from '../shared/work-execution-descriptor.mjs';
-import { buildPreRegisteredShadowMatrix } from '../shared/shadow-validation-fixtures.mjs';
+import {
+  SHADOW_ACCEPTANCE_CASE_IDS,
+  SHADOW_CORRUPTION_CASE_IDS,
+  buildPreRegisteredShadowMatrix,
+} from '../shared/shadow-validation-fixtures.mjs';
 import { runShadowValidation } from '../shared/shadow-validation.mjs';
 import {
   PARENT_RUN_STORE_SCHEMA_VERSION,
@@ -74,6 +78,27 @@ function review() {
     reviewed: true,
     actorId: 'operator:cutover-reviewer',
     reviewedAt: new Date(now).toISOString(),
+  };
+}
+
+function cutoverConfigurationDigest(input) {
+  return canonicalDigest({
+    cutoverId: input.cutoverId,
+    activationRevision: input.activationRevision,
+    buildIdentity: input.buildIdentity,
+    rollbackBuildIdentity: input.rollbackBuildIdentity,
+    expectedStore: input.expectedStore,
+  });
+}
+
+function cutoverReview(input) {
+  return {
+    ...review(),
+    shadowValidationDigest: input.shadowReport.digest,
+    shadowMatrixDigest: input.shadowReport.matrixDigest,
+    buildIdentity: input.buildIdentity,
+    expectedStoreDigest: canonicalDigest(input.expectedStore),
+    configurationDigest: cutoverConfigurationDigest(input),
   };
 }
 
@@ -204,15 +229,16 @@ async function fixture(name) {
 }
 
 function request(cutoverId) {
-  return {
+  const input = {
     cutoverId,
     activationRevision: 73,
     buildIdentity: build,
     rollbackBuildIdentity: rollbackBuild,
     expectedStore: expectedStore(),
     shadowReport: shadowReport(),
-    operatorReview: review(),
   };
+  input.operatorReview = cutoverReview(input);
+  return input;
 }
 
 async function expectCode(code, operation) {
@@ -597,15 +623,91 @@ try {
     assert.equal((await admissionGate.read()).state, 'OPEN');
   }
 
+  for (const [name, mutate, code] of [
+    ['missing-corruption-case', (matrix) => {
+      matrix.cases = matrix.cases.filter(({ caseId }) => caseId !== SHADOW_CORRUPTION_CASE_IDS[0]);
+    }, 'CUTOVER_SHADOW_INCOMPLETE'],
+    ['different-matrix', (matrix) => {
+      const changed = matrix.cases.find(({ caseId }) => caseId === SHADOW_ACCEPTANCE_CASE_IDS[0]);
+      changed.legacy.selectedFeatures = ['site', 'changed-but-matching'];
+      changed.shared.selectedFeatures = ['site', 'changed-but-matching'];
+    }, 'CUTOVER_SHADOW_MATRIX_MISMATCH'],
+  ]) {
+    const { directory, store, admissionGate, coordinator } = await fixture(`reject-shadow-${name}`);
+    const input = request(`cutover-reject-shadow-${name}`);
+    const matrix = structuredClone(buildPreRegisteredShadowMatrix());
+    mutate(matrix);
+    input.shadowReport = runShadowValidation({ ...matrix, generatedAt: new Date(now).toISOString() });
+    input.operatorReview = cutoverReview(input);
+    await expectCode(code, () => prepareSharedAuthorityCutover({
+      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
+    }));
+    assert.equal((await admissionGate.read()).state, 'OPEN');
+  }
+
+  for (const field of [
+    'shadowValidationDigest', 'shadowMatrixDigest', 'buildIdentity', 'expectedStoreDigest', 'configurationDigest',
+  ]) {
+    const { directory, store, admissionGate, coordinator } = await fixture(`reject-review-${field}`);
+    const input = request(`cutover-reject-review-${field}`);
+    input.operatorReview[field] = field === 'buildIdentity' ? 'build:other' : digest('9');
+    await expectCode('CUTOVER_SHADOW_REVIEW_MISMATCH', () => prepareSharedAuthorityCutover({
+      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
+    }));
+    assert.equal((await admissionGate.read()).state, 'OPEN');
+  }
+
+  {
+    const { directory, store, admissionGate, coordinator } = await fixture('reject-review-predates-shadow');
+    const input = request('cutover-reject-review-predates-shadow');
+    input.operatorReview.reviewedAt = new Date(now - 1).toISOString();
+    await expectCode('CUTOVER_SHADOW_REVIEW_MISMATCH', () => prepareSharedAuthorityCutover({
+      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
+    }));
+    assert.equal((await admissionGate.read()).state, 'OPEN');
+  }
+
+  {
+    const { directory, store, admissionGate, coordinator } = await fixture('reject-activation-shadow-rebinding');
+    const input = request('cutover-reject-activation-shadow-rebinding');
+    const prepared = await prepareSharedAuthorityCutover({
+      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
+    });
+    const drainObservation = observation(input.cutoverId, prepared.admissionGate, coordinator);
+
+    const incompleteInput = structuredClone(input);
+    const incompleteMatrix = structuredClone(buildPreRegisteredShadowMatrix());
+    incompleteMatrix.cases = incompleteMatrix.cases
+      .filter(({ caseId }) => caseId !== SHADOW_CORRUPTION_CASE_IDS[0]);
+    incompleteInput.shadowReport = runShadowValidation({
+      ...incompleteMatrix, generatedAt: new Date(now).toISOString(),
+    });
+    incompleteInput.operatorReview = cutoverReview(incompleteInput);
+    await expectCode('CUTOVER_SHADOW_INCOMPLETE', () => activateSharedAuthorityCutover({
+      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'),
+      input: incompleteInput, drainObservation,
+    }));
+
+    const staleReviewInput = structuredClone(input);
+    staleReviewInput.operatorReview.configurationDigest = digest('9');
+    await expectCode('CUTOVER_SHADOW_REVIEW_MISMATCH', () => activateSharedAuthorityCutover({
+      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'),
+      input: staleReviewInput, drainObservation,
+    }));
+    assert.equal((await readReleaseAuthoritySelector(store)).phase, 'DRAINING');
+  }
+
   {
     const { directory, store, admissionGate, coordinator } = await fixture('reject-mismatch');
     const input = request('cutover-reject-mismatch');
     input.expectedStore.storeMarkerDigest = canonicalDigest({ storeMarker: 'ef'.repeat(32) });
+    input.operatorReview = cutoverReview(input);
     await expectCode('CUTOVER_STORE_MISMATCH', () => prepareSharedAuthorityCutover({
       store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
     }));
     input.expectedStore = expectedStore();
     input.rollbackBuildIdentity = 'build:not-prequalified';
+    input.operatorReview = cutoverReview(input);
     await expectCode('CUTOVER_ROLLBACK_BUILD_UNQUALIFIED', () => prepareSharedAuthorityCutover({
       store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
     }));

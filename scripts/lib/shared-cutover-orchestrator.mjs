@@ -10,6 +10,11 @@ import {
 } from '../../shared/canonical-contract.mjs';
 import { parseShadowValidationReport } from '../../shared/shadow-validation.mjs';
 import {
+  SHADOW_ACCEPTANCE_CASE_IDS,
+  SHADOW_CORRUPTION_CASE_IDS,
+  SHADOW_PRE_REGISTERED_MATRIX_DIGEST,
+} from '../../shared/shadow-validation-matrix-contract.mjs';
+import {
   atomicWriteJson,
   containedPath,
   openAtomicStorage,
@@ -30,7 +35,11 @@ import { inspectLegacyAuthorityDrainSources } from './legacy-authority-drain-sou
 
 const SAFE_ID = /^[A-Za-z0-9._-]{1,128}$/u;
 const MAX_OBSERVATION_AGE_MS = 5 * 60_000;
-const AE_CASE_IDS = Object.freeze(Array.from({ length: 16 }, (_, index) => `AE${index + 1}`));
+const SHADOW_CASE_IDS = Object.freeze([
+  ...SHADOW_ACCEPTANCE_CASE_IDS,
+  ...SHADOW_CORRUPTION_CASE_IDS,
+]);
+const SHADOW_CASE_ID_SET = new Set(SHADOW_CASE_IDS);
 
 export class SharedCutoverError extends Error {
   constructor(code, message, details = undefined, statusCode = undefined) {
@@ -341,9 +350,56 @@ function parseExpectedStore(value) {
 
 function parseOperatorReview(value) {
   exactKeys(value, ['reviewed', 'actorId', 'reviewedAt'], 'operatorReview');
+  validateOperatorReviewFields(value);
+  return clone(value);
+}
+
+function validateOperatorReviewFields(value) {
   if (value.reviewed !== true) fail('CUTOVER_REVIEW_REQUIRED', 'Cutover requires an explicit operator review.');
   nonEmptyString(value.actorId, 'operatorReview.actorId');
   canonicalTimestamp(value.reviewedAt, 'operatorReview.reviewedAt');
+}
+
+function cutoverConfigurationDigest(input) {
+  return canonicalDigest({
+    cutoverId: input.cutoverId,
+    activationRevision: input.activationRevision,
+    buildIdentity: input.buildIdentity,
+    rollbackBuildIdentity: input.rollbackBuildIdentity,
+    expectedStore: input.expectedStore,
+  });
+}
+
+function parseCutoverOperatorReview(value, input) {
+  exactKeys(value, [
+    'reviewed', 'actorId', 'reviewedAt', 'shadowValidationDigest', 'shadowMatrixDigest',
+    'buildIdentity', 'expectedStoreDigest', 'configurationDigest',
+  ], 'operatorReview');
+  validateOperatorReviewFields(value);
+  assertDigest(value.shadowValidationDigest, 'operatorReview.shadowValidationDigest');
+  assertDigest(value.shadowMatrixDigest, 'operatorReview.shadowMatrixDigest');
+  nonEmptyString(value.buildIdentity, 'operatorReview.buildIdentity');
+  assertDigest(value.expectedStoreDigest, 'operatorReview.expectedStoreDigest');
+  assertDigest(value.configurationDigest, 'operatorReview.configurationDigest');
+  const expectedBindings = {
+    shadowValidationDigest: input.shadowReport.digest,
+    shadowMatrixDigest: input.shadowReport.matrixDigest,
+    buildIdentity: input.buildIdentity,
+    expectedStoreDigest: canonicalDigest(input.expectedStore),
+    configurationDigest: cutoverConfigurationDigest(input),
+  };
+  const mismatches = Object.entries(expectedBindings)
+    .filter(([key, expected]) => value[key] !== expected)
+    .map(([key]) => key);
+  if (Date.parse(value.reviewedAt) < Date.parse(input.shadowReport.generatedAt)) {
+    mismatches.push('reviewedAt');
+  }
+  if (mismatches.length > 0) {
+    fail(
+      'CUTOVER_SHADOW_REVIEW_MISMATCH',
+      `Operator shadow review is not bound to this cutover: ${mismatches.join(', ')}.`,
+    );
+  }
   return clone(value);
 }
 
@@ -358,24 +414,34 @@ function parseCutoverInput(input) {
   }
   const buildIdentity = nonEmptyString(input.buildIdentity, 'buildIdentity');
   const rollbackBuildIdentity = nonEmptyString(input.rollbackBuildIdentity, 'rollbackBuildIdentity');
+  const expectedStore = parseExpectedStore(input.expectedStore);
   const shadowReport = parseShadowValidationReport(input.shadowReport);
   if (shadowReport.validationStatus !== 'PASS' || shadowReport.summary.unexplainedDrift !== 0) {
     fail('CUTOVER_SHADOW_BLOCKED', 'Cutover requires a PASS shadow report with zero unexplained drift.');
   }
-  const presentCases = new Set(shadowReport.comparisons.map(({ caseId }) => caseId));
-  const missingCases = AE_CASE_IDS.filter((caseId) => !presentCases.has(caseId));
-  if (missingCases.length > 0) {
-    fail('CUTOVER_SHADOW_INCOMPLETE', `Cutover shadow report is missing ${missingCases.join(', ')}.`);
+  const reportCaseIds = shadowReport.comparisons.map(({ caseId }) => caseId);
+  const presentCases = new Set(reportCaseIds);
+  const missingCases = SHADOW_CASE_IDS.filter((caseId) => !presentCases.has(caseId));
+  const unexpectedCases = reportCaseIds.filter((caseId) => !SHADOW_CASE_ID_SET.has(caseId));
+  if (reportCaseIds.length !== SHADOW_CASE_IDS.length || presentCases.size !== reportCaseIds.length
+    || missingCases.length > 0 || unexpectedCases.length > 0) {
+    fail(
+      'CUTOVER_SHADOW_INCOMPLETE',
+      `Cutover shadow report must contain the complete pre-registered matrix${missingCases.length ? `; missing ${missingCases.join(', ')}` : ''}${unexpectedCases.length ? `; unexpected ${unexpectedCases.join(', ')}` : ''}.`,
+    );
+  }
+  if (shadowReport.matrixDigest !== SHADOW_PRE_REGISTERED_MATRIX_DIGEST) {
+    fail('CUTOVER_SHADOW_MATRIX_MISMATCH', 'Cutover shadow report does not match the pre-registered semantic matrix.');
   }
   const normalized = {
     cutoverId,
     activationRevision: input.activationRevision,
     buildIdentity,
     rollbackBuildIdentity,
-    expectedStore: parseExpectedStore(input.expectedStore),
+    expectedStore,
     shadowReport,
-    operatorReview: parseOperatorReview(input.operatorReview),
   };
+  normalized.operatorReview = parseCutoverOperatorReview(input.operatorReview, normalized);
   return { ...normalized, digest: canonicalDigest(normalized) };
 }
 

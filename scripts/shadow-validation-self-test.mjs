@@ -12,6 +12,7 @@ import {
   SHADOW_CORRUPTION_CASE_IDS,
   buildPreRegisteredShadowMatrix,
 } from '../shared/shadow-validation-fixtures.mjs';
+import { SHADOW_PRE_REGISTERED_MATRIX_DIGEST } from '../shared/shadow-validation-matrix-contract.mjs';
 import {
   SHADOW_FORBIDDEN_AUTHORITY_FIELDS,
   parseShadowValidationReport,
@@ -91,6 +92,11 @@ assert.deepEqual(
 );
 
 const report = runShadowValidation({ ...matrix, generatedAt });
+assert.equal(
+  report.matrixDigest,
+  SHADOW_PRE_REGISTERED_MATRIX_DIGEST,
+  'the checked-in pre-registered matrix identity must track the semantic matrix',
+);
 assert.equal(report.kind, 'release-shadow-validation');
 assert.equal(report.purpose, 'diagnostic-only');
 assert.equal(report.validationStatus, 'PASS');

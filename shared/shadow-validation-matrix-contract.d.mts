@@ -1,7 +1,7 @@
 export const SHADOW_ACCEPTANCE_CASE_IDS: readonly string[];
 export const SHADOW_CORRUPTION_CASE_IDS: readonly string[];
 export const SHADOW_PRE_REGISTERED_MATRIX_DIGEST: string;
-export function buildPreRegisteredShadowMatrix(): {
-  cases: unknown[];
-  intentionalDifferences: unknown[];
-};
+export const SHADOW_COMPARATIVE_FAILURE_SCENARIOS: Readonly<{
+  AE6: 'MATCHING_SIGNATURES';
+  AE7: 'DIFFERING_SIGNATURES';
+}>;
