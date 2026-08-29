@@ -30,6 +30,7 @@ import {
   writeGalleryArchive,
   type NormalizedGalleryTest,
 } from './gallery-model.js';
+import type { ArchiveReleasePublicationBinding } from './archive-bundle.js';
 
 export type ChecklistStatus =
   | 'PASS'
@@ -349,6 +350,8 @@ export interface GenerateReportOptions {
   selectedProjects?: readonly ReportProjectInput[];
   /** Exact shared publication envelope selected for report and gallery export. */
   releasePublicationEnvelope?: unknown;
+  releasePublicationBinding?: ArchiveReleasePublicationBinding;
+  releasePublicationVerifier?: () => Promise<void>;
 }
 
 const STATUS_ORDER: ChecklistStatus[] = [
@@ -1137,13 +1140,11 @@ export async function writeAuditReport(options: GenerateReportOptions): Promise<
     outputDir,
     catalog: galleryCatalog,
     exportedAt: manifest.generatedAt,
-    ...(options.releasePublicationEnvelope === undefined ? {} : {
-      releasePublicationEnvelope: options.releasePublicationEnvelope,
-    }),
+    releasePublicationEnvelope: options.releasePublicationEnvelope,
+    releasePublicationBinding: options.releasePublicationBinding as ArchiveReleasePublicationBinding,
+    ...(options.releasePublicationVerifier ? { releasePublicationVerifier: options.releasePublicationVerifier } : {}),
   });
-  const releasePublication = options.releasePublicationEnvelope === undefined
-    ? null
-    : projectPublicationView(options.releasePublicationEnvelope);
+  const releasePublication = projectPublicationView(options.releasePublicationEnvelope);
   await writeFile(path.join(outputDir, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
   await writeFile(path.join(outputDir, 'index.html'), reportHtml(manifest, galleryDescriptor, releasePublication), 'utf8');
   await writePortalReportData(outputDir, manifest);

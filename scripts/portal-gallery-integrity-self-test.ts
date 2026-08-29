@@ -7,7 +7,8 @@ import path from 'node:path';
 // exercises that exact module rather than a typed reimplementation.
 // @ts-expect-error portal/gallery-data.mjs has no TypeScript declaration.
 import { loadGallerySnapshot } from '../portal/gallery-data.mjs';
-import { writeGalleryArchive } from '../reporters/gallery-model.js';
+import { writeGalleryArchive as writeUnboundGalleryArchive, type WriteGalleryArchiveOptions } from '../reporters/gallery-model.js';
+import { sharedPublicationFixture } from '../portal/tests/shared-publication-fixture.js';
 import {
   GALLERY_SCHEMA_VERSION,
   assertGalleryCatalog,
@@ -16,6 +17,17 @@ import {
 } from '../shared/gallery-contract.mjs';
 
 const root = await mkdtemp(path.join(tmpdir(), 'portal-gallery-integrity-self-test-'));
+const sharedPublication = sharedPublicationFixture('comparative', 'portal-gallery-integrity-self-test');
+const writeGalleryArchive = (options: WriteGalleryArchiveOptions) => writeUnboundGalleryArchive({
+  ...options,
+  releasePublicationEnvelope: sharedPublication.envelope,
+  releasePublicationBinding: {
+    runId: sharedPublication.view.publication.runId, mode: 'comparative',
+    finalSubjectDigest: sharedPublication.view.subjectDigest as `sha256:${string}`,
+    runRevision: sharedPublication.view.revisions.run,
+    publicationDigest: sharedPublication.view.publication.envelopeDigest as `sha256:${string}`,
+  },
+});
 try {
   const runDirectory = path.join(root, 'integrity-run');
   const outputDir = path.join(runDirectory, 'checklist');

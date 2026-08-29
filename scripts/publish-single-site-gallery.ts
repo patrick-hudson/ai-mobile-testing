@@ -8,6 +8,10 @@ import {
   createAttachmentSourceBoundary,
   writeGalleryArchive,
 } from '../reporters/gallery-model.js';
+import {
+  loadCurrentArchiveReleasePublication,
+  type ArchiveReleasePublicationBinding,
+} from '../reporters/archive-bundle.js';
 import { collectTests } from './rebuild-report.js';
 
 const MAX_RESULTS_BYTES = 64 * 1_048_576;
@@ -161,6 +165,10 @@ export async function publishSingleSiteGallery(input: {
   artifactRoot: string;
   outputDir: string;
   generatedAt: string;
+  sharedPublication?: { envelope: unknown; binding: ArchiveReleasePublicationBinding; verifyCurrent?: () => Promise<void> };
+  sharedStoreRoot?: string;
+  sharedRunId?: string;
+  finalSubjectDigest?: `sha256:${string}`;
 }): Promise<Record<string, unknown>> {
   const artifactRoot = path.resolve(input.artifactRoot);
   const outputDir = path.resolve(input.outputDir);
@@ -176,7 +184,22 @@ export async function publishSingleSiteGallery(input: {
     sourceRoot: sourceBoundary.realRoot,
     warnings,
   });
-  const descriptor = await writeGalleryArchive({ outputDir, catalog, exportedAt: generatedAt });
+  const sharedPublication = input.sharedPublication ?? await loadCurrentArchiveReleasePublication({
+    storeRoot: input.sharedStoreRoot ?? '',
+    expected: {
+      runId: input.sharedRunId ?? '',
+      mode: 'single-site',
+      finalSubjectDigest: input.finalSubjectDigest ?? '' as `sha256:${string}`,
+    },
+  });
+  const descriptor = await writeGalleryArchive({
+    outputDir,
+    catalog,
+    exportedAt: generatedAt,
+    releasePublicationEnvelope: sharedPublication.envelope,
+    releasePublicationBinding: sharedPublication.binding,
+    ...(sharedPublication.verifyCurrent ? { releasePublicationVerifier: sharedPublication.verifyCurrent } : {}),
+  });
   const index = await publishSingleSiteIndex(
     outputDir,
     generatedAt,
@@ -208,10 +231,20 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   const artifactRoot = option(argv, '--artifact-root');
   const outputDir = option(argv, '--output-dir');
   const generatedAt = option(argv, '--generated-at');
-  if (!artifactRoot || !outputDir || !generatedAt) {
-    throw new Error('Usage: publish-single-site-gallery.ts --artifact-root <processed-root> --output-dir <report-checklist-dir> --generated-at <ISO timestamp>');
+  const sharedStoreRoot = option(argv, '--shared-store-root');
+  const sharedRunId = option(argv, '--shared-run-id');
+  const finalSubjectDigest = option(argv, '--final-subject-digest');
+  if (!artifactRoot || !outputDir || !generatedAt || !sharedStoreRoot || !sharedRunId || !/^sha256:[a-f0-9]{64}$/.test(finalSubjectDigest ?? '')) {
+    throw new Error('Usage: publish-single-site-gallery.ts --artifact-root <processed-root> --output-dir <report-checklist-dir> --generated-at <ISO timestamp> --shared-store-root <root> --shared-run-id <run> --final-subject-digest <sha256>');
   }
-  const publication = await publishSingleSiteGallery({ artifactRoot, outputDir, generatedAt });
+  const publication = await publishSingleSiteGallery({
+    artifactRoot,
+    outputDir,
+    generatedAt,
+    sharedStoreRoot,
+    sharedRunId,
+    finalSubjectDigest: finalSubjectDigest as `sha256:${string}`,
+  });
   process.stdout.write(`${JSON.stringify(publication)}\n`);
 }
 

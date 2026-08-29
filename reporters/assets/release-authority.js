@@ -4,6 +4,8 @@
   const AVAILABILITY = new Set(['LOADING', 'PROVISIONAL', 'AVAILABLE', 'PARTIAL', 'EMPTY', 'UNAVAILABLE']);
   const SEVERITY = Object.freeze({ critical: 0, high: 1, medium: 2, low: 3 });
   const OPERATIONAL = new Set(['certificate-bypass', 'evidence-pipeline-limitation']);
+  const ACTIVE_REVIEW = new Set(['OPEN', 'ACKNOWLEDGED']);
+  const RISK_PAGE_SIZE = 50;
 
   function canonicalJson(value) {
     if (value === null || typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value);
@@ -92,6 +94,8 @@
 
   function orderedRisks(risks) {
     return [...risks].sort((left, right) => {
+      const lifecycle = Number(!ACTIVE_REVIEW.has(left.reviewState)) - Number(!ACTIVE_REVIEW.has(right.reviewState));
+      if (lifecycle) return lifecycle;
       const severity = (SEVERITY[left.severity] ?? 99) - (SEVERITY[right.severity] ?? 99);
       if (severity) return severity;
       const operational = Number(OPERATIONAL.has(left.category)) - Number(OPERATIONAL.has(right.category));
@@ -116,23 +120,63 @@
     }
     head.append(headRow);
     const body = documentObject.createElement('tbody');
-    for (const risk of orderedRisks(risks).slice(0, 200)) {
-      const row = documentObject.createElement('tr');
-      const riskCell = documentObject.createElement('td');
-      riskCell.append(element(documentObject, 'strong', humanize(risk.category)), element(documentObject, 'span', risk.explanation));
-      row.append(
-        riskCell,
-        element(documentObject, 'td', risk.severity.toUpperCase()),
-        element(documentObject, 'td', scopeSummary(risk.scope)),
-        element(documentObject, 'td', humanize(risk.reviewState)),
-        element(documentObject, 'td', `${risk.releaseEffect} · never changes the decision`),
-        element(documentObject, 'td', risk.recommendedAction),
-      );
-      body.append(row);
-    }
     table.append(head, body);
     wrapper.append(table);
-    return wrapper;
+    const ordered = orderedRisks(risks);
+    const pageCount = Math.max(1, Math.ceil(ordered.length / RISK_PAGE_SIZE));
+    let page = 0;
+    const controls = documentObject.createElement('nav');
+    controls.className = 'archive-risk-pager';
+    controls.setAttribute('aria-label', 'Risk Register pages');
+    const first = element(documentObject, 'button', 'First', 'archive-risk-page-button');
+    first.type = 'button';
+    first.setAttribute('aria-label', 'First risk page');
+    const previous = element(documentObject, 'button', 'Previous', 'archive-risk-page-button');
+    previous.type = 'button';
+    previous.setAttribute('aria-label', 'Previous risks');
+    const status = element(documentObject, 'span', '', 'archive-risk-page-status');
+    status.id = 'archive-risk-page-status';
+    status.setAttribute('role', 'status');
+    status.setAttribute('aria-live', 'polite');
+    const next = element(documentObject, 'button', 'Next', 'archive-risk-page-button');
+    next.type = 'button';
+    next.setAttribute('aria-label', 'Next risks');
+    const last = element(documentObject, 'button', 'Last', 'archive-risk-page-button');
+    last.type = 'button';
+    last.setAttribute('aria-label', 'Last risk page');
+    controls.append(first, previous, status, next, last);
+    function renderPage(focusTarget = null) {
+      const start = page * RISK_PAGE_SIZE;
+      const visible = ordered.slice(start, start + RISK_PAGE_SIZE);
+      body.replaceChildren(...visible.map((risk) => {
+        const row = documentObject.createElement('tr');
+        const riskCell = documentObject.createElement('td');
+        riskCell.append(element(documentObject, 'strong', humanize(risk.category)), element(documentObject, 'span', risk.explanation));
+        row.append(
+          riskCell,
+          element(documentObject, 'td', risk.severity.toUpperCase()),
+          element(documentObject, 'td', scopeSummary(risk.scope)),
+          element(documentObject, 'td', humanize(risk.reviewState)),
+          element(documentObject, 'td', `${risk.releaseEffect} · never changes the decision`),
+          element(documentObject, 'td', risk.recommendedAction),
+        );
+        return row;
+      }));
+      status.textContent = ordered.length === 0
+        ? 'Showing 0 of 0 risks'
+        : `Showing ${start + 1}–${start + visible.length} of ${ordered.length} risks`;
+      first.disabled = previous.disabled = page === 0;
+      next.disabled = last.disabled = page >= pageCount - 1;
+      focusTarget?.focus();
+    }
+    first.addEventListener('click', () => { page = 0; renderPage(first); });
+    previous.addEventListener('click', () => { page = Math.max(0, page - 1); renderPage(previous); });
+    next.addEventListener('click', () => { page = Math.min(pageCount - 1, page + 1); renderPage(next); });
+    last.addEventListener('click', () => { page = pageCount - 1; renderPage(last); });
+    renderPage();
+    const container = documentObject.createElement('div');
+    container.append(controls, wrapper);
+    return container;
   }
 
   async function render(documentObject = document) {
@@ -146,6 +190,16 @@
       const expectedDigest = requiredText(descriptor?.releasePublicationDigest, 'Shared release projection digest', 80);
       if (!/^sha256:[a-f0-9]{64}$/.test(expectedDigest) || await canonicalDigest(projection) !== expectedDigest) {
         throw new TypeError('The embedded shared release publication failed its revision-bound digest check.');
+      }
+      const authority = descriptor?.releaseAuthority;
+      if (authority?.schemaVersion !== 1 || authority?.status !== 'shared-current'
+        || authority.runId !== projection.publication.runId
+        || authority.mode !== projection.decision.mode
+        || authority.finalSubjectDigest !== projection.subjectDigest
+        || authority.runRevision !== projection.revisions.run
+        || authority.publicationDigest !== projection.publication.envelopeDigest
+        || authority.projectionDigest !== expectedDigest) {
+        throw new TypeError('The embedded shared release publication failed its run, mode, subject, or current-head binding check.');
       }
     } catch (error) {
       root.dataset.riskAvailability = 'UNAVAILABLE';

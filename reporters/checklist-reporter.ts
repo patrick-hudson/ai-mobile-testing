@@ -18,6 +18,7 @@ import {
   type ReportTestInput,
 } from './report-model.js';
 import type { SingleSiteReportInput } from '../scripts/lib/site-health-report.mjs';
+import { loadCurrentArchiveReleasePublication } from './archive-bundle.js';
 
 interface ChecklistReporterOptions {
   outputDir?: string;
@@ -137,8 +138,25 @@ export default class ChecklistReporter implements Reporter {
       );
       return;
     }
+    const sharedStoreRoot = process.env.AUDIT_SHARED_STORE_ROOT;
+    const sharedRunId = process.env.AUDIT_SHARED_RUN_ID;
+    const sharedFinalSubjectDigest = process.env.AUDIT_SHARED_FINAL_SUBJECT_DIGEST;
+    if (!sharedStoreRoot || !sharedRunId || !/^sha256:[a-f0-9]{64}$/.test(sharedFinalSubjectDigest ?? '')) {
+      throw new Error('Comparative archive publication requires AUDIT_SHARED_STORE_ROOT, AUDIT_SHARED_RUN_ID, and AUDIT_SHARED_FINAL_SUBJECT_DIGEST.');
+    }
+    const sharedPublication = await loadCurrentArchiveReleasePublication({
+      storeRoot: sharedStoreRoot,
+      expected: {
+        runId: sharedRunId,
+        mode: 'comparative',
+        finalSubjectDigest: sharedFinalSubjectDigest as `sha256:${string}`,
+      },
+    });
     const manifest = await writeAuditReport({
       outputDir,
+      releasePublicationEnvelope: sharedPublication.envelope,
+      releasePublicationBinding: sharedPublication.binding,
+      releasePublicationVerifier: sharedPublication.verifyCurrent,
       tests,
       selectedProjects: (this.config?.projects ?? []).map((project) => ({
         name: project.name,

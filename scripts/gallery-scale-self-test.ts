@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { writeGalleryArchive } from '../reporters/gallery-model.js';
+import { writeGalleryArchive as writeUnboundGalleryArchive, type WriteGalleryArchiveOptions } from '../reporters/gallery-model.js';
+import { sharedPublicationFixture } from '../portal/tests/shared-publication-fixture.js';
 import { galleryItemHref } from '../shared/gallery-contract.mjs';
 import {
   GALLERY_SCALE,
@@ -12,6 +13,17 @@ import {
 } from './gallery-scale-fixture.js';
 
 const root = await mkdtemp(path.join(tmpdir(), 'gallery-scale-self-test-'));
+const sharedPublication = sharedPublicationFixture('comparative', 'gallery-scale-self-test');
+const writeGalleryArchive = (options: WriteGalleryArchiveOptions) => writeUnboundGalleryArchive({
+  ...options,
+  releasePublicationEnvelope: sharedPublication.envelope,
+  releasePublicationBinding: {
+    runId: sharedPublication.view.publication.runId, mode: 'comparative',
+    finalSubjectDigest: sharedPublication.view.subjectDigest as `sha256:${string}`,
+    runRevision: sharedPublication.view.revisions.run,
+    publicationDigest: sharedPublication.view.publication.envelopeDigest as `sha256:${string}`,
+  },
+});
 try {
   const catalog = buildGalleryScaleCatalog();
   assert.equal(catalog.blobs.length, GALLERY_SCALE.reportArtifacts);

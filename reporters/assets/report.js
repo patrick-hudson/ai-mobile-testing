@@ -14,8 +14,21 @@
       galleryDescriptor.schemaVersion,
     );
     if (document.getElementById('shared-release-publication')) {
-      if (!globalThis.Quitting7ohArchiveRelease?.render) throw new TypeError('The pinned release-authority renderer is unavailable.');
-      sharedRelease = await globalThis.Quitting7ohArchiveRelease.render(document);
+      try {
+        if (!globalThis.Quitting7ohArchiveRelease?.render) throw new TypeError('The pinned release-authority renderer is unavailable.');
+        sharedRelease = await globalThis.Quitting7ohArchiveRelease.render(document);
+      } catch (error) {
+        const root = document.getElementById('archive-product-risk');
+        if (root) {
+          root.dataset.riskAvailability = 'UNAVAILABLE';
+          root.removeAttribute('aria-busy');
+        }
+        const status = document.getElementById('archive-risk-status');
+        if (status) status.textContent = `UNAVAILABLE · ${error instanceof Error ? error.message : 'Release authority renderer failed.'}`;
+        const content = document.getElementById('archive-authority-content');
+        if (content) content.textContent = 'Legacy evidence remains readable but cannot substitute for a valid revision-bound publication.';
+        sharedRelease = { unavailable: true };
+      }
     }
   } catch (error) {
     const fatal = document.getElementById('archive-runtime-fatal');
@@ -219,10 +232,10 @@
       basis: `Shared publication run revision ${sharedRelease.revisions.run}; Site Health and checklist diagnostics remain separate.`,
       ready: sharedRelease.decision.ready,
     } : {
-      label: manifest.release.decision.replace('_', ' '),
-      reason: manifest.release.reason,
-      basis: manifest.release.decisionBasis,
-      ready: manifest.release.ready,
+      label: 'HISTORICAL EVIDENCE — NON-AUTHORITATIVE',
+      reason: 'This retained report has no current shared release publication.',
+      basis: 'Legacy checklist results remain readable but cannot authorize promotion.',
+      ready: false,
     };
     decision.innerHTML = `<strong>${text(headerRelease.label)}</strong><span>${text(headerRelease.reason)}</span><small>${text(headerRelease.basis)}</small>`;
     decision.dataset.ready = String(headerRelease.ready);

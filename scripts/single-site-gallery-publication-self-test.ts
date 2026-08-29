@@ -3,6 +3,7 @@ import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { publishSingleSiteGallery } from './publish-single-site-gallery.js';
+import { sharedPublicationFixture } from '../portal/tests/shared-publication-fixture.js';
 
 const root = await fs.mkdtemp(path.join(os.tmpdir(), 'single-site-gallery-publication-'));
 try {
@@ -66,10 +67,21 @@ try {
   };
   await fs.writeFile(path.join(artifactRoot, 'results.json'), `${JSON.stringify(report, null, 2)}\n`);
   const before = await fs.readFile(path.join(artifactRoot, 'results.json'));
+  const shared = sharedPublicationFixture('single-site', 'single-site-gallery-publication');
   const publication = await publishSingleSiteGallery({
     artifactRoot,
     outputDir,
     generatedAt: '2026-08-25T12:00:00.000Z',
+    sharedPublication: {
+      envelope: shared.envelope,
+      binding: {
+        runId: shared.view.publication.runId,
+        mode: 'single-site',
+        finalSubjectDigest: shared.view.subjectDigest as `sha256:${string}`,
+        runRevision: shared.view.revisions.run,
+        publicationDigest: shared.view.publication.envelopeDigest as `sha256:${string}`,
+      },
+    },
   });
   assert.equal(publication.kind, 'single-site-gallery-publication');
   assert.equal((publication.descriptor as { primaryCounts: { images: number } }).primaryCounts.images, 1);

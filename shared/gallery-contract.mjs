@@ -240,6 +240,19 @@ export function assertGalleryArchiveDescriptor(value) {
     && (typeof value.releasePublicationDigest !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(value.releasePublicationDigest))) {
     throw new TypeError('Gallery archive descriptor has an invalid shared release publication digest.');
   }
+  if (value.archiveBundle?.bundleVersion === 3) {
+    const authority = value.releaseAuthority;
+    if (!authority || authority.schemaVersion !== 1 || authority.status !== 'shared-current'
+      || typeof authority.runId !== 'string' || authority.runId.length === 0
+      || !['single-site', 'comparative'].includes(authority.mode)
+      || !/^sha256:[a-f0-9]{64}$/.test(authority.finalSubjectDigest ?? '')
+      || !Number.isSafeInteger(authority.runRevision) || authority.runRevision < 1
+      || !/^sha256:[a-f0-9]{64}$/.test(authority.publicationDigest ?? '')
+      || !/^sha256:[a-f0-9]{64}$/.test(authority.projectionDigest ?? '')
+      || value.releasePublicationDigest !== authority.projectionDigest) {
+      throw new TypeError('Bundle-v3 gallery archives require a current shared release authority binding.');
+    }
+  }
   if (!value.query || !Array.isArray(value.query.chunks) || !Number.isInteger(value.query.rows) || value.query.rows < 0) {
     throw new TypeError('Gallery archive descriptor has an invalid query index.');
   }

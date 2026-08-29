@@ -3,9 +3,87 @@ import { lstat, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'no
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { projectPublicationView, type PublicationView } from '../shared/release-projection.mjs';
+import { openParentRunStore, readCurrentEnvelope } from '../scripts/lib/parent-run-store.mjs';
 
 export function projectArchiveReleasePublication(value: unknown): PublicationView {
   return projectPublicationView(value);
+}
+
+export interface ArchiveReleasePublicationBinding {
+  runId: string;
+  mode: 'single-site' | 'comparative';
+  finalSubjectDigest: `sha256:${string}`;
+  runRevision: number;
+  publicationDigest: `sha256:${string}`;
+}
+
+export interface ArchiveReleaseAuthority extends ArchiveReleasePublicationBinding {
+  schemaVersion: 1;
+  status: 'shared-current';
+  projectionDigest: `sha256:${string}`;
+}
+
+const SHA256 = /^sha256:[a-f0-9]{64}$/;
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value);
+  if (typeof value === 'number' && Number.isFinite(value)) return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (!value || typeof value !== 'object' || Object.getPrototypeOf(value) !== Object.prototype) {
+    throw new TypeError('Archive release publication contains a non-canonical value.');
+  }
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(',')}}`;
+}
+
+export function bindArchiveReleasePublication(
+  envelope: unknown,
+  expected: ArchiveReleasePublicationBinding,
+): { publication: PublicationView; authority: ArchiveReleaseAuthority } {
+  if (!expected || typeof expected !== 'object') throw new TypeError('Archive release publication binding is required.');
+  if (typeof expected.runId !== 'string' || expected.runId.length === 0) throw new TypeError('Archive release run binding is invalid.');
+  if (!['single-site', 'comparative'].includes(expected.mode)) throw new TypeError('Archive release mode binding is invalid.');
+  if (!SHA256.test(expected.finalSubjectDigest)) throw new TypeError('Archive release subject binding is invalid.');
+  if (!Number.isSafeInteger(expected.runRevision) || expected.runRevision < 1) throw new TypeError('Archive release revision binding is invalid.');
+  if (!SHA256.test(expected.publicationDigest)) throw new TypeError('Archive release publication binding is invalid.');
+  const publication = projectPublicationView(envelope);
+  if (publication.publication.runId !== expected.runId) throw new TypeError('Shared release publication belongs to a different run.');
+  if (publication.decision.mode !== expected.mode) throw new TypeError('Shared release publication belongs to a different audit mode.');
+  if (publication.subjectDigest !== expected.finalSubjectDigest || publication.decision.subjectDigest !== expected.finalSubjectDigest) {
+    throw new TypeError('Shared release publication belongs to a different final subject.');
+  }
+  if (publication.revisions.run !== expected.runRevision) throw new TypeError('Shared release publication is stale or has the wrong run revision.');
+  if (publication.publication.envelopeDigest !== expected.publicationDigest) {
+    throw new TypeError('Shared release publication is stale or has the wrong publication digest.');
+  }
+  const projectionDigest = `sha256:${createHash('sha256').update(canonicalJson(publication)).digest('hex')}` as const;
+  return {
+    publication,
+    authority: Object.freeze({ schemaVersion: 1, status: 'shared-current', ...expected, projectionDigest }),
+  };
+}
+
+export async function loadCurrentArchiveReleasePublication(input: {
+  storeRoot: string;
+  expected: Omit<ArchiveReleasePublicationBinding, 'runRevision' | 'publicationDigest'>;
+}): Promise<{ envelope: unknown; binding: ArchiveReleasePublicationBinding; verifyCurrent: () => Promise<void> }> {
+  const store = await openParentRunStore({ root: input.storeRoot, verifyStorage: false });
+  const envelope = await readCurrentEnvelope(store, input.expected.runId);
+  const publication = projectPublicationView(envelope);
+  const binding: ArchiveReleasePublicationBinding = {
+    ...input.expected,
+    runRevision: publication.revisions.run,
+    publicationDigest: publication.publication.envelopeDigest as `sha256:${string}`,
+  };
+  bindArchiveReleasePublication(envelope, binding);
+  return {
+    envelope,
+    binding,
+    verifyCurrent: async () => {
+      const current = await readCurrentEnvelope(store, input.expected.runId);
+      bindArchiveReleasePublication(current, binding);
+    },
+  };
 }
 
 export const ARCHIVE_BUNDLE_VERSION = 3 as const;

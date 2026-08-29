@@ -112,6 +112,14 @@ pre { max-height: 24rem; overflow: auto; margin: .5rem 0 0; padding: .7rem; bord
 .archive-risk-table th { position: sticky; z-index: 1; top: 0; background: var(--panel-strong); }
 .archive-risk-table td:first-child { min-width: 13rem; }
 .archive-risk-table td:first-child span { display: block; margin-top: .25rem; color: var(--muted); }
+.archive-risk-pager { display: flex; align-items: center; gap: .45rem; margin: .5rem 0; }
+.archive-risk-page-status { margin-right: auto; font-variant-numeric: tabular-nums; }
+.archive-risk-page-button { min-width: 4.5rem; }
+@media (max-width: 600px) {
+  .archive-risk-pager { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .archive-risk-page-status { grid-column: 1 / -1; grid-row: 1; }
+  .archive-risk-page-button { min-width: 0; }
+}
 .visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 [hidden] { display: none !important; }
 

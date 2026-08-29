@@ -6,10 +6,23 @@ import path from 'node:path';
 import type { AuditDefinition } from '../audit/types.js';
 import { AUDIT_EVIDENCE_POLICY_ANNOTATION, serializeEvidencePolicy } from '../audit/evidence-policy.js';
 import { ARCHIVE_ASSET_DIRECTORY } from '../reporters/archive-bundle.js';
-import { writeAuditReport, type ReportTestInput } from '../reporters/report-model.js';
+import { writeAuditReport as writeUnboundAuditReport, type GenerateReportOptions, type ReportTestInput } from '../reporters/report-model.js';
+import { sharedPublicationFixture } from '../portal/tests/shared-publication-fixture.js';
 import { galleryItemHref, type GalleryArchiveDescriptor, type GalleryQueryIndexRow } from '../shared/gallery-contract.mjs';
 
 const root = await mkdtemp(path.join(tmpdir(), 'audit-poster-self-test-'));
+const sharedPublication = sharedPublicationFixture('comparative', 'report-poster-self-test');
+const archiveAuthority = {
+  releasePublicationEnvelope: sharedPublication.envelope,
+  releasePublicationBinding: {
+    runId: sharedPublication.view.publication.runId,
+    mode: 'comparative' as const,
+    finalSubjectDigest: sharedPublication.view.subjectDigest as `sha256:${string}`,
+    runRevision: sharedPublication.view.revisions.run,
+    publicationDigest: sharedPublication.view.publication.envelopeDigest as `sha256:${string}`,
+  },
+};
+const writeAuditReport = (options: GenerateReportOptions) => writeUnboundAuditReport({ ...options, ...archiveAuthority });
 try {
   const videoWithPoster = path.join(root, 'with-poster.webm');
   const sourcePoster = path.join(root, 'with-poster-poster.jpg');

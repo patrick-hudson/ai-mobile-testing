@@ -227,6 +227,16 @@ export interface GalleryArchiveDescriptor {
   };
   /** Digest of the canonical shared release projection embedded in this sealed surface. */
   releasePublicationDigest?: `sha256:${string}`;
+  releaseAuthority?: {
+    schemaVersion: 1;
+    status: 'shared-current';
+    runId: string;
+    mode: 'single-site' | 'comparative';
+    finalSubjectDigest: `sha256:${string}`;
+    runRevision: number;
+    publicationDigest: `sha256:${string}`;
+    projectionDigest: `sha256:${string}`;
+  };
   primaryCounts: GalleryCatalog['primaryCounts'];
   facets: {
     kinds: string[];

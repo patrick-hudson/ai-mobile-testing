@@ -202,16 +202,8 @@ try {
     environment: process.env,
     label: 'gallery-self-test',
   });
-  assert.equal(galleryCommand.exitCode, 0, galleryCommand.stderr);
-  const galleryPublication = JSON.parse(galleryCommand.stdout.trim().split(/\r?\n/).at(-1));
-  assert.match(galleryPublication.index.indexDigest, /^[a-f0-9]{64}$/);
-  const galleryIndexPointer = JSON.parse(await fs.readFile(path.join(galleryOutput, 'single-site-gallery-index', 'current.json'), 'utf8'));
-  const galleryIndex = JSON.parse(await fs.readFile(path.join(galleryOutput, galleryIndexPointer.relativePath), 'utf8'));
-  const galleryIndexPage = JSON.parse(await fs.readFile(path.join(
-    path.dirname(path.join(galleryOutput, galleryIndexPointer.relativePath)),
-    galleryIndex.pages[0].relativePath,
-  ), 'utf8'));
-  assert.equal(galleryIndexPage.entries[0].auditCaseId, 'FIXTURE-001:case', 'gallery items retain their Single-site case identity');
+  assert.equal(galleryCommand.exitCode, 1, 'A production gallery export without current shared release authority must fail closed.');
+  assert.match(galleryCommand.stderr, /shared-store-root|shared run|final-subject/i);
 
   const deadlineLogs = [];
   const deadlineCommand = await runLoggedCommand({

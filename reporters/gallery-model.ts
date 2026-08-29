@@ -66,12 +66,13 @@ import type {
   ReportResultInput,
   ReportTestInput,
 } from './report-model.js';
-import { projectPublicationView } from '../shared/release-projection.mjs';
 import type { PublicationView } from '../shared/release-projection.mjs';
 import { canonicalDigest } from '../shared/canonical-contract.mjs';
 import {
   archiveBundleContract,
+  bindArchiveReleasePublication,
   ensureArchiveRuntimeBundle,
+  type ArchiveReleasePublicationBinding,
 } from './archive-bundle.js';
 
 export interface NormalizedGalleryAttachment {
@@ -130,6 +131,9 @@ export interface WriteGalleryArchiveOptions {
   cwd?: string;
   /** Exact shared publication envelope selected for this sealed export. */
   releasePublicationEnvelope?: unknown;
+  releasePublicationBinding?: ArchiveReleasePublicationBinding;
+  /** Rechecks the current publication head immediately before sealing the surface. */
+  releasePublicationVerifier?: () => Promise<void>;
 }
 
 export interface PreparedGalleryArchive {
@@ -141,7 +145,7 @@ export interface PreparedGalleryArchive {
   expectedExportRevision: string | null;
   expectedFlagRevision: string;
   flagHistoryPath: string;
-  releasePublication: PublicationView | null;
+  releasePublication: PublicationView;
 }
 
 const execFileAsync = promisify(execFile);
@@ -1683,12 +1687,12 @@ export async function prepareGalleryArchive(options: WriteGalleryArchiveOptions)
     ? new Date(options.exportedAt).toISOString()
     : new Date().toISOString();
   const archiveBundle = archiveBundleContract();
-  const releasePublication = options.releasePublicationEnvelope === undefined
-    ? null
-    : projectPublicationView(options.releasePublicationEnvelope);
-  const releasePublicationDigest = releasePublication === null
-    ? null
-    : canonicalDigest(releasePublication) as `sha256:${string}`;
+  const boundPublication = bindArchiveReleasePublication(
+    options.releasePublicationEnvelope,
+    options.releasePublicationBinding as ArchiveReleasePublicationBinding,
+  );
+  const releasePublication = boundPublication.publication;
+  const releasePublicationDigest = canonicalDigest(releasePublication) as `sha256:${string}`;
   const exportRevision = `export_${stableGalleryKey({
     contentRevision,
     flagRevision,
@@ -1696,6 +1700,7 @@ export async function prepareGalleryArchive(options: WriteGalleryArchiveOptions)
     exportedAt,
     archiveBundle,
     releasePublicationDigest,
+    releaseAuthority: boundPublication.authority,
   })}`;
   const revisionHref = `gallery/revisions/${exportRevision}`;
   const finalDir = path.join(galleryRoot, 'revisions', exportRevision);
@@ -1770,7 +1775,8 @@ export async function prepareGalleryArchive(options: WriteGalleryArchiveOptions)
     exportRevision,
     exportedAt,
     archiveBundle,
-    ...(releasePublicationDigest === null ? {} : { releasePublicationDigest }),
+    releasePublicationDigest,
+    releaseAuthority: boundPublication.authority,
     primaryCounts: options.catalog.primaryCounts,
     facets: {
       kinds: facet(queryRows.map(({ kind }) => kind)),
@@ -1862,6 +1868,7 @@ export async function writeGalleryArchive(options: WriteGalleryArchiveOptions): 
   for (let attempt = 0; attempt < 5; attempt += 1) {
     const prepared = await prepareGalleryArchive(options);
     try {
+      await options.releasePublicationVerifier?.();
       return await publishPreparedGalleryArchive(prepared);
     } catch (error) {
       lastError = error;
@@ -1949,7 +1956,20 @@ function galleryArchiveHtml(
   <script id="gallery-archive-head" type="application/json">${inlineArchiveJson(descriptor)}</script>
   ${releasePublication ? `<script id="shared-release-publication" type="application/json">${inlineArchiveJson(releasePublication)}</script>` : ''}
   <script src="${bundle.assetBase}/archive-runtime.js"></script>
-  ${releasePublication ? `<script src="${bundle.assetBase}/release-authority.js"></script><script>void globalThis.Quitting7ohArchiveRelease.render(document)</script>` : ''}
+  ${releasePublication ? `<script src="${bundle.assetBase}/release-authority.js"></script><script>
+    (() => {
+      const fail = (error) => {
+        const root = document.querySelector('#archive-product-risk');
+        if (root) { root.dataset.riskAvailability = 'UNAVAILABLE'; root.removeAttribute('aria-busy'); }
+        const status = document.querySelector('#archive-risk-status');
+        if (status) status.textContent = 'UNAVAILABLE · ' + (error && error.message ? error.message : 'Release authority renderer failed to load.');
+        const content = document.querySelector('#archive-authority-content');
+        if (content) content.textContent = 'Legacy evidence remains readable but cannot substitute for a valid revision-bound publication.';
+      };
+      if (!globalThis.Quitting7ohArchiveRelease?.render) { fail(new Error('The pinned release-authority renderer is unavailable.')); return; }
+      Promise.resolve(globalThis.Quitting7ohArchiveRelease.render(document)).catch(fail);
+    })();
+  </script>` : ''}
   <script src="${bundle.assetBase}/gallery-loader.js"></script>
   <script type="module">${inlineModule}</script>
 </body>

@@ -15,9 +15,24 @@ import {
   buildAuditManifest,
   buildAuditModels,
   projectReviewedExecutionTruth,
-  writeAuditReport,
+  writeAuditReport as writeUnboundAuditReport,
+  type GenerateReportOptions,
   type ReportTestInput,
 } from '../reporters/report-model.js';
+import { sharedPublicationFixture } from '../portal/tests/shared-publication-fixture.js';
+
+const sharedPublication = sharedPublicationFixture('comparative', 'report-audit-id-self-test');
+const writeAuditReport = (options: GenerateReportOptions) => writeUnboundAuditReport({
+  ...options,
+  releasePublicationEnvelope: sharedPublication.envelope,
+  releasePublicationBinding: {
+    runId: sharedPublication.view.publication.runId,
+    mode: 'comparative',
+    finalSubjectDigest: sharedPublication.view.subjectDigest as `sha256:${string}`,
+    runRevision: sharedPublication.view.revisions.run,
+    publicationDigest: sharedPublication.view.publication.envelopeDigest as `sha256:${string}`,
+  },
+});
 
 const definitions: AuditDefinition[] = [
   {

@@ -3,7 +3,8 @@ import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { ALL_AUDIT_CATALOG } from '../audit/definitions.js';
-import { buildGalleryCatalog, writeGalleryArchive } from '../reporters/gallery-model.js';
+import { buildGalleryCatalog, writeGalleryArchive as writeUnboundGalleryArchive, type WriteGalleryArchiveOptions } from '../reporters/gallery-model.js';
+import { sharedPublicationFixture } from '../portal/tests/shared-publication-fixture.js';
 import {
   GALLERY_FLAG_MAX_EVENTS,
   applyGalleryFlagTransition,
@@ -17,6 +18,17 @@ import {
 } from './gallery-flags.mjs';
 
 const root = await mkdtemp(path.join(tmpdir(), 'gallery-flags-self-test-'));
+const sharedPublication = sharedPublicationFixture('comparative', 'gallery-flags-self-test');
+const writeGalleryArchive = (options: WriteGalleryArchiveOptions) => writeUnboundGalleryArchive({
+  ...options,
+  releasePublicationEnvelope: sharedPublication.envelope,
+  releasePublicationBinding: {
+    runId: sharedPublication.view.publication.runId, mode: 'comparative',
+    finalSubjectDigest: sharedPublication.view.subjectDigest as `sha256:${string}`,
+    runRevision: sharedPublication.view.revisions.run,
+    publicationDigest: sharedPublication.view.publication.envelopeDigest as `sha256:${string}`,
+  },
+});
 try {
   const checklist = path.join(root, 'checklist');
   const releasePath = path.join(root, 'sharded-run.json');

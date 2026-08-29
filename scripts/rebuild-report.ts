@@ -23,6 +23,7 @@ import {
   type ReportErrorInput,
   type ReportTestInput,
 } from '../reporters/report-model.js';
+import { loadCurrentArchiveReleasePublication } from '../reporters/archive-bundle.js';
 
 interface JsonAttachment {
   name: string;
@@ -356,8 +357,25 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   const pipelineErrors = integrityFailures.map(({ stage, reason }) => ({
     message: `Pipeline integrity failure in ${stage}: ${reason}`,
   }));
+  const sharedStoreRoot = process.env.AUDIT_SHARED_STORE_ROOT;
+  const sharedRunId = process.env.AUDIT_SHARED_RUN_ID;
+  const sharedFinalSubjectDigest = process.env.AUDIT_SHARED_FINAL_SUBJECT_DIGEST;
+  if (!sharedStoreRoot || !sharedRunId || !/^sha256:[a-f0-9]{64}$/.test(sharedFinalSubjectDigest ?? '')) {
+    throw new Error('Comparative report rebuild requires AUDIT_SHARED_STORE_ROOT, AUDIT_SHARED_RUN_ID, and AUDIT_SHARED_FINAL_SUBJECT_DIGEST.');
+  }
+  const sharedPublication = await loadCurrentArchiveReleasePublication({
+    storeRoot: sharedStoreRoot,
+    expected: {
+      runId: sharedRunId,
+      mode: 'comparative',
+      finalSubjectDigest: sharedFinalSubjectDigest as `sha256:${string}`,
+    },
+  });
   const reportOptions = {
     outputDir,
+    releasePublicationEnvelope: sharedPublication.envelope,
+    releasePublicationBinding: sharedPublication.binding,
+    releasePublicationVerifier: sharedPublication.verifyCurrent,
     tests,
     selectedProjects: (report.config?.projects ?? []).map((project) => ({
       ...(project.id ? { id: project.id } : {}),

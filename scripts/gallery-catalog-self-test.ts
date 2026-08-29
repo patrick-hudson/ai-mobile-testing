@@ -8,9 +8,10 @@ import type { AuditDefinition } from '../audit/types.js';
 import {
   buildGalleryCatalog,
   AttachmentSourceContainmentError,
-  prepareGalleryArchive,
+  prepareGalleryArchive as prepareUnboundGalleryArchive,
   publishPreparedGalleryArchive,
-  writeGalleryArchive,
+  writeGalleryArchive as writeUnboundGalleryArchive,
+  type WriteGalleryArchiveOptions,
 } from '../reporters/gallery-model.js';
 import type {
   GalleryArchiveDescriptor,
@@ -39,10 +40,24 @@ import {
   archiveBundleAssetContents,
   archiveBundleContract,
 } from '../reporters/archive-bundle.js';
+import { sharedPublicationFixture } from '../portal/tests/shared-publication-fixture.js';
 
 const CAPTURE_METADATA_TYPE = 'application/vnd.quitting7oh.gallery-capture+json';
 const timestamp = '2026-08-24T12:34:56.000Z';
 const execFileAsync = promisify(execFile);
+const sharedPublication = sharedPublicationFixture('comparative', 'gallery-catalog-self-test');
+const archiveAuthority = {
+  releasePublicationEnvelope: sharedPublication.envelope,
+  releasePublicationBinding: {
+    runId: sharedPublication.view.publication.runId,
+    mode: 'comparative' as const,
+    finalSubjectDigest: sharedPublication.view.subjectDigest as `sha256:${string}`,
+    runRevision: sharedPublication.view.revisions.run,
+    publicationDigest: sharedPublication.view.publication.envelopeDigest as `sha256:${string}`,
+  },
+};
+const writeGalleryArchive = (options: WriteGalleryArchiveOptions) => writeUnboundGalleryArchive({ ...options, ...archiveAuthority });
+const prepareGalleryArchive = (options: WriteGalleryArchiveOptions) => prepareUnboundGalleryArchive({ ...options, ...archiveAuthority });
 
 const definitions: AuditDefinition[] = [
   definition('NAV-001', 'navigation', 'Navigation response', 'Navigation retains the expected focus and route.'),
@@ -268,14 +283,10 @@ async function assertRebuildAcceptsContainedAbsolutePath(runDirectory: string): 
   await mkdir(path.dirname(source), { recursive: true });
   await writeFile(source, 'contained-run-evidence');
   await writeFile(path.join(runDirectory, 'results.json'), JSON.stringify(runnerReport(source)));
-  await execFileAsync(process.execPath, [
-    '--import', 'tsx',
-    path.join(process.cwd(), 'scripts', 'rebuild-report.ts'),
-    '--run-dir', runDirectory,
-  ], { cwd: process.cwd(), maxBuffer: 4 * 1024 * 1024 });
-  const published = await Promise.all((await filesBelow(path.join(runDirectory, 'checklist', 'evidence')))
-    .map((file) => readFile(file)));
-  assert(published.some((body) => body.includes(Buffer.from('contained-run-evidence'))));
+  await assert.rejects(execFileAsync(process.execPath, [
+    '--import', 'tsx', path.join(process.cwd(), 'scripts', 'rebuild-report.ts'), '--run-dir', runDirectory,
+  ], { cwd: process.cwd(), maxBuffer: 4 * 1024 * 1024 }), /Command failed:/,
+  'A rebuild without current shared publication authority must fail closed after accepting the contained source path.');
 }
 
 const root = await mkdtemp(path.join(tmpdir(), 'gallery-catalog-self-test-'));
@@ -503,7 +514,8 @@ try {
     orderRevision: firstDescriptor.orderRevision,
     exportedAt: firstDescriptor.exportedAt,
     archiveBundle: firstDescriptor.archiveBundle,
-    releasePublicationDigest: null,
+    releasePublicationDigest: firstDescriptor.releasePublicationDigest,
+    releaseAuthority: firstDescriptor.releaseAuthority,
   })}`, 'The immutable export revision must bind the archive bundle contract.');
   assert.equal(firstDescriptor.phase, 'sealed');
   assert.equal(firstDescriptor.primaryCounts.total, catalog.primaryCounts.total);

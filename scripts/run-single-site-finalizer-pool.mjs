@@ -405,11 +405,28 @@ export async function revalidateSingleSitePublicationCheckpoint({
   };
 }
 
-async function publishSingleSiteGalleryByCommand({ artifactRoot, outputDir, generatedAt, logger, signal, deadlineAt }) {
+async function publishSingleSiteGalleryByCommand({ artifactRoot, outputDir, generatedAt, jobId, logger, signal, deadlineAt }) {
   const script = path.resolve(path.dirname(scriptPath), 'publish-single-site-gallery.ts');
+  const sharedStoreRoot = process.env.AUDIT_SHARED_STORE_ROOT;
+  const sharedRunId = process.env.AUDIT_SHARED_RUN_ID;
+  const finalSubjectDigest = process.env.AUDIT_SHARED_FINAL_SUBJECT_DIGEST;
+  if (!sharedStoreRoot || !sharedRunId || !/^sha256:[a-f0-9]{64}$/.test(finalSubjectDigest ?? '')) {
+    fail('SINGLE_SITE_FINALIZER_GALLERY_INVALID', 'Single-site gallery publication requires the current shared run, store, and final subject binding.');
+  }
+  if (sharedRunId !== jobId) {
+    fail('SINGLE_SITE_FINALIZER_GALLERY_INVALID', 'Single-site gallery shared run binding does not match the finalized job.');
+  }
   const result = await runLoggedCommand({
     command: process.execPath,
-    args: ['--import', 'tsx', script, '--artifact-root', artifactRoot, '--output-dir', outputDir, '--generated-at', generatedAt],
+    args: [
+      '--import', 'tsx', script,
+      '--artifact-root', artifactRoot,
+      '--output-dir', outputDir,
+      '--generated-at', generatedAt,
+      '--shared-store-root', sharedStoreRoot,
+      '--shared-run-id', sharedRunId,
+      '--final-subject-digest', finalSubjectDigest,
+    ],
     cwd: path.dirname(path.dirname(scriptPath)),
     environment: process.env,
     logger,
@@ -768,6 +785,7 @@ async function processTerminalJob({
             artifactRoot: mediaPublication.artifactRoot,
             outputDir: reportOutputDirectory,
             generatedAt,
+            jobId: job.jobId,
             logger,
             signal,
             deadlineAt,

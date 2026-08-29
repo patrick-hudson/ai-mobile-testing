@@ -43,6 +43,14 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline: 3px soli
 .archive-risk-table th { position: sticky; z-index: 1; top: 0; background: var(--archive-panel); }
 .archive-risk-table td:first-child { min-width: 13rem; }
 .archive-risk-table td:first-child span { display: block; margin-top: .25rem; color: var(--archive-muted); }
+.archive-risk-pager { display: flex; align-items: center; gap: .45rem; margin: .5rem 0; }
+.archive-risk-page-status { margin-right: auto; font-variant-numeric: tabular-nums; }
+.archive-risk-page-button { min-width: 4.5rem; }
+@media (max-width: 600px) {
+  .archive-risk-pager { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .archive-risk-page-status { grid-column: 1 / -1; grid-row: 1; }
+  .archive-risk-page-button { min-width: 0; }
+}
 .gallery-archive-loading, .gallery-archive-error { margin-bottom: .75rem; padding: 1rem; border: 1px solid var(--archive-line); border-radius: .65rem; background: var(--archive-panel); }
 .gallery-archive-error { border-left: .4rem solid #b42318; }
 .gallery-archive-drawers { display: grid; gap: .75rem; margin-top: 1rem; }

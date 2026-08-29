@@ -30,6 +30,13 @@ test.describe.serial('archive-offline generated report', () => {
   let temporaryRoot: string;
   let reportDirectory: string;
   const publication = sharedPublicationFixture('comparative', 'archive-shared-release');
+  const authorityBinding = {
+    runId: publication.view.publication.runId,
+    mode: publication.view.decision.mode,
+    finalSubjectDigest: publication.view.subjectDigest as `sha256:${string}`,
+    runRevision: publication.view.revisions.run,
+    publicationDigest: publication.view.publication.envelopeDigest as `sha256:${string}`,
+  } as const;
 
   test.beforeAll(async () => {
     temporaryRoot = await mkdtemp(path.join(tmpdir(), 'quitting7oh-archive-offline-'));
@@ -37,6 +44,7 @@ test.describe.serial('archive-offline generated report', () => {
     await writeAuditReport({
       outputDir: reportDirectory,
       releasePublicationEnvelope: publication.envelope,
+      releasePublicationBinding: authorityBinding,
       tests: [],
       run: {
         status: 'passed',
@@ -45,6 +53,66 @@ test.describe.serial('archive-offline generated report', () => {
       },
       selectedProjects: [],
     });
+  });
+
+  test('new archive exports reject mismatched or stale shared publication authority', async () => {
+    const cases = [
+      ['wrong run', { ...authorityBinding, runId: 'another-run' }, /run/i],
+      ['wrong mode', { ...authorityBinding, mode: 'single-site' as const }, /mode/i],
+      ['wrong subject', { ...authorityBinding, finalSubjectDigest: `sha256:${'f'.repeat(64)}` as const }, /subject/i],
+      ['stale head', { ...authorityBinding, runRevision: authorityBinding.runRevision + 1 }, /revision|stale/i],
+      ['wrong publication', { ...authorityBinding, publicationDigest: `sha256:${'e'.repeat(64)}` as const }, /publication|stale/i],
+    ] as const;
+    for (const [name, releasePublicationBinding, message] of cases) {
+      await expect(writeAuditReport({
+        outputDir: path.join(temporaryRoot, `rejected-${name.replaceAll(' ', '-')}`),
+        releasePublicationEnvelope: publication.envelope,
+        releasePublicationBinding,
+        tests: [],
+        run: { status: 'passed', source: 'playwright-json', profile: 'archive-authority-rejection' },
+        selectedProjects: [],
+      }), name).rejects.toThrow(message);
+    }
+    await expect(writeAuditReport({
+      outputDir: path.join(temporaryRoot, 'rejected-superseded-during-export'),
+      releasePublicationEnvelope: publication.envelope,
+      releasePublicationBinding: authorityBinding,
+      releasePublicationVerifier: async () => { throw new Error('Shared publication head is stale.'); },
+      tests: [],
+      run: { status: 'passed', source: 'playwright-json', profile: 'archive-authority-rejection' },
+      selectedProjects: [],
+    })).rejects.toThrow(/stale/i);
+  });
+
+  test('large mixed-lifecycle Risk Registers are active-first and truthfully paged', async ({ page }) => {
+    const large = sharedPublicationFixture('comparative', 'archive-large-risk-register', 'AVAILABLE', 9, 205);
+    const outputDir = path.join(temporaryRoot, 'large-risk-register');
+    await writeAuditReport({
+      outputDir,
+      releasePublicationEnvelope: large.envelope,
+      releasePublicationBinding: {
+        runId: large.view.publication.runId,
+        mode: 'comparative',
+        finalSubjectDigest: large.view.subjectDigest as `sha256:${string}`,
+        runRevision: large.view.revisions.run,
+        publicationDigest: large.view.publication.envelopeDigest as `sha256:${string}`,
+      },
+      tests: [],
+      run: { status: 'passed', source: 'playwright-json', profile: 'archive-risk-scale' },
+      selectedProjects: [],
+    });
+    await page.goto(pathToFileURL(path.join(outputDir, 'index.html')).href);
+    await expect(page.locator('#archive-risk-page-status')).toHaveText('Showing 1–50 of 205 risks');
+    await expect(page.locator('#archive-risk-register tbody tr')).toHaveCount(50);
+    await expect(page.locator('#archive-risk-register tbody tr').first()).toContainText(/OPEN|ACKNOWLEDGED/i);
+    const next = page.getByRole('button', { name: 'Next risks' });
+    await next.focus();
+    await next.press('Enter');
+    await expect(page.locator('#archive-risk-page-status')).toHaveText('Showing 51–100 of 205 risks');
+    await expect(next).toBeFocused();
+    await page.getByRole('button', { name: 'Last risk page' }).click();
+    await expect(page.locator('#archive-risk-page-status')).toHaveText('Showing 201–205 of 205 risks');
+    await expect(page.locator('#archive-risk-register tbody tr')).toHaveCount(5);
   });
 
   test.afterAll(async () => {
@@ -163,6 +231,18 @@ test.describe.serial('archive-offline generated report', () => {
     await expect(page.locator('#archive-runtime-fatal-message')).toContainText(/archive bundle|does not match/i);
     await expect(page.locator('.masthead')).toBeHidden();
     await expect(page.locator('main')).toBeHidden();
+  });
+
+  test('missing release-authority asset becomes unavailable instead of remaining loading', async ({ page }) => {
+    const reportPath = path.join(reportDirectory, 'index.html');
+    const source = await readFile(reportPath, 'utf8');
+    const missingPath = path.join(reportDirectory, 'missing-release-authority.html');
+    await writeFile(missingPath, source.replace('/release-authority.js', '/missing-release-authority.js'), 'utf8');
+    await page.goto(pathToFileURL(missingPath).href);
+    await expect(page.locator('#archive-product-risk')).toHaveAttribute('data-risk-availability', 'UNAVAILABLE');
+    await expect(page.locator('#archive-product-risk')).not.toHaveAttribute('aria-busy', 'true');
+    await expect(page.locator('#archive-risk-status')).toContainText('UNAVAILABLE');
+    await expect(page.locator('#archive-runtime-fatal')).toBeHidden();
   });
 
   test('decision, risk, and revision tampering fail the embedded publication digest closed', async ({ context, page }) => {
