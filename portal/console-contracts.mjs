@@ -60,6 +60,7 @@ const routeContracts = {
       run: identifier({ required: true }),
       view: choice(['overview', 'tests', 'findings', 'evidence', 'timeline', 'logs', 'report'], { default: 'overview' }),
       record: identifier(),
+      operation: identifier(),
       inspector: choice(['open', 'closed'], { default: 'closed' }),
       search: text({ maximum: 300 }),
       source: token(),
@@ -242,7 +243,10 @@ const capabilityContexts = {
       cancel: false,
       purge: true,
       manualEvidence: true,
-      visualDisposition: false,
+      rekick: true,
+      riskAcknowledge: true,
+      riskResolve: true,
+      visualDisposition: true,
       baseline: false,
       aiReview: true,
       settings: true,
@@ -259,6 +263,9 @@ const capabilityContexts = {
       cancel: true,
       purge: true,
       manualEvidence: false,
+      rekick: true,
+      riskAcknowledge: true,
+      riskResolve: true,
       visualDisposition: true,
       baseline: true,
       aiReview: true,
@@ -276,6 +283,9 @@ const capabilityContexts = {
       cancel: false,
       purge: false,
       manualEvidence: false,
+      rekick: false,
+      riskAcknowledge: false,
+      riskResolve: false,
       visualDisposition: false,
       baseline: false,
       aiReview: false,
@@ -291,6 +301,9 @@ const ACTION_DEFINITIONS = Object.freeze({
   cancel: { mutates: true, authorization: 'required', eligibility: 'source-defined' },
   purge: { mutates: true, authorization: 'required', eligibility: 'source-defined' },
   manualEvidence: { mutates: true, authorization: 'required', eligibility: 'source-defined' },
+  rekick: { mutates: true, authorization: 'required', eligibility: 'incomplete-executions-only' },
+  riskAcknowledge: { mutates: true, authorization: 'required', eligibility: 'open-nonvisual-risk-only' },
+  riskResolve: { mutates: true, authorization: 'required', eligibility: 'resolvable-nonvisual-risk-only' },
   visualDisposition: { mutates: true, authorization: 'required', eligibility: 'source-defined' },
   baseline: { mutates: true, authorization: 'required', eligibility: 'source-defined' },
   aiReview: { mutates: true, authorization: 'required', eligibility: 'source-defined' },
@@ -387,7 +400,8 @@ export function resolveConsoleActionAvailability(contextId, actionId, {
     unavailableReason: unavailableReason
       ?? (normalizedAuthorized === false ? 'Permission denied.'
         : normalizedAuthorized === null ? 'Authorization has not been established.'
-          : normalizedEligible === false ? 'The authoritative run state does not permit this action.'
+          : normalizedEligible === false && actionId === 'rekick' ? 'Only incomplete executions are eligible for rekick.'
+            : normalizedEligible === false ? 'The authoritative run state does not permit this action.'
             : normalizedEligible === null ? 'Action eligibility has not been established.' : null),
     runtime: context.runtime,
   });
@@ -551,7 +565,7 @@ function unsupportedActionReason(contextId, actionId) {
   if (contextId === 'sealed-archive') return 'Sealed archives are read-only and expose no live actions.';
   if (contextId === 'comparative-live') {
     if (actionId === 'cancel') return 'Comparative runs use the stop contract.';
-    if (actionId === 'visualDisposition' || actionId === 'baseline') return 'This action belongs to Single-site visual review.';
+    if (actionId === 'baseline') return 'Baseline mutation remains a Single-site evidence operation.';
   }
   if (contextId === 'single-site-live') {
     if (actionId === 'stop') return 'Single-site audits use the cancel contract.';

@@ -9,6 +9,7 @@ import { createConsoleUrlState } from './console-url-state.js';
 import { createConsoleLogViewer } from './console-log-viewer.js';
 import { createRunActionController } from './run-actions.js';
 import { createRunInvalidationBus, publishRunInvalidation } from './console-invalidation.js';
+import { createSharedControlBrowserClient } from './shared-control-client.js';
 
 const ACTIVE_COMPARATIVE_STATES = new Set(['queued', 'starting', 'running', 'stopping']);
 const ACTIVE_SINGLE_SITE_STATES = new Set(['queued', 'starting', 'running', 'finalizing']);
@@ -380,7 +381,18 @@ function initializeRunWorkspace(root) {
   viewRegion.className = 'run-region';
   viewRegion.dataset.asyncState = 'initial-loading';
   viewRegion.setAttribute('aria-live', 'polite');
-  shell.main.append(identity, stateGrid, trustGrid, actionArea, destinations, navigation, viewRegion);
+  const productRisk = document.createElement('section');
+  productRisk.id = 'run-product-risk';
+  productRisk.className = 'run-product-risk';
+  productRisk.dataset.riskAvailability = 'LOADING';
+  productRisk.setAttribute('aria-labelledby', 'run-product-risk-title');
+  productRisk.setAttribute('aria-busy', 'true');
+  const productRiskTitle = textElement(document, 'h2', 'Product Risk', { id: 'run-product-risk-title' });
+  const productRiskStatus = textElement(document, 'p', 'Loading shared release authority…', { id: 'run-product-risk-status', role: 'status', 'aria-live': 'polite' });
+  const productRiskBody = document.createElement('div');
+  productRiskBody.id = 'run-product-risk-body';
+  productRisk.append(productRiskTitle, productRiskStatus, productRiskBody);
+  shell.main.append(identity, stateGrid, trustGrid, productRisk, actionArea, destinations, navigation, viewRegion);
   for (const [key, target] of viewFocusTargets) focus.register(key, target);
 
   const inspectorHeading = textElement(document, 'h2', 'Run context', { tabindex: '-1' });
@@ -394,6 +406,24 @@ function initializeRunWorkspace(root) {
     definition(document, 'Limitations', 'run-inspector-limitations'),
   );
   shell.inspector.append(inspectorHeading, inspectorList);
+
+  const sharedSession = document.createElement('section');
+  sharedSession.className = 'run-shared-session';
+  sharedSession.append(textElement(document, 'h3', 'Shared control session'));
+  const sharedSessionStatus = textElement(document, 'p', 'Checking current browser authorization…', { id: 'run-shared-session-status', role: 'status', 'aria-live': 'polite' });
+  const sharedLogin = document.createElement('form');
+  const sharedCredentialLabel = textElement(document, 'label', 'Scoped control credential');
+  const sharedCredential = document.createElement('input');
+  sharedCredential.type = 'password';
+  sharedCredential.required = true;
+  sharedCredential.autocomplete = 'off';
+  sharedCredential.maxLength = 4_096;
+  sharedCredential.name = 'control-credential';
+  sharedCredentialLabel.append(sharedCredential);
+  const sharedLoginButton = textElement(document, 'button', 'Authorize this browser session', { type: 'submit' });
+  sharedLogin.append(sharedCredentialLabel, sharedLoginButton);
+  sharedSession.append(sharedSessionStatus, sharedLogin);
+  shell.inspector.append(sharedSession);
 
   let routeState = null;
   let urlState = null;
@@ -409,7 +439,12 @@ function initializeRunWorkspace(root) {
   let purged = false;
   let authorityPartial = false;
   let authorityRefreshRevision = 0;
+  let sharedWorkspace = null;
+  let sharedSessionReady = false;
+  let sharedAuthorityActive = false;
+  let sharedOperationInFlight = null;
   const authorityControllers = new Set();
+  const sharedControl = createSharedControlBrowserClient();
 
   const logRoot = document.createElement('section');
   const logViewer = createConsoleLogViewer({
@@ -534,6 +569,300 @@ function initializeRunWorkspace(root) {
       return (binding?.actionId ? actionArea.querySelector(`[data-run-action="${binding.actionId}"]`) : null) ?? shell.heading;
     },
     announce,
+  });
+
+  function scopeSummary(scope) {
+    if (!scope || typeof scope !== 'object') return 'Scope unavailable';
+    const values = Object.values(scope).flatMap((value) => Array.isArray(value) ? value : []);
+    return values.length ? values.slice(0, 12).join(', ') : 'Declared scope is bound to the release subject.';
+  }
+
+  function sharedActionButton(label, action, body) {
+    const button = textElement(document, 'button', label, { type: 'button', 'data-shared-action': action });
+    button.addEventListener('click', () => void executeSharedAction(action, body, button));
+    return button;
+  }
+
+  function assertSharedWorkspaceProjection(value, capture) {
+    const publication = value?.publication;
+    const executions = value?.executions;
+    const register = publication?.riskRegister;
+    if (!publication || !executions || publication.runId !== capture.runId
+      || publication.decision?.mode !== capture.mode || publication.runRevision !== executions.runRevision
+      || !Number.isSafeInteger(publication.runRevision) || publication.runRevision < 1
+      || !Number.isSafeInteger(publication.decisionRevision) || publication.decisionRevision < 1
+      || typeof publication.finalSubjectDigest !== 'string'
+      || typeof publication.decision?.label !== 'string' || typeof publication.decision?.grantedAuthority !== 'string'
+      || !['LOADING', 'PROVISIONAL', 'AVAILABLE', 'PARTIAL', 'EMPTY', 'UNAVAILABLE'].includes(register?.availability)
+      || !Array.isArray(register.risks) || !Array.isArray(executions.executions)
+      || executions.executions.some((entry) => typeof entry?.id !== 'string' || typeof entry?.state !== 'string')
+      || !Array.isArray(executions.oracleExecutions)
+      || executions.oracleExecutions.some((entry) => typeof entry?.id !== 'string')
+      || value.logs?.runId !== capture.runId || value.logs?.runRevision !== publication.runRevision
+      || !Array.isArray(value.logs?.events) || !Array.isArray(value.logs?.attemptLogs)) {
+      throw new Error('Shared release projection is unavailable or revision-incoherent.');
+    }
+    for (const risk of register.risks) {
+      if (!risk || typeof risk.identity !== 'string' || typeof risk.category !== 'string'
+        || typeof risk.severity !== 'string' || typeof risk.reviewState !== 'string'
+        || typeof risk.explanation !== 'string' || typeof risk.recommendedAction !== 'string'
+        || typeof risk.source?.kind !== 'string' || typeof risk.source?.id !== 'string'
+        || risk.releaseEffect !== 'non-blocking') {
+        throw new Error('Shared Risk Register contains an invalid bounded projection.');
+      }
+    }
+    return value;
+  }
+
+  function applySharedWorkspaceAuthority() {
+    const publication = sharedWorkspace.publication;
+    const executions = sharedWorkspace.executions.executions;
+    const completedStates = new Set(['completed_pass', 'completed_product_failure', 'incomplete', 'cancelled']);
+    const terminal = executions.every(({ state }) => completedStates.has(state));
+    const completed = executions.filter(({ state }) => completedStates.has(state)).length;
+    const sourceRevision = `shared-${publication.runRevision}`;
+    const authorityComplete = ['AVAILABLE', 'EMPTY'].includes(sharedWorkspace.riskAvailability);
+    summaryBody = {
+      complete: authorityComplete,
+      limitations: authorityComplete ? [] : [{ code: `risk-register-${sharedWorkspace.riskAvailability.toLowerCase()}` }],
+      capabilities: { items: [] },
+      data: { record: {
+        mode: currentMode, runId: currentRunId, sourceRevision, sourceUpdatedAt: null,
+        fields: {
+          terminal, executionState: terminal ? 'completed' : 'running', activityState: terminal ? 'idle' : 'normal',
+          phase: terminal ? 'release-published' : 'shared-execution', progressTotal: executions.length,
+          progressCompleted: completed, outcome: publication.decision.label,
+          coverageStatus: publication.decision.grantedAuthority, evidenceAuthorityStatus: 'revision-bound',
+          pipelineIntegrityStatus: sharedWorkspace.logs?.truncated ? 'partial' : 'available',
+          finalizationStatus: 'shared publication', scopeLabel: scopeSummary(publication.decision.certifiedScope), destinations: [],
+        },
+      } },
+    };
+    detail = {
+      id: currentRunId, mode: currentMode, sourceRevision, status: terminal ? 'completed' : 'running',
+      activity: terminal ? 'idle' : 'normal', phase: terminal ? 'release-published' : 'shared-execution',
+      progress: { total: executions.length, completed }, release: publication.decision,
+      pipeline: { status: sharedWorkspace.logs?.truncated ? 'partial' : 'available', reason: 'Bounded shared operation and attempt logs.' },
+      scope: { qualifier: publication.decision.grantedAuthority }, finalization: { status: 'complete' },
+    };
+    sharedAuthorityActive = true;
+    transport?.destroy();
+    transport = null;
+    applyAuthority(summaryBody, detail);
+    renderView();
+  }
+
+  function renderSharedWorkspace() {
+    const publication = sharedWorkspace?.publication;
+    const decision = publication?.decision;
+    const register = publication?.riskRegister;
+    const availability = register?.availability ?? 'UNAVAILABLE';
+    productRisk.dataset.riskAvailability = availability;
+    productRisk.setAttribute('aria-busy', String(availability === 'LOADING'));
+    productRiskStatus.textContent = availability === 'EMPTY'
+      ? 'Risk Register is complete. No active product risks were published.'
+      : availability === 'AVAILABLE' ? `${register.risks.length} published risk record${register.risks.length === 1 ? '' : 's'}.`
+        : availability === 'PROVISIONAL' ? 'Risk Register is provisional; review may change as evidence arrives.'
+          : availability === 'PARTIAL' ? 'Risk Register is partial. Published risks are visible, but absence is not a no-risk claim.'
+            : availability === 'LOADING' ? 'Risk Register is still loading.'
+              : 'Risk Register is unavailable. No no-risk claim can be made.';
+    const decisionCard = document.createElement('article');
+    decisionCard.className = 'run-release-decision';
+    decisionCard.append(
+      textElement(document, 'p', 'Release Decision'),
+      textElement(document, 'h3', decision?.label ?? 'Release decision unavailable'),
+      textElement(document, 'p', `Authority: ${decision?.grantedAuthority ?? 'unavailable'} · Decision revision ${publication?.decisionRevision ?? 'unavailable'} · Run revision ${publication?.runRevision ?? 'unavailable'}`),
+      textElement(document, 'p', `Certified scope: ${scopeSummary(decision?.certifiedScope)}`),
+      textElement(document, 'p', 'Site Health remains a separate diagnostic truth. Non-blocking risks never change this decision.'),
+    );
+    const riskList = document.createElement('ol');
+    riskList.className = 'run-risk-list';
+    const oracleExecutionIds = new Set((sharedWorkspace?.executions?.oracleExecutions ?? []).map(({ id }) => id));
+    for (const risk of register?.risks ?? []) {
+      const item = document.createElement('li');
+      item.dataset.riskIdentity = risk.identity;
+      item.append(
+        textElement(document, 'strong', `${risk.severity.toUpperCase()} · ${humanize(risk.category)}`),
+        textElement(document, 'span', ` ${risk.reviewState} · non-blocking`),
+        textElement(document, 'p', risk.explanation),
+        textElement(document, 'p', `Recommended action: ${risk.recommendedAction}`),
+      );
+      const controls = document.createElement('div');
+      controls.className = 'run-risk-actions';
+      const bound = { expectedSubjectDigest: publication.finalSubjectDigest, riskIdentity: risk.identity };
+      if (risk.category === 'unreviewed-visual-change' && risk.reviewState === 'PENDING_REVIEW'
+        && oracleExecutionIds.has(risk.source.id)) {
+        const rationaleLabel = textElement(document, 'label', 'Review rationale');
+        const rationale = document.createElement('textarea');
+        rationale.required = true;
+        rationale.maxLength = 2_048;
+        rationale.rows = 2;
+        rationaleLabel.append(rationale);
+        controls.append(rationaleLabel);
+        for (const [label, disposition] of [['Accept visual change', 'ACCEPTED'], ['Confirm visual defect', 'DEFECT_CONFIRMED']]) {
+          const button = textElement(document, 'button', label, { type: 'button', 'data-shared-action': 'visualDisposition' });
+          button.addEventListener('click', () => {
+            const explanation = rationale.value.trim();
+            if (!explanation) {
+              rationale.setCustomValidity('Explain the visual review decision.');
+              rationale.reportValidity();
+              return;
+            }
+            rationale.setCustomValidity('');
+            void executeSharedAction('visualDisposition', {
+              ...bound, executionId: risk.source.id, disposition, rationale: explanation,
+            }, button);
+          });
+          controls.append(button);
+        }
+      } else if (risk.reviewState === 'OPEN') {
+        controls.append(sharedActionButton('Acknowledge risk', 'riskAcknowledge', bound));
+        if (!['certificate-bypass', 'coverage-gap', 'evidence-pipeline-limitation'].includes(risk.category)) {
+          controls.append(sharedActionButton('Resolve risk', 'riskResolve', bound));
+        }
+      } else if (risk.reviewState === 'ACKNOWLEDGED' && !['certificate-bypass', 'coverage-gap', 'evidence-pipeline-limitation'].includes(risk.category)) {
+        controls.append(sharedActionButton('Resolve risk', 'riskResolve', bound));
+      }
+      item.append(controls);
+      riskList.append(item);
+    }
+    const recovery = document.createElement('section');
+    recovery.className = 'run-recovery';
+    recovery.append(textElement(document, 'h3', 'Active recovery'));
+    const incomplete = (sharedWorkspace?.executions?.executions ?? []).filter(({ state }) => state === 'incomplete');
+    if (incomplete.length === 0) recovery.append(textElement(document, 'p', 'No incomplete execution is eligible for rekick.'));
+    for (const execution of incomplete.slice(0, 100)) {
+      const row = document.createElement('div');
+      row.dataset.executionId = execution.id;
+      row.append(
+        textElement(document, 'code', execution.id),
+        sharedActionButton('Rekick incomplete execution', 'rekick', {
+          expectedSubjectDigest: publication.finalSubjectDigest,
+          workItemIds: [execution.id],
+        }),
+      );
+      recovery.append(row);
+    }
+    const pipeline = document.createElement('aside');
+    pipeline.className = 'run-pipeline-integrity';
+    pipeline.append(
+      textElement(document, 'h3', 'Pipeline Integrity'),
+      textElement(document, 'p', `${sharedWorkspace?.logs?.truncated ? 'Partial' : 'Available'} · ${sharedWorkspace?.logs?.events?.length ?? 0} bounded operation events and ${sharedWorkspace?.logs?.attemptLogs?.length ?? 0} attempt log records loaded.`),
+    );
+    productRiskBody.replaceChildren(decisionCard, riskList, recovery, pipeline);
+  }
+
+  async function loadSharedWorkspace({ announceResult = false } = {}) {
+    if (!sharedSessionReady || !currentRunId) return;
+    productRisk.dataset.riskAvailability = 'LOADING';
+    productRisk.setAttribute('aria-busy', 'true');
+    productRiskStatus.textContent = 'Loading current revision-bound release authority…';
+    try {
+      const capture = captureWorkspaceIdentity();
+      const next = assertSharedWorkspaceProjection(await sharedControl.readWorkspace(capture.runId), capture);
+      assertCurrentWorkspace(capture);
+      sharedWorkspace = next;
+      renderSharedWorkspace();
+      applySharedWorkspaceAuthority();
+      if (announceResult) announce(`Shared release revision ${next.publication.runRevision} loaded.`);
+      if (routeState?.state?.operation && routeState.state.operation !== sharedOperationInFlight) {
+        void resumeSharedOperation(routeState.state.operation);
+      }
+    } catch (error) {
+      productRisk.dataset.riskAvailability = 'UNAVAILABLE';
+      productRisk.setAttribute('aria-busy', 'false');
+      productRiskStatus.textContent = `Shared Product Risk unavailable: ${error.message}`;
+    }
+  }
+
+  async function executeSharedAction(kind, body, button) {
+    if (!sharedWorkspace?.publication) return;
+    button.disabled = true;
+    const focusIdentity = button.closest('[data-risk-identity]')?.dataset.riskIdentity ?? null;
+    const focusExecution = button.closest('[data-execution-id]')?.dataset.executionId ?? null;
+    const requestId = `${kind}-${crypto.randomUUID()}`;
+    productRiskStatus.textContent = 'Submitting a durable shared operation…';
+    try {
+      const accepted = await sharedControl.mutate(currentRunId, kind, {
+        expectedRunRevision: sharedWorkspace.publication.runRevision, body, requestId,
+      });
+      if (accepted.statusUrl) {
+        const operationId = accepted.operationId ?? accepted.statusUrl.split('/').at(-1);
+        sharedOperationInFlight = operationId;
+        urlState.setState({ ...routeState.state, operation: operationId }, { replace: true });
+        productRiskStatus.textContent = `Operation accepted (${operationId}). Waiting for durable completion…`;
+        const completed = await sharedControl.waitForOperation(accepted.statusUrl, { runId: currentRunId });
+        productRiskStatus.textContent = completed.outcome?.status === 'succeeded'
+          ? 'Operation completed. Loading the newly published revision…'
+          : `Operation finished: ${completed.outcome?.status ?? completed.state}.`;
+        urlState.setState({ ...routeState.state, operation: undefined }, { replace: true });
+        await loadSharedWorkspace({ announceResult: true });
+        const returnTarget = focusIdentity
+          ? productRiskBody.querySelector(`[data-risk-identity="${CSS.escape(focusIdentity)}"]`)
+          : focusExecution ? productRiskBody.querySelector(`[data-execution-id="${CSS.escape(focusExecution)}"]`) : null;
+        (returnTarget ?? productRiskTitle).tabIndex = -1;
+        (returnTarget ?? productRiskTitle).focus({ preventScroll: true });
+        sharedOperationInFlight = null;
+      }
+    } catch (error) {
+      sharedOperationInFlight = null;
+      productRiskStatus.textContent = `Operation failed: ${error.message}`;
+      button.disabled = false;
+      button.focus({ preventScroll: true });
+    }
+  }
+
+  async function resumeSharedOperation(operationId) {
+    try {
+      sharedOperationInFlight = operationId;
+      productRiskStatus.textContent = `Restoring durable operation ${operationId}…`;
+      await sharedControl.waitForOperation(`/api/control/v1/runs/${encodeURIComponent(currentRunId)}/operations/${encodeURIComponent(operationId)}`, { runId: currentRunId });
+      urlState.setState({ ...routeState.state, operation: undefined }, { replace: true });
+      await loadSharedWorkspace();
+    } catch (error) {
+      productRiskStatus.textContent = `Operation status unavailable: ${error.message}`;
+    } finally {
+      sharedOperationInFlight = null;
+    }
+  }
+
+  sharedLogin.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    if (!sharedLogin.reportValidity()) return;
+    sharedLoginButton.disabled = true;
+    sharedSessionStatus.textContent = 'Authorizing this browser session…';
+    try {
+      await sharedControl.login(sharedCredential.value);
+      sharedCredential.value = '';
+      sharedSessionReady = true;
+      sharedSessionStatus.textContent = 'Shared control session authorized. Credential discarded from the form.';
+      sharedLogin.hidden = true;
+      await loadSharedWorkspace({ announceResult: true });
+    } catch (error) {
+      sharedCredential.value = '';
+      sharedSessionStatus.textContent = `Authorization failed: ${error.message}`;
+      sharedCredential.focus();
+    } finally {
+      sharedLoginButton.disabled = false;
+    }
+  });
+
+  void sharedControl.restore().then(() => {
+    sharedSessionReady = true;
+    sharedLogin.hidden = true;
+    sharedSessionStatus.textContent = 'Shared control session restored.';
+    return loadSharedWorkspace();
+  }).catch((error) => {
+    if (error?.status === 404
+      || (error?.status === 503 && error?.message === 'Shared control API is not enabled.')) {
+      sharedSession.hidden = true;
+      productRisk.hidden = true;
+      return;
+    }
+    sharedSessionStatus.textContent = 'Enter a scoped credential to view shared release authority and authorized actions.';
+    productRisk.dataset.riskAvailability = 'UNAVAILABLE';
+    productRisk.setAttribute('aria-busy', 'false');
+    productRiskStatus.textContent = 'Shared Product Risk is unavailable until this browser session is authorized.';
   });
 
   async function reconcileAction(binding) {
@@ -809,6 +1138,7 @@ function initializeRunWorkspace(root) {
         fetchJson(`${capture.mode === 'single-site' ? '/api/single-site/runs' : '/api/runs'}/${encodeURIComponent(capture.runId)}/logs?maxBytes=262144`, { signal: refresh.signal }),
       ]);
       assertLatestAuthorityRefresh(refresh, capture);
+      if (sharedAuthorityActive) return;
       if (nextSummary?.data?.record?.mode !== capture.mode || nextSummary?.data?.record?.runId !== capture.runId
         || nextDetail?.id !== capture.runId) throw new Error('Run authority identity changed during initial load.');
       assertCoherentAuthority(nextSummary, nextDetail, tail);
@@ -820,6 +1150,7 @@ function initializeRunWorkspace(root) {
       renderView();
     } catch (error) {
       if (capture.generation !== workspaceGeneration || error?.name === 'AbortError') return;
+      if (sharedAuthorityActive) return;
       viewRegion.dataset.asyncState = error?.status === 403 ? 'permission-denied' : error?.status === 404 || error?.status === 410 ? 'unavailable' : 'retryable-failure';
       viewRegion.replaceChildren(textElement(document, 'h2', 'Run unavailable'), textElement(document, 'p', error.message), retryButton());
     } finally {
@@ -913,11 +1244,18 @@ function initializeRunWorkspace(root) {
 
   function renderOverview() {
     const heading = textElement(document, 'h2', 'Run overview');
-    const copy = textElement(document, 'p', currentMode === 'comparative'
+    const copy = textElement(document, 'p', sharedAuthorityActive
+      ? 'Current release authority is revision- and subject-bound. Product Risk remains primary; Pipeline Integrity is adjacent operational context.'
+      : currentMode === 'comparative'
       ? 'Comparative release authority remains separate from connection state and diagnostic exit information.'
       : 'Single-site execution, worker activity, deterministic finalization, and advisory outcome remain separate authorities.');
     const pre = textElement(document, 'pre', '', { class: 'run-authority-detail' });
-    if (currentMode === 'comparative') {
+    if (sharedAuthorityActive) {
+      const newestCompleted = [...(sharedWorkspace?.executions?.executions ?? [])]
+        .filter(({ state }) => ['completed_pass', 'completed_product_failure'].includes(state))
+        .at(-1);
+      pre.textContent = `Release Decision: ${sharedWorkspace.publication.decision.label}\nCertified authority: ${sharedWorkspace.publication.decision.grantedAuthority}\nDecision revision: ${sharedWorkspace.publication.decisionRevision}\nRun revision: ${sharedWorkspace.publication.runRevision}\nActive tests: ${(sharedWorkspace.executions.executions ?? []).filter(({ state }) => !['completed_pass', 'completed_product_failure', 'incomplete', 'cancelled'].includes(state)).length}\nNewest completion: ${newestCompleted?.id ?? 'none available'}`;
+    } else if (currentMode === 'comparative') {
       pre.textContent = `Profile: ${detail?.options?.profile ?? 'unavailable'}\nTargets: ${(detail?.options?.projects ?? []).join(', ') || 'unavailable'}\nPipeline: ${detail?.pipeline?.status ?? 'unavailable'}\nRelease: ${detail?.release?.decision ?? 'unavailable'}\nCommand: ${(detail?.command ?? []).join(' ') || 'unavailable'}`;
     } else {
       pre.textContent = `Deployment role: ${detail?.deploymentRole ?? 'unavailable'}\nTargets: ${(detail?.scope?.selectedTargetIds ?? []).join(', ') || 'unavailable'}\nAttempt: ${detail?.attempt?.number ?? 'unavailable'}\nFinalization: ${detail?.finalization?.status ?? 'unavailable'}\nAdvisory only: yes`;
@@ -1136,10 +1474,14 @@ function initializeRunWorkspace(root) {
     purged = false;
     currentMode = parsed.state.mode;
     currentRunId = parsed.state.run;
+    sharedWorkspace = null;
+    sharedAuthorityActive = false;
+    sharedOperationInFlight = null;
     logViewer.setMode(currentMode);
     setText('run-mode', humanize(currentMode));
     setText('run-id', currentRunId);
     void initialLoad();
+    if (sharedSessionReady) void loadSharedWorkspace();
   }
 
   urlState = createConsoleUrlState({

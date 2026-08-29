@@ -190,6 +190,85 @@ async function fulfillCommon(route: Route, mode: Mode, runId: string, values: {
 }
 
 test.describe('run-workspace', () => {
+  for (const mode of ['comparative', 'single-site'] as const) {
+    test(`shared ${mode} workspace authenticates in-page and presents revision-bound Product Risk with durable rekick`, async ({ page }) => {
+      const runId = `shared-${mode}-run`;
+      let authorized = false;
+      let operationAccepted = false;
+      const finalSubjectDigest = `sha256:${'b'.repeat(64)}`;
+      const route = async (route: Route) => {
+        const request = route.request();
+        const url = new URL(request.url());
+        if (url.pathname === '/api/control/v1/session' && request.method() === 'GET') {
+          return route.fulfill({ status: authorized ? 200 : 401, json: authorized
+            ? { schemaVersion: 1, data: { csrfToken: 'csrf-fixture', principal: { id: 'reviewer-1' } } }
+            : { schemaVersion: 1, error: { code: 'AUTHENTICATION_REQUIRED', message: 'Authentication is required.' } } });
+        }
+        if (url.pathname === '/api/control/v1/session' && request.method() === 'POST') {
+          expect((await request.postDataJSON()).credential).toBe('scoped-browser-credential');
+          authorized = true;
+          return route.fulfill({ json: { schemaVersion: 1, data: { csrfToken: 'csrf-fixture', principal: { id: 'reviewer-1' } } } });
+        }
+        const root = `/api/control/v1/runs/${runId}`;
+        const revision = operationAccepted ? 8 : 7;
+        if (url.pathname === `${root}/publication`) return route.fulfill({ json: { schemaVersion: 1, data: {
+          runId, runRevision: revision, decisionRevision: 3, riskRevision: 2, finalSubjectDigest,
+          decision: { mode, label: 'FEATURE READY', grantedAuthority: 'TARGETED', certifiedScope: { features: ['navigation'] } },
+          riskRegister: { availability: 'PARTIAL', risks: [
+            {
+              identity: 'risk-manual-1', category: 'manual-check', severity: 'high', mode,
+              reviewState: 'OPEN', releaseEffect: 'non-blocking', explanation: 'Manual checkout remains outstanding.',
+              recommendedAction: 'Review checkout on a physical device.', source: { kind: 'manual', id: 'manual-1' },
+            },
+            {
+              identity: 'risk-visual-1', category: 'unreviewed-visual-change', severity: 'medium', mode,
+              reviewState: 'PENDING_REVIEW', releaseEffect: 'non-blocking', explanation: 'A deterministic comparison changed.',
+              recommendedAction: 'Review the bounded visual evidence.', source: { kind: 'visual-review', id: 'oracle-visual-1' },
+            },
+          ] },
+        } } });
+        if (url.pathname === `${root}/executions`) return route.fulfill({ json: { schemaVersion: 1, data: {
+          runId, runRevision: revision, executions: operationAccepted ? [] : [{ id: 'work-incomplete', state: 'incomplete' }],
+          oracleExecutions: [{ id: 'oracle-visual-1' }],
+        } } });
+        if (url.pathname === `${root}/logs`) return route.fulfill({ json: { schemaVersion: 1, data: { runId, runRevision: revision, limit: 200, truncated: false, events: [], attemptLogs: [] } } });
+        if (url.pathname === `${root}/rekick` && request.method() === 'POST') {
+          expect(request.headers()['x-audit-csrf']).toBe('csrf-fixture');
+          expect(request.headers()['idempotency-key']).toBeTruthy();
+          expect((await request.postDataJSON()).workItemIds).toEqual(['work-incomplete']);
+          operationAccepted = true;
+          return route.fulfill({ status: 202, json: { schemaVersion: 1, data: {
+            operationId: 'a'.repeat(64), state: 'accepted', statusUrl: `${root}/operations/${'a'.repeat(64)}`,
+          } } });
+        }
+        if (url.pathname === `${root}/operations/${'a'.repeat(64)}`) return route.fulfill({ json: { schemaVersion: 1, data: {
+          operationId: 'a'.repeat(64), state: 'completed', outcome: { status: 'succeeded' },
+        } } });
+        if (url.pathname.startsWith('/api/console/v1/runs/')
+          || url.pathname.startsWith('/api/runs/') || url.pathname.startsWith('/api/single-site/runs/')) {
+          return route.fulfill({ status: 404, json: { error: { code: 'NOT_FOUND', message: 'No legacy projection exists.' } } });
+        }
+        return route.fallback();
+      };
+      await page.route('**/api/**', route);
+      await page.goto(`/run.html?mode=${mode}&run=${runId}`);
+      await expect(page.locator('#run-product-risk')).toHaveAttribute('data-risk-availability', 'UNAVAILABLE');
+      await expect(page.locator('input[name="control-credential"]')).toHaveAttribute('type', 'password');
+      await page.locator('input[name="control-credential"]').fill('scoped-browser-credential');
+      await page.getByRole('button', { name: 'Authorize this browser session' }).click();
+      await expect(page.getByRole('heading', { name: 'FEATURE READY' })).toBeVisible();
+      await expect(page.locator('#run-product-risk')).toHaveAttribute('data-risk-availability', 'PARTIAL');
+      await expect(page.locator('#run-product-risk')).toContainText('non-blocking');
+      await expect(page.locator('#run-product-risk')).toContainText('Pipeline Integrity');
+      await expect(page.getByRole('button', { name: 'Accept visual change' })).toBeVisible();
+      await page.getByRole('button', { name: 'Rekick incomplete execution' }).click();
+      await expect(page.locator('#run-inspector-source-revision')).toHaveText('shared-8');
+      await expect(page.getByRole('button', { name: 'Rekick incomplete execution' })).toHaveCount(0);
+      await expect(page.getByRole('heading', { name: 'Product Risk' })).toBeFocused();
+      await expect(page.locator('input[name="control-credential"]')).toHaveValue('');
+    });
+  }
+
   test('direct entry keeps authority fields separate, grouped navigation canonical, and terminal transport dormant', async ({ page }) => {
     const runId = 'run-workspace-terminal';
     await installFakeEventSource(page);
@@ -206,6 +285,8 @@ test.describe('run-workspace', () => {
     await expect(page.locator('#run-connection-state')).toHaveText('Closed');
     await expect(page.locator('#run-finalization')).toHaveText('Not applicable');
     await expect(page.locator('#run-evidence-authority')).toHaveText('Authoritative');
+    await expect(page.locator('.run-shared-session')).toBeHidden();
+    await expect(page.locator('#run-product-risk')).toBeHidden();
     expect(new URL(page.url()).searchParams.has('unknown')).toBe(false);
     expect(new URL(page.url()).hash).toBe('');
     expect(await page.locator('.run-view-group').allTextContents()).toEqual([

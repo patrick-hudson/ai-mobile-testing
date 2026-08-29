@@ -115,6 +115,72 @@
   color: var(--console-danger);
 }
 
+.run-product-risk {
+  margin-top: 1rem;
+  padding: 1rem;
+  border: 2px solid var(--console-rule-strong);
+  background: var(--console-surface);
+}
+
+.run-product-risk[data-risk-availability="PARTIAL"],
+.run-product-risk[data-risk-availability="PROVISIONAL"] {
+  border-left: 0.35rem solid var(--console-warning);
+}
+
+.run-product-risk[data-risk-availability="UNAVAILABLE"] {
+  border-left: 0.35rem solid var(--console-danger);
+}
+
+.run-release-decision,
+.run-recovery,
+.run-pipeline-integrity,
+.run-risk-list > li {
+  padding: 0.8rem;
+  border-top: 1px solid var(--console-rule);
+}
+
+.run-release-decision h3 {
+  margin-block: 0.25rem;
+}
+
+.run-pipeline-integrity {
+  color: var(--console-muted);
+}
+
+.run-risk-actions,
+.run-recovery > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.run-risk-actions label {
+  display: grid;
+  flex: 1 1 18rem;
+  gap: 0.25rem;
+}
+
+.run-risk-actions textarea {
+  min-height: 3.5rem;
+  border: 1px solid var(--console-rule-strong);
+  background: var(--console-surface);
+  color: var(--console-ink);
+}
+
+.run-shared-session label {
+  display: grid;
+  gap: 0.3rem;
+}
+
+.run-shared-session input {
+  width: 100%;
+  min-height: 2.75rem;
+  border: 1px solid var(--console-rule-strong);
+  background: var(--console-surface);
+  color: var(--console-ink);
+}
+
 .run-actions,
 .run-destinations,
 .console-dialog-actions {

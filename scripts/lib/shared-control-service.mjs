@@ -78,12 +78,12 @@ export function createSharedControlService({ store, projectId = 'default' } = {}
     async readLogs(principal, runId, { limit = 200 } = {}) {
       assertPrincipalAuthorized(principal, CONTROL_ACTIONS.RUN_VIEW, object(runId));
       if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_LOG_EVENTS) fail('LOG_LIMIT_INVALID', 'Log limit is outside bounds.');
-      const [histories, workerLogs] = await Promise.all([
-        readRunHistories(store, runId), readBoundedAttemptLogs(store, runId, { limit }),
+      const [state, histories, workerLogs] = await Promise.all([
+        readParentRun(store, runId), readRunHistories(store, runId), readBoundedAttemptLogs(store, runId, { limit }),
       ]);
       const events = Object.values(histories).flat().sort((left, right) => left.runRevision - right.runRevision);
       return {
-        runId, limit, truncated: events.length > limit || workerLogs.truncated,
+        runId, runRevision: state.runRevision, limit, truncated: events.length > limit || workerLogs.truncated,
         events: events.slice(-limit), attemptLogs: workerLogs.entries,
       };
     },

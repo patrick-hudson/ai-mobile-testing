@@ -64,6 +64,9 @@ export interface ConsoleCapabilityContract {
     cancel: boolean;
     purge: boolean;
     manualEvidence: boolean;
+    rekick: boolean;
+    riskAcknowledge: boolean;
+    riskResolve: boolean;
     visualDisposition: boolean;
     baseline: boolean;
     aiReview: boolean;
@@ -84,7 +87,7 @@ export type ConsoleActionId = keyof ConsoleCapabilityContract['actions'];
 export interface ConsoleActionPolicy {
   mutates: true;
   authorization: 'required';
-  eligibility: 'source-defined';
+  eligibility: 'source-defined' | 'incomplete-executions-only' | 'open-nonvisual-risk-only' | 'resolvable-nonvisual-risk-only';
   supported: boolean;
   unsupportedReason: string | null;
 }

@@ -48,7 +48,10 @@ assert.equal(comparative.auditMode, 'comparative');
 assert.equal(comparative.actions.stop, true);
 assert.equal(comparative.actions.cancel, false);
 assert.equal(comparative.actions.manualEvidence, true);
-assert.equal(comparative.actions.visualDisposition, false);
+assert.equal(comparative.actions.visualDisposition, true);
+assert.equal(comparative.actions.rekick, true);
+assert.equal(comparative.actions.riskAcknowledge, true);
+assert.equal(comparative.actions.riskResolve, true);
 assert.equal(comparative.archiveMutability, 'not-applicable');
 
 const singleSite = getConsoleCapabilities('single-site-live');
@@ -59,6 +62,9 @@ assert.equal(singleSite.actions.cancel, true);
 assert.equal(singleSite.actions.manualEvidence, false);
 assert.equal(singleSite.actions.visualDisposition, true);
 assert.equal(singleSite.actions.baseline, true);
+assert.equal(singleSite.actions.rekick, true);
+assert.equal(singleSite.actions.riskAcknowledge, true);
+assert.equal(singleSite.actions.riskResolve, true);
 
 const archive = getConsoleCapabilities('sealed-archive');
 assert.deepEqual(archive.transport, { kind: 'sealed', resume: 'none', fallback: 'none' });
@@ -87,6 +93,12 @@ assert.equal(eligibleStop.unavailableReason, null);
 const ineligibleBaseline = resolveConsoleActionAvailability('single-site-live', 'baseline', { authorized: true, eligible: false });
 assert.equal(ineligibleBaseline.available, false);
 assert.match(ineligibleBaseline.unavailableReason, /authoritative run state/i);
+for (const contextId of ['comparative-live', 'single-site-live']) {
+  const rekick = resolveConsoleActionAvailability(contextId, 'rekick', { authorized: true, eligible: false });
+  assert.equal(rekick.supported, true);
+  assert.match(rekick.unavailableReason, /incomplete/i);
+  assert.equal(resolveConsoleActionAvailability(contextId, 'visualDisposition', { authorized: true, eligible: true }).available, true);
+}
 
 assert.equal(stateDomainOwner('execution'), 'audit-authority');
 assert.equal(stateDomainOwner('activity'), 'audit-authority');

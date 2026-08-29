@@ -90,6 +90,7 @@
     "shared-release-contracts:self-test": "node --import tsx scripts/shared-release-contracts-self-test.mjs",
     "shared-release-projections:self-test": "node --import tsx scripts/shared-release-projections-self-test.mjs",
     "shared-control-plane:self-test": "node scripts/shared-control-plane-self-test.mjs",
+    "shared-control-browser-client:self-test": "node scripts/shared-control-browser-client-self-test.mjs",
     "shared-portal-read-auth:self-test": "node scripts/shared-portal-read-auth-self-test.mjs",
     "audit:control": "node scripts/audit-control.mjs",
     "audit:principal": "node scripts/manage-control-principal.mjs",

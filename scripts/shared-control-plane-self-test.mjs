@@ -471,6 +471,9 @@ try {
   const projectedExecutions = await projectionControl.readExecutions(projectionReviewer, 'run-projection');
   assert.deepEqual(projectedExecutions.oracleExecutions.map(({ id }) => id), ['oracle-visual']);
   assert.equal(projectedExecutions.executions.length, 1);
+  const projectedLogs = await projectionControl.readLogs(projectionReviewer, 'run-projection');
+  assert.equal(projectedLogs.runId, 'run-projection');
+  assert.equal(projectedLogs.runRevision, projectedExecutions.runRevision);
   const visualRisk = projectionView.riskRegister.risks.find(({ category }) => category === 'unreviewed-visual-change');
   const manualRisk = projectionView.riskRegister.risks.find(({ category }) => category === 'manual-check');
   let projectionState = await recoverParentRun(reopenedStore, 'run-projection');
