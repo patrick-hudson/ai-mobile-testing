@@ -126,9 +126,12 @@ services:
       AUDIT_SHARED_VOLUME_IDENTITY: named-volume:shared-parent-runs
       AUDIT_SHARED_RUN_ID: ${AUDIT_SHARED_RUN_ID:-}
       AUDIT_SHARED_COORDINATOR_PORT: "4180"
+      AUDIT_SHARED_CREDENTIAL_ROOT: /var/lib/ai-mobile-testing/shared/credentials
+      AUDIT_SHARED_PROJECT_ID: ${AUDIT_SHARED_PROJECT_ID:-default}
     volumes:
       - shared-parent-runs:/var/lib/ai-mobile-testing/shared/canonical
       - shared-worker-exchange:/var/lib/ai-mobile-testing/shared/exchange
+      - shared-control-identities:/var/lib/ai-mobile-testing/shared/credentials
 
   shared-worker-ordinary:
     <<: *audit-base
@@ -146,8 +149,10 @@ services:
       AUDIT_SHARED_WORKER_CAPABILITIES: browser:chromium,browser:firefox,browser:webkit
       AUDIT_SHARED_RESOURCE_CLASS: ordinary
       AUDIT_SHARED_EXECUTOR_JSON: ${AUDIT_SHARED_EXECUTOR_JSON:-}
+      AUDIT_SHARED_WORKER_TOKEN_FILE: /run/secrets/shared-worker-token
     volumes:
       - ./certs:/work/certs:ro
+      - ${AUDIT_SHARED_ORDINARY_WORKER_TOKEN_FILE:-/dev/null}:/run/secrets/shared-worker-token:ro
 
   shared-worker-performance:
     <<: *audit-base
@@ -167,8 +172,10 @@ services:
       AUDIT_SHARED_WORKER_CAPABILITIES: performance:lighthouse
       AUDIT_SHARED_RESOURCE_CLASS: performance
       AUDIT_SHARED_EXECUTOR_JSON: ${AUDIT_SHARED_PERFORMANCE_EXECUTOR_JSON:-}
+      AUDIT_SHARED_WORKER_TOKEN_FILE: /run/secrets/shared-worker-token
     volumes:
       - ./certs:/work/certs:ro
+      - ${AUDIT_SHARED_PERFORMANCE_WORKER_TOKEN_FILE:-/dev/null}:/run/secrets/shared-worker-token:ro
 
   single-site-lease-load-proof:
     <<: *audit-base
@@ -327,3 +334,4 @@ volumes:
   single-site-baselines:
   shared-parent-runs:
   shared-worker-exchange:
+  shared-control-identities:

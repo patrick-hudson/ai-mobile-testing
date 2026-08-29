@@ -152,6 +152,12 @@ function timestamp(store) {
   return new Date(store.clock()).toISOString();
 }
 
+function nextTimestamp(store, previous) {
+  const clockTime = store.clock();
+  const previousTime = previous === null || previous === undefined ? Number.NEGATIVE_INFINITY : Date.parse(previous);
+  return new Date(Math.max(clockTime, previousTime + 1)).toISOString();
+}
+
 function manifestBody(value) {
   return {
     schemaVersion: 1,
@@ -285,6 +291,7 @@ async function recoverUnlocked(store, runId, { repairCache = true } = {}) {
   }
   const latest = events.at(-1);
   const snapshot = latest.stateSnapshot;
+  snapshot.authorityTombstone ??= null;
   if (snapshot?.schemaVersion !== 1 || snapshot.kind !== 'durable-parent-run'
     || snapshot.runId !== runId || !Number.isSafeInteger(snapshot.runRevision)
     || !['active', 'cancelled'].includes(snapshot.status)
@@ -296,14 +303,24 @@ async function recoverUnlocked(store, runId, { repairCache = true } = {}) {
     || !snapshot.operations || typeof snapshot.operations !== 'object' || Array.isArray(snapshot.operations)) {
     fail('STORE_CORRUPT', `Parent run ${runId} recovery state is invalid.`);
   }
+  if (snapshot.authorityTombstone !== null && (
+    snapshot.authorityTombstone?.schemaVersion !== 1
+    || snapshot.authorityTombstone.kind !== 'release-authority-tombstone'
+    || snapshot.authorityTombstone.runId !== runId
+    || !canonicalTimestamp(snapshot.authorityTombstone.tombstonedAt, 'authority tombstonedAt')
+    || typeof snapshot.authorityTombstone.reason !== 'string'
+    || !snapshot.authorityTombstone.reason
+  )) fail('STORE_CORRUPT', `Parent run ${runId} has an invalid authority tombstone.`);
   for (const [id, item] of Object.entries(snapshot.workItems)) {
+    item.manualRekicks ??= 0;
     if (item?.id !== id || !SAFE_ID.test(id) || !Number.isSafeInteger(item.maxAttempts) || item.maxAttempts < 1
       || !['queued', 'running', 'completed_pass', 'completed_product_failure', 'cancelled', 'incomplete'].includes(item.state)
       || !Array.isArray(item.attempts)
       || !CAPABILITY_PATTERN.test(item.capability)
       || !RESOURCE_CLASSES.has(item.resourceClass)
       || typeof item.targetId !== 'string'
-      || (item.specAffinity !== null && typeof item.specAffinity !== 'string')) {
+      || (item.specAffinity !== null && typeof item.specAffinity !== 'string')
+      || !Number.isSafeInteger(item.manualRekicks) || item.manualRekicks < 0 || item.manualRekicks > 3) {
       fail('STORE_CORRUPT', `Parent run ${runId} has invalid work-item state.`);
     }
   }
@@ -334,7 +351,7 @@ async function appendMutationUnlocked(store, state, kind, type, apply, { actor =
   apply(next);
   delete next.clockNow;
   next.runRevision = state.runRevision + 1;
-  next.updatedAt = timestamp(store);
+  next.updatedAt = nextTimestamp(store, state.updatedAt);
   next.ledgerSequences[kind] += 1;
   const event = await appendLedgerEvent(store.storage, runDirectory(store, state.runId), kind, {
     sequence: next.ledgerSequences[kind],
@@ -463,6 +480,7 @@ export async function createParentRun(store, input) {
         maxAttempts: item.maxAttempts,
         lease: null,
         attempts: [],
+        manualRekicks: 0,
         canonicalResult: null,
       };
     }
@@ -489,6 +507,7 @@ export async function createParentRun(store, input) {
         exclusiveLease: null,
       },
       operations: {},
+      authorityTombstone: null,
       currentPublicationDigest: null,
       ledgerSequences: { decision: 0, risk: 0, mutation: 1, operation: 0 },
       ledgerHeads: { decision: null, risk: null, mutation: null, operation: null },
@@ -1106,11 +1125,21 @@ export async function acceptOperation(store, runId, request) {
       if (existing.bodyDigest !== digest) fail('IDEMPOTENCY_CONFLICT', 'Idempotency key was reused with a different operation body.');
       return clone(existing);
     }
+    if (state.authorityTombstone !== null) fail('RELEASE_AUTHORITY_TOMBSTONED', 'Tombstoned runs cannot accept operations.');
+    if (request.expectedRunRevision !== undefined
+      && (!Number.isSafeInteger(request.expectedRunRevision) || request.expectedRunRevision !== state.runRevision)) {
+      fail('RUN_REVISION_CONFLICT', 'Expected run revision is stale.');
+    }
+    if (request.expectedSubjectDigest !== undefined && request.expectedSubjectDigest !== state.finalSubjectDigest) {
+      fail('RELEASE_SUBJECT_MISMATCH', 'Operation does not match the immutable final subject.');
+    }
+    if (Object.keys(state.operations).length >= 128) fail('OPERATION_LIMIT_REACHED', 'Run operation retention limit was reached.');
     const operation = {
       operationId: createHash('sha256').update(`${runId}\0${request.idempotencyKey}`).digest('hex'),
       idempotencyKey: request.idempotencyKey,
       kind: request.kind,
       bodyDigest: digest,
+      body: clone(request.body),
       actor: request.actor,
       state: 'accepted',
       acceptedAt: timestamp(store),
@@ -1129,6 +1158,28 @@ export async function getOperation(store, runId, idempotencyKey) {
   const operation = state.operations[idempotencyKey];
   if (!operation) fail('OPERATION_NOT_FOUND', `Operation ${idempotencyKey} was not found.`);
   return clone(operation);
+}
+
+export async function listAcceptedOperations(store, runId, { limit = 32 } = {}) {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 128) fail('STORE_SCHEMA_INVALID', 'Operation list limit is invalid.');
+  const state = await recoverUnlocked(store, runId);
+  return Object.values(state.operations).filter(({ state: operationState }) => operationState === 'accepted').slice(0, limit).map(clone);
+}
+
+export async function rekickIncompleteWork(store, runId, coordinator, input) {
+  const ids = [...new Set(input?.workItemIds ?? [])];
+  if (ids.length < 1 || ids.length > 64 || ids.some((id) => !SAFE_ID.test(id))) fail('STORE_SCHEMA_INVALID', 'Rekick requires 1 through 64 valid work-item IDs.');
+  return mutate(store, runId, { coordinator, kind: 'mutation', type: 'incomplete-work-rekicked', actor: input.actor, data: { workItemIds: ids } }, (next) => {
+    for (const id of ids) {
+      const item = next.workItems[id];
+      if (!item || item.state !== 'incomplete' || item.canonicalResult !== null || item.manualRekicks >= 3) {
+        fail('REKICK_NOT_INCOMPLETE', `Work item ${id} is not eligible for incomplete-work rekick.`);
+      }
+      item.state = 'queued';
+      item.lease = null;
+      item.manualRekicks += 1;
+    }
+  });
 }
 
 export async function completeOperation(store, runId, coordinator, operationId, outcome) {
@@ -1179,9 +1230,77 @@ export async function appendMutationAuditEvent(store, runId, coordinator, input)
   }, () => {});
 }
 
+export async function tombstoneParentRunAuthority(store, runId, coordinator, input) {
+  return withDirectoryLock(store.storage, globalLockPath(store), () => withDirectoryLock(store.storage, lockPath(store, runId), async () => {
+    const state = await recoverUnlocked(store, runId);
+    await validateCoordinator(store, coordinator);
+    if (state.authorityTombstone !== null) return clone(state.authorityTombstone);
+    if (!input?.actor || typeof input.actor.id !== 'string' || !input.actor.id
+      || !['human', 'service'].includes(input.actor.kind)) fail('STORE_SCHEMA_INVALID', 'Authority tombstone requires an immutable human or service actor.');
+    const tombstone = {
+      schemaVersion: 1,
+      kind: 'release-authority-tombstone',
+      runId,
+      subjectCoreDigest: state.subjectCoreDigest,
+      finalSubjectDigest: state.finalSubjectDigest,
+      lastPublicationDigest: state.currentPublicationDigest,
+      tombstonedAt: timestamp(store),
+      reason: schedulingString(input?.reason, 'authority tombstone reason', { maximum: 1_024 }),
+      actor: input?.actor ?? null,
+    };
+    await appendMutationUnlocked(store, state, 'mutation', 'release-authority-tombstoned', (next) => {
+      next.authorityTombstone = tombstone;
+      next.status = 'cancelled';
+      for (const item of Object.values(next.workItems)) {
+        if (!['completed_pass', 'completed_product_failure'].includes(item.state)) {
+          item.state = 'cancelled';
+          item.lease = null;
+        }
+      }
+      next.resourceScheduling.performanceDrain = null;
+      next.resourceScheduling.exclusiveLease = null;
+    }, { actor: input?.actor ?? null, data: { reason: tombstone.reason, lastPublicationDigest: tombstone.lastPublicationDigest } });
+    return clone(tombstone);
+  }));
+}
+
+export async function purgeParentRunEvidence(store, runId) {
+  return withDirectoryLock(store.storage, globalLockPath(store), () => withDirectoryLock(store.storage, lockPath(store, runId), async () => {
+    const state = await recoverUnlocked(store, runId);
+    if (state.authorityTombstone === null) fail('PURGE_REQUIRES_TOMBSTONE', 'Evidence cannot be purged before release authority is tombstoned.');
+    const directory = runDirectory(store, runId);
+    for (const relative of ['evidence', 'inboxes']) {
+      const target = containedPath(directory, relative);
+      await store.storage.fs.rm(target, { recursive: true, force: true });
+    }
+    await store.storage.fs.mkdir(path.join(directory, 'inboxes'), { recursive: true, mode: 0o2770 });
+    return clone(state.authorityTombstone);
+  }));
+}
+
 export async function readRunHistories(store, runId) {
   await recoverUnlocked(store, runId);
   return readAllLedgers(store.storage, runDirectory(store, runId));
+}
+
+export async function readBoundedAttemptLogs(store, runId, { limit = 200 } = {}) {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000) fail('STORE_SCHEMA_INVALID', 'Attempt log limit is invalid.');
+  const state = await recoverUnlocked(store, runId, { repairCache: false });
+  const entries = [];
+  for (const workItemId of Object.keys(state.workItems)) {
+    const directory = path.join(runDirectory(store, runId), 'inboxes', workItemId, 'logs');
+    const names = await store.storage.fs.readdir(directory).catch((error) => error?.code === 'ENOENT' ? [] : Promise.reject(error));
+    for (const name of names) {
+      if (!/^\d{6}-[A-Za-z0-9._-]+-\d{8}\.json$/.test(name)) continue;
+      const document = await readBoundedJson(store.storage, path.join(directory, name), { label: 'attempt log', maximumBytes: 16 * 1_024 });
+      const { digest, ...body } = document;
+      if (document.kind !== 'attempt-log-inbox' || document.runId !== runId || document.workItemId !== workItemId
+        || digest !== canonicalDigest(body)) fail('STORE_CORRUPT', 'Attempt log is corrupt.');
+      entries.push(document);
+    }
+  }
+  entries.sort((left, right) => left.occurredAt.localeCompare(right.occurredAt) || left.sequence - right.sequence);
+  return { entries: entries.slice(-limit), truncated: entries.length > limit };
 }
 
 function publicationPath(store, runId, digest) {
@@ -1267,6 +1386,9 @@ export async function publishCurrentEnvelope(store, runId, coordinator, envelope
 
 export async function readCurrentEnvelope(store, runId) {
   const state = await recoverUnlocked(store, runId);
+  if (state.authorityTombstone !== null) {
+    fail('RELEASE_AUTHORITY_TOMBSTONED', 'Parent run release authority was irreversibly tombstoned before purge.', state.authorityTombstone);
+  }
   if (state.currentPublicationDigest === null) fail('PUBLICATION_UNAVAILABLE', 'Parent run has no current publication.');
   let head;
   try {
@@ -1293,4 +1415,15 @@ export async function readCurrentEnvelope(store, runId) {
     fail('STORE_CORRUPT', 'Publication head disagrees with canonical recovered state.');
   }
   return current;
+}
+
+export async function withCurrentEnvelopeFence(store, runId, callback) {
+  if (typeof callback !== 'function') fail('STORE_SCHEMA_INVALID', 'Publication fence callback is required.');
+  return withDirectoryLock(store.storage, globalLockPath(store), () => withDirectoryLock(store.storage, lockPath(store, runId), async () => {
+    const state = await recoverUnlocked(store, runId);
+    if (state.authorityTombstone !== null) fail('RELEASE_AUTHORITY_TOMBSTONED', 'Parent run release authority is tombstoned.');
+    if (state.currentPublicationDigest === null) fail('PUBLICATION_UNAVAILABLE', 'Parent run has no current publication.');
+    const current = (await readPublicationChain(store, runId, state.currentPublicationDigest)).at(-1);
+    return callback(current);
+  }));
 }

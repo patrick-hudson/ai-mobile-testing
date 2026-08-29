@@ -11,6 +11,12 @@ const required = (name) => {
   return value;
 };
 const coordinatorUrl = new URL(required('AUDIT_SHARED_COORDINATOR_URL'));
+const workerCredentialPath = path.resolve(required('AUDIT_SHARED_WORKER_TOKEN_FILE'));
+const workerCredentialStat = await fs.lstat(workerCredentialPath);
+if (!workerCredentialStat.isFile() || workerCredentialStat.isSymbolicLink() || workerCredentialStat.size < 40 || workerCredentialStat.size > 4_096
+  || (workerCredentialStat.mode & 0o077) !== 0) throw new Error('Worker credential file must be a bounded, regular mode-0600 file.');
+const workerCredential = (await fs.readFile(workerCredentialPath, 'utf8')).trim();
+if (!/^amt\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{32,}$/.test(workerCredential)) throw new Error('Worker credential file is invalid.');
 if (coordinatorUrl.protocol !== 'http:' || coordinatorUrl.username || coordinatorUrl.password || coordinatorUrl.pathname !== '/') {
   throw new Error('AUDIT_SHARED_COORDINATOR_URL must be an exact credential-free HTTP origin on the private Compose network.');
 }
@@ -33,7 +39,7 @@ if (!Array.isArray(executor) || executor.length === 0 || executor.some((part) =>
 
 const post = async (pathname, body) => {
   const response = await fetch(new URL(pathname, coordinatorUrl), {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(30_000),
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${workerCredential}` }, body: JSON.stringify(body), signal: AbortSignal.timeout(30_000),
   });
   const value = await response.json();
   return { response, value };

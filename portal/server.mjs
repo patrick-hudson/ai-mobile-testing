@@ -19,6 +19,12 @@ import { ByteLruCache } from './byte-lru-cache.mjs';
 import { readBoundedFileTail } from './bounded-file.mjs';
 import { openContainedArtifactFile } from './safe-artifact-open.mjs';
 import { createConsoleApi, handleConsoleApiRequest } from './console-api.mjs';
+import { createSharedControlApi } from './shared-control-api.mjs';
+import { openScopedCredentialAuthority } from './scoped-credential-authority.mjs';
+import { validateMutationDeployment } from '../shared/control-plane-contract.mjs';
+import { createParentRun, openParentRunStore } from '../scripts/lib/parent-run-store.mjs';
+import { createSharedControlService } from '../scripts/lib/shared-control-service.mjs';
+import { openPromotionClaimStore } from '../scripts/lib/promotion-claim-store.mjs';
 import {
   getConsoleCapabilities,
   resolveConsoleActionAvailability,
@@ -450,6 +456,8 @@ let consoleKnownSingleSiteRefreshRunning = false;
 let consoleKnownSingleSiteCursor = 0;
 let consoleComparativeReportWatermark = 0;
 let consoleSingleSiteReportWatermark = 0;
+let sharedControlApi = null;
+let legacyOperatorEnabled = true;
 
 const singleSiteRunnerRevision = await resolveRunnerRevision({ root: REPOSITORY_ROOT });
 const previewTlsBypassOrigins = String(process.env.AUDIT_PREVIEW_TLS_BYPASS_ALLOWLIST ?? '')
@@ -490,6 +498,36 @@ const singleSiteLaunch = createSingleSiteLaunchCoordinator({
 await fs.mkdir(ARTIFACT_ROOT, { recursive: true });
 await fs.mkdir(SINGLE_SITE_FINALIZATION_ROOT, { recursive: true, mode: 0o700 });
 await initializeSecretVault();
+if (process.env.PORTAL_SHARED_CONTROL === '1') {
+  const publishedOrigin = process.env.PORTAL_PUBLISHED_ORIGIN ?? `http://${HOST}:${PORT}`;
+  const deployment = validateMutationDeployment({
+    bindHost: HOST,
+    acceptedSocketHost: process.env.PORTAL_ACCEPTED_SOCKET_HOST ?? HOST,
+    publishedOrigin,
+    sessionSecure: process.env.PORTAL_SESSION_SECURE === '1',
+  });
+  legacyOperatorEnabled = deployment.local;
+  const controlStore = await openParentRunStore({
+    root: process.env.AUDIT_SHARED_STORE_ROOT,
+    deploymentIdentity: process.env.AUDIT_SHARED_DEPLOYMENT_IDENTITY,
+    volumeIdentity: process.env.AUDIT_SHARED_VOLUME_IDENTITY,
+  });
+  const credentialAuthority = await openScopedCredentialAuthority({ root: join(SECRET_ROOT, 'control-identities') });
+  const claimStore = await openPromotionClaimStore({ root: join(SECRET_ROOT, 'promotion-claims') });
+  const sharedProjectId = process.env.AUDIT_SHARED_PROJECT_ID ?? 'default';
+  sharedControlApi = createSharedControlApi({
+    authority: credentialAuthority,
+    service: createSharedControlService({ store: controlStore, projectId: sharedProjectId }),
+    claimStore,
+    expectedOrigin: deployment.publishedOrigin,
+    launch: async (_principal, body) => {
+      if (!body?.parentRun || !['single-site', 'comparative'].includes(body.mode)) throw httpError(400, 'Shared launch requires mode and parentRun.');
+      if (body.projectId !== sharedProjectId) throw httpError(403, 'Shared launch project does not match this control service.');
+      if (body.parentRun.subjectCore?.mode && body.parentRun.subjectCore.mode !== body.mode) throw httpError(409, 'Shared launch mode disagrees with the release subject.');
+      return createParentRun(controlStore, body.parentRun);
+    },
+  });
+}
 const recoveredSingleSiteAiReviews = await recoverSingleSiteAiReviews(singleSiteAiReview);
 for (const recovery of recoveredSingleSiteAiReviews) {
   console.warn(`Recovered Single-site AI advisory ${recovery.jobId} as ${recovery.state}.`);
@@ -619,7 +657,7 @@ server.listen(PORT, HOST, () => {
   console.log(`Externally launched sharded runs will be tracked from ${SHARDED_ARTIFACT_ROOT}`);
   console.log(`Single-site jobs use the verified ${singleSiteQueue.storage?.filesystemType ?? 'unknown'} queue at ${SINGLE_SITE_QUEUE_ROOT}`);
   console.log(`Single-site visual baselines use the independent persistent store at ${VISUAL_BASELINE_ROOT}`);
-  console.log(`Operator unlock path (append to the published portal origin): /operator/bootstrap?token=${operatorCapabilityToken}`);
+  if (legacyOperatorEnabled) console.log(`Operator unlock path (append to the published portal origin): /operator/bootstrap?token=${operatorCapabilityToken}`);
 });
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
@@ -1502,6 +1540,13 @@ async function routeRequest(request, response) {
   if (request.method === 'GET' && pathname === '/healthz') {
     return sendJson(response, 200, { ok: true });
   }
+  if (pathname === '/api/control/v1' || pathname.startsWith('/api/control/v1/')) {
+    if (!sharedControlApi) throw httpError(503, 'Shared control API is not enabled.');
+    const body = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method) ? await readJsonBody(request) : null;
+    const result = await sharedControlApi.handle({ method: request.method, url: request.url, headers: request.headers, body });
+    if (!result.handled) throw httpError(404, 'Not found.');
+    return sendJson(response, result.status, result.body, result.headers);
+  }
   if (pathname === '/api/console/v1' || pathname.startsWith('/api/console/v1/')) {
     const result = await withConsoleRequest(request, response, (signal) => handleConsoleApiRequest(consoleApi, {
       method: request.method,
@@ -1513,6 +1558,7 @@ async function routeRequest(request, response) {
     return sendConsoleApiResult(request, response, result);
   }
   if (request.method === 'GET' && pathname === '/operator/bootstrap') {
+    if (!legacyOperatorEnabled) throw httpError(404, 'Legacy operator unlock is unavailable in shared mutation mode.');
     if (!constantTimeTokenMatch(requestUrl.searchParams.get('token'), operatorCapabilityToken)) {
       throw httpError(403, 'The operator unlock link is invalid. Copy the current link from the portal service log.');
     }
@@ -1526,6 +1572,7 @@ async function routeRequest(request, response) {
     return response.end();
   }
   if (request.method === 'POST' && pathname === '/api/operator/session') {
+    if (!legacyOperatorEnabled) throw httpError(404, 'Legacy operator unlock is unavailable in shared mutation mode.');
     assertOperatorSessionRequest(request);
     const body = await readJsonBody(request);
     if (!body || typeof body !== 'object' || Array.isArray(body)
@@ -7860,6 +7907,7 @@ function requireOperatorAuthorization(request) {
 }
 
 function operatorRequestAuthorized(request) {
+  if (!legacyOperatorEnabled) return false;
   const authorization = String(request.headers['x-portal-operator-token'] ?? '');
   if (constantTimeTokenMatch(authorization, operatorCapabilityToken)) return true;
   const cookie = String(request.headers.cookie ?? '')
