@@ -1,86 +1,263 @@
-# Quitting7oh comparative and Single-site audit
+<div align="center">
 
-This repository is a Docker-first visual and functional audit system. It supports a one-origin Single-site Audit and the established release comparison between:
+# Quitting7oh Audit Console
 
-- production baseline: `https://quitting7oh.org`
-- redesigned candidate: `https://beta.quitting7oh-org.pages.dev`
+**Release decisions backed by browser evidence—not a mysterious green check.**
 
-It does not reduce a launch decision to a green check. Every audit has an ID, a reader-facing promise, explicit expected behavior, severity, release-blocking policy, performed steps, observed values, findings, and required evidence. Interaction tests record an action-and-response video with a human-readable rationale; rendered static checks capture relevant screenshots; request, redirect, sitemap, and other data-only contracts retain structured evidence without decorative media. FFmpeg rejects blank, static, and blank-ending recordings. A harmless leading browser-capture gap is trimmed only when the clip contains a later action after sustained page content and the derivative independently passes every quality gate. A run also retains traces, browser/network observations, Playwright results, a searchable long-form checklist, and an optional AI evidence review.
+A Docker-first visual, functional, accessibility, and performance audit system for
+[quitting7oh.org](https://quitting7oh.org), built with Playwright, TypeScript, and FFmpeg.
 
-## Start the portal
+[![Node.js 24.15+](https://img.shields.io/badge/Node.js-24.15%2B-339933?logo=nodedotjs&logoColor=white)](package.json)
+[![Playwright 1.62.1](https://img.shields.io/badge/Playwright-1.62.1-2EAD33?logo=playwright&logoColor=white)](package.json)
+[![TypeScript](https://img.shields.io/badge/TypeScript-7.0-3178C6?logo=typescript&logoColor=white)](tsconfig.json)
+[![Docker first](https://img.shields.io/badge/runtime-Docker_first-2496ED?logo=docker&logoColor=white)](docs/DOCKER.md)
+[![183 audit contracts](https://img.shields.io/badge/audit_contracts-183-6D5DFB)](docs/ASSERTION_LEDGER.md)
 
-Docker is the supported browser runtime, including on macOS. This command starts the portal, the durable Single-site worker pool, and the Single-site finalizer:
+[Quick start](#quick-start) · [Choose an audit](#choose-an-audit-mode) · [How it works](#how-it-works) · [Commands](#command-reference) · [Documentation](#documentation)
+
+</div>
+
+![Quitting7oh audit console overview](portal/tests/__screenshots__/overview-1440.png)
+
+## What this is
+
+This repository audits the quitting7oh experience in two complementary modes:
+
+| Mode | Use it for | Result authority |
+| --- | --- | --- |
+| **Single-site Audit** | Inspect one Preview or Production origin against standalone Product Oracles | Advisory site health, coverage, visual review, and evidence integrity |
+| **Comparative Audit** | Compare `https://quitting7oh.org` with `https://beta.quitting7oh-org.pages.dev` | Portal runs are review evidence; a fresh sharded run is required for release signoff |
+
+Every check declares a stable audit ID, user promise, expected behavior, severity,
+release-blocking policy, performed steps, observations, findings, and required
+evidence. The result is a reviewable record—not a test count stripped of context.
+
+### Highlights
+
+- **183 explicit audit contracts**: 81 feature and cross-cutting checks plus 102 generated route checks.
+- **Reproducible browsers**: pinned Chromium, Firefox, and WebKit runtimes inside Docker.
+- **Evidence matched to the assertion**: action-and-response video, relevant screenshots, or structured data.
+- **Durable execution**: queue-backed Single-site workers and an independent finalizer survive browser disconnects and container replacement.
+- **Human-readable review**: searchable reports, a visual gallery, bounded logs, traces, network observations, and Playwright output.
+- **Fail-closed release truth**: incomplete execution or missing required evidence cannot become green.
+- **Optional AI review**: bounded, advisory evidence analysis that can never override a deterministic failure.
+- **Extensible test plugins**: reviewed manifests connect audit definitions to allowlisted Playwright specs.
+
+## Quick start
+
+### Prerequisites
+
+- Docker Engine or Docker Desktop with Compose v2
+- Node.js `24.15.0` or newer
+- npm `11.6.2` (the version pinned by `packageManager`)
+
+The supported browser runtime is Docker. Do not use host-installed Playwright
+browsers for release evidence.
+
+### Install and launch
 
 ```sh
+git clone https://github.com/patrick-hudson/ai-mobile-testing.git
+cd ai-mobile-testing
+npm ci
+cp .env.example .env
 npm run portal
 ```
 
-Open <http://127.0.0.1:4173>. Choose **Audit one site** to test one Preview or Production deployment without a comparison origin, or use the comparative launcher for the established production-versus-candidate release audit. The portal streams timestamped output from queue/start through browser execution, FFmpeg processing, report/gallery publication, optional AI review, and final disposition.
+Open [http://127.0.0.1:4173](http://127.0.0.1:4173).
 
-The portal is organized as a desktop administration console rather than a launch form with modal run details. `/` is a bounded Overview led by current Product Risk; Run Trust, active work, and the latest terminal run remain separate beside it. `/runs.html`, `/findings.html`, and `/evidence.html` are global, server-filtered indexes. `/new-audit.html` owns launch configuration, `/settings.html` owns credentials and runtime inventories, and `/run.html?mode=<mode>&run=<id>` is the stable live workspace from queue through finalization. Reports and galleries retain the same run identity and console navigation. An empty attention queue is never labelled as a pass, and a broken evidence pipeline is visible in Run Trust without erasing a product defect.
+`npm run portal` builds and starts the complete stack: the audit console, two
+durable Single-site workers, and one finalizer. The first build downloads the
+pinned Playwright image and may take a few minutes.
 
-Safe filters, selections, inspector state, and run identity are addressable in the URL. Credentials, authorization, mutation bindings, and oversized or secret-like values are never URL or saved-view state. Every index response carries source revision, freshness, completeness, limitations, and bounded-work metadata; stale refreshes preserve the last sourced rows and say so explicitly. Purge invalidates matching rows, selections, media, live transports, and cached projections before the UI accepts completion.
+> [!IMPORTANT]
+> Starting only the `portal` Compose service does not provide a complete
+> Single-site runtime. Use `npm run portal` so the workers and finalizer start too.
 
-For Single-site Audit, enter the site origin, explicitly confirm Preview or Production, and choose **Check site and preview coverage** before launch. That preflight is read-only: it verifies quitting7oh identity and previews the compiled Product Oracle and target coverage without creating a run. `FULL` means the complete versioned Single-site profile with no narrowing filters; selecting plugins, audit IDs, areas, or a target subset is `TARGETED`. A filtered run must never be described as whole-site coverage.
+### Run your first audit
 
-The Single-site report keeps separate truths separate:
+1. Open **New Audit** and choose **Audit one site**.
+2. Enter an HTTP(S) origin and identify it as **Preview** or **Production**.
+3. Select **Check site and preview coverage**. Preflight is read-only and creates no run.
+4. Review the compiled Product Oracle, browser targets, coverage gaps, and evidence authority.
+5. Choose `FULL` for the complete profile or narrow the selection for a `TARGETED` run.
+6. Launch, then follow queueing, browser execution, media processing, report publication, and final disposition in the run workspace.
 
-- **Site Health** is `HEALTHY`, `FINDINGS`, or `INCOMPLETE` for the executed automated scope. It is advisory and never has promotion authority.
-- **Coverage** is `COMPLETE`, `GAPS`, or `UNKNOWN`; a missing standalone oracle or executable case is visible rather than silently passing.
-- **Manual acceptance** remains outstanding until a human supplies signed evidence. Automation and AI cannot turn it green.
-- **Visual Review** reports `UNCHANGED` or `CHANGED` for compatible same-site baselines, with explicit absent, incompatible, and unavailable states. A reviewer can record an accepted-change or known-defect disposition to move an exact `CHANGED` comparison to `REVIEWED`; this append-only review record does not rewrite Site Health, Coverage, or deterministic Findings.
-- **Evidence Authority** and Pipeline Integrity qualify all of the above. Preview certificate bypass is non-authoritative, and missing required evidence makes the run `INCOMPLETE`.
+## Choose an audit mode
 
-A portal-launched comparative release remains review evidence only: even a `READY` checklist is shown as **review required**, because the single-container launch has no canonical sharded/isolated-performance provenance. Final comparative signoff requires a new run ID with `npm run audit:release:sharded`. Every run has a plain-language report, searchable checklist, bounded log views, and evidence gallery. Comparative portal artifacts remain under `artifacts/runs/<run-id>/`; terminal sharded artifacts remain under `artifacts/sharded/<run-id>/`. Single-site jobs, immutable finalizations, and copied visual baselines live in separate Docker volumes so they survive container replacement.
+### Single-site Audit
 
-Scale Single-site throughput across queued jobs with worker replicas (one job is claimed by one worker):
+Use Single-site mode to audit exactly one deployment without inventing a second
+origin. It compiles independently observable one-origin expectations, exposes
+comparison-only exclusions, and records missing executable coverage as a gap.
 
-```sh
-SINGLE_SITE_WORKER_REPLICAS=4 npm run portal
-```
+- `FULL` selects the complete default Single-site profile with no plugin, audit,
+  area, target, or route narrowing.
+- `TARGETED` selects a subset. A healthy targeted run is not a whole-site approval.
 
-Completed, failed, and stopped runs can be permanently purged from their run detail view. The portal requires the reviewer to type `PURGE <run-id>` exactly, refuses active work and nested mounts, atomically moves the direct-child run into quarantine, and records the transaction in the root-only secret volume before recursive deletion. A restart therefore recovers any partial deletion as a visible `evidence-failed` record that accepts a safe retry. This applies to both portal-managed and terminal-launched sharded evidence. Keep release evidence that still needs sign-off or archival; purge cannot be undone.
+The final report keeps these dimensions separate:
 
-Long actions are asynchronous: the portal stays interactive while run details, artifacts, reports, uploads, and saved settings load. Visible busy states, progress copy, disabled duplicate actions, and accessible live announcements make slow work explicit instead of looking frozen. The reviewer report never downloads the monolithic checklist manifest or a complete log: it uses a compact summary, server-filtered 25-row audit pages, one bounded detail record at a time, and a 64 KB log tail loaded only on request. The large raw checklist remains a download for offline analysis.
+| Dimension | Values | What it means |
+| --- | --- | --- |
+| **Site Health** | `HEALTHY`, `FINDINGS`, `INCOMPLETE` | Deterministic outcome for the automated scope; always advisory |
+| **Scope** | `FULL`, `TARGETED` | Whether the complete versioned profile or a subset ran |
+| **Coverage** | `COMPLETE`, `GAPS`, `UNKNOWN` | Whether standalone oracles, cases, routes, and targets were available |
+| **Manual acceptance** | `NOT_REQUIRED`, `OUTSTANDING`, `FAILED_OR_BLOCKED`, `COMPLETE` | Whether human-only physical-device, assistive-technology, or design review is unnecessary, pending, unsuccessful, or complete |
+| **Visual Review** | `UNCHANGED`, `CHANGED`, `REVIEWED`, absent, incompatible, unavailable | Same-site baseline comparison and explicit human disposition |
+| **Evidence Authority** | Authoritative or non-authoritative | Whether deployment identity and certificate policy support trust |
+| **Pipeline Integrity** | `complete`, `incomplete` | Whether collection, media processing, and immutable publication completed safely |
 
-Do not use host-installed Playwright browsers as the normal execution path. The image pins the Playwright package and Microsoft browser image to the same version, providing consistent Chromium, Firefox, WebKit, system libraries, and FFmpeg behavior.
+### Comparative Audit
 
-For the full sharded release, visual and functional checks default to eight functional shards with one Playwright worker each, scheduled through a bounded pool of four simultaneous Docker containers. This keeps the finer partitions without asking a typical Docker Desktop allocation to hold eight browsers in memory at once. The partition, concurrency, and worker counts remain configurable. Lighthouse and browser performance budgets run alone afterward in a dedicated single-worker container. All fresh blobs are required and merged into the same checklist; performance is isolated for measurement quality, not split into a separate release decision. Each sharded execution reserves a new run directory before any work starts and refuses an existing run ID without touching it, so stale lifecycle files, reports, media, or manual approvals cannot leak into a new decision. Coordinator deadlines, terminated shards, abnormal exits, and required media-stage failures force the generated checklist to `UNAVAILABLE`; its counts remain diagnostic while `sharded-run.json` remains the external release authority.
+Comparative mode runs the established release contract between:
 
-The portal is itself covered by a Docker browser/API acceptance suite. It checks asynchronous loading, the encrypted-key UI, the root-derived operator capability, DNS-rebinding Host rejection plus same-origin mutation protection, atomic launch capacity, browser-wide TLS-bypass rejection, a real targeted run with live logs, non-authoritative portal release labeling, serialized manual evidence, signature/probe/decode rejection of fake media, external sharded-run discovery from active through completed, descriptor-walk artifact containment and HTTP 206 video seeking, refresh/reconnect behavior, stopping portal-managed work, and guarded portal/external evidence purges that notify both live streams. Compact report data is written into immutable revision directories and exposed only after an atomic `current.json` switch; summary, filtered audit pages, and lazy-loaded details stay pinned to that exact digest-verified revision:
+- **Production baseline:** `https://quitting7oh.org`
+- **Redesigned candidate:** `https://beta.quitting7oh-org.pages.dev`
 
-```sh
-npm run portal:e2e
-```
-
-Portal visual baselines are generated only in the pinned Docker browser image. After inspecting the rendered Overview, indexes, workspace, launch/settings, report, gallery, and sealed-archive fixtures, an intentional visual change can be recorded with `npm run portal:e2e:update-snapshots`; a normal `npm run portal:e2e` must then pass without update mode.
-
-Every run exposes a Visual Gallery as soon as finalized evidence exists. The workbench keeps the selected test dominant, groups and sorts by feature or technical suite, preserves a frozen review order until the reviewer accepts an update, and provides keyboard navigation, a virtualized overview, test context, reviewer flags, and bounded activity/execution/raw drawers. The generated Long Build Checklist contains the same shared gallery as an immutable read-only snapshot. It works over HTTP or by opening `checklist/gallery.html` directly; it never needs the full manifest or eager item/media downloads.
-
-## Browser and device targets
-
-Normal and sharded releases retain the same seven-project Chromium, Firefox, WebKit, mobile, tablet, desktop, production, and candidate matrix. Extra profiles are opt-in with `AUDIT_TARGET_IDS`; the registry includes recent/current iPhone WebKit emulations, Pixel and Galaxy Android Chromium emulations, Edge-compatible Chromium, and capability-gated branded Microsoft Edge. Invalid, duplicate, provider-only, or unavailable targets stop before launch.
-
-Device emulation is labeled honestly: it covers viewport, input, scale, user-agent, and engine behavior inside the Linux container, not real iOS, Mobile Safari, Android Chrome, or physical hardware. The registry includes provider-ready metadata for real current/previous iOS and Android devices, but does not expose those rows as runnable until a real-device adapter and evidence pipeline exist. See [`docs/DOCKER.md`](docs/DOCKER.md#browser-and-device-target-matrix) for IDs, commands, Edge installation, and fidelity limits.
-
-The canonical gallery scale gate is Docker-only:
-
-```sh
-npm run portal:e2e:scale
-```
-
-It rebuilds the pinned image, enforces exactly 2 CPUs and 4 GiB, physically creates and recounts the 5,659-artifact / 1,241-logical-item / 110-video / 17,527-stored-file corpus, then measures it. Before each invocation, only the exact portal-E2E output directory is cleared and a new running/passed/failed record is written, so stale green artifacts cannot survive a failed rerun. Results, all timing samples, resource profile, a network trace, portal/archive screenshots, and an interaction-navigation video are saved under `artifacts/portal-e2e/`. Host measurements are informational and cannot satisfy the release gate.
-
-## Run without the portal
+A portal-launched comparison is useful review evidence, but it does not have the
+isolated sharding and performance provenance required for final signoff. Create a
+fresh run ID and use the sharded release command for authoritative evidence:
 
 ```sh
-npm run audit:smoke
-npm run audit:release
+npm run audit:release:sharded
 ```
 
-The smoke profile checks the environment and critical recovery paths. The release profile records every selected test and executes the full device/browser matrix. The checklist intentionally keeps unexecuted and physical-device checks visible as `NOT RUN` or `MANUAL`.
+Visual and functional checks default to eight functional shards with one Playwright worker each.
+They run through a pool of four containers, followed by Lighthouse and browser performance budgets
+alone in a dedicated one-worker container. Every fresh blob is required before
+the final checklist is merged.
 
-With the portal stack running, a second terminal can submit the same durable Single-site contract through the command adapter:
+## How it works
+
+```mermaid
+flowchart LR
+    A[Portal or CLI] --> B[Read-only preflight]
+    B --> C[Compiled audit contract]
+    C --> D[Durable queue]
+    D --> E[Playwright workers]
+    E --> F[Raw evidence]
+    F --> G[FFmpeg and finalizer]
+    G --> H[Immutable report revision]
+    G --> I[Visual gallery]
+    G -. optional .-> J[Advisory AI review]
+    H --> K[Human review and release decision]
+    I --> K
+    J --> K
+```
+
+### Evidence contract
+
+| Assertion type | Required evidence | Examples |
+| --- | --- | --- |
+| **Interaction** | Action-and-response video with named steps and rationale | Navigation, search, calculators, meeting actions |
+| **Rendered static state** | Screenshot of the relevant state | Layout, theme, responsive shell, visual baselines |
+| **Structured/data-only** | Machine-readable observations without decorative media | Redirects, headers, sitemap, network and contract checks |
+
+Interaction video is validated rather than merely attached. FFmpeg rejects blank,
+static, and blank-ending recordings. A leading browser-capture gap may be trimmed
+only when later interaction exists over sustained page content and the derivative
+independently passes every quality gate.
+
+### Execution and publication
+
+- The portal validates origins, targets, profiles, plugins, audit IDs, and areas against repository-owned allowlists.
+- Single-site work is claimed from a durable Docker volume; one job is owned by one worker.
+- Browser work and finalization are separate, so evidence processing can recover independently.
+- Reports are published as digest-verified immutable revisions behind an atomic `current.json` switch.
+- Stale refreshes keep the last sourced data visible and label its freshness and limitations.
+- Missing required media, reports, or execution provenance produces `INCOMPLETE` or `UNAVAILABLE`, never an optimistic pass.
+
+## Audit coverage
+
+Five first-party plugins own the complete audit inventory:
+
+| Plugin | Protects |
+| --- | --- |
+| `platform-routes-content` | Origins, redirects, route inventory, content, visual baselines, homepage, crisis paths, and SEO |
+| `shell-navigation-theme-search` | Global shell, drawers, navigation, themes, breakpoints, and search |
+| `calculators-sows` | Taper and SR-17 calculators, arithmetic, persistence, exports, SOWS, and sharing |
+| `meetings` | Meeting timing, timezones, discovery, filters, history, joins, and failure states |
+| `accessibility-responsive-performance-reliability` | WCAG, keyboard flows, reduced motion, responsiveness, performance, and resilience |
+
+The suite covers availability, redirects, caching, assets, indexing, content
+semantics, route parity, navigation, themes, search, crisis flows, calculators,
+SOWS scoring, meeting discovery, accessibility, responsive behavior, performance,
+layout stability, runtime errors, and explicit manual acceptance rows.
+
+Browse every user promise and oracle in the
+[generated assertion ledger](docs/ASSERTION_LEDGER.md).
+
+## Browser and device coverage
+
+The comparative default is a seven-project matrix:
+
+| Environment | Target |
+| --- | --- |
+| Production | Mobile Chromium |
+| Candidate | Mobile Chromium |
+| Production | Desktop Chromium |
+| Candidate | Desktop Chromium |
+| Candidate | Mobile WebKit |
+| Candidate | Tablet WebKit |
+| Candidate | Desktop Firefox |
+
+Single-site mode maps compatible checks onto neutral one-origin versions of the
+default mobile Chromium, desktop Chromium, mobile WebKit, tablet WebKit, and
+desktop Firefox targets.
+
+Additional Docker-local profiles are opt-in through `AUDIT_TARGET_IDS`, including
+reviewed iPhone/WebKit, Pixel/Chromium, Galaxy/Chromium, Edge-compatible Chromium,
+and capability-gated branded Microsoft Edge profiles.
+
+> [!NOTE]
+> Playwright device emulation covers viewport, input, scale, user agent, and browser
+> engine behavior in Linux. It is not physical iOS, Mobile Safari, Android Chrome,
+> or real hardware. Those acceptance rows remain manual until a real-device adapter
+> and evidence pipeline exist.
+
+See the [browser and device target matrix](docs/DOCKER.md#browser-and-device-target-matrix)
+for exact IDs and fidelity limits.
+
+## Portal guide
+
+| Route | Purpose |
+| --- | --- |
+| `/` | Product Risk overview, Run Trust, active work, and latest terminal run |
+| `/new-audit.html` | Single-site or comparative launch configuration and preflight |
+| `/runs.html` | Global run index |
+| `/findings.html` | Global findings index |
+| `/evidence.html` | Global evidence index |
+| `/settings.html` | Credential status and runtime inventories |
+| `/run.html?mode=<mode>&run=<id>` | Stable live workspace from queue through finalization |
+| `/report.html?mode=<mode>&run=<id>` | Human-readable report |
+| `/gallery.html?mode=<mode>&run=<id>` | Visual evidence workbench |
+
+Filters, selections, inspector state, and run identity are URL-addressable.
+Ordinary console and saved-view URLs never encode credentials, authorization
+material, mutation bindings, or secret-like values. Prefer the in-page POST
+exchange for authorization. The legacy compatibility endpoint
+`/operator/bootstrap?token=...` is the sole exception: it accepts a short-lived
+token, immediately redirects to a clean URL, and uses `no-store` behavior.
+
+## Command reference
+
+### Everyday workflows
+
+| Command | Purpose |
+| --- | --- |
+| `npm run portal` | Build and start the complete portal, worker, and finalizer stack |
+| `npm run audit:smoke` | Check the environment and critical recovery paths |
+| `npm run audit:release` | Run the full profile in one audit container |
+| `npm run audit:release:sharded` | Produce authoritative comparative release evidence |
+| `npm run audit:candidate` | Run the release profile against candidate targets |
+| `npm run audit:lighthouse` | Run the performance suite |
+| `npm run portal:e2e` | Run Docker browser/API acceptance tests for the portal |
+| `npm run portal:e2e:scale` | Run the canonical 2 CPU / 4 GiB gallery scale gate |
+| `npm run validate` | Run registries, contracts, security self-tests, and type checking |
+
+### Submit a Single-site job from the CLI
+
+Keep the portal stack running, then use a second terminal:
 
 ```sh
 docker compose exec portal node scripts/run-single-site.mjs \
@@ -90,58 +267,345 @@ docker compose exec portal node scripts/run-single-site.mjs \
   --scope FULL
 ```
 
-Use `--scope TARGETED` with one or more of `--targets`, `--plugins`, `--audits`, or `--areas`. Add `--ai-review <model-id>` only when advisory AI is desired. The command performs preflight, repeats validation at launch, and enqueues work; the worker and finalizer services must remain running. See [`docs/DOCKER.md`](docs/DOCKER.md#single-site-audit-operations) for recovery, TLS exceptions, baselines, and purge.
+For a targeted run, use `--scope TARGETED` with one or more of `--targets`,
+`--plugins`, `--audits`, or `--areas`. Add `--ai-review <model-id>` only when
+advisory AI review is wanted.
+
+<details>
+<summary><strong>Complete Single-site CLI contract</strong></summary>
+
+```text
+node scripts/run-single-site.mjs --queue-root <path> \
+  (--launch <launch.json> | --url <origin> --role <preview|production> \
+  [--certificate-policy strict|preview-bypass] [--scope FULL|TARGETED] \
+  [--targets id,...] [--plugins id,...] [--audits id,...] [--areas name,...] \
+  [--ai-review model-id] [--idempotency-key key])
+```
+
+The adapter performs preflight, repeats validation at launch, queues the job, and
+returns. Execution and finalization continue asynchronously in the worker pools.
+
+</details>
+
+### Reproducible beta proofs
+
+With the complete stack running:
+
+```sh
+npm run single-site:beta:smoke
+npm run single-site:beta:targeted
+npm run single-site:beta:full
+npm run single-site:beta:baseline-follow-up
+```
+
+These commands submit named scenarios, follow durable state, verify publication,
+and finish with exact report and gallery links. The baseline follow-up requires a
+human to inspect and approve eligible source evidence first.
+
+### Scale the worker pool
+
+```sh
+SINGLE_SITE_WORKER_REPLICAS=4 npm run portal
+```
+
+The supported range is 1–16. More replicas increase throughput across queued
+jobs; they do not parallelize one job. Keep the finalizer at one replica.
+
+### Update visual baselines
+
+```sh
+npm run audit:update-visuals
+npm run portal:e2e:update-snapshots
+```
+
+Only update baselines after inspecting the rendered change. Follow either command
+with the matching normal audit to prove the new expectations pass without update
+mode.
+
+## Configuration
+
+Copy [`.env.example`](.env.example) to `.env` for local overrides. Common controls:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `PRODUCTION_URL` | `https://quitting7oh.org` | Comparative production origin |
+| `CANDIDATE_URL` | `https://beta.quitting7oh-org.pages.dev` | Comparative candidate origin |
+| `PORTAL_PORT` | `4173` | Loopback host port for the console |
+| `PORTAL_MAX_CONCURRENT_RUNS` | `1` | Concurrent launches; server-capped at four |
+| `SINGLE_SITE_WORKER_REPLICAS` | `2` | Durable worker replicas started by `npm run portal` |
+| `AUDIT_WORKERS` | `3` | Playwright workers for ordinary container runs |
+| `AUDIT_TARGET_IDS` | Default matrix | Exact comma-separated Docker-local target selection |
+| `AUDIT_SHARD_TOTAL` | `8` | Functional partitions for sharded releases |
+| `AUDIT_SHARD_CONCURRENCY` | `4` | Maximum shard containers running together |
+| `AUDIT_SHARD_WORKERS` | `1` | Playwright workers in each functional shard |
+| `AUDIT_SHARDED_RUN_ID` | Generated | Unique lowercase evidence-run ID; existing IDs are refused |
+| `AUDIT_PREVIEW_TLS_BYPASS_ALLOWLIST` | `unset` in Compose; `https://beta.quitting7oh-org.pages.dev` in copied `.env.example` | Exact Preview origins eligible for non-authoritative bypass |
+| `ANTHROPIC_MODEL` | `claude-sonnet-5` | Default advisory evidence-review model |
+| `AI_REVIEW_DRY_RUN` | `0` | Validate AI-stage artifacts without an API request when set to `1` |
+
+The [Docker operations guide](docs/DOCKER.md#operational-controls) documents the
+complete set of supported controls, bounds, and resource tradeoffs.
 
 ## AI evidence review
 
-AI review is optional and advisory. The portal can save, replace, or delete a key from its Claude settings after the operator appends the root-derived unlock path printed in the portal service log to the published portal origin and opens it once. The resulting session is HttpOnly; workers receive neither capability nor cookie. The saved value is AES-256-GCM encrypted in a dedicated project-scoped Docker volume outside the repository and browser-discovery tree; only its status and short SHA-256 fingerprint are returned to the browser. The root supervisor can use credentials only when it has three separate non-root workers: Playwright and video processing run as `pwuser`, AI review runs as `aiworker`, and checklist generation runs as `reportworker` in private staging after the run tree is frozen. None can read the vault. The saved key reaches `aiworker` once through an anonymous stdin pipe, never through the worker environment. AI and report inputs use contained, descriptor-pinned/no-follow regular-file reads; the supervisor atomically publishes the completed staged checklist. The key is never stored in browser storage, source, run manifests, logs, reports, artifacts, image layers, or Compose configuration.
+AI review is optional, bounded, and advisory. It cannot turn failed deterministic
+checks into passes or complete human acceptance.
 
-The default model is `claude-sonnet-5`; set `ANTHROPIC_MODEL` to an explicit supported model ID when needed. Portal AI review calls Anthropic's API and consumes separately billed API credits; Claude.ai Pro or Max subscription usage does not cover these calls. The pipeline logs the model, selected evidence names and sizes, HTTP status, latency, and token usage, but never authorization headers, request image data, or the API key. AI output cannot convert a failed deterministic check into a pass and is labeled for human verification.
+When operator controls are locked, copy the root-derived unlock path printed in
+the portal service log and paste either the full link or token into the **New
+Audit** unlock form. The page exchanges it without navigation, immediately clears
+the field, and receives only an HttpOnly session cookie. The append-and-open
+bootstrap link remains supported.
 
-## TLS and Netskope
+Saved Anthropic credentials are AES-256-GCM encrypted in a project-scoped Docker
+volume outside the repository and artifact tree. The browser sees only configured
+status and a short one-way fingerprint. The key is not written to source, browser
+storage, Compose configuration, image layers, run manifests, logs, reports, or
+artifacts.
 
-TLS verification is strict by default. The Docker image includes this team's public Netskope root CA so normal production and beta checks validate certificates in the inspected network without disabling TLS. The public CA details live in [`certs/README.md`](certs/README.md); no private key is included.
+The execution identities are deliberately separate:
 
-Comparative runs never permit browser-wide certificate bypass. Playwright and Chromium implement it across a browser context or process, so it cannot remain limited to the candidate after redirects or subresource loads. Any `CANDIDATE_IGNORE_HTTPS_ERRORS=1` request fails before launch; install the development/Netskope CA instead.
+- `pwuser` runs Playwright and video processing;
+- `aiworker` receives a selected key once over anonymous stdin and reviews bounded evidence;
+- `reportworker` builds the checklist in private staging after the run tree is frozen;
+- the root supervisor owns the credential vault, while none of the workers can read it.
 
-Single-site Preview runs have a narrower, explicit development exception. `preview-bypass` is accepted only after confirming the Preview role and only when the exact normalized origin appears in comma-separated `AUDIT_PREVIEW_TLS_BYPASS_ALLOWLIST`. Production always remains strict. Bypass makes Evidence Authority non-authoritative even when the automated Site Health calculation would otherwise be `HEALTHY`; it is diagnostic development evidence, not trustworthy promotion evidence.
+Read [AI evidence review](docs/AI_REVIEW.md) for input limits, output contracts,
+retry behavior, and security boundaries.
 
-## What is tested
+## TLS and network trust
 
-The shipped suite covers the complete candidate route inventory and these feature domains:
+TLS verification is strict by default. The Docker image includes the team's public
+Netskope root CA; no private key is stored in this repository. Comparative runs
+never allow browser-wide certificate bypass because the setting cannot be safely
+confined to one origin after redirects and subresource loads.
 
-- availability, redirects, headers, cache policy, assets, error routes, sitemap, and indexing policy;
-- production-to-candidate route mapping and intentional redesign parity;
-- responsive shell, scheduling notice, header/footer, navigation drawer/sidebar, breadcrumbs, table of contents, and sharing;
-- light/dark/system themes, breakpoint boundaries, narrow-screen overflow, and reduced motion;
-- search dialog, keyboard navigation, relevance, filters, no-result guidance, and dependency failure;
-- homepage starting paths, immediate-support panels, directory coverage, crisis actions, and third-party fallbacks;
-- 7-OH taper and SR-17 calculators, arithmetic invariants, persistence, boundaries, copy, print, charts, and phone output;
-- all sixteen SOWS items, score thresholds, copy logging, collapse/reopen, and reset;
-- kratom, NA, and SMART meeting time states, timezone conversion, filter combinations, join/copy actions, history, and failure states;
-- page structure, internal/external links, imagery, long and wide content, accessibility, performance, layout stability, and runtime failures;
-- Chromium, WebKit, and Firefox emulations plus explicit physical-device and screen-reader acceptance rows.
+Single-site Preview runs have a narrow development exception. `preview-bypass`
+is accepted only when the deployment role is Preview and the exact normalized
+origin appears in `AUDIT_PREVIEW_TLS_BYPASS_ALLOWLIST`. The resulting evidence is
+always non-authoritative. Production remains strict.
 
-The authoritative inventory contains 81 feature and cross-cutting contracts plus 102 generated route contracts. All 183 are first-class portal checks; the generated route family can be filtered, selected individually, or launched as part of the platform suite. The inventory is defined by [`audit/catalog.ts`](audit/catalog.ts) and the reviewed route inventory, then rendered as the reviewer-facing [`docs/ASSERTION_LEDGER.md`](docs/ASSERTION_LEDGER.md). Generated checklist rows link to their available video, poster, screenshot, trace, network/JSON, Lighthouse, and AI evidence. Test declarations must use `interactionTest(..., interactionEvidence("action → response"), ...)`, `staticTest(..., staticEvidence("relevant rendered state"), ...)`, or `structuredTest(..., structuredEvidence("machine-readable proof"), ...)`; validation rejects undecided tests and plugins. The assertion-quality gate also rejects tautologies, swallowed failures, conditional-only checks, observation-only cases, missing executable cases, and non-blocking P0/P1 definitions. Interaction actions live inside named `audit.step` checkpoints, and the fixture adds interaction-only pacing plus on-video test, step, pointer, and action labels so clips remain understandable during human review.
+See [certificate trust details](certs/README.md) and the
+[TLS operations guide](docs/DOCKER.md#tls-trust-and-development-bypass).
+
+## Visual baselines and human review
+
+Same-site visual comparison requires an exact compatible identity: deployment
+role, route, target, viewport, theme, audit definition, named capture state, and
+rendering-contract fingerprint.
+
+- A missing baseline is `absent`, not failed or unchanged.
+- A rendering-contract mismatch is `incompatible`, not changed.
+- An exact match is `UNCHANGED`; a difference is `CHANGED`.
+- A reviewer may record accepted-change or known-defect disposition as `REVIEWED`.
+- A disposition never erases a deterministic Finding or changes Site Health or Coverage.
+- Baselines never advance automatically.
+
+Approving evidence with an unresolved Finding requires a written waiver reason.
+That accepts only the image as a baseline; it does not waive the Finding.
 
 ## Extend the suite
 
-Feature tests are installed plugins written with Playwright and TypeScript. A plugin manifest provides stable audit definitions and allowlisted spec entries; the portal discovers those entries and never executes arbitrary commands supplied by a browser client. See [`docs/PLUGINS.md`](docs/PLUGINS.md) and the disabled starter under `plugins/_template/`.
-
-Before shipping a plugin:
+Plugins are reviewed repository-local packages. Their manifests connect canonical
+audit definitions to exact allowlisted Playwright specs; the portal never accepts
+an arbitrary command or test path from a browser client.
 
 ```sh
+cp -R plugins/_template plugins/my-audit
+# Edit plugin.json and tests, then:
 npm run plugins:validate
 npm run typecheck
-docker compose run --rm audit-smoke
+docker compose --profile audit run --rm audit-smoke
 ```
+
+Each test must assert a user-visible outcome and use the matching shared evidence
+declaration:
+
+- `interactionTest(..., interactionEvidence("action → response"), ...)`
+- `staticTest(..., staticEvidence("relevant rendered state"), ...)`
+- `structuredTest(..., structuredEvidence("machine-readable proof"), ...)`
+
+Validation rejects unknown audit IDs, projects, paths, evidence modes, unsafe
+manifest entries, silent coverage gaps, weak assertions, and missing executable
+cases. Follow the complete [plugin authoring guide](docs/PLUGINS.md).
+
+## Project structure
+
+```text
+ai-mobile-testing/
+├── ai/                              # Optional advisory evidence review
+│   ├── evidence-review.ts
+│   └── types.ts
+├── audit/                           # Audit definitions and runtime policy
+│   ├── catalog.ts                  # Canonical audit catalog
+│   ├── definitions.ts              # Generated registry loader and catalog merge
+│   ├── targets.ts                  # Browser and viewport targets
+│   ├── plugins.ts                  # Validated plugin registry
+│   └── evidence-policy.ts           # Evidence requirements
+├── certs/                           # Development CA and trust documentation
+├── docker/                          # Container entrypoints and browser policy
+├── docs/                            # Guides, plans, traceability, and learnings
+│   ├── plans/
+│   └── solutions/
+├── fixtures/                        # Shared Playwright fixture and calibration corpus
+│   ├── test.ts
+│   └── visual-comparator-calibration/
+├── plugins/                         # First-party suites and starter template
+│   ├── _template/
+│   └── <plugin-id>/
+│       ├── plugin.json
+│       └── tests/
+├── portal/                          # Audit console server, UI, and acceptance tests
+│   ├── public/                     # Browser-delivered console
+│   ├── tests/                      # Portal Playwright coverage and baselines
+│   └── server.mjs                  # Portal HTTP/API entrypoint
+├── reporters/                       # Live, checklist, report, and archive builders
+│   └── assets/                     # Self-contained archive runtime assets
+├── scripts/                         # Runners, finalizers, generators, and self-tests
+│   └── lib/                        # Reusable pipeline and report primitives
+├── shared/                          # Contracts shared by portal and worker processes
+├── tests/                           # Core Playwright audit specs and snapshots
+│   └── __screenshots__/
+├── artifacts/                       # Generated local evidence; Git-ignored
+├── Dockerfile                       # Reproducible Playwright audit image
+├── docker-compose.yml              # Portal, workers, finalizers, and audit profiles
+├── package.json                    # Commands and toolchain contract
+├── playwright.config.ts            # Core Playwright projects and reporters
+└── playwright.merge.config.ts      # Shard-merge reporting configuration
+```
+
+### Directory responsibilities
+
+| Path | Owns | Start here when you need to… |
+| --- | --- | --- |
+| `audit/` | Audit IDs, definitions, route inventory, target matrix, evidence policy, TLS rules, and generated registries | Add or change an audit promise, target, route, or execution rule |
+| `tests/` | Core functional, content, accessibility, responsive, performance, and visual Playwright specs | Implement the executable proof for a catalog audit |
+| `plugins/` | Versioned suite manifests and plugin-owned tests | Package an audit slice or create a new suite from `_template/` |
+| `fixtures/` | The shared audit-aware Playwright fixture plus comparator calibration images | Declare evidence correctly or calibrate visual comparison behavior |
+| `portal/` | HTTP APIs, console view models, static UI, gallery/review workflows, and portal acceptance tests | Change the operator experience, run lifecycle, or evidence review surface |
+| `reporters/` | Playwright reporters, report models, live gallery publication, and portable archive assets | Change emitted reports, checklist data, or offline evidence bundles |
+| `scripts/` | Release orchestration, workers, finalizers, generators, diagnostics, and executable self-tests | Change how audits launch, merge, publish, validate, or recover |
+| `scripts/lib/` | Shared queue, lifecycle, release-truth, report-writing, and media-processing primitives | Reuse pipeline behavior across commands instead of duplicating it |
+| `shared/` | Runtime contracts consumed by both the portal and background workers | Change cross-process run, route, target, gallery, or baseline data shapes |
+| `ai/` | Optional advisory review of captured evidence | Change AI review prompts, inputs, outputs, or status handling |
+| `docker/` | Container startup, Firefox policy, CA bootstrapping, and named-volume initialization | Change container runtime behavior or browser trust setup |
+| `certs/` | The public development root CA and its scope documentation | Rotate or inspect the certificate trusted by audit containers |
+| `docs/` | Operations guides, assertion ledger, test plan, traceability, implementation plans, and durable solutions | Understand a subsystem or record a decision beyond the README |
+| `artifacts/` | Screenshots, videos, traces, reports, manifests, logs, and merged results generated by local runs | Inspect evidence from a run; do not hand-edit or commit this directory |
+
+### Common change map
+
+| Goal | Primary files | Validate with |
+| --- | --- | --- |
+| Add or revise an audit | `audit/catalog.ts`, owning `plugins/<plugin-id>/plugin.json`, matching `tests/*.spec.ts` | `npm run plugins:validate`<br>`npm run assertions:ledger:check`<br>`npm run typecheck` |
+| Add a browser or viewport target | `audit/targets.ts` | `npm run targets:validate` |
+| Create a plugin | `plugins/<plugin-id>/plugin.json`, plugin-owned tests | `npm run plugins:validate` |
+| Change the audit console | `portal/public/`, `portal/server.mjs`, `portal/tests/` | `npm run portal:e2e` |
+| Change evidence or reports | `reporters/`, `shared/`, related `scripts/` | Focused self-test, then `npm run validate` |
+| Change container behavior | `Dockerfile`, `docker-compose.yml`, `docker/`, `certs/` | 1. `npm run tls:check`<br>2. `npm run docker:identity:self-test`<br>3. `docker compose --profile audit build --pull audit-smoke`<br>4. `npm run audit:smoke` |
+
+### Artifact locations
+
+| Run type | Location |
+| --- | --- |
+| Comparative portal run | `artifacts/runs/<run-id>/` |
+| Terminal sharded release | `artifacts/sharded/<run-id>/` |
+| Portal browser acceptance | `artifacts/portal-e2e/` |
+| Single-site queue, finalizations, and copied baselines | Separate named Docker volumes |
+
+Completed, failed, and stopped evidence can be purged from the run detail view.
+Purge requires the exact phrase `PURGE <run-id>`, rejects active work and unsafe
+mounts, and is unrecoverable. Preserve evidence that still needs review or archival.
+
+## Validation and quality gates
+
+```sh
+npm run validate       # Registry, contract, security, evidence, and type checks
+npm run audit:smoke    # Docker environment and critical audit paths
+npm run portal:e2e     # Portal browser/API acceptance
+```
+
+The canonical gallery scale gate is Docker-only:
+
+```sh
+npm run portal:e2e:scale
+```
+
+It creates and recounts a 5,659-artifact, 1,241-logical-item, 110-video,
+17,527-file corpus under exactly 2 CPUs and 4 GiB, then stores timings, resource
+data, screenshots, network traces, and navigation video under
+`artifacts/portal-e2e/`. Host-only measurements are informational.
+
+## Troubleshooting
+
+<details>
+<summary><strong>The portal opens, but Single-site jobs do not start</strong></summary>
+
+Start the complete stack with `npm run portal`. Running only `docker compose up
+portal` omits the worker and finalizer services.
+
+</details>
+
+<details>
+<summary><strong>Docker is short on memory</strong></summary>
+
+Reduce shard concurrency before changing the eight-part coverage partition:
+
+```sh
+AUDIT_SHARD_TOTAL=8 \
+AUDIT_SHARD_CONCURRENCY=2 \
+AUDIT_SHARD_WORKERS=1 \
+npm run audit:release:sharded
+```
+
+For portal work, keep `PORTAL_MAX_CONCURRENT_RUNS=1` and lower `AUDIT_WORKERS`.
+
+</details>
+
+<details>
+<summary><strong>A Preview certificate fails</strong></summary>
+
+Prefer installing the correct CA. For an explicitly confirmed Preview origin,
+add its exact normalized origin to `AUDIT_PREVIEW_TLS_BYPASS_ALLOWLIST` and request
+`preview-bypass`. The resulting evidence is diagnostic and non-authoritative.
+Comparative and Production runs cannot use the exception.
+
+</details>
+
+<details>
+<summary><strong>A sharded run ID already exists</strong></summary>
+
+Choose a new 8–80 character run ID that begins with a lowercase letter or number;
+the remaining characters may be lowercase letters, numbers, or hyphens. The exact
+pattern is `^[a-z0-9][a-z0-9-]{7,79}$`. Existing directories are intentionally
+refused so old evidence cannot leak into a new release decision.
+
+</details>
+
+For queue recovery, finalizer recovery, permissions, ownership, retention, and
+container diagnostics, use the [full troubleshooting guide](docs/DOCKER.md#recovery-and-troubleshooting).
 
 ## Documentation
 
-- [`docs/TEST_PLAN.md`](docs/TEST_PLAN.md) — strategy, layers, evidence, and pass/fail rules
-- [`docs/ASSERTION_LEDGER.md`](docs/ASSERTION_LEDGER.md) — generated promise-to-oracle, source, evidence, and target map for every audit
-- [`docs/RELEASE_PROCESS.md`](docs/RELEASE_PROCESS.md) — launch sequence and human sign-off
-- [`docs/REQUIREMENTS_TRACEABILITY.md`](docs/REQUIREMENTS_TRACEABILITY.md) — requirement-to-implementation ledger
-- [`docs/DOCKER.md`](docs/DOCKER.md) — container operations and troubleshooting
-- [`docs/PLUGINS.md`](docs/PLUGINS.md) — adding a feature plugin
-- [`docs/AI_REVIEW.md`](docs/AI_REVIEW.md) — AI scope, security, and review contract
+| Document | Read it for |
+| --- | --- |
+| [Concepts](CONCEPTS.md) | Shared glossary for audit entities, named processes, and status vocabulary |
+| [Test plan](docs/TEST_PLAN.md) | Strategy, audit layers, profiles, evidence contract, and pass/fail rules |
+| [Assertion ledger](docs/ASSERTION_LEDGER.md) | Every promise, oracle, source, target, and required evidence item |
+| [Release process](docs/RELEASE_PROCESS.md) | Evidence run, triage, human acceptance, and go-live decision |
+| [Docker operations](docs/DOCKER.md) | Runtime operations, targets, sharding, recovery, TLS, and configuration |
+| [Plugin guide](docs/PLUGINS.md) | Manifest contract, validation, discovery, and adding audit suites |
+| [AI review](docs/AI_REVIEW.md) | Advisory review inputs, outputs, security, and telemetry |
+| [Requirements traceability](docs/REQUIREMENTS_TRACEABILITY.md) | Requirement-to-implementation and verification mapping |
+| [Single-site completion evidence](docs/SINGLE_SITE_COMPLETION_EVIDENCE.md) | Proof ledger, accepted limitations, and completion receipts |
+| [Trustworthy comparative visual release audits](docs/solutions/best-practices/trustworthy-comparative-visual-release-audits.md) | Durable guidance for trustworthy comparative release evidence and verdicts |
+| [Responsive gallery hydration](docs/solutions/performance-issues/keep-background-gallery-hydration-from-starving-foreground-review.md) | Request scheduling, cancellation, and coalescing for responsive evidence review |
+| [Certificate authority](certs/README.md) | Bundled Netskope CA scope and certificate details |
+
+## Release philosophy
+
+A browser exit code is diagnostic data, not release authority. Site health,
+coverage, manual acceptance, visual review, evidence authority, and pipeline
+integrity remain distinct so one kind of success cannot conceal another kind of
+failure. A release decision still belongs to a human reviewer with complete,
+traceable evidence.
