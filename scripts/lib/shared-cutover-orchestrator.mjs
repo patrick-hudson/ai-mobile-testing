@@ -1,0 +1,596 @@
+import path from 'node:path';
+
+import {
+  assertDigest,
+  canonicalDigest,
+  canonicalJson,
+  exactKeys,
+  isRecord,
+  nonEmptyString,
+} from '../../shared/canonical-contract.mjs';
+import { parseShadowValidationReport } from '../../shared/shadow-validation.mjs';
+import {
+  atomicWriteJson,
+  containedPath,
+  openAtomicStorage,
+  pathExists,
+  readBoundedJson,
+  withDirectoryLock,
+} from './atomic-filesystem.mjs';
+import {
+  readReleaseAuthoritySelector,
+  transitionReleaseAuthority,
+} from './parent-run-store.mjs';
+
+const SAFE_ID = /^[A-Za-z0-9._-]{1,128}$/u;
+const MAX_OBSERVATION_AGE_MS = 5 * 60_000;
+const AE_CASE_IDS = Object.freeze(Array.from({ length: 16 }, (_, index) => `AE${index + 1}`));
+
+export class SharedCutoverError extends Error {
+  constructor(code, message, details = undefined) {
+    super(message);
+    this.name = 'SharedCutoverError';
+    this.code = code;
+    this.details = details;
+  }
+}
+
+function fail(code, message, details) {
+  throw new SharedCutoverError(code, message, details);
+}
+
+function timestamp(clock) {
+  return new Date(clock()).toISOString();
+}
+
+function canonicalTimestamp(value, label) {
+  if (typeof value !== 'string' || !Number.isFinite(Date.parse(value)) || new Date(value).toISOString() !== value) {
+    fail('CUTOVER_INPUT_INVALID', `${label} must be a canonical ISO timestamp.`);
+  }
+  return value;
+}
+
+function safeId(value, label) {
+  if (typeof value !== 'string' || !SAFE_ID.test(value) || /^\.+$/u.test(value)) {
+    fail('CUTOVER_INPUT_INVALID', `${label} is invalid.`);
+  }
+  return value;
+}
+
+function clone(value) {
+  return JSON.parse(canonicalJson(value));
+}
+
+function seal(body) {
+  return Object.freeze({ ...body, digest: canonicalDigest(body) });
+}
+
+function parseSealed(value, label) {
+  if (!isRecord(value)) fail('CUTOVER_DOCUMENT_INVALID', `${label} must be an object.`);
+  const { digest, ...body } = value;
+  assertDigest(digest, `${label}.digest`);
+  if (digest !== canonicalDigest(body)) fail('CUTOVER_DOCUMENT_INVALID', `${label} digest is corrupt.`);
+  return value;
+}
+
+function gateBody(value) {
+  return {
+    schemaVersion: 1,
+    kind: 'release-admission-gate',
+    state: value.state,
+    revision: value.revision,
+    cutoverId: value.cutoverId,
+    previousDigest: value.previousDigest,
+    updatedAt: value.updatedAt,
+  };
+}
+
+function parseGate(value) {
+  parseSealed(value, 'Admission gate');
+  exactKeys(value, [...Object.keys(gateBody(value)), 'digest'], 'Admission gate');
+  if (value.schemaVersion !== 1 || value.kind !== 'release-admission-gate'
+    || !['OPEN', 'CLOSED'].includes(value.state)
+    || !Number.isSafeInteger(value.revision) || value.revision < 1
+    || (value.cutoverId !== null && !SAFE_ID.test(value.cutoverId))
+    || (value.previousDigest !== null && typeof value.previousDigest !== 'string')) {
+    fail('CUTOVER_DOCUMENT_INVALID', 'Admission gate is invalid.');
+  }
+  if (value.previousDigest !== null) assertDigest(value.previousDigest, 'Admission gate previousDigest');
+  canonicalTimestamp(value.updatedAt, 'Admission gate updatedAt');
+  if ((value.state === 'OPEN' && value.cutoverId !== null) || (value.state === 'CLOSED' && value.cutoverId === null)) {
+    fail('CUTOVER_DOCUMENT_INVALID', 'Admission gate state and cutover ownership disagree.');
+  }
+  return clone(value);
+}
+
+export async function openCutoverAdmissionGate({ root, filesystem, nonce, verifyStorage = true, clock = () => Date.now() } = {}) {
+  if (typeof root !== 'string' || !root) fail('CUTOVER_INPUT_INVALID', 'Admission gate root is required.');
+  const storage = await openAtomicStorage({ root, filesystem, nonce, verify: verifyStorage });
+  const gatePath = containedPath(storage.root, 'release-admission-gate.json');
+  const lockPath = containedPath(storage.root, '.release-admission-gate.lock');
+  if (!await pathExists(storage.fs, gatePath)) {
+    const body = gateBody({
+      state: 'OPEN', revision: 1, cutoverId: null, previousDigest: null, updatedAt: timestamp(clock),
+    });
+    try {
+      await atomicWriteJson(storage, gatePath, seal(body), { exclusive: true });
+    } catch (error) {
+      if (error?.code !== 'ATOMIC_ALREADY_EXISTS') throw error;
+    }
+  }
+
+  async function read() {
+    return parseGate(await readBoundedJson(storage, gatePath, { label: 'release admission gate', maximumBytes: 64 * 1_024 }));
+  }
+
+  async function transition({ expectedDigest, state, cutoverId }) {
+    safeId(cutoverId, 'cutoverId');
+    if (!['OPEN', 'CLOSED'].includes(state)) fail('CUTOVER_INPUT_INVALID', 'Admission state is invalid.');
+    return withDirectoryLock(storage, lockPath, async () => {
+      const current = await read();
+      if (current.digest !== expectedDigest) fail('CUTOVER_ADMISSION_CONFLICT', 'Admission gate changed before transition.');
+      const desiredCutoverId = state === 'CLOSED' ? cutoverId : null;
+      if (current.state === state && current.cutoverId === desiredCutoverId) return current;
+      if (current.state === 'CLOSED' && current.cutoverId !== cutoverId) {
+        fail('CUTOVER_ADMISSION_OWNED', `Admission is already closed by ${current.cutoverId}.`);
+      }
+      if (state === 'OPEN' && current.state !== 'CLOSED') {
+        fail('CUTOVER_ADMISSION_CONFLICT', 'Admission can only reopen from CLOSED.');
+      }
+      const next = seal(gateBody({
+        state,
+        revision: current.revision + 1,
+        cutoverId: desiredCutoverId,
+        previousDigest: current.digest,
+        updatedAt: timestamp(clock),
+      }));
+      await atomicWriteJson(storage, gatePath, next);
+      return clone(next);
+    });
+  }
+
+  return Object.freeze({
+    root: storage.root,
+    read,
+    close: (expectedDigest, cutoverId) => transition({ expectedDigest, state: 'CLOSED', cutoverId }),
+    open: (expectedDigest, cutoverId) => transition({ expectedDigest, state: 'OPEN', cutoverId }),
+  });
+}
+
+function parseExpectedStore(value) {
+  exactKeys(value, [
+    'deploymentIdentity', 'volumeIdentity', 'storeMarkerDigest', 'storeGeneration',
+    'schemaVersion', 'schemaFloor', 'currentWriterProtocol', 'minimumWriterProtocol',
+    'backupMarker',
+  ], 'expectedStore');
+  nonEmptyString(value.deploymentIdentity, 'expectedStore.deploymentIdentity');
+  nonEmptyString(value.volumeIdentity, 'expectedStore.volumeIdentity');
+  assertDigest(value.storeMarkerDigest, 'expectedStore.storeMarkerDigest');
+  for (const key of ['storeGeneration', 'schemaVersion', 'schemaFloor']) {
+    if (!Number.isSafeInteger(value[key]) || value[key] < 1) fail('CUTOVER_INPUT_INVALID', `expectedStore.${key} is invalid.`);
+  }
+  nonEmptyString(value.currentWriterProtocol, 'expectedStore.currentWriterProtocol');
+  nonEmptyString(value.minimumWriterProtocol, 'expectedStore.minimumWriterProtocol');
+  nonEmptyString(value.backupMarker, 'expectedStore.backupMarker');
+  return clone(value);
+}
+
+function parseOperatorReview(value) {
+  exactKeys(value, ['reviewed', 'actorId', 'reviewedAt'], 'operatorReview');
+  if (value.reviewed !== true) fail('CUTOVER_REVIEW_REQUIRED', 'Cutover requires an explicit operator review.');
+  nonEmptyString(value.actorId, 'operatorReview.actorId');
+  canonicalTimestamp(value.reviewedAt, 'operatorReview.reviewedAt');
+  return clone(value);
+}
+
+function parseCutoverInput(input) {
+  exactKeys(input, [
+    'cutoverId', 'activationRevision', 'buildIdentity', 'rollbackBuildIdentity',
+    'expectedStore', 'shadowReport', 'operatorReview',
+  ], 'cutover input');
+  const cutoverId = safeId(input.cutoverId, 'cutoverId');
+  if (!Number.isSafeInteger(input.activationRevision) || input.activationRevision < 1) {
+    fail('CUTOVER_INPUT_INVALID', 'activationRevision must be a positive integer.');
+  }
+  const buildIdentity = nonEmptyString(input.buildIdentity, 'buildIdentity');
+  const rollbackBuildIdentity = nonEmptyString(input.rollbackBuildIdentity, 'rollbackBuildIdentity');
+  const shadowReport = parseShadowValidationReport(input.shadowReport);
+  if (shadowReport.validationStatus !== 'PASS' || shadowReport.summary.unexplainedDrift !== 0) {
+    fail('CUTOVER_SHADOW_BLOCKED', 'Cutover requires a PASS shadow report with zero unexplained drift.');
+  }
+  const presentCases = new Set(shadowReport.comparisons.map(({ caseId }) => caseId));
+  const missingCases = AE_CASE_IDS.filter((caseId) => !presentCases.has(caseId));
+  if (missingCases.length > 0) {
+    fail('CUTOVER_SHADOW_INCOMPLETE', `Cutover shadow report is missing ${missingCases.join(', ')}.`);
+  }
+  const normalized = {
+    cutoverId,
+    activationRevision: input.activationRevision,
+    buildIdentity,
+    rollbackBuildIdentity,
+    expectedStore: parseExpectedStore(input.expectedStore),
+    shadowReport,
+    operatorReview: parseOperatorReview(input.operatorReview),
+  };
+  return { ...normalized, digest: canonicalDigest(normalized) };
+}
+
+function validateStore(store, input, { activated = false } = {}) {
+  const manifest = store?.manifest;
+  if (!isRecord(manifest)) fail('CUTOVER_STORE_MISMATCH', 'Parent-run store manifest is unavailable.');
+  const expected = input.expectedStore;
+  const expectedGeneration = expected.storeGeneration + (activated ? 1 : 0);
+  const comparisons = {
+    deploymentIdentity: expected.deploymentIdentity,
+    volumeIdentity: expected.volumeIdentity,
+    storeMarkerDigest: expected.storeMarkerDigest,
+    storeGeneration: expectedGeneration,
+    schemaVersion: expected.schemaVersion,
+    schemaFloor: expected.schemaFloor,
+    currentWriterProtocol: expected.currentWriterProtocol,
+    minimumWriterProtocol: expected.minimumWriterProtocol,
+    backupMarker: expected.backupMarker,
+  };
+  const mismatches = Object.entries(comparisons)
+    .filter(([key, expectedValue]) => manifest[key] !== expectedValue)
+    .map(([key]) => key);
+  if (mismatches.length > 0 || store.buildIdentity !== input.buildIdentity) {
+    fail('CUTOVER_STORE_MISMATCH', `Shared store identity or protocol mismatch: ${[...mismatches, ...(store.buildIdentity === input.buildIdentity ? [] : ['buildIdentity'])].join(', ')}.`);
+  }
+  if (!manifest.prequalifiedRollbackBuilds.includes(input.rollbackBuildIdentity)
+    || !manifest.prequalifiedRollbackBuilds.includes(input.buildIdentity)) {
+    fail('CUTOVER_ROLLBACK_BUILD_UNQUALIFIED', 'Current and rollback builds must both be prequalified before cutover.');
+  }
+  return clone(manifest);
+}
+
+function reportStoragePath(storage, cutoverId, suffix) {
+  return containedPath(storage.root, `${cutoverId}${suffix}`);
+}
+
+async function openReportStorage(reportDirectory) {
+  if (typeof reportDirectory !== 'string' || !reportDirectory) fail('CUTOVER_INPUT_INVALID', 'reportDirectory is required.');
+  return openAtomicStorage({ root: reportDirectory, verify: false });
+}
+
+function checkpointBody(value) {
+  return {
+    schemaVersion: 1,
+    kind: 'release-authority-cutover-checkpoint',
+    cutoverId: value.cutoverId,
+    inputDigest: value.inputDigest,
+    status: value.status,
+    selectorBefore: value.selectorBefore,
+    selectorCurrent: value.selectorCurrent,
+    admissionBefore: value.admissionBefore,
+    admissionCurrent: value.admissionCurrent,
+    drainObservation: value.drainObservation,
+    updatedAt: value.updatedAt,
+  };
+}
+
+function parseCheckpoint(value, cutoverId, inputDigest) {
+  parseSealed(value, 'Cutover checkpoint');
+  exactKeys(value, [...Object.keys(checkpointBody(value)), 'digest'], 'Cutover checkpoint');
+  if (value.schemaVersion !== 1 || value.kind !== 'release-authority-cutover-checkpoint'
+    || value.cutoverId !== cutoverId || value.inputDigest !== inputDigest
+    || !['INITIALIZED', 'ADMISSION_CLOSED', 'DRAINING', 'ACTIVE'].includes(value.status)) {
+    fail('CUTOVER_CHECKPOINT_CONFLICT', 'Cutover checkpoint does not match this request.');
+  }
+  return clone(value);
+}
+
+async function readCheckpoint(storage, input) {
+  const file = reportStoragePath(storage, input.cutoverId, '.state.json');
+  if (!await pathExists(storage.fs, file)) return null;
+  return parseCheckpoint(await readBoundedJson(storage, file, { label: 'cutover checkpoint', maximumBytes: 2 * 1_048_576 }), input.cutoverId, input.digest);
+}
+
+async function writeCheckpoint(storage, value) {
+  const body = checkpointBody(value);
+  const checkpoint = seal(body);
+  await atomicWriteJson(storage, reportStoragePath(storage, value.cutoverId, '.state.json'), checkpoint);
+  return clone(checkpoint);
+}
+
+async function initializeCheckpoint(storage, input, selector, gate, clock) {
+  const existing = await readCheckpoint(storage, input);
+  if (existing) return existing;
+  return writeCheckpoint(storage, {
+    cutoverId: input.cutoverId,
+    inputDigest: input.digest,
+    status: 'INITIALIZED',
+    selectorBefore: selector,
+    selectorCurrent: selector,
+    admissionBefore: gate,
+    admissionCurrent: gate,
+    drainObservation: null,
+    updatedAt: timestamp(clock),
+  });
+}
+
+function parseDrainObservation(value, { input, gate, coordinator, clock }) {
+  parseSealed(value, 'Drain observation');
+  exactKeys(value, [
+    'schemaVersion', 'kind', 'cutoverId', 'observedAt', 'admissionGateDigest',
+    'activeLegacyAuthoritativeRunIds', 'releaseChangingMutationIds',
+    'unresolvedOperationIds', 'unfencedLegacyLeaseIds', 'canonicalWriterOwnerIds',
+    'legacyHeadMarkers', 'digest',
+  ], 'Drain observation');
+  if (value.schemaVersion !== 1 || value.kind !== 'release-cutover-drain-observation'
+    || value.cutoverId !== input.cutoverId || value.admissionGateDigest !== gate.digest) {
+    fail('CUTOVER_OBSERVATION_MISMATCH', 'Drain observation is not bound to the closed admission gate.');
+  }
+  canonicalTimestamp(value.observedAt, 'Drain observation observedAt');
+  const observedMs = Date.parse(value.observedAt);
+  if (observedMs < Date.parse(gate.updatedAt) || observedMs > clock()
+    || clock() - observedMs > MAX_OBSERVATION_AGE_MS) {
+    fail('CUTOVER_OBSERVATION_STALE', 'Drain observation is stale or predates admission closure.');
+  }
+  for (const key of [
+    'activeLegacyAuthoritativeRunIds', 'releaseChangingMutationIds', 'unresolvedOperationIds',
+    'unfencedLegacyLeaseIds', 'canonicalWriterOwnerIds', 'legacyHeadMarkers',
+  ]) {
+    if (!Array.isArray(value[key]) || value[key].some((entry) => typeof entry !== 'string' || !entry)
+      || new Set(value[key]).size !== value[key].length) {
+      fail('CUTOVER_DOCUMENT_INVALID', `Drain observation ${key} must contain unique non-empty strings.`);
+    }
+  }
+  if (value.activeLegacyAuthoritativeRunIds.length) fail('CUTOVER_LEGACY_RUNS_ACTIVE', 'Legacy authoritative runs remain active.');
+  if (value.releaseChangingMutationIds.length) fail('CUTOVER_MUTATIONS_ACTIVE', 'Release-changing mutations remain in flight.');
+  if (value.unresolvedOperationIds.length) fail('CUTOVER_OPERATIONS_UNRESOLVED', 'Durable operations are neither terminal nor fenced.');
+  if (value.unfencedLegacyLeaseIds.length) fail('CUTOVER_LEASES_UNFENCED', 'Legacy leases remain unfenced.');
+  if (value.canonicalWriterOwnerIds.length !== 1 || value.canonicalWriterOwnerIds[0] !== coordinator.ownerId) {
+    fail('CUTOVER_WRITER_NOT_SINGLETON', 'The active coordinator is not the singleton canonical writer.');
+  }
+  if (value.legacyHeadMarkers.length < 1) {
+    fail('CUTOVER_HEAD_MARKER_MISSING', 'Drain observation must record at least one sealed legacy head marker.');
+  }
+  return clone(value);
+}
+
+function ensureCoordinator(coordinator) {
+  if (!isRecord(coordinator) || typeof coordinator.ownerId !== 'string'
+    || !Number.isSafeInteger(coordinator.epoch) || coordinator.epoch < 1
+    || typeof coordinator.token !== 'string') {
+    fail('CUTOVER_INPUT_INVALID', 'A valid singleton store coordinator fence is required.');
+  }
+}
+
+async function withCutoverLock(storage, cutoverId, operation) {
+  return withDirectoryLock(storage, reportStoragePath(storage, cutoverId, '.lock'), operation);
+}
+
+export async function prepareSharedAuthorityCutover({
+  store, coordinator, admissionGate, reportDirectory, input: rawInput,
+  clock = store?.clock ?? (() => Date.now()), hooks = {},
+} = {}) {
+  ensureCoordinator(coordinator);
+  const input = parseCutoverInput(rawInput);
+  const storage = await openReportStorage(reportDirectory);
+  return withCutoverLock(storage, input.cutoverId, async () => {
+    if (await pathExists(storage.fs, reportStoragePath(storage, input.cutoverId, '.rollback.json'))) {
+      fail('CUTOVER_ALREADY_ROLLED_BACK', 'This cutover attempt was rolled back; start a new cutover ID.');
+    }
+    const selector = await readReleaseAuthoritySelector(store);
+    if (!['SHADOW', 'DRAINING'].includes(selector.phase) || selector.activationEpoch !== 0) {
+      fail('CUTOVER_PHASE_INVALID', `Prepare requires SHADOW or DRAINING; found ${selector.phase}.`);
+    }
+    validateStore(store, input);
+    const gate = await admissionGate.read();
+    if (gate.state === 'CLOSED' && gate.cutoverId !== input.cutoverId) {
+      fail('CUTOVER_ADMISSION_OWNED', `Admission is closed by ${gate.cutoverId}.`);
+    }
+    let checkpoint = await initializeCheckpoint(storage, input, selector, gate, clock);
+    let closed = gate;
+    if (closed.state === 'OPEN') {
+      closed = await admissionGate.close(closed.digest, input.cutoverId);
+      checkpoint = await writeCheckpoint(storage, {
+        ...checkpoint, status: 'ADMISSION_CLOSED', admissionCurrent: closed, updatedAt: timestamp(clock),
+      });
+      await hooks.afterAdmissionClosed?.(clone(closed));
+    }
+    let draining = selector;
+    if (draining.phase === 'SHADOW') {
+      draining = await transitionReleaseAuthority(store, coordinator, {
+        expectedSelectorDigest: draining.digest,
+        phase: 'DRAINING',
+        buildIdentity: input.buildIdentity,
+      });
+      await hooks.afterDraining?.(clone(draining));
+    }
+    checkpoint = await writeCheckpoint(storage, {
+      ...checkpoint,
+      status: 'DRAINING',
+      selectorCurrent: draining,
+      admissionCurrent: closed,
+      updatedAt: timestamp(clock),
+    });
+    return Object.freeze({
+      status: checkpoint.status,
+      cutoverId: input.cutoverId,
+      inputDigest: input.digest,
+      admissionGate: clone(closed),
+      selector: clone(draining),
+    });
+  });
+}
+
+function reportBody({ input, checkpoint, selectorAfter, admissionGate, observation, store, completedAt }) {
+  return {
+    schemaVersion: 1,
+    kind: 'release-authority-cutover-report',
+    cutoverId: input.cutoverId,
+    status: 'ACTIVE_ADMISSION_CLOSED',
+    completedAt,
+    inputDigest: input.digest,
+    shadowValidationDigest: input.shadowReport.digest,
+    shadowMatrixDigest: input.shadowReport.matrixDigest,
+    selectorBefore: checkpoint.selectorBefore,
+    selectorAfter,
+    admissionGateBefore: checkpoint.admissionBefore,
+    admissionGateAfter: admissionGate,
+    drainObservation: observation,
+    storeBefore: input.expectedStore,
+    storeAfter: clone(store.manifest),
+    rollbackBuildIdentity: input.rollbackBuildIdentity,
+    preconditions: {
+      activeLegacyAuthoritativeRuns: observation.activeLegacyAuthoritativeRunIds.length,
+      releaseChangingMutations: observation.releaseChangingMutationIds.length,
+      unresolvedOperations: observation.unresolvedOperationIds.length,
+      unfencedLegacyLeases: observation.unfencedLegacyLeaseIds.length,
+      singletonCanonicalWriter: observation.canonicalWriterOwnerIds.length === 1,
+      unexplainedAuthorityDrift: input.shadowReport.summary.unexplainedDrift,
+      shadowValidationStatus: input.shadowReport.validationStatus,
+      backupRehearsed: input.expectedStore.backupMarker !== null,
+      rollbackBuildPrequalified: true,
+    },
+    operatorReview: input.operatorReview,
+  };
+}
+
+function parseFinalReport(value, input) {
+  parseSealed(value, 'Cutover report');
+  if (value.kind !== 'release-authority-cutover-report' || value.cutoverId !== input.cutoverId
+    || value.inputDigest !== input.digest || value.status !== 'ACTIVE_ADMISSION_CLOSED') {
+    fail('CUTOVER_REPORT_CONFLICT', 'Existing cutover report does not match this request.');
+  }
+  return clone(value);
+}
+
+export async function activateSharedAuthorityCutover({
+  store, coordinator, admissionGate, reportDirectory, input: rawInput, drainObservation,
+  clock = store?.clock ?? (() => Date.now()), hooks = {},
+} = {}) {
+  ensureCoordinator(coordinator);
+  const input = parseCutoverInput(rawInput);
+  const storage = await openReportStorage(reportDirectory);
+  return withCutoverLock(storage, input.cutoverId, async () => {
+    if (await pathExists(storage.fs, reportStoragePath(storage, input.cutoverId, '.rollback.json'))) {
+      fail('CUTOVER_ALREADY_ROLLED_BACK', 'This cutover attempt was rolled back and cannot activate.');
+    }
+    const reportPath = reportStoragePath(storage, input.cutoverId, '.json');
+    if (await pathExists(storage.fs, reportPath)) {
+      return parseFinalReport(await readBoundedJson(storage, reportPath, { label: 'cutover report', maximumBytes: 4 * 1_048_576 }), input);
+    }
+    let selector = await readReleaseAuthoritySelector(store);
+    if (!['DRAINING', 'ACTIVE'].includes(selector.phase)) {
+      fail('CUTOVER_PHASE_INVALID', `Activation requires DRAINING or a resumable ACTIVE selector; found ${selector.phase}.`);
+    }
+    validateStore(store, input, { activated: selector.phase === 'ACTIVE' });
+    const gate = await admissionGate.read();
+    if (gate.state !== 'CLOSED' || gate.cutoverId !== input.cutoverId) {
+      fail('CUTOVER_ADMISSION_OPEN', 'Activation requires admission closed by this cutover.');
+    }
+    let checkpoint = await readCheckpoint(storage, input);
+    if (!checkpoint) fail('CUTOVER_CHECKPOINT_MISSING', 'Prepare must complete before activation.');
+    let observed = checkpoint.drainObservation;
+    if (selector.phase !== 'ACTIVE') {
+      observed = parseDrainObservation(drainObservation, { input, gate, coordinator, clock });
+      checkpoint = await writeCheckpoint(storage, {
+        ...checkpoint,
+        status: 'DRAINING',
+        selectorCurrent: selector,
+        admissionCurrent: gate,
+        drainObservation: observed,
+        updatedAt: timestamp(clock),
+      });
+      selector = await transitionReleaseAuthority(store, coordinator, {
+        expectedSelectorDigest: selector.digest,
+        phase: 'ACTIVE',
+        activationRevision: input.activationRevision,
+        buildIdentity: input.buildIdentity,
+      });
+      await hooks.afterAuthorityActivated?.(clone(selector));
+    } else {
+      if (selector.activationRevision !== input.activationRevision || selector.activeBuildIdentity !== input.buildIdentity) {
+        fail('CUTOVER_ACTIVATION_MISMATCH', 'Durable activation does not match this cutover request.');
+      }
+      if (observed === null) fail('CUTOVER_OBSERVATION_MISSING', 'Recovered activation is missing its pre-activation drain observation.');
+      observed = parseDrainObservation(observed, { input, gate, coordinator, clock: () => Date.parse(observed.observedAt) });
+    }
+    validateStore(store, input, { activated: true });
+    checkpoint = await writeCheckpoint(storage, {
+      ...checkpoint,
+      status: 'ACTIVE',
+      selectorCurrent: selector,
+      admissionCurrent: gate,
+      drainObservation: observed,
+      updatedAt: timestamp(clock),
+    });
+    const report = seal(reportBody({
+      input, checkpoint, selectorAfter: selector, admissionGate: gate,
+      observation: observed, store, completedAt: timestamp(clock),
+    }));
+    await atomicWriteJson(storage, reportPath, report, { exclusive: true });
+    return clone(report);
+  });
+}
+
+function rollbackReportBody({ cutoverId, selectorBefore, selectorAfter, gateBefore, gateAfter, operatorReview, completedAt }) {
+  return {
+    schemaVersion: 1,
+    kind: 'release-authority-cutover-rollback-report',
+    cutoverId,
+    status: 'PREACTIVATION_ROLLED_BACK',
+    completedAt,
+    selectorBefore,
+    selectorAfter,
+    admissionGateBefore: gateBefore,
+    admissionGateAfter: gateAfter,
+    operatorReview,
+  };
+}
+
+export async function rollbackSharedAuthorityBeforeActivation({
+  store, coordinator, admissionGate, reportDirectory, cutoverId, buildIdentity,
+  operatorReview: rawOperatorReview, clock = store?.clock ?? (() => Date.now()),
+} = {}) {
+  ensureCoordinator(coordinator);
+  safeId(cutoverId, 'cutoverId');
+  nonEmptyString(buildIdentity, 'buildIdentity');
+  const operatorReview = parseOperatorReview(rawOperatorReview);
+  const storage = await openReportStorage(reportDirectory);
+  return withCutoverLock(storage, cutoverId, async () => {
+    const selectorBefore = await readReleaseAuthoritySelector(store);
+    if (selectorBefore.phase !== 'DRAINING' || selectorBefore.activationEpoch !== 0) {
+      fail('AUTHORITY_TRANSITION_INVALID', 'Pre-activation rollback is allowed only from DRAINING before activation.');
+    }
+    const gateBefore = await admissionGate.read();
+    if (gateBefore.state !== 'CLOSED' || gateBefore.cutoverId !== cutoverId) {
+      fail('CUTOVER_ADMISSION_OPEN', 'Pre-activation rollback requires this cutover to own the closed gate.');
+    }
+    const selectorAfter = await transitionReleaseAuthority(store, coordinator, {
+      expectedSelectorDigest: selectorBefore.digest,
+      phase: 'SHADOW',
+      buildIdentity,
+    });
+    const gateAfter = await admissionGate.open(gateBefore.digest, cutoverId);
+    const report = seal(rollbackReportBody({
+      cutoverId, selectorBefore, selectorAfter, gateBefore, gateAfter,
+      operatorReview, completedAt: timestamp(clock),
+    }));
+    await atomicWriteJson(storage, reportStoragePath(storage, cutoverId, '.rollback.json'), report);
+    return clone(report);
+  });
+}
+
+export async function setSharedPromotionAvailability({ store, coordinator, phase, buildIdentity } = {}) {
+  ensureCoordinator(coordinator);
+  if (!['ACTIVE', 'PROMOTION_DISABLED'].includes(phase)) {
+    fail('CUTOVER_INPUT_INVALID', 'Post-activation authority may only be ACTIVE or PROMOTION_DISABLED.');
+  }
+  const selector = await readReleaseAuthoritySelector(store);
+  if (selector.activationEpoch !== 1 || !['ACTIVE', 'PROMOTION_DISABLED'].includes(selector.phase)) {
+    fail('AUTHORITY_TRANSITION_INVALID', 'Promotion availability can change only after shared activation.');
+  }
+  if (!selector.prequalifiedRollbackBuilds.includes(buildIdentity) || store.buildIdentity !== buildIdentity) {
+    fail('CUTOVER_ROLLBACK_BUILD_UNQUALIFIED', 'Post-activation operation requires the exact opened prequalified build.');
+  }
+  return transitionReleaseAuthority(store, coordinator, {
+    expectedSelectorDigest: selector.digest,
+    phase,
+    activationRevision: selector.activationRevision,
+    buildIdentity,
+  });
+}
