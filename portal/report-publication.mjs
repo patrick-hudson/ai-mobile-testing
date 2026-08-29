@@ -7,6 +7,9 @@ import {
   parseSingleSiteReportSummary,
 } from '../scripts/lib/site-health-report.mjs';
 import { openParentRunStore, readCurrentEnvelope } from '../scripts/lib/parent-run-store.mjs';
+import { projectPublicationView } from '../shared/release-projection.mjs';
+
+export { projectPublicationView as projectReportReleasePublication } from '../shared/release-projection.mjs';
 
 const REVISION_PATTERN = /^[a-f0-9]{32}$/;
 const REPORT_PATH_PATTERN = /^(?:summary\.json|audits\.json|audits\/[A-Z0-9-]{3,160}\.json|(?:audits|coverage|scope\/(?:selected|omitted|outside-mode))\/page-\d{6}\.json)$/;
@@ -21,6 +24,10 @@ export async function loadSharedReleasePublication(storeRoot, runId, options = {
     verifyStorage: options.verifyStorage ?? false,
   });
   return readCurrentEnvelope(store, runId);
+}
+
+export async function loadSharedReleaseProjection(storeRoot, runId, options = {}) {
+  return projectPublicationView(await loadSharedReleasePublication(storeRoot, runId, options));
 }
 
 export async function loadReportPublication(runDirectoryValue, requestedRevision = null, options = {}) {

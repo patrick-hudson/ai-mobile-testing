@@ -40,5 +40,6 @@ export interface SiteHealthTruth {
 }
 
 export const SITE_HEALTH_SCHEMA_VERSION: 1;
+export { projectPublicationView as projectSiteHealthRelease } from '../../shared/release-projection.mjs';
 export function parseSiteHealthInput(input: unknown): SiteHealthInput;
 export function deriveSiteHealth(input: SiteHealthInput): SiteHealthTruth;

@@ -25,6 +25,8 @@ const NOVELTY_PRECEDENCE = new Map([
 const INCOMPLETE_FINALIZATION_STATES = new Set(['pending', 'incomplete', 'invalid', 'deadline-exceeded']);
 const INCOMPLETE_EXECUTION_STATES = new Set(['incomplete']);
 
+export { projectPublicationView as projectConsoleReleasePublication } from '../shared/release-projection.mjs';
+
 export function buildComparablePredecessorKey(run) {
   assertNormalizedRun(run);
   const factors = {

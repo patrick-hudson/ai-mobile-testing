@@ -1,0 +1,287 @@
+import assert from 'node:assert/strict';
+import { canonicalDigest } from '../shared/canonical-contract.mjs';
+import { sealExecutionManifest, sealOracleResult, sealWorkItemResult } from '../shared/execution-contract.mjs';
+import { appendPublicationEnvelope } from '../shared/publication-envelope.mjs';
+import { sealFinalReleaseSubject, sealReleaseSubjectCore } from '../shared/release-subject.mjs';
+import {
+  appendVisualDisposition,
+  projectSharedReleaseView,
+  projectPublicationView,
+} from '../shared/release-projection.mjs';
+import { parseChecklistRelease } from './lib/release-truth.mjs';
+import { applySharedReleaseEligibility } from '../portal/release-eligibility.mjs';
+import { projectSharedReleasePublication } from '../reporters/report-model.ts';
+import { projectConsoleReleasePublication } from '../portal/console-risk.mjs';
+import { projectReportReleasePublication } from '../portal/report-publication.mjs';
+import { projectSiteHealthRelease } from './lib/site-health.mjs';
+import { projectArchiveReleasePublication } from '../reporters/archive-bundle.ts';
+
+const D1 = `sha256:${'1'.repeat(64)}`;
+const D2 = `sha256:${'2'.repeat(64)}`;
+
+function fixture(mode, outcome = 'completed_pass') {
+  const targetRows = mode === 'single-site'
+    ? [{ role: 'audited', origin: 'https://beta.example.test' }]
+    : [{ role: 'candidate', origin: 'https://beta.example.test' }, { role: 'production', origin: 'https://example.test' }];
+  const targetIds = mode === 'single-site' ? ['audited-desktop'] : ['candidate-desktop', 'production-desktop'];
+  const core = sealReleaseSubjectCore({
+    schemaVersion: 1,
+    deploymentIdentity: { kind: 'build', value: `build-${mode}` },
+    targets: targetRows,
+    mode,
+    requestedAuthority: {
+      qualifier: 'FULL',
+      scope: { features: ['site'], definitions: ['VISUAL-001'], targets: targetIds, knownLimits: [] },
+    },
+    revisions: { runner: D1, plugins: D1, targets: D1, configuration: D1 },
+    environmentIdentity: D2,
+    certificatePolicy: 'strict',
+  });
+  const workItems = targetIds.map((targetId, index) => ({
+    id: `work-${index + 1}`,
+    definitionId: 'VISUAL-001',
+    targetId,
+    targetRole: mode === 'single-site' ? 'audited' : index === 0 ? 'candidate' : 'production',
+  }));
+  const manifest = sealExecutionManifest({
+    schemaVersion: 1,
+    subjectCoreDigest: core.digest,
+    workItems,
+    oracleExecutions: [{ id: 'oracle-visual', definitionId: 'VISUAL-001', requiredWorkItemIds: workItems.map(({ id }) => id) }],
+  });
+  const finalSubject = sealFinalReleaseSubject({
+    schemaVersion: 1,
+    subjectCore: core,
+    executionManifest: manifest,
+    grantedAuthority: core.requestedAuthority,
+    coverageBasis: { selectedDefinitions: ['VISUAL-001'], selectedTargets: targetIds, excludedAsNotApplicable: [] },
+    deploymentIdentityRecheck: core.deploymentIdentity,
+  });
+  const results = workItems.map(({ id }) => sealWorkItemResult({
+    schemaVersion: 1,
+    workItemId: id,
+    subjectCoreDigest: core.digest,
+    attempt: 1,
+    authoritative: true,
+    outcome,
+    evidenceDigests: [D1],
+  }));
+  const oracle = sealOracleResult({
+    schemaVersion: 1,
+    oracleExecution: manifest.oracleExecutions[0],
+    finalSubjectDigest: finalSubject.digest,
+    workItemResults: results,
+  });
+  return { core, manifest, finalSubject, oracleResults: [oracle] };
+}
+
+function riskSource(f, overrides = {}) {
+  return {
+    schemaVersion: 1,
+    category: 'manual-check',
+    severity: 'medium',
+    mode: f.finalSubject.mode,
+    scope: f.finalSubject.grantedAuthority.scope,
+    source: { kind: 'manual-obligation', id: 'screen-reader' },
+    explanation: 'A human screen-reader pass remains outstanding.',
+    recommendedAction: 'Complete the manual accessibility review.',
+    reviewState: 'OPEN',
+    releaseEffect: 'non-blocking',
+    actor: { id: 'runner', kind: 'service' },
+    observedAt: '2026-08-28T20:00:00.000Z',
+    updatedAt: '2026-08-28T20:00:00.000Z',
+    ...overrides,
+  };
+}
+
+function viewInput(f, overrides = {}) {
+  return {
+    schemaVersion: 1,
+    runId: `run-${f.finalSubject.mode}`,
+    baseDecisionRevision: 1,
+    baseRiskRevision: 1,
+    finalSubject: f.finalSubject,
+    executionManifest: f.manifest,
+    oracleResults: f.oracleResults,
+    riskAvailability: 'AVAILABLE',
+    riskSources: [riskSource(f)],
+    riskLifecycleEvents: [],
+    visualDispositions: [],
+    ...overrides,
+  };
+}
+
+const single = fixture('single-site');
+const comparative = fixture('comparative');
+const singleView = projectSharedReleaseView(viewInput(single));
+const comparativeView = projectSharedReleaseView(viewInput(comparative));
+assert.equal(singleView.decision.code, 'RELEASE_READY');
+assert.equal(comparativeView.decision.code, 'RELEASE_READY');
+assert.equal(singleView.riskRegister.availability, comparativeView.riskRegister.availability);
+for (const [outcome, expectedCode] of [
+  ['completed_product_failure', 'NOT_READY_TEST_FAILURE'],
+  ['operational_failure', 'NOT_READY_INCOMPLETE_EXECUTION'],
+]) {
+  const singleOutcome = fixture('single-site', outcome);
+  const comparativeOutcome = fixture('comparative', outcome);
+  assert.equal(projectSharedReleaseView(viewInput(singleOutcome)).decision.code, expectedCode);
+  assert.equal(projectSharedReleaseView(viewInput(comparativeOutcome)).decision.code, expectedCode);
+}
+
+const productionBaseline = projectSharedReleaseView(viewInput(comparative, {
+  riskSources: [riskSource(comparative, {
+    category: 'production-baseline-defect',
+    severity: 'high',
+    source: { kind: 'production-context', id: 'production-nav-defect' },
+    explanation: 'Production alone contains a navigation defect.',
+    recommendedAction: 'Track the production baseline separately from candidate promotion.',
+  })],
+}));
+assert.equal(productionBaseline.decision.code, 'RELEASE_READY');
+assert.equal(productionBaseline.riskRegister.risks[0].releaseEffect, 'non-blocking');
+
+const candidateRegression = fixture('comparative', 'completed_product_failure');
+assert.equal(projectSharedReleaseView(viewInput(candidateRegression)).decision.code, 'NOT_READY_TEST_FAILURE');
+
+const visualRisk = riskSource(single, {
+  category: 'unreviewed-visual-change',
+  severity: 'high',
+  source: { kind: 'visual-result', id: 'hero-change' },
+  explanation: 'The hero changed and needs human review.',
+  recommendedAction: 'Review the visual comparison.',
+  reviewState: 'PENDING_REVIEW',
+});
+const pendingVisual = projectSharedReleaseView(viewInput(single, { riskSources: [visualRisk] }));
+const visualRiskIdentity = pendingVisual.riskRegister.risks[0].identity;
+assert.equal(pendingVisual.decision.code, 'RELEASE_READY');
+
+const acceptedHistory = appendVisualDisposition([], {
+  schemaVersion: 1,
+  expectedReviewRevision: 0,
+  runId: 'run-single-site',
+  mode: 'single-site',
+  subjectDigest: single.finalSubject.digest,
+  executionId: 'oracle-visual',
+  riskIdentity: visualRiskIdentity,
+  disposition: 'ACCEPTED',
+  actor: { id: 'reviewer-1', kind: 'operator' },
+  rationale: 'The redesign intentionally changes the hero.',
+  at: '2026-08-28T20:01:00.000Z',
+});
+const accepted = projectSharedReleaseView(viewInput(single, { riskSources: [visualRisk], visualDispositions: acceptedHistory }));
+assert.equal(accepted.decision.code, 'RELEASE_READY');
+assert.equal(accepted.decision.decisionRevision, 2, 'Visual acceptance supersedes even an unchanged ready value.');
+assert.equal(accepted.riskRegister.risks[0].reviewState, 'ACCEPTED');
+
+const defectHistory = appendVisualDisposition([], {
+  schemaVersion: 1,
+  expectedReviewRevision: 0,
+  runId: 'run-single-site',
+  mode: 'single-site',
+  subjectDigest: single.finalSubject.digest,
+  executionId: 'oracle-visual',
+  riskIdentity: visualRiskIdentity,
+  disposition: 'DEFECT_CONFIRMED',
+  actor: { id: 'reviewer-1', kind: 'operator' },
+  rationale: 'The hero call to action is clipped.',
+  at: '2026-08-28T20:01:00.000Z',
+});
+const defect = projectSharedReleaseView(viewInput(single, { riskSources: [visualRisk], visualDispositions: defectHistory }));
+assert.equal(defect.decision.code, 'NOT_READY_TEST_FAILURE');
+assert.equal(defect.decision.decisionRevision, 2);
+
+const resolvedAfterDefect = projectSharedReleaseView(viewInput(single, {
+  riskSources: [visualRisk],
+  visualDispositions: defectHistory,
+  riskLifecycleEvents: [{
+    riskIdentity: visualRiskIdentity,
+    action: 'RESOLVED',
+    actor: { id: 'triage-1', kind: 'operator' },
+    at: '2026-08-28T20:02:00.000Z',
+  }],
+}));
+assert.equal(resolvedAfterDefect.riskRegister.risks[0].reviewState, 'RESOLVED', 'The latest lifecycle event controls Risk Register state.');
+assert.equal(resolvedAfterDefect.decision.code, 'NOT_READY_TEST_FAILURE', 'Risk-only resolution cannot clear a confirmed release defect.');
+assert.equal(resolvedAfterDefect.decision.decisionRevision, defect.decision.decisionRevision);
+
+const correctedHistory = appendVisualDisposition(defectHistory, {
+  schemaVersion: 1,
+  expectedReviewRevision: 1,
+  runId: 'run-single-site',
+  mode: 'single-site',
+  subjectDigest: single.finalSubject.digest,
+  executionId: 'oracle-visual',
+  riskIdentity: visualRiskIdentity,
+  disposition: 'ACCEPTED',
+  actor: { id: 'reviewer-2', kind: 'operator' },
+  rationale: 'The screenshot was stale; current evidence is expected.',
+  at: '2026-08-28T20:02:00.000Z',
+});
+assert.equal(correctedHistory.length, 2);
+assert.equal(correctedHistory[1].supersedes, correctedHistory[0].digest);
+assert.throws(() => appendVisualDisposition(correctedHistory, {
+  schemaVersion: 1,
+  expectedReviewRevision: 1,
+  runId: 'run-single-site',
+  mode: 'single-site',
+  subjectDigest: single.finalSubject.digest,
+  executionId: 'oracle-visual',
+  riskIdentity: visualRiskIdentity,
+  disposition: 'ACCEPTED',
+  actor: { id: 'reviewer-2', kind: 'operator' },
+  rationale: 'A stale correction must fail optimistic concurrency.',
+  at: '2026-08-28T20:04:00.000Z',
+}), (error) => error?.code === 'VISUAL_REVIEW_REVISION_CONFLICT');
+
+const acknowledged = projectSharedReleaseView(viewInput(single, {
+  riskLifecycleEvents: [{
+    riskIdentity: singleView.riskRegister.risks[0].identity,
+    action: 'ACKNOWLEDGED',
+    actor: { id: 'reviewer-1', kind: 'operator' },
+    at: '2026-08-28T20:03:00.000Z',
+  }],
+}));
+assert.equal(acknowledged.decision.decisionRevision, singleView.decision.decisionRevision);
+assert.equal(acknowledged.riskRevision, 2);
+const superseded = projectSharedReleaseView(viewInput(single, {
+  riskLifecycleEvents: [{
+    riskIdentity: singleView.riskRegister.risks[0].identity,
+    action: 'SUPERSEDED',
+    actor: { id: 'coordinator', kind: 'service' },
+    at: '2026-08-28T20:05:00.000Z',
+  }],
+}));
+assert.equal(superseded.riskRegister.risks.length, 1, 'Disappearing risk sources remain in history instead of being deleted.');
+assert.equal(superseded.riskRegister.risks[0].reviewState, 'SUPERSEDED');
+assert.equal(superseded.decision.decisionRevision, singleView.decision.decisionRevision);
+
+for (const availability of ['LOADING', 'PROVISIONAL', 'PARTIAL', 'UNAVAILABLE', 'EMPTY', 'AVAILABLE']) {
+  const sources = ['LOADING', 'UNAVAILABLE', 'EMPTY'].includes(availability) ? [] : [riskSource(single)];
+  const projected = projectSharedReleaseView(viewInput(single, { riskAvailability: availability, riskSources: sources }));
+  assert.equal(projected.riskRegister.availability, availability);
+  if (availability === 'EMPTY') assert.equal(projected.riskRegister.risks.length, 0);
+}
+
+const envelope = appendPublicationEnvelope(null, {
+  schemaVersion: 1,
+  runId: 'run-single-site',
+  runRevision: 1,
+  decisionRevision: accepted.decision.decisionRevision,
+  riskRevision: accepted.riskRevision,
+  ledgerSequences: { observations: 1, decisions: 2, risks: 2 },
+  finalSubjectDigest: single.finalSubject.digest,
+  decision: accepted.decision,
+  riskRegister: accepted.riskRegister,
+});
+const golden = projectPublicationView(envelope);
+assert.deepEqual(projectSharedReleasePublication(envelope), golden);
+assert.deepEqual(projectConsoleReleasePublication(envelope), golden);
+assert.deepEqual(projectReportReleasePublication(envelope), golden);
+assert.deepEqual(projectSiteHealthRelease(envelope), golden);
+assert.deepEqual(projectArchiveReleasePublication(envelope), golden);
+assert.deepEqual(parseChecklistRelease(envelope, 'release/publication/current.json'), golden.releaseTruth);
+const manifest = applySharedReleaseEligibility({}, envelope, 'Shared finalization');
+assert.deepEqual(manifest.sharedRelease, golden);
+assert.equal(canonicalDigest(manifest.sharedRelease), canonicalDigest(golden));
+
+console.log('Shared release projections self-test passed.');

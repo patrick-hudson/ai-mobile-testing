@@ -2,6 +2,7 @@ export interface ReportPublicationFileRecord {
   bytes: number;
   sha256: string;
 }
+export { projectPublicationView as projectReportReleasePublication } from '../shared/release-projection.mjs';
 
 export interface ReportPublication {
   runDirectory: string;
@@ -27,6 +28,11 @@ export function loadSharedReleasePublication(
   runId: string,
   options?: { filesystem?: typeof import('node:fs/promises'); verifyStorage?: boolean },
 ): Promise<import('../shared/publication-envelope.mjs').PublicationEnvelope>;
+export function loadSharedReleaseProjection(
+  storeRoot: string,
+  runId: string,
+  options?: { filesystem?: typeof import('node:fs/promises'); verifyStorage?: boolean },
+): Promise<import('../shared/release-projection.mjs').PublicationView>;
 
 export function loadReportPublication(
   runDirectory: string,

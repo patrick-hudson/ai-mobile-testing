@@ -1,4 +1,5 @@
 import type { ConsoleAuditMode, ConsoleNormalizedRun, ConsoleRunIdentityModel } from './console-view-model.mjs';
+export { projectPublicationView as projectConsoleReleasePublication } from '../shared/release-projection.mjs';
 
 export interface ConsoleComparabilityFactor {
   name: string;

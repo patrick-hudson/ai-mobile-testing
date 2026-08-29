@@ -6,6 +6,10 @@ import {
   withVisualBaselineMutationLock,
 } from './visual-baselines.mjs';
 import { visualBaselineCanonicalJson, visualBaselineDigest } from '../shared/visual-baseline-contract.mjs';
+export {
+  appendVisualDisposition as appendScopedVisualDisposition,
+  parseVisualDispositionHistory as parseScopedVisualDispositionHistory,
+} from '../shared/release-projection.mjs';
 
 const EVENT_NAME = /^(\d{12})-([A-Za-z0-9][A-Za-z0-9._-]{0,127})\.json$/;
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/;

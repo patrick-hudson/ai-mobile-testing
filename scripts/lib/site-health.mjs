@@ -1,5 +1,7 @@
 import { AUDIT_MODES, AUTHORITY_QUALIFIERS } from '../../shared/release-subject.mjs';
 
+export { projectPublicationView as projectSiteHealthRelease } from '../../shared/release-projection.mjs';
+
 export const SITE_HEALTH_SCHEMA_VERSION = 1;
 
 const EXECUTION_STATUSES = new Set([

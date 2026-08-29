@@ -1,5 +1,5 @@
 import { readFile } from 'node:fs/promises';
-import { parsePublicationEnvelope } from '../../shared/publication-envelope.mjs';
+import { projectPublicationView } from '../../shared/release-projection.mjs';
 import { RELEASE_DECISION_CODES } from '../../shared/release-decision.mjs';
 
 export const RELEASE_DECISIONS = Object.freeze(['READY', 'NOT_READY']);
@@ -7,27 +7,8 @@ export const PIPELINE_STATUSES = Object.freeze(['pending', 'running', 'completed
 export const CHECKLIST_SCHEMA_VERSION = 1;
 
 export function parseReleasePublication(document, source = 'release/publication/current.json') {
-  const envelope = parsePublicationEnvelope(document);
-  const { decision } = envelope;
-  return {
-    decision: decision.ready ? 'READY' : 'NOT_READY',
-    decisionCode: decision.code,
-    ready: decision.ready,
-    reason: decision.label,
-    decisionBasis: 'Shared canonical oracle results and authorized release-affecting dispositions.',
-    blockingFailures: decision.blockingReasons.filter(({ class: reasonClass }) => reasonClass === 'product-failure').length,
-    blockingIncomplete: decision.blockingReasons.filter(({ class: reasonClass }) => reasonClass !== 'product-failure').length,
-    baselineIssues: envelope.riskSummary.active,
-    runIntegrityFailure: decision.code === 'NOT_READY_INCOMPLETE_EXECUTION',
-    authority: decision.grantedAuthority,
-    certifiedScope: decision.certifiedScope,
-    subjectDigest: decision.subjectDigest,
-    decisionRevision: decision.decisionRevision,
-    superseded: decision.superseded,
-    riskSummary: envelope.riskSummary,
-    source,
-    evaluatedAt: null,
-  };
+  const releaseTruth = projectPublicationView(document).releaseTruth;
+  return source === releaseTruth.source ? releaseTruth : { ...releaseTruth, source };
 }
 
 export function pendingRelease(source = 'checklist/manifest.json') {

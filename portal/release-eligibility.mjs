@@ -1,9 +1,11 @@
 import { parsePublicationEnvelope } from '../shared/publication-envelope.mjs';
+import { projectPublicationView } from '../shared/release-projection.mjs';
 
 const CANONICAL_EXECUTION_MODE = 'external-sharded-performance-isolated';
 
 export function applySharedReleaseEligibility(manifest, publication, context) {
   const envelope = parsePublicationEnvelope(publication);
+  const sharedRelease = projectPublicationView(envelope);
   const { decision } = envelope;
   const finishedAt = new Date().toISOString();
   manifest.reviewReasons = [];
@@ -12,6 +14,7 @@ export function applySharedReleaseEligibility(manifest, publication, context) {
   manifest.releaseDecision = decision;
   manifest.riskRegister = envelope.riskRegister;
   manifest.riskSummary = envelope.riskSummary;
+  manifest.sharedRelease = sharedRelease;
   manifest.status = decision.ready ? 'passed' : 'not-ready';
   manifest.phase = `${context} · ${decision.label}${envelope.riskSummary.active > 0 ? ` · RISKS FLAGGED (${envelope.riskSummary.active})` : ''}`;
   return manifest;

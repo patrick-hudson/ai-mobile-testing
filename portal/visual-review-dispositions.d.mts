@@ -1,4 +1,8 @@
 export type VisualReviewDisposition = 'accepted-change' | 'known-defect';
+export {
+  appendVisualDisposition as appendScopedVisualDisposition,
+  parseVisualDispositionHistory as parseScopedVisualDispositionHistory,
+} from '../shared/release-projection.mjs';
 
 export interface VisualReviewBinding {
   jobId: string;

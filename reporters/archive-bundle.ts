@@ -2,6 +2,11 @@ import { createHash, randomUUID } from 'node:crypto';
 import { lstat, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { projectPublicationView, type PublicationView } from '../shared/release-projection.mjs';
+
+export function projectArchiveReleasePublication(value: unknown): PublicationView {
+  return projectPublicationView(value);
+}
 
 export const ARCHIVE_BUNDLE_VERSION = 2 as const;
 export const ARCHIVE_RUNTIME_VERSION = 2 as const;
