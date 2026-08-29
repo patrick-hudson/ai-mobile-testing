@@ -39,6 +39,14 @@ export function heartbeatWorkItem(store: ParentRunStore, runId: string, lease: W
 export function adoptWorkHeartbeat(store: ParentRunStore, runId: string, coordinator: CoordinatorFence, receipt: WorkHeartbeatReceipt): Promise<WorkLease>;
 export function requeueExpiredWork(store: ParentRunStore, runId: string, coordinator: CoordinatorFence): Promise<number>;
 export function publishAttemptEvidence(store: ParentRunStore, runId: string, lease: WorkLease, result: any): Promise<any>;
+export function createAttemptEvidenceUploadIntent(store: ParentRunStore, runId: string, lease: WorkLease, result: any): Promise<any>;
+export function uploadAttemptEvidenceArtifact(store: ParentRunStore, runId: string, binding: {
+  workItemId: string; workerId: string; attempt: number; leaseToken: string; intentDigest: string; ordinal: number;
+  contentLength: number; mediaType: string;
+}, chunks: AsyncIterable<Uint8Array>): Promise<any>;
+export function finalizeAttemptEvidenceUpload(store: ParentRunStore, runId: string, binding: {
+  workItemId: string; workerId: string; attempt: number; leaseToken: string; intentDigest: string;
+}): Promise<any>;
 export function appendAttemptLog(store: ParentRunStore, runId: string, lease: WorkLease, entry: { sequence: number; level: 'debug' | 'info' | 'warn' | 'error'; message: string }): Promise<any>;
 export function adoptAttemptEvidence(store: ParentRunStore, runId: string, coordinator: CoordinatorFence, inbox: any): Promise<any>;
 export function readAdoptedAttemptArtifactJson(store: ParentRunStore, runId: string, input: { workItemId: string; name: string; maximumBytes?: number }): Promise<any>;

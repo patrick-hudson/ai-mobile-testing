@@ -62,7 +62,7 @@ export async function maintainSharedWorkerLease({
       }
       if (maintenanceStop.signal.aborted) return;
       try {
-        const renewed = await heartbeat(currentLease);
+        const renewed = await heartbeat(currentLease, maintenanceStop.signal);
         if (!renewed || typeof renewed !== 'object' || renewed.token !== currentLease.token
           || renewed.workItemId !== currentLease.workItemId || renewed.workerId !== currentLease.workerId
           || renewed.attempt !== currentLease.attempt || renewed.epoch !== currentLease.epoch) {
@@ -70,6 +70,7 @@ export async function maintainSharedWorkerLease({
         }
         currentLease = Object.freeze({ ...renewed });
       } catch (error) {
+        if (maintenanceStop.signal.aborted) return;
         heartbeatFailure = error;
         reportHeartbeatFailure({ kind: 'heartbeat-failed' });
         return;

@@ -4,6 +4,7 @@ import * as fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { canonicalDigest } from '../shared/canonical-contract.mjs';
+import { sealWorkItemEvidenceMember } from '../shared/work-item-evidence-index.mjs';
 import {
   classifyExecutionFailure,
   runSharedWorkerPool,
@@ -14,14 +15,18 @@ import {
   acquireCoordinator,
   adoptAttemptEvidence,
   claimWorkItem,
+  createAttemptEvidenceUploadIntent,
   createParentRun,
+  finalizeAttemptEvidenceUpload,
   heartbeatWorkItem,
+  MAX_ATTEMPT_ARTIFACT_BYTES,
   adoptWorkHeartbeat,
   openParentRunStore,
   publishAttemptEvidence,
   readParentRun,
   requeueExpiredWork,
   requestPerformanceDrain,
+  uploadAttemptEvidenceArtifact,
 } from './lib/parent-run-store.mjs';
 
 const digest = (character) => `sha256:${character.repeat(64)}`;
@@ -68,7 +73,8 @@ try {
   })));
   const collected = await collectSharedWorkerEvidence(executorEvidenceRoot, { code: 0, signal: null }, executorLease);
   assert.equal(collected.artifacts[0].name, 'screens/home.png');
-  assert.equal(collected.artifacts[0].contentBase64, Buffer.from('executor-screen').toString('base64'));
+  assert.equal(await fs.readFile(collected.artifacts[0].sourcePath, 'utf8'), 'executor-screen');
+  assert.equal('contentBase64' in collected.artifacts[0], false, 'worker evidence remains file-backed instead of base64-buffered');
   await fs.writeFile(path.join(executorEvidenceRoot, 'screens', 'home-copy.png'), 'executor-screen');
   await fs.writeFile(path.join(executorEvidenceRoot, 'result.json'), JSON.stringify(executorResult({
     artifacts: [
@@ -303,7 +309,7 @@ try {
   );
   await assert.rejects(
     publishAttemptEvidence(store, 'evidence-boundary-run', leases[4], {
-      outcome: 'completed_pass', artifacts: [{ ...upload('oversize.bin', 'x'), sizeBytes: 8 * 1_048_576 + 1 }],
+      outcome: 'completed_pass', artifacts: [{ ...upload('oversize.bin', 'x'), sizeBytes: MAX_ATTEMPT_ARTIFACT_BYTES + 1 }],
     }),
     (error) => error?.code === 'STORE_SCHEMA_INVALID',
   );
@@ -354,9 +360,153 @@ try {
     legacyState.workItems['evidence-9'].attempts[0].artifacts[0].digest,
     'legacy durable inbox records remain adoptable with their original content-digest identity');
 
+  await createParentRun(store, {
+    runId: 'streaming-evidence-run', subjectCoreDigest: digest('4'), runnerRevision: 'runner-u4',
+    workItems: [
+      { id: 'stream-ok', maxAttempts: 2, capability: 'browser:chromium', resourceClass: 'ordinary', targetId: 'candidate-desktop-chromium', specAffinity: null },
+      { id: 'stream-restart', maxAttempts: 2, capability: 'browser:chromium', resourceClass: 'ordinary', targetId: 'candidate-desktop-chromium', specAffinity: null },
+      { id: 'stream-orphan', maxAttempts: 2, capability: 'browser:chromium', resourceClass: 'ordinary', targetId: 'candidate-desktop-chromium', specAffinity: null },
+    ],
+  });
+  const streamingLeases = [];
+  for (const workItemId of ['stream-ok', 'stream-restart', 'stream-orphan']) {
+    streamingLeases.push(await claimWorkItem(store, 'streaming-evidence-run', recoveryCoordinator, {
+      workerId: `worker-${workItemId}`, workItemId,
+      capabilities: ['browser:chromium'], resourceClasses: ['ordinary'], leaseMs: 10_000,
+    }));
+  }
+  const streamFixture = (lease, name, content) => {
+    const bytes = Buffer.from(content);
+    const contentDigest = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
+    const member = sealWorkItemEvidenceMember({
+      workItemId: lease.workItemId,
+      executionDescriptorDigest: lease.executionDescriptorDigest ?? lease.subjectCoreDigest,
+      ordinal: 1,
+      logicalName: name,
+      purpose: 'primary',
+      mediaType: 'video/webm',
+      sizeBytes: bytes.length,
+      contentDigest,
+      transportPath: name,
+    });
+    return {
+      bytes,
+      artifact: {
+        name, mediaType: member.mediaType, sizeBytes: member.sizeBytes, digest: member.contentDigest,
+        logicalName: member.logicalName, purpose: member.purpose, memberDigest: member.memberDigest,
+      },
+    };
+  };
+  const byteChunks = async function* (bytes) {
+    const split = Math.max(1, Math.floor(bytes.length / 2));
+    yield bytes.subarray(0, split);
+    yield bytes.subarray(split);
+  };
+  const okFixture = streamFixture(streamingLeases[0], 'video/action.webm', 'streamed-video-evidence');
+  const okResult = { outcome: 'completed_pass', reason: null, executionDescriptorDigest: null, artifacts: [okFixture.artifact] };
+  const okIntent = await createAttemptEvidenceUploadIntent(store, 'streaming-evidence-run', streamingLeases[0], okResult);
+  const replayedIntent = await createAttemptEvidenceUploadIntent(store, 'streaming-evidence-run', streamingLeases[0], okResult);
+  assert.equal(replayedIntent.intentDigest, okIntent.intentDigest, 'exact intent replay is idempotent');
+  const okBinding = {
+    workItemId: streamingLeases[0].workItemId, workerId: streamingLeases[0].workerId,
+    attempt: streamingLeases[0].attempt, leaseToken: streamingLeases[0].token,
+    intentDigest: okIntent.intentDigest, ordinal: 1,
+    contentLength: okFixture.bytes.length, mediaType: okFixture.artifact.mediaType,
+  };
+  const firstUpload = await uploadAttemptEvidenceArtifact(store, 'streaming-evidence-run', okBinding, byteChunks(okFixture.bytes));
+  const replayedUpload = await uploadAttemptEvidenceArtifact(store, 'streaming-evidence-run', okBinding, byteChunks(okFixture.bytes));
+  assert.deepEqual(replayedUpload, firstUpload, 'exact streamed blob replay is idempotent');
+  await assert.rejects(
+    uploadAttemptEvidenceArtifact(store, 'streaming-evidence-run', okBinding, byteChunks(Buffer.from('conflicting-video-bytes'))),
+    (error) => error?.code === 'ARTIFACT_DIGEST_MISMATCH',
+  );
+  const okFinalizeBinding = {
+    workItemId: okBinding.workItemId, workerId: okBinding.workerId, attempt: okBinding.attempt,
+    leaseToken: okBinding.leaseToken, intentDigest: okBinding.intentDigest,
+  };
+  const okInbox = await finalizeAttemptEvidenceUpload(store, 'streaming-evidence-run', okFinalizeBinding);
+  const adoptedStreaming = await adoptAttemptEvidence(store, 'streaming-evidence-run', recoveryCoordinator, okInbox);
+  assert.equal(adoptedStreaming.state, 'completed_pass');
+  const replayedInbox = await finalizeAttemptEvidenceUpload(store, 'streaming-evidence-run', okFinalizeBinding);
+  assert.equal(replayedInbox.digest, okInbox.digest, 'finalization replay retains the immutable inbox');
+  assert.equal((await adoptAttemptEvidence(store, 'streaming-evidence-run', recoveryCoordinator, replayedInbox)).state,
+    'completed_pass', 'adoption replay succeeds after the lease has been cleared');
+
+  const restartFixture = streamFixture(streamingLeases[1], 'trace/restart.webm', 'restartable-stream-evidence');
+  const restartIntent = await createAttemptEvidenceUploadIntent(store, 'streaming-evidence-run', streamingLeases[1], {
+    outcome: 'completed_pass', reason: null, executionDescriptorDigest: null, artifacts: [restartFixture.artifact],
+  });
+  const restartBinding = {
+    workItemId: streamingLeases[1].workItemId, workerId: streamingLeases[1].workerId,
+    attempt: streamingLeases[1].attempt, leaseToken: streamingLeases[1].token,
+    intentDigest: restartIntent.intentDigest, ordinal: 1,
+    contentLength: restartFixture.bytes.length, mediaType: restartFixture.artifact.mediaType,
+  };
+  const interrupted = async function* () {
+    yield restartFixture.bytes.subarray(0, 4);
+    throw new Error('simulated connection loss');
+  };
+  await assert.rejects(
+    uploadAttemptEvidenceArtifact(store, 'streaming-evidence-run', restartBinding, interrupted()),
+    /simulated connection loss/,
+  );
+  await assert.rejects(
+    finalizeAttemptEvidenceUpload(store, 'streaming-evidence-run', restartBinding),
+    (error) => error?.code === 'ATTEMPT_ARTIFACT_UNAVAILABLE',
+    'partial uploads cannot finalize or mutate canonical truth',
+  );
+  await uploadAttemptEvidenceArtifact(store, 'streaming-evidence-run', restartBinding, byteChunks(restartFixture.bytes));
+  const restartInbox = await finalizeAttemptEvidenceUpload(store, 'streaming-evidence-run', restartBinding);
+  assert.equal((await adoptAttemptEvidence(store, 'streaming-evidence-run', recoveryCoordinator, restartInbox)).state,
+    'completed_pass', 'an interrupted upload can resume from its immutable intent without rerunning work');
+
+  const orphanFixture = streamFixture(streamingLeases[2], 'video/orphan.webm', 'orphaned-stream-evidence');
+  const orphanIntent = await createAttemptEvidenceUploadIntent(store, 'streaming-evidence-run', streamingLeases[2], {
+    outcome: 'completed_pass', reason: null, executionDescriptorDigest: null, artifacts: [orphanFixture.artifact],
+  });
+  const orphanBinding = {
+    workItemId: streamingLeases[2].workItemId, workerId: streamingLeases[2].workerId,
+    attempt: streamingLeases[2].attempt, leaseToken: streamingLeases[2].token,
+    intentDigest: orphanIntent.intentDigest, ordinal: 1,
+    contentLength: orphanFixture.bytes.length, mediaType: orphanFixture.artifact.mediaType,
+  };
+  await uploadAttemptEvidenceArtifact(store, 'streaming-evidence-run', orphanBinding, byteChunks(orphanFixture.bytes));
+  const orphanKey = `${String(streamingLeases[2].attempt).padStart(6, '0')}-${streamingLeases[2].token}`;
+  const orphanEvidenceDirectory = path.join(root, 'runs', 'streaming-evidence-run', 'evidence', 'stream-orphan', orphanKey);
+  const orphanIntentDirectory = path.join(root, 'runs', 'streaming-evidence-run', 'inboxes', 'stream-orphan', 'uploads', orphanKey);
+  await fs.writeFile(path.join(orphanEvidenceDirectory, '.connection-crash.upload'), 'partial-upload-temp');
+
   now += 10_001;
   await requeueExpiredWork(store, 'recovery-run', recoveryCoordinator);
   await requeueExpiredWork(store, 'evidence-boundary-run', recoveryCoordinator);
+  assert.equal(await requeueExpiredWork(store, 'streaming-evidence-run', recoveryCoordinator), 1);
+  await assert.rejects(fs.lstat(orphanEvidenceDirectory), (error) => error?.code === 'ENOENT');
+  await assert.rejects(fs.lstat(orphanIntentDirectory), (error) => error?.code === 'ENOENT');
+  await assert.rejects(
+    fs.lstat(path.join(root, 'runs', 'streaming-evidence-run', 'quarantine', 'orphan-attempts')),
+    (error) => error?.code === 'ENOENT',
+    'stale attempt blobs, intents, and crash temporaries are deleted outside the mutation lock',
+  );
+  await assert.rejects(
+    finalizeAttemptEvidenceUpload(store, 'streaming-evidence-run', orphanBinding),
+    (error) => error?.code === 'ATOMIC_NOT_FOUND',
+    'an expired fully uploaded attempt cannot finalize after its evidence is quarantined',
+  );
+  const orphanRetryLease = await claimWorkItem(store, 'streaming-evidence-run', recoveryCoordinator, {
+    workerId: 'worker-stream-orphan-retry', workItemId: 'stream-orphan',
+    capabilities: ['browser:chromium'], resourceClasses: ['ordinary'], leaseMs: 10_000,
+  });
+  assert.equal(orphanRetryLease.attempt, 2);
+  const postTakeoverState = await readParentRun(store, 'streaming-evidence-run');
+  assert.equal(postTakeoverState.workItems['stream-orphan'].canonicalResult, null);
+  assert.equal(postTakeoverState.workItems['stream-orphan'].attempts[0].outcome, 'operational_failure');
+  const adoptedEvidencePath = postTakeoverState.workItems['stream-ok'].attempts[0].artifacts[0].relativePath;
+  assert.equal((await fs.lstat(path.join(root, 'runs', 'streaming-evidence-run', adoptedEvidencePath))).isFile(), true,
+    'orphan cleanup must retain adopted evidence from completed work items');
+  const retryInbox = await publishAttemptEvidence(store, 'streaming-evidence-run', orphanRetryLease, {
+    outcome: 'completed_pass', artifacts: [],
+  });
+  await adoptAttemptEvidence(store, 'streaming-evidence-run', recoveryCoordinator, retryInbox);
 
   await createParentRun(store, {
     runId: 'maintenance-run', subjectCoreDigest: digest('5'), runnerRevision: 'runner-u4',
@@ -518,12 +668,27 @@ try {
     'Compose workers must use only the fixed repository-owned dispatcher.');
   assert.doesNotMatch(sharedWorkerSource, /AUDIT_SHARED_EXECUTOR_JSON/);
   assert.match(sharedWorkerSource, /\/v1\/heartbeat/);
-  assert.match(sharedCoordinatorSource, /request\.url === '\/v1\/heartbeat'/);
+  assert.match(sharedCoordinatorSource, /requestUrl\.pathname === '\/v1\/heartbeat'/);
   assert.match(sharedCoordinatorSource, /heartbeatWorkItem\(store, leaseRunId, body\.lease/);
   assert.match(sharedCoordinatorSource, /adoptWorkHeartbeat\(store, leaseRunId, coordinator, receipt\)/,
     'worker heartbeats must remain inbox writes adopted by the sole canonical coordinator');
   assert.match(sharedEvidenceSource, /result\.json/);
-  assert.match(sharedEvidenceSource, /contentBase64/);
+  assert.doesNotMatch(sharedEvidenceSource, /contentBase64|\.readFile\(\)/,
+    'worker evidence remains file-backed and never enters the JSON metadata transport');
+  assert.match(sharedWorkerSource, /method: 'PUT'/);
+  assert.match(sharedWorkerSource, /duplex: 'half'/);
+  assert.match(sharedWorkerSource, /\/v1\/result-intent/);
+  assert.match(sharedWorkerSource, /\/v1\/result-finalize/);
+  assert.match(sharedWorkerSource, /evidence-artifact-upload-started/);
+  assert.match(sharedWorkerSource, /evidence-artifact-upload-completed/);
+  assert.match(sharedWorkerSource, /responseStatus/,
+    'operator logs must expose streaming request progress and coordinator response status');
+  assert.match(sharedWorkerSource, /abortSignal, uploadTimeoutMs/,
+    'large finalize hashing must use the evidence-upload timeout rather than the metadata timeout');
+  assert.match(sharedCoordinatorSource, /server\.requestTimeout = uploadTimeoutMs \+ 30_000/,
+    'coordinator request lifetime must exceed the worker large-upload timeout');
+  assert.doesNotMatch(sharedCoordinatorSource, /\/v1\/result'|publishAttemptEvidence/,
+    'the production coordinator must not retain the base64 JSON result endpoint');
   assert.doesNotMatch(sharedWorkerSource, /AUDIT_SHARED_STORE_ROOT|shared\/canonical/,
     'workers exchange bounded evidence over HTTP and never learn the canonical store root');
 

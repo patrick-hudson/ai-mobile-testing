@@ -4,10 +4,13 @@ import {
   adoptAttemptEvidence,
   adoptWorkHeartbeat,
   appendAttemptLog,
+  createAttemptEvidenceUploadIntent,
+  finalizeAttemptEvidenceUpload,
   heartbeatWorkItem,
-  MAX_ATTEMPT_EVIDENCE_BYTES,
+  MAX_ATTEMPT_ARTIFACT_BYTES,
   openParentRunStore,
-  publishAttemptEvidence,
+  readParentRun,
+  uploadAttemptEvidenceArtifact,
 } from './lib/parent-run-store.mjs';
 import { createSharedControlService } from './lib/shared-control-service.mjs';
 import { createSharedCoordinatorSupervisor } from './lib/shared-coordinator-supervisor.mjs';
@@ -35,8 +38,8 @@ async function readJson(request) {
   const chunks = [];
   for await (const chunk of request) {
     bytes += chunk.length;
-    if (bytes > Math.ceil(MAX_ATTEMPT_EVIDENCE_BYTES * 4 / 3) + 262_144) {
-      throw Object.assign(new Error('Request exceeds the bounded evidence upload size.'), { status: 413 });
+    if (bytes > 262_144) {
+      throw Object.assign(new Error('JSON request exceeds its metadata byte bound.'), { status: 413 });
     }
     chunks.push(chunk);
   }
@@ -48,6 +51,7 @@ async function readJson(request) {
 
 const leaseMs = boundedInteger('AUDIT_SHARED_LEASE_MS', 30_000, 1_000, 3_600_000);
 const coordinatorLeaseMs = boundedInteger('AUDIT_SHARED_COORDINATOR_LEASE_MS', 60_000, 5_000, 3_600_000);
+const uploadTimeoutMs = boundedInteger('AUDIT_SHARED_UPLOAD_TIMEOUT_MS', 20 * 60_000, 30_000, 3_600_000);
 const port = boundedInteger('AUDIT_SHARED_COORDINATOR_PORT', 4_180, 1_024, 65_535);
 const store = await openParentRunStore({
   root: required('AUDIT_SHARED_STORE_ROOT'),
@@ -87,25 +91,51 @@ heartbeat.unref();
 
 const server = http.createServer(async (request, response) => {
   try {
-    if (request.method === 'GET' && request.url === '/healthz') {
+    const requestUrl = new URL(request.url ?? '/', 'http://shared-coordinator.invalid');
+    if (request.method === 'GET' && requestUrl.pathname === '/healthz') {
       const status = supervisor.status();
       return json(response, status.state === 'ready' ? 200 : 503, status);
     }
-    if (request.method !== 'POST') return json(response, 404, { error: 'Not found.' });
     const authorization = String(request.headers.authorization ?? '');
     if (!authorization.startsWith('Bearer ')) throw Object.assign(new Error('Worker authentication is required.'), { status: 401 });
     const principal = await credentialAuthority.authenticateCredential(authorization.slice(7));
-    const action = ['/v1/performance-drain', '/v1/claim'].includes(request.url) ? CONTROL_ACTIONS.WORK_CLAIM : CONTROL_ACTIONS.WORK_PUBLISH;
+    if (request.method === 'PUT' && requestUrl.pathname === '/v1/result-artifact') {
+      const runId = String(request.headers['x-audit-run-id'] ?? '');
+      assertPrincipalAuthorized(principal, CONTROL_ACTIONS.WORK_PUBLISH, { projectId, runId });
+      const contentLength = Number(request.headers['content-length']);
+      if (!Number.isSafeInteger(contentLength) || contentLength < 1 || contentLength > MAX_ATTEMPT_ARTIFACT_BYTES) {
+        throw Object.assign(new Error('Artifact upload requires an exact bounded Content-Length.'), { status: 411 });
+      }
+      if (request.headers['content-encoding'] !== undefined) {
+        throw Object.assign(new Error('Artifact upload Content-Encoding is not supported.'), { status: 415 });
+      }
+      const receipt = await uploadAttemptEvidenceArtifact(store, runId, {
+        workItemId: String(request.headers['x-audit-work-item-id'] ?? ''),
+        workerId: principal.id,
+        attempt: Number(request.headers['x-audit-attempt']),
+        leaseToken: String(request.headers['x-audit-lease-token'] ?? ''),
+        intentDigest: String(request.headers['x-audit-intent-digest'] ?? ''),
+        ordinal: Number(request.headers['x-audit-artifact-ordinal']),
+        contentLength,
+        mediaType: String(request.headers['content-type'] ?? ''),
+      }, request);
+      if (receipt.sizeBytes !== contentLength) {
+        throw Object.assign(new Error('Artifact upload Content-Length disagrees with its sealed declaration.'), { status: 400 });
+      }
+      return json(response, 201, receipt);
+    }
+    if (request.method !== 'POST') return json(response, 404, { error: 'Not found.' });
+    const action = ['/v1/performance-drain', '/v1/claim'].includes(requestUrl.pathname) ? CONTROL_ACTIONS.WORK_CLAIM : CONTROL_ACTIONS.WORK_PUBLISH;
     const body = await readJson(request);
     const leaseRunId = body?.lease?.runId;
     assertPrincipalAuthorized(principal, action, {
       projectId,
-      ...(['/v1/performance-drain', '/v1/claim'].includes(request.url) ? {} : { runId: leaseRunId }),
+      ...(['/v1/performance-drain', '/v1/claim'].includes(requestUrl.pathname) ? {} : { runId: leaseRunId }),
     });
-    if (request.url === '/v1/performance-drain') {
+    if (requestUrl.pathname === '/v1/performance-drain') {
       return json(response, 202, await supervisor.requestPerformanceDrain(principal, body));
     }
-    if (request.url === '/v1/claim') {
+    if (requestUrl.pathname === '/v1/claim') {
       const lease = await supervisor.claim(principal, body);
       return json(response, 200, lease);
     }
@@ -114,21 +144,41 @@ const server = http.createServer(async (request, response) => {
     }
     const coordinator = supervisor.coordinator();
     if (coordinator === null) return json(response, 503, { code: 'COORDINATOR_UNAVAILABLE', error: 'No active coordinator lease.' });
-    if (request.url === '/v1/heartbeat') {
+    if (requestUrl.pathname === '/v1/heartbeat') {
       if (body.lease?.workerId !== principal.id) throw Object.assign(new Error('Worker lease belongs to another principal.'), { status: 403 });
-      const receipt = await heartbeatWorkItem(store, leaseRunId, body.lease, { leaseMs });
-      return json(response, 202, await adoptWorkHeartbeat(store, leaseRunId, coordinator, receipt));
+      try {
+        const receipt = await heartbeatWorkItem(store, leaseRunId, body.lease, { leaseMs });
+        return json(response, 202, await adoptWorkHeartbeat(store, leaseRunId, coordinator, receipt));
+      } catch (error) {
+        if (error?.code !== 'STALE_WORK_LEASE') throw error;
+        const state = await readParentRun(store, leaseRunId);
+        const item = state.workItems?.[body.lease?.workItemId];
+        const adoptedAttempt = item?.attempts?.find((attempt) => attempt.attempt === body.lease?.attempt
+          && attempt.workerId === principal.id && attempt.leaseToken === body.lease?.token && attempt.inboxDigest);
+        if (!adoptedAttempt || !['completed_pass', 'completed_product_failure'].includes(item.state)) throw error;
+        return json(response, 202, { ...body.lease, terminal: true });
+      }
     }
-    if (request.url === '/v1/result') {
+    if (requestUrl.pathname === '/v1/result-intent') {
       if (body.lease?.workerId !== principal.id) throw Object.assign(new Error('Worker lease belongs to another principal.'), { status: 403 });
       if (!['completed_pass', 'completed_product_failure'].includes(body?.result?.outcome)) {
         return json(response, 422, { error: 'Workers may publish only completed product outcomes; operational recovery requires coordinator-trusted evidence.' });
       }
-      const inbox = await publishAttemptEvidence(store, leaseRunId, body.lease, body.result);
+      return json(response, 201, await createAttemptEvidenceUploadIntent(store, leaseRunId, body.lease, body.result));
+    }
+    if (requestUrl.pathname === '/v1/result-finalize') {
+      if (body.lease?.workerId !== principal.id) throw Object.assign(new Error('Worker lease belongs to another principal.'), { status: 403 });
+      const inbox = await finalizeAttemptEvidenceUpload(store, leaseRunId, {
+        workItemId: body.lease.workItemId,
+        workerId: principal.id,
+        attempt: body.lease.attempt,
+        leaseToken: body.lease.token,
+        intentDigest: body.intentDigest,
+      });
       const adopted = await adoptAttemptEvidence(store, leaseRunId, coordinator, inbox);
       return json(response, 202, { workItemId: adopted.id, state: adopted.state, canonicalResult: adopted.canonicalResult });
     }
-    if (request.url === '/v1/log') {
+    if (requestUrl.pathname === '/v1/log') {
       if (body.lease?.workerId !== principal.id) throw Object.assign(new Error('Worker lease belongs to another principal.'), { status: 403 });
       const receipt = await appendAttemptLog(store, leaseRunId, body.lease, {
         sequence: body.sequence,
@@ -144,9 +194,13 @@ const server = http.createServer(async (request, response) => {
       'PERFORMANCE_DRAIN_PENDING', 'PERFORMANCE_DRAIN_REQUIRED', 'PERFORMANCE_DRAINING',
       'PERFORMANCE_DRAIN_HELD', 'PERFORMANCE_LEASE_HELD', 'PERFORMANCE_RECOVERY_PENDING',
     ].includes(error?.code);
-    json(response, error?.status ?? (unavailable ? 409 : 400), { code: error?.code ?? 'SHARED_COORDINATOR_REQUEST_INVALID', error: error?.message ?? 'Request failed.' });
+    const conflict = unavailable || error?.code === 'ATTEMPT_UPLOAD_CONFLICT';
+    json(response, error?.status ?? (conflict ? 409 : 400), { code: error?.code ?? 'SHARED_COORDINATOR_REQUEST_INVALID', error: error?.message ?? 'Request failed.' });
   }
 });
+server.requestTimeout = uploadTimeoutMs + 30_000;
+server.headersTimeout = 60_000;
+server.maxHeadersCount = 64;
 await maintain();
 server.listen(port, '0.0.0.0', () => process.stdout.write(`${JSON.stringify({
   event: 'shared-coordinator-listening', port, state: supervisor.status().state, epoch: supervisor.status().epoch,

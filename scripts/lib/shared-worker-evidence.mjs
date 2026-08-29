@@ -5,8 +5,8 @@ import path from 'node:path';
 import { sealWorkItemEvidenceMember } from '../../shared/work-item-evidence-index.mjs';
 
 export const MAX_WORKER_ARTIFACTS = 64;
-export const MAX_WORKER_ARTIFACT_BYTES = 8 * 1_048_576;
-export const MAX_WORKER_EVIDENCE_BYTES = 16 * 1_048_576;
+export const MAX_WORKER_ARTIFACT_BYTES = 512 * 1_048_576;
+export const MAX_WORKER_EVIDENCE_BYTES = 1_024 * 1_048_576;
 const MEDIA_TYPE = /^[a-z0-9][a-z0-9.+-]{0,126}\/[a-z0-9][a-z0-9.+-]{0,126}$/i;
 
 function artifactPath(root, value) {
@@ -93,20 +93,29 @@ export async function collectSharedWorkerEvidence(evidenceRoot, { code, signal =
     const realCandidate = await fs.realpath(candidate);
     if (!realCandidate.startsWith(`${realRoot}${path.sep}`)) throw new Error(`Executor artifact ${name} escaped its evidence directory.`);
     let handle;
-    let bytes;
+    let sizeBytes = 0;
+    let digest;
     try {
       handle = await fs.open(candidate, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
       const stat = await handle.stat();
       if (!stat.isFile() || stat.size < 1 || stat.size > MAX_WORKER_ARTIFACT_BYTES) {
         throw new Error(`Executor artifact ${name} exceeds its file bound.`);
       }
-      bytes = await handle.readFile();
+      const hash = createHash('sha256');
+      const chunk = Buffer.allocUnsafe(64 * 1_024);
+      while (true) {
+        const { bytesRead } = await handle.read(chunk, 0, chunk.length, null);
+        if (bytesRead === 0) break;
+        sizeBytes += bytesRead;
+        if (sizeBytes > MAX_WORKER_ARTIFACT_BYTES) throw new Error(`Executor artifact ${name} exceeds its file bound.`);
+        hash.update(chunk.subarray(0, bytesRead));
+      }
+      digest = `sha256:${hash.digest('hex')}`;
     } finally {
       await handle?.close();
     }
-    totalBytes += bytes.length;
+    totalBytes += sizeBytes;
     if (totalBytes > MAX_WORKER_EVIDENCE_BYTES) throw new Error('Executor artifacts exceed the attempt evidence byte bound.');
-    const digest = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
     const member = sealWorkItemEvidenceMember({
       workItemId: lease.workItemId,
       executionDescriptorDigest: lease.executionDescriptorDigest ?? lease.subjectCoreDigest,
@@ -114,19 +123,19 @@ export async function collectSharedWorkerEvidence(evidenceRoot, { code, signal =
       logicalName: indexed ? declaration.logicalName : name,
       purpose: indexed ? declaration.purpose : 'structured',
       mediaType: declaration.mediaType,
-      sizeBytes: bytes.length,
+      sizeBytes,
       contentDigest: digest,
       transportPath: name,
     });
-    if (indexed && (declaration.sizeBytes !== bytes.length || declaration.contentDigest !== digest
+    if (indexed && (declaration.sizeBytes !== sizeBytes || declaration.contentDigest !== digest
       || declaration.memberDigest !== member.memberDigest)) {
       throw new Error(`Executor artifact ${name} disagrees with its sealed evidence member.`);
     }
     names.add(name);
     uploads.push({
-      name, mediaType: declaration.mediaType.toLowerCase(), sizeBytes: bytes.length,
+      name, mediaType: declaration.mediaType.toLowerCase(), sizeBytes,
       digest, logicalName: member.logicalName, purpose: member.purpose,
-      memberDigest: member.memberDigest, contentBase64: bytes.toString('base64'),
+      memberDigest: member.memberDigest, sourcePath: candidate,
     });
   }
   return {

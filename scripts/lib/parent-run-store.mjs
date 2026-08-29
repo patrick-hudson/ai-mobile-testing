@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
+import { constants as fsConstants } from 'node:fs';
 import path from 'node:path';
 import {
   canonicalDigest,
@@ -14,6 +15,7 @@ import {
   atomicWriteJson,
   atomicWriteFile,
   containedPath,
+  ensureDirectory,
   fsyncDirectory,
   openAtomicStorage,
   pathExists,
@@ -39,13 +41,15 @@ const DIGEST_PATTERN = /^sha256:[a-f0-9]{64}$/;
 const CAPABILITY_PATTERN = /^[a-z][a-z0-9.-]*:[a-z][a-z0-9.-]*$/;
 const RESOURCE_CLASSES = new Set(['ordinary', 'performance']);
 export const MAX_ATTEMPT_ARTIFACTS = 64;
-export const MAX_ATTEMPT_ARTIFACT_BYTES = 8 * 1_048_576;
-export const MAX_ATTEMPT_EVIDENCE_BYTES = 16 * 1_048_576;
+export const MAX_ATTEMPT_ARTIFACT_BYTES = 512 * 1_048_576;
+export const MAX_ATTEMPT_EVIDENCE_BYTES = 1_024 * 1_048_576;
 const ARTIFACT_MEDIA_TYPE = /^[a-z0-9][a-z0-9.+-]{0,126}\/[a-z0-9][a-z0-9.+-]{0,126}$/i;
 const MAX_OPERATION_RESOURCES = 128;
 const MAX_OPERATION_BODY_BYTES = 16 * 1_024;
 const OPERATION_RETRY_WINDOW_MS = 24 * 60 * 60 * 1_000;
 const MAX_DISCOVERED_PARENT_RUNS = 2_048;
+const MAX_BUFFERED_ATTEMPT_ARTIFACT_BYTES = 8 * 1_048_576;
+const MAX_BUFFERED_ATTEMPT_EVIDENCE_BYTES = 16 * 1_048_576;
 
 export class ParentRunStoreError extends Error {
   constructor(code, message, details = undefined) {
@@ -135,6 +139,70 @@ function artifactName(value) {
   return value;
 }
 
+async function inspectBoundedArtifact(store, file, { label, maximumBytes = MAX_ATTEMPT_ARTIFACT_BYTES } = {}) {
+  let handle;
+  try {
+    handle = await store.storage.fs.open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.size < 1 || stat.size > maximumBytes) {
+      fail('STORE_CORRUPT', `${label} must be a bounded regular file.`);
+    }
+    const hash = createHash('sha256');
+    const chunk = Buffer.allocUnsafe(64 * 1_024);
+    let sizeBytes = 0;
+    while (true) {
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length, null);
+      if (bytesRead === 0) break;
+      sizeBytes += bytesRead;
+      if (sizeBytes > maximumBytes) fail('STORE_CORRUPT', `${label} exceeds its byte bound.`);
+      hash.update(chunk.subarray(0, bytesRead));
+    }
+    return { sizeBytes, digest: `sha256:${hash.digest('hex')}` };
+  } catch (error) {
+    if (error?.code === 'ENOENT') fail('ATTEMPT_ARTIFACT_UNAVAILABLE', `${label} was not uploaded.`);
+    throw error;
+  } finally {
+    await handle?.close();
+  }
+}
+
+function normalizeArtifactDeclaration(value, context) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || Object.keys(value).length !== 7
+    || !['name', 'mediaType', 'sizeBytes', 'digest', 'logicalName', 'purpose', 'memberDigest'].every((key) => key in value)) {
+    fail('STORE_SCHEMA_INVALID', 'Artifact declaration has an invalid schema.');
+  }
+  const name = artifactName(value.name);
+  let member;
+  try {
+    member = sealWorkItemEvidenceMember({
+      workItemId: context.workItemId,
+      executionDescriptorDigest: context.executionDescriptorDigest,
+      ordinal: context.ordinal,
+      logicalName: value.logicalName,
+      purpose: value.purpose,
+      mediaType: value.mediaType,
+      sizeBytes: value.sizeBytes,
+      contentDigest: value.digest,
+      transportPath: name,
+    });
+  } catch (error) {
+    fail('STORE_SCHEMA_INVALID', `Artifact ${name} logical evidence declaration is invalid: ${error.message}`);
+  }
+  if (member.memberDigest !== value.memberDigest) {
+    fail('ARTIFACT_MEMBER_DIGEST_MISMATCH', `Artifact ${name} member digest does not match its logical identity.`);
+  }
+  return {
+    name,
+    mediaType: member.mediaType,
+    sizeBytes: member.sizeBytes,
+    digest: member.contentDigest,
+    logicalName: member.logicalName,
+    purpose: member.purpose,
+    memberDigest: member.memberDigest,
+  };
+}
+
 function decodeArtifactUpload(value, context) {
   const keys = Object.keys(value ?? {});
   const indexed = keys.length === 8
@@ -149,7 +217,7 @@ function decodeArtifactUpload(value, context) {
   if (typeof value.mediaType !== 'string' || !ARTIFACT_MEDIA_TYPE.test(value.mediaType)) {
     fail('STORE_SCHEMA_INVALID', 'Artifact media type is invalid.');
   }
-  if (!Number.isSafeInteger(value.sizeBytes) || value.sizeBytes < 1 || value.sizeBytes > MAX_ATTEMPT_ARTIFACT_BYTES
+  if (!Number.isSafeInteger(value.sizeBytes) || value.sizeBytes < 1 || value.sizeBytes > MAX_BUFFERED_ATTEMPT_ARTIFACT_BYTES
     || typeof value.contentBase64 !== 'string' || value.contentBase64.length === 0
     || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value.contentBase64)) {
     fail('STORE_SCHEMA_INVALID', 'Artifact upload size or encoding is invalid.');
@@ -1274,8 +1342,34 @@ export async function adoptWorkHeartbeat(store, runId, coordinator, receipt) {
   return clone(renewed);
 }
 
+async function quarantineFailedAttemptEvidenceUnlocked(store, runId, state) {
+  const runRoot = runDirectory(store, runId);
+  const quarantineRoot = containedPath(runRoot, 'quarantine', 'orphan-attempts');
+  const quarantined = [];
+  for (const item of Object.values(state.workItems)) {
+    for (const attempt of item.attempts) {
+      if (attempt.outcome !== 'operational_failure' || !SAFE_ID.test(attempt.leaseToken ?? '')) continue;
+      const key = `${String(attempt.attempt).padStart(6, '0')}-${attempt.leaseToken}`;
+      for (const [kind, source] of [
+        ['evidence', containedPath(runRoot, 'evidence', item.id, key)],
+        ['upload-intent', containedPath(runRoot, 'inboxes', item.id, 'uploads', key)],
+      ]) {
+        if (!await pathExists(store.storage.fs, source)) continue;
+        const target = containedPath(quarantineRoot, item.id, key, `${kind}-${store.storage.nonce()}`);
+        await ensureDirectory(store.storage.fs, path.dirname(target));
+        await store.storage.fs.rename(source, target);
+        await fsyncDirectory(store.storage.fs, path.dirname(source));
+        await fsyncDirectory(store.storage.fs, path.dirname(target));
+        quarantined.push(target);
+      }
+    }
+  }
+  return { quarantineRoot, quarantined };
+}
+
 export async function requeueExpiredWork(store, runId, coordinator) {
-  return withDirectoryLock(store.storage, globalLockPath(store), () => withDirectoryLock(store.storage, lockPath(store, runId), async () => {
+  let quarantineRoot;
+  const expiredCount = await withDirectoryLock(store.storage, globalLockPath(store), () => withDirectoryLock(store.storage, lockPath(store, runId), async () => {
     const state = await recoverUnlocked(store, runId);
     await validateCoordinator(store, coordinator);
     const expiredIds = Object.values(state.workItems)
@@ -1286,38 +1380,44 @@ export async function requeueExpiredWork(store, runId, coordinator) {
       && Date.parse(state.resourceScheduling.performanceDrain.expiresAt) <= store.clock();
     const exclusiveExpired = state.resourceScheduling.exclusiveLease
       && Date.parse(state.resourceScheduling.exclusiveLease.expiresAt) <= store.clock();
-    if (expiredIds.length === 0 && !drainExpired && !exclusiveExpired) return 0;
-    await appendMutationUnlocked(store, state, 'mutation', 'expired-work-requeued', (next) => {
-      for (const id of expiredIds) {
-        const item = next.workItems[id];
-        const reason = item.lease.epoch !== coordinator.epoch ? 'coordinator-epoch-fenced' : 'lease-expired';
-        item.attempts.push({
-          attempt: item.lease.attempt,
-          outcome: 'operational_failure',
-          evidenceDigests: [],
-          artifacts: [],
-          workerId: item.lease.workerId,
-          completedAt: timestamp(store),
-          reason,
-        });
-        item.lease = null;
-        item.state = item.attempts.length >= item.maxAttempts ? 'incomplete' : 'queued';
-      }
-      if (exclusiveExpired || expiredIds.some((id) => next.workItems[id].resourceClass === 'performance')) {
-        next.resourceScheduling.exclusiveLease = null;
-      }
-      if (drainExpired || expiredIds.some((id) => next.workItems[id].resourceClass === 'performance'
-        && next.workItems[id].state === 'incomplete')) {
-        next.resourceScheduling.performanceDrain = null;
-      }
-    });
+    let current = state;
+    if (expiredIds.length > 0 || drainExpired || exclusiveExpired) {
+      current = await appendMutationUnlocked(store, state, 'mutation', 'expired-work-requeued', (next) => {
+        for (const id of expiredIds) {
+          const item = next.workItems[id];
+          const reason = item.lease.epoch !== coordinator.epoch ? 'coordinator-epoch-fenced' : 'lease-expired';
+          item.attempts.push({
+            attempt: item.lease.attempt,
+            outcome: 'operational_failure',
+            evidenceDigests: [],
+            artifacts: [],
+            workerId: item.lease.workerId,
+            leaseToken: item.lease.token,
+            completedAt: timestamp(store),
+            reason,
+          });
+          item.lease = null;
+          item.state = item.attempts.length >= item.maxAttempts ? 'incomplete' : 'queued';
+        }
+        if (exclusiveExpired || expiredIds.some((id) => next.workItems[id].resourceClass === 'performance')) {
+          next.resourceScheduling.exclusiveLease = null;
+        }
+        if (drainExpired || expiredIds.some((id) => next.workItems[id].resourceClass === 'performance'
+          && next.workItems[id].state === 'incomplete')) {
+          next.resourceScheduling.performanceDrain = null;
+        }
+      });
+    }
     const scheduler = await readPerformanceSchedulerUnlocked(store);
     if (scheduler.phase !== 'idle' && scheduler.reservation.runId === runId
       && expiredIds.includes(scheduler.reservation.workItemId)) {
       await writePerformanceSchedulerUnlocked(store, scheduler, 'idle');
     }
+    ({ quarantineRoot } = await quarantineFailedAttemptEvidenceUnlocked(store, runId, current));
     return expiredIds.length;
   }));
+  if (quarantineRoot) await store.storage.fs.rm(quarantineRoot, { recursive: true, force: true });
+  return expiredCount;
 }
 
 export async function publishAttemptEvidence(store, runId, lease, result) {
@@ -1338,7 +1438,7 @@ export async function publishAttemptEvidence(store, runId, lease, result) {
   if (new Set(uploads.map(({ name }) => name)).size !== uploads.length) {
     fail('STORE_SCHEMA_INVALID', 'Attempt evidence contains a duplicate artifact name.');
   }
-  if (uploads.reduce((total, artifact) => total + artifact.sizeBytes, 0) > MAX_ATTEMPT_EVIDENCE_BYTES) {
+  if (uploads.reduce((total, artifact) => total + artifact.sizeBytes, 0) > MAX_BUFFERED_ATTEMPT_EVIDENCE_BYTES) {
     fail('STORE_SCHEMA_INVALID', 'Attempt evidence exceeds the total byte bound.');
   }
   const attemptDirectory = path.posix.join('evidence', lease.workItemId,
@@ -1409,6 +1509,308 @@ export async function publishAttemptEvidence(store, runId, lease, result) {
   return { runId, workItemId: lease.workItemId, attempt: lease.attempt, leaseToken: lease.token, relativePath, digest: inboxDigest };
 }
 
+function attemptUploadIntentRelativePath(workItemId, attempt, leaseToken) {
+  return path.posix.join('inboxes', safeId(workItemId, 'workItemId'), 'uploads',
+    `${String(attempt).padStart(6, '0')}-${safeId(leaseToken, 'leaseToken')}`, 'intent.json');
+}
+
+async function readAttemptEvidenceUploadIntent(store, runId, binding) {
+  const relativePath = attemptUploadIntentRelativePath(binding.workItemId, binding.attempt, binding.leaseToken);
+  const document = await readBoundedJson(store.storage,
+    containedPath(runDirectory(store, runId), ...relativePath.split('/')),
+    { label: 'attempt evidence upload intent', maximumBytes: 262_144 });
+  const { digest, ...body } = document;
+  exactKeys(document, [
+    'schemaVersion', 'kind', 'runId', 'workItemId', 'workerId', 'attempt', 'coordinatorEpoch',
+    'leaseToken', 'subjectCoreDigest', 'runnerRevision', 'executionDescriptorDigest', 'outcome', 'reason',
+    'artifacts', 'createdAt', 'digest',
+  ], 'attempt evidence upload intent');
+  if (document.schemaVersion !== 1 || document.kind !== 'attempt-evidence-upload-intent'
+    || document.runId !== runId || document.workItemId !== binding.workItemId
+    || document.attempt !== binding.attempt || document.leaseToken !== binding.leaseToken
+    || document.digest !== binding.intentDigest || digest !== canonicalDigest(body)
+    || !Array.isArray(document.artifacts) || document.artifacts.length > MAX_ATTEMPT_ARTIFACTS) {
+    fail('STORE_CORRUPT', 'Attempt evidence upload intent is corrupt or disagrees with its binding.');
+  }
+  if (!SAFE_ID.test(document.workItemId) || !SAFE_ID.test(document.workerId) || !SAFE_ID.test(document.leaseToken)
+    || !Number.isSafeInteger(document.attempt) || document.attempt < 1
+    || !Number.isSafeInteger(document.coordinatorEpoch) || document.coordinatorEpoch < 1
+    || !DIGEST_PATTERN.test(document.subjectCoreDigest)
+    || typeof document.runnerRevision !== 'string' || !document.runnerRevision || document.runnerRevision.length > 512
+    || (document.executionDescriptorDigest !== null && !DIGEST_PATTERN.test(document.executionDescriptorDigest))
+    || !['completed_pass', 'completed_product_failure'].includes(document.outcome)
+    || (document.reason !== null && (typeof document.reason !== 'string' || !document.reason || document.reason.length > 256))) {
+    fail('STORE_CORRUPT', 'Attempt evidence upload intent metadata is invalid.');
+  }
+  canonicalTimestamp(document.createdAt, 'attempt evidence upload intent createdAt');
+  const evidenceBindingDigest = document.executionDescriptorDigest ?? document.subjectCoreDigest;
+  let normalizedArtifacts;
+  try {
+    normalizedArtifacts = document.artifacts.map((artifact, index) => normalizeArtifactDeclaration(artifact, {
+      workItemId: document.workItemId,
+      executionDescriptorDigest: evidenceBindingDigest,
+      ordinal: index + 1,
+    }));
+  } catch (error) {
+    fail('STORE_CORRUPT', 'Attempt evidence upload intent artifact declarations are invalid.', { cause: error?.code ?? error?.message });
+  }
+  if (new Set(normalizedArtifacts.map(({ name }) => name)).size !== normalizedArtifacts.length
+    || normalizedArtifacts.reduce((total, artifact) => total + artifact.sizeBytes, 0) > MAX_ATTEMPT_EVIDENCE_BYTES
+    || canonicalJson(normalizedArtifacts) !== canonicalJson(document.artifacts)) {
+    fail('STORE_CORRUPT', 'Attempt evidence upload intent artifact declarations are invalid.');
+  }
+  return { document, relativePath };
+}
+
+export async function createAttemptEvidenceUploadIntent(store, runId, lease, result) {
+  const state = await recoverUnlocked(store, runId, { repairCache: false });
+  validateWorkLease(state, lease);
+  if (!result || typeof result !== 'object' || Array.isArray(result)
+    || Object.keys(result).some((key) => !['outcome', 'reason', 'artifacts', 'executionDescriptorDigest'].includes(key))
+    || !['completed_pass', 'completed_product_failure'].includes(result.outcome)
+    || !Array.isArray(result.artifacts) || result.artifacts.length > MAX_ATTEMPT_ARTIFACTS) {
+    fail('STORE_SCHEMA_INVALID', 'Attempt evidence upload intent has an invalid result schema.');
+  }
+  const expectedDescriptorDigest = lease.executionDescriptorDigest ?? null;
+  if ((result.executionDescriptorDigest ?? null) !== expectedDescriptorDigest) {
+    fail('WORK_DESCRIPTOR_BINDING_MISMATCH', 'Attempt evidence upload intent does not match the compiler-issued execution descriptor.');
+  }
+  const evidenceBindingDigest = lease.executionDescriptorDigest ?? lease.subjectCoreDigest ?? state.subjectCoreDigest;
+  const artifacts = result.artifacts.map((artifact, index) => normalizeArtifactDeclaration(artifact, {
+    workItemId: lease.workItemId,
+    executionDescriptorDigest: evidenceBindingDigest,
+    ordinal: index + 1,
+  }));
+  if (new Set(artifacts.map(({ name }) => name)).size !== artifacts.length
+    || artifacts.reduce((total, artifact) => total + artifact.sizeBytes, 0) > MAX_ATTEMPT_EVIDENCE_BYTES) {
+    fail('STORE_SCHEMA_INVALID', 'Attempt evidence upload intent has duplicate names or exceeds its total byte bound.');
+  }
+  const body = {
+    schemaVersion: 1,
+    kind: 'attempt-evidence-upload-intent',
+    runId,
+    workItemId: lease.workItemId,
+    workerId: lease.workerId,
+    attempt: lease.attempt,
+    coordinatorEpoch: lease.epoch,
+    leaseToken: lease.token,
+    subjectCoreDigest: lease.subjectCoreDigest ?? state.subjectCoreDigest,
+    runnerRevision: lease.runnerRevision ?? state.runnerRevision,
+    executionDescriptorDigest: expectedDescriptorDigest,
+    outcome: result.outcome,
+    reason: schedulingString(result.reason ?? null, 'Attempt evidence reason', { nullable: true, maximum: 256 }),
+    artifacts,
+    createdAt: timestamp(store),
+  };
+  const document = { ...body, digest: canonicalDigest(body) };
+  const relativePath = attemptUploadIntentRelativePath(lease.workItemId, lease.attempt, lease.token);
+  const file = containedPath(runDirectory(store, runId), ...relativePath.split('/'));
+  let intentDigest = document.digest;
+  try {
+    await atomicWriteJson(store.storage, file, document, { exclusive: true });
+  } catch (error) {
+    if (error?.code !== 'ATOMIC_ALREADY_EXISTS') throw error;
+    const existing = await readBoundedJson(store.storage, file, {
+      label: 'attempt evidence upload intent', maximumBytes: 262_144,
+    });
+    const { digest: existingDigest, createdAt: existingCreatedAt, ...existingStable } = existing;
+    const desiredStable = { ...body };
+    delete desiredStable.createdAt;
+    if (!DIGEST_PATTERN.test(existingDigest)
+      || canonicalDigest({ ...existingStable, createdAt: existingCreatedAt }) !== existingDigest) {
+      fail('STORE_CORRUPT', 'Immutable attempt evidence upload intent was replaced with different content.');
+    }
+    if (canonicalJson(existingStable) !== canonicalJson(desiredStable)) {
+      fail('ATTEMPT_UPLOAD_CONFLICT', 'A different evidence upload intent already exists for this fenced attempt.');
+    }
+    intentDigest = existingDigest;
+  }
+  return Object.freeze({
+    runId,
+    workItemId: lease.workItemId,
+    attempt: lease.attempt,
+    leaseToken: lease.token,
+    intentDigest,
+    artifactCount: artifacts.length,
+  });
+}
+
+export async function uploadAttemptEvidenceArtifact(store, runId, binding, chunks) {
+  if (!chunks || typeof chunks[Symbol.asyncIterator] !== 'function') {
+    fail('STORE_SCHEMA_INVALID', 'Attempt artifact upload body must be an async byte stream.');
+  }
+  const { document: intent } = await readAttemptEvidenceUploadIntent(store, runId, binding);
+  if (binding.workerId !== intent.workerId
+    || !Number.isSafeInteger(binding.ordinal) || binding.ordinal < 1 || binding.ordinal > intent.artifacts.length) {
+    fail('WORK_RESULT_BINDING_MISMATCH', 'Attempt artifact upload does not match its worker or declared ordinal.');
+  }
+  const state = await recoverUnlocked(store, runId, { repairCache: false });
+  validateWorkLease(state, {
+    runId,
+    workItemId: intent.workItemId,
+    workerId: intent.workerId,
+    attempt: intent.attempt,
+    epoch: intent.coordinatorEpoch,
+    token: intent.leaseToken,
+  });
+  const artifact = intent.artifacts[binding.ordinal - 1];
+  if (binding.contentLength !== artifact.sizeBytes
+    || String(binding.mediaType ?? '').toLowerCase() !== artifact.mediaType) {
+    fail('WORK_RESULT_BINDING_MISMATCH', `Attempt artifact ${artifact.name} transport metadata disagrees with its sealed declaration.`);
+  }
+  const attemptDirectory = path.posix.join('evidence', intent.workItemId,
+    `${String(intent.attempt).padStart(6, '0')}-${intent.leaseToken}`);
+  const relativePath = path.posix.join(attemptDirectory, artifact.name);
+  const destination = containedPath(runDirectory(store, runId), ...relativePath.split('/'));
+  const directory = path.dirname(destination);
+  await ensureDirectory(store.storage.fs, directory);
+  const temporary = path.join(directory, `.${path.basename(destination)}.${process.pid}.${store.storage.nonce()}.upload`);
+  let handle;
+  let sizeBytes = 0;
+  const hash = createHash('sha256');
+  try {
+    handle = await store.storage.fs.open(temporary, 'wx', 0o660);
+    for await (const value of chunks) {
+      const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+      if (chunk.length === 0) continue;
+      sizeBytes += chunk.length;
+      if (sizeBytes > artifact.sizeBytes || sizeBytes > MAX_ATTEMPT_ARTIFACT_BYTES) {
+        fail('STORE_SCHEMA_INVALID', `Attempt artifact ${artifact.name} exceeds its declared byte length.`);
+      }
+      hash.update(chunk);
+      let offset = 0;
+      while (offset < chunk.length) {
+        const { bytesWritten } = await handle.write(chunk, offset, chunk.length - offset, null);
+        if (bytesWritten < 1) fail('STORE_CORRUPT', `Attempt artifact ${artifact.name} upload made no write progress.`);
+        offset += bytesWritten;
+      }
+    }
+    const digest = `sha256:${hash.digest('hex')}`;
+    if (sizeBytes !== artifact.sizeBytes || digest !== artifact.digest) {
+      fail('ARTIFACT_DIGEST_MISMATCH', `Attempt artifact ${artifact.name} does not match its declared bytes.`);
+    }
+    await handle.sync();
+    await handle.close();
+    handle = null;
+    const currentState = await recoverUnlocked(store, runId, { repairCache: false });
+    validateWorkLease(currentState, {
+      runId,
+      workItemId: intent.workItemId,
+      workerId: intent.workerId,
+      attempt: intent.attempt,
+      epoch: intent.coordinatorEpoch,
+      token: intent.leaseToken,
+    });
+    try {
+      await store.storage.fs.link(temporary, destination);
+      await store.storage.fs.unlink(temporary);
+      await fsyncDirectory(store.storage.fs, directory);
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error;
+      const existing = await inspectBoundedArtifact(store, destination, { label: `attempt artifact ${artifact.name}` });
+      if (existing.sizeBytes !== artifact.sizeBytes || existing.digest !== artifact.digest) {
+        fail('STORE_CORRUPT', `Immutable attempt artifact ${artifact.name} was replaced with different bytes.`);
+      }
+    }
+  } finally {
+    await handle?.close();
+    await store.storage.fs.rm(temporary, { force: true });
+  }
+  return Object.freeze({
+    runId,
+    workItemId: intent.workItemId,
+    attempt: intent.attempt,
+    leaseToken: intent.leaseToken,
+    intentDigest: intent.digest,
+    ordinal: binding.ordinal,
+    sizeBytes: artifact.sizeBytes,
+    digest: artifact.digest,
+    memberDigest: artifact.memberDigest,
+  });
+}
+
+export async function finalizeAttemptEvidenceUpload(store, runId, binding) {
+  const { document: intent } = await readAttemptEvidenceUploadIntent(store, runId, binding);
+  if (binding.workerId !== intent.workerId) {
+    fail('WORK_RESULT_BINDING_MISMATCH', 'Attempt evidence finalization belongs to another worker.');
+  }
+  const state = await recoverUnlocked(store, runId, { repairCache: false });
+  const item = state.workItems[intent.workItemId];
+  const alreadyAdopted = item?.attempts?.find((attempt) => attempt.attempt === intent.attempt
+    && attempt.workerId === intent.workerId && attempt.leaseToken === intent.leaseToken
+    && attempt.uploadIntentDigest === intent.digest && attempt.inboxDigest);
+  if (!alreadyAdopted) {
+    validateWorkLease(state, {
+      runId,
+      workItemId: intent.workItemId,
+      workerId: intent.workerId,
+      attempt: intent.attempt,
+      epoch: intent.coordinatorEpoch,
+      token: intent.leaseToken,
+    });
+  }
+  const attemptDirectory = path.posix.join('evidence', intent.workItemId,
+    `${String(intent.attempt).padStart(6, '0')}-${intent.leaseToken}`);
+  const artifacts = [];
+  for (const artifact of intent.artifacts) {
+    const relativePath = path.posix.join(attemptDirectory, artifact.name);
+    const actual = await inspectBoundedArtifact(store,
+      containedPath(runDirectory(store, runId), ...relativePath.split('/')),
+      { label: `attempt artifact ${artifact.name}` });
+    if (actual.sizeBytes !== artifact.sizeBytes || actual.digest !== artifact.digest) {
+      fail('ARTIFACT_DIGEST_MISMATCH', `Attempt artifact ${artifact.name} does not match its upload intent.`);
+    }
+    artifacts.push({ ...artifact, relativePath });
+  }
+  const body = {
+    schemaVersion: 1,
+    kind: 'attempt-evidence-inbox',
+    runId,
+    workItemId: intent.workItemId,
+    workerId: intent.workerId,
+    attempt: intent.attempt,
+    coordinatorEpoch: intent.coordinatorEpoch,
+    leaseToken: intent.leaseToken,
+    subjectCoreDigest: intent.subjectCoreDigest,
+    runnerRevision: intent.runnerRevision,
+    executionDescriptorDigest: intent.executionDescriptorDigest,
+    uploadIntentDigest: intent.digest,
+    outcome: intent.outcome,
+    reason: intent.reason,
+    evidenceDigests: artifacts.map(({ memberDigest }) => memberDigest),
+    artifacts,
+    publishedAt: timestamp(store),
+  };
+  const document = { ...body, digest: canonicalDigest(body) };
+  const relativePath = path.posix.join('inboxes', intent.workItemId,
+    `${String(intent.attempt).padStart(6, '0')}-${intent.leaseToken}.json`);
+  const file = containedPath(runDirectory(store, runId), ...relativePath.split('/'));
+  let inboxDigest = document.digest;
+  try {
+    await atomicWriteJson(store.storage, file, document, { exclusive: true });
+  } catch (error) {
+    if (error?.code !== 'ATOMIC_ALREADY_EXISTS') throw error;
+    const existing = await readBoundedJson(store.storage, file, { label: 'attempt evidence inbox' });
+    const { digest: existingDigest, publishedAt: existingPublishedAt, ...existingStable } = existing;
+    const desiredStable = { ...body };
+    delete desiredStable.publishedAt;
+    if (!DIGEST_PATTERN.test(existingDigest)
+      || canonicalDigest({ ...existingStable, publishedAt: existingPublishedAt }) !== existingDigest
+      || canonicalJson(existingStable) !== canonicalJson(desiredStable)) {
+      fail('STORE_CORRUPT', 'Immutable finalized attempt evidence inbox disagrees with its upload intent.');
+    }
+    inboxDigest = existingDigest;
+  }
+  return Object.freeze({
+    runId,
+    workItemId: intent.workItemId,
+    attempt: intent.attempt,
+    leaseToken: intent.leaseToken,
+    relativePath,
+    digest: inboxDigest,
+  });
+}
+
 export async function appendAttemptLog(store, runId, lease, entry) {
   const state = await recoverUnlocked(store, runId, { repairCache: false });
   validateWorkLease(state, lease);
@@ -1445,10 +1847,12 @@ export async function adoptAttemptEvidence(store, runId, coordinator, inbox) {
   const file = containedPath(runDirectory(store, runId), inbox.relativePath);
   const document = await readBoundedJson(store.storage, file, { label: 'attempt evidence inbox' });
   const { digest, ...body } = document;
-  exactKeys(document, [
+  const inboxKeys = [
     'schemaVersion', 'kind', 'runId', 'workItemId', 'workerId', 'attempt', 'coordinatorEpoch',
     'leaseToken', 'subjectCoreDigest', 'runnerRevision', 'executionDescriptorDigest', 'outcome', 'reason', 'evidenceDigests', 'artifacts', 'publishedAt', 'digest',
-  ], 'attempt evidence inbox');
+  ];
+  const streamedUpload = 'uploadIntentDigest' in document;
+  exactKeys(document, streamedUpload ? [...inboxKeys, 'uploadIntentDigest'] : inboxKeys, 'attempt evidence inbox');
   canonicalTimestamp(document.publishedAt, 'attempt evidence publishedAt');
   if (document.schemaVersion !== 1 || document.kind !== 'attempt-evidence-inbox' || document.runId !== runId
     || document.workItemId !== inbox.workItemId || document.attempt !== inbox.attempt
@@ -1459,24 +1863,23 @@ export async function adoptAttemptEvidence(store, runId, coordinator, inbox) {
     || (document.reason !== null && (typeof document.reason !== 'string' || !document.reason || document.reason.length > 256))
     || document.evidenceDigests.length > MAX_ATTEMPT_ARTIFACTS || document.artifacts.length !== document.evidenceDigests.length
     || document.evidenceDigests.some((entry) => !DIGEST_PATTERN.test(entry))
+    || (streamedUpload && !DIGEST_PATTERN.test(document.uploadIntentDigest))
     || digest !== canonicalDigest(body) || digest !== inbox.digest) fail('STORE_CORRUPT', 'Attempt evidence inbox is corrupt.');
-  if (document.coordinatorEpoch !== coordinator?.epoch) {
-    fail('STALE_WORK_LEASE', 'Attempt evidence belongs to a stale coordinator epoch.');
-  }
-  validateWorkLease(state, {
-    runId,
-    workItemId: document.workItemId,
-    workerId: document.workerId,
-    attempt: document.attempt,
-    epoch: document.coordinatorEpoch,
-    token: document.leaseToken,
-  });
   if (document.subjectCoreDigest !== state.subjectCoreDigest || document.runnerRevision !== state.runnerRevision) {
     fail('WORK_RESULT_BINDING_MISMATCH', 'Attempt evidence does not match the run subject or runner revision.');
   }
   const expectedDescriptorDigest = state.workItems[document.workItemId]?.executionDescriptor?.digest ?? null;
   if (document.executionDescriptorDigest !== expectedDescriptorDigest) {
     fail('WORK_DESCRIPTOR_BINDING_MISMATCH', 'Attempt evidence does not match the compiler-issued execution descriptor.');
+  }
+  const existingItem = state.workItems[document.workItemId];
+  const existingAttempt = existingItem?.attempts?.find((attempt) => attempt.attempt === document.attempt
+    && attempt.workerId === document.workerId && attempt.inboxDigest === digest
+    && (!streamedUpload || (attempt.leaseToken === document.leaseToken
+      && attempt.uploadIntentDigest === document.uploadIntentDigest)));
+  if (existingAttempt) return clone(existingItem);
+  if (document.coordinatorEpoch !== coordinator?.epoch) {
+    fail('STALE_WORK_LEASE', 'Attempt evidence belongs to a stale coordinator epoch.');
   }
   const artifactNames = new Set();
   let artifactBytes = 0;
@@ -1490,11 +1893,12 @@ export async function adoptAttemptEvidence(store, runId, coordinator, inbox) {
     artifactNames.add(artifact.name);
     artifactBytes += artifact.sizeBytes;
     if (artifactBytes > MAX_ATTEMPT_EVIDENCE_BYTES) fail('STORE_CORRUPT', 'Stored attempt evidence exceeds its total byte bound.');
-    const bytes = await readBoundedFile(store.storage,
-      containedPath(runDirectory(store, runId), ...artifact.relativePath.split('/')),
-      { label: `attempt artifact ${artifact.name}`, maximumBytes: MAX_ATTEMPT_ARTIFACT_BYTES });
-    const actualDigest = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
-    if (bytes.length !== artifact.sizeBytes || actualDigest !== artifact.digest) {
+    const artifactFile = containedPath(runDirectory(store, runId), ...artifact.relativePath.split('/'));
+    const actual = streamedUpload
+      ? await store.storage.fs.lstat(artifactFile).then((stat) => ({ sizeBytes: stat.isFile() && !stat.isSymbolicLink() ? stat.size : -1, digest: artifact.digest }))
+      : await inspectBoundedArtifact(store, artifactFile,
+        { label: `attempt artifact ${artifact.name}`, maximumBytes: MAX_ATTEMPT_ARTIFACT_BYTES });
+    if (actual.sizeBytes !== artifact.sizeBytes || actual.digest !== artifact.digest) {
       fail('ARTIFACT_DIGEST_MISMATCH', `Stored attempt artifact ${artifact.name} does not match its manifest.`);
     }
   }
@@ -1523,9 +1927,11 @@ export async function adoptAttemptEvidence(store, runId, coordinator, inbox) {
       evidenceDigests: document.evidenceDigests,
       artifacts: document.artifacts,
       workerId: document.workerId,
+      leaseToken: document.leaseToken,
       completedAt: timestamp(store),
       reason: document.reason,
       inboxDigest: digest,
+      ...(streamedUpload ? { uploadIntentDigest: document.uploadIntentDigest } : {}),
       canonicalResultDigest: canonicalResult.digest,
     };
     item.attempts.push(attempt);

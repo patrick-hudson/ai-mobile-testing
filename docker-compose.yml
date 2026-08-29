@@ -142,6 +142,7 @@ services:
       AUDIT_SHARED_DEPLOYMENT_IDENTITY: ${AUDIT_SHARED_DEPLOYMENT_IDENTITY:-compose:ai-mobile-testing}
       AUDIT_SHARED_VOLUME_IDENTITY: named-volume:shared-parent-runs
       AUDIT_SHARED_COORDINATOR_PORT: "4180"
+      AUDIT_SHARED_UPLOAD_TIMEOUT_MS: ${AUDIT_SHARED_UPLOAD_TIMEOUT_MS:-1200000}
       AUDIT_SHARED_CREDENTIAL_ROOT: /var/lib/ai-mobile-testing/shared/credentials
       AUDIT_SHARED_PROJECT_ID: ${AUDIT_SHARED_PROJECT_ID:-default}
     volumes:
@@ -191,6 +192,7 @@ services:
       AUDIT_SHARED_COORDINATOR_URL: http://shared-coordinator:4180
       AUDIT_SHARED_WORKER_CAPABILITIES: ${AUDIT_SHARED_ORDINARY_CAPABILITIES:-inventory:http,browser:chromium,browser:firefox,browser:webkit}
       AUDIT_SHARED_RESOURCE_CLASS: ordinary
+      AUDIT_SHARED_UPLOAD_TIMEOUT_MS: ${AUDIT_SHARED_UPLOAD_TIMEOUT_MS:-1200000}
       AUDIT_SHARED_WORKER_TOKEN_FILE: /run/secrets/shared-worker/token
     volumes:
       - ./certs:/work/certs:ro
@@ -214,6 +216,7 @@ services:
       AUDIT_SHARED_COORDINATOR_URL: http://shared-coordinator:4180
       AUDIT_SHARED_WORKER_CAPABILITIES: ${AUDIT_SHARED_ORDINARY_CAPABILITIES:-inventory:http,browser:chromium,browser:firefox,browser:webkit}
       AUDIT_SHARED_RESOURCE_CLASS: ordinary
+      AUDIT_SHARED_UPLOAD_TIMEOUT_MS: ${AUDIT_SHARED_UPLOAD_TIMEOUT_MS:-1200000}
       AUDIT_SHARED_WORKER_TOKEN_FILE: /run/secrets/shared-worker/token
     volumes:
       - ./certs:/work/certs:ro
@@ -239,6 +242,7 @@ services:
       AUDIT_SHARED_COORDINATOR_URL: http://shared-coordinator:4180
       AUDIT_SHARED_WORKER_CAPABILITIES: performance:lighthouse
       AUDIT_SHARED_RESOURCE_CLASS: performance
+      AUDIT_SHARED_UPLOAD_TIMEOUT_MS: ${AUDIT_SHARED_UPLOAD_TIMEOUT_MS:-1200000}
       AUDIT_SHARED_WORKER_TOKEN_FILE: /run/secrets/shared-worker/token
     volumes:
       - ./certs:/work/certs:ro
