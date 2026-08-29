@@ -9,6 +9,7 @@ import {
   SHARED_DOCKER_RESILIENCE_ENV,
   SHARED_DOCKER_RESILIENCE_WORK_ITEM_COUNT,
 } from '../shared/shared-docker-resilience-contract.mjs';
+import { deriveRunnerRevision, runnerRevisionDigest } from '../shared/runner-revision.mjs';
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const mode = process.argv[2] ?? '--authoritative';
@@ -49,6 +50,14 @@ const commonEnvironment = {
 };
 const observedEvents = new Map();
 const eventFollowers = new Map();
+
+function oneLine(value, label) {
+  const normalized = String(value ?? '').trim();
+  if (!normalized || normalized.includes('\n') || normalized.includes('\r')) {
+    throw new Error(`${label} did not produce one non-empty line.`);
+  }
+  return normalized;
+}
 
 function execute(command, args, { environment = commonEnvironment, allowFailure = false, timeoutMs = 240_000 } = {}) {
   const result = spawnSync(command, args, {
@@ -486,11 +495,26 @@ const evidencePath = path.join(repositoryRoot, 'artifacts', 'self-tests', author
 const failurePath = path.join(repositoryRoot, 'artifacts', 'self-tests', 'shared-docker-resilience-failure.json');
 
 try {
+  if (authority === 'AUTHORITATIVE') {
+    const status = execute('git', ['status', '--porcelain=v1', '--untracked-files=all']);
+    assert.equal(status.stdout, '', 'the authoritative Docker proof requires a clean source checkout');
+  }
+  const workspaceRevision = await deriveRunnerRevision(repositoryRoot);
   // Every proof service resolves to the same tagged image. Building one service
   // avoids running the image's full validation layer concurrently four times.
   if (skipBuildValue === '0') {
     execute('docker', ['compose', '--profile', 'shared-proof', 'build', 'shared-resilience-driver'], { timeoutMs: 1_200_000 });
   }
+  const imageRevision = oneLine(execute('docker', [
+    'compose', '--profile', 'shared-proof', 'run', '--rm', '--no-deps', '--entrypoint', 'node',
+    'shared-resilience-driver', '-e', "process.stdout.write(require('node:fs').readFileSync('/work/.audit-runner-revision','utf8'))",
+  ]).stdout, 'built image runner revision');
+  assert.equal(runnerRevisionDigest(imageRevision), runnerRevisionDigest(workspaceRevision),
+    'the shared proof image must contain the exact current runner source revision');
+  const imageId = oneLine(execute('docker', [
+    'compose', '--profile', 'shared-proof', 'images', '-q', 'shared-resilience-driver',
+  ]).stdout, 'built proof image ID');
+  assert.match(imageId, /^sha256:[a-f0-9]{64}$/u, 'the built proof image must have a content-addressed image ID');
   await runSteady('warm-one', 1, 0);
   await runSteady('warm-many', 2, 0);
   const recorded = [];
@@ -522,6 +546,8 @@ try {
     kind: 'shared-docker-resilience-proof',
     authority,
     buildPolicy: skipBuildValue === '0' ? 'compose-build-invoked' : 'existing-image-diagnostic-only',
+    generatedAt: new Date().toISOString(),
+    source: { workspaceRevision, imageRevision, imageId },
     workload: { digest: recorded[0].seed.workloadDigest, workItemCount, trials, warmedTrials: true,
       cachePolicy: 'fresh named volume per trial; shared image layers warm' },
     resources: { oneWorkerPrincipals: ['ordinary-a'], manyWorkerPrincipals: ['ordinary-a', 'ordinary-b'],

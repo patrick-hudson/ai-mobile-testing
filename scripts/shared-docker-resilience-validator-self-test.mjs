@@ -12,6 +12,12 @@ const valid = {
   kind: 'shared-docker-resilience-proof',
   authority: 'AUTHORITATIVE',
   buildPolicy: 'compose-build-invoked',
+  generatedAt: '2026-08-29T23:30:00.000Z',
+  source: {
+    workspaceRevision: `workspace:${digest('c')}`,
+    imageRevision: `image:${digest('c')}`,
+    imageId: digest('d'),
+  },
   workload: { digest: SHARED_DOCKER_RESILIENCE_WORKLOAD_DIGEST, workItemCount: 8, trials: 3, warmedTrials: true },
   resources: {
     ordinaryWorkerCpuLimit: '1.0', ordinaryWorkerMemoryLimit: '2g', browserConcurrencyPerWorker: 1,
@@ -34,8 +40,14 @@ const valid = {
   },
 };
 
-assert.equal(validateSharedDockerResilienceProof(valid), valid);
+assert.equal(validateSharedDockerResilienceProof(valid, {
+  expectedWorkspaceRevision: valid.source.workspaceRevision,
+}), valid);
 const rejected = [
+  (report) => { report.generatedAt = 'not-a-timestamp'; },
+  (report) => { report.source.workspaceRevision = `workspace:${digest('e')}`; },
+  (report) => { report.source.imageRevision = `image:${digest('e')}`; },
+  (report) => { report.source.imageId = 'local'; },
   (report) => { delete report.invariants.digest; },
   (report) => { report.workload.digest = digest('a'); },
   (report) => { report.invariants.workerKillDigest = digest('c'); },
@@ -57,5 +69,8 @@ for (const mutate of rejected) {
   mutate(report);
   assert.throws(() => validateSharedDockerResilienceProof(report));
 }
+assert.throws(() => validateSharedDockerResilienceProof(valid, {
+  expectedWorkspaceRevision: `workspace:${digest('f')}`,
+}), /stale for the current runner source/);
 
 process.stdout.write('Shared Docker resilience proof validator self-test passed.\n');

@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { SHARED_DOCKER_RESILIENCE_WORKLOAD_DIGEST } from '../shared/shared-docker-resilience-contract.mjs';
+import { deriveRunnerRevision, runnerRevisionDigest } from '../shared/runner-revision.mjs';
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const DIGEST = /^sha256:[a-f0-9]{64}$/u;
@@ -20,11 +21,23 @@ const variance = (values) => {
   return values.reduce((sum, value) => sum + ((value - mean) ** 2), 0) / values.length;
 };
 
-export function validateSharedDockerResilienceProof(report) {
+export function validateSharedDockerResilienceProof(report, { expectedWorkspaceRevision = null } = {}) {
   assert.equal(report?.schemaVersion, 1);
   assert.equal(report?.kind, 'shared-docker-resilience-proof');
   assert.equal(report?.authority, 'AUTHORITATIVE');
   assert.equal(report?.buildPolicy, 'compose-build-invoked');
+  const generatedAtMs = Date.parse(report?.generatedAt);
+  assert(Number.isFinite(generatedAtMs), 'the proof must record a canonical generation timestamp');
+  assert.equal(new Date(generatedAtMs).toISOString(), report.generatedAt);
+  assert.match(report?.source?.workspaceRevision ?? '', /^workspace:sha256:[a-f0-9]{64}$/u);
+  assert.match(report?.source?.imageRevision ?? '', /^image:sha256:[a-f0-9]{64}$/u);
+  assert.match(report?.source?.imageId ?? '', DIGEST);
+  assert.equal(runnerRevisionDigest(report.source.workspaceRevision), runnerRevisionDigest(report.source.imageRevision),
+    'the proof image must match the recorded workspace runner revision');
+  if (expectedWorkspaceRevision !== null) {
+    assert.equal(report.source.workspaceRevision, expectedWorkspaceRevision,
+      'the authoritative proof is stale for the current runner source');
+  }
   assert.equal(report?.workload?.digest, SHARED_DOCKER_RESILIENCE_WORKLOAD_DIGEST);
   assert.equal(report?.workload?.workItemCount, 8);
   assert.equal(report?.workload?.trials, 3);
@@ -107,6 +120,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
   const evidencePath = process.argv[2] ?? path.join(
     repositoryRoot, 'artifacts', 'self-tests', 'shared-docker-resilience-proof.json',
   );
-  validateSharedDockerResilienceProof(JSON.parse(await readFile(evidencePath, 'utf8')));
+  validateSharedDockerResilienceProof(JSON.parse(await readFile(evidencePath, 'utf8')), {
+    expectedWorkspaceRevision: await deriveRunnerRevision(repositoryRoot),
+  });
   process.stdout.write(`Authoritative shared Docker resilience proof is valid: ${evidencePath}\n`);
 }
