@@ -195,6 +195,7 @@ try {
   };
   await expectCode('PROMOTION_CLAIM_STALE', () => consumePromotionClaim(claimStore, claim.token, {
     principal: delivery,
+    requestId: 'selector-consume-stale-0001',
     expectedSubjectDigest: published.finalSubjectDigest,
     withCurrentPublication: (callback) => callback(published, staleContext),
   }));
@@ -212,6 +213,7 @@ try {
   }));
   await expectCode('RELEASE_AUTHORITY_INACTIVE', () => consumePromotionClaim(claimStore, claim.token, {
     principal: delivery,
+    requestId: 'selector-consume-disabled-0002',
     expectedSubjectDigest: published.finalSubjectDigest,
     withCurrentPublication: (callback) => withCurrentEnvelopeFence(store, 'run-selector', callback),
   }));

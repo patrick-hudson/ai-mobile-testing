@@ -9,6 +9,7 @@ import {
 } from './canonical-contract.mjs';
 import { parseExecutionManifest } from './execution-contract.mjs';
 import { parsePublicationEnvelope } from './publication-envelope.mjs';
+import { sealPublicationText } from './publication-text-policy.mjs';
 import { deriveReleaseDecision } from './release-decision.mjs';
 import { parseFinalReleaseSubject } from './release-subject.mjs';
 import { parseRisk, parseRiskRegister } from './risk-contract.mjs';
@@ -67,7 +68,7 @@ function parseVisualDisposition(value, expectedRevision, previousDigest, identit
     riskIdentity: assertDigest(value.riskIdentity, 'visual disposition riskIdentity'),
     disposition: value.disposition,
     actor: actor(value.actor, 'visual disposition actor'),
-    rationale: nonEmptyString(value.rationale, 'visual disposition rationale'),
+    rationale: sealPublicationText(value.rationale),
     at: timestamp(value.at, 'visual disposition at'),
     supersedes: value.supersedes === null ? null : assertDigest(value.supersedes, 'visual disposition supersedes'),
     previousDigest,
@@ -130,7 +131,7 @@ export function appendVisualDisposition(historyValue, input) {
     riskIdentity: assertDigest(input.riskIdentity, 'visual disposition riskIdentity'),
     disposition: input.disposition,
     actor: actor(input.actor, 'visual disposition actor'),
-    rationale: nonEmptyString(input.rationale, 'visual disposition rationale'),
+    rationale: sealPublicationText(input.rationale),
     at: timestamp(input.at, 'visual disposition at'),
     supersedes: priorForRisk?.digest ?? null,
     previousDigest: history.at(-1)?.digest ?? null,

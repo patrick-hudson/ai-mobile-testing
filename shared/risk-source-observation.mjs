@@ -7,6 +7,7 @@ import {
   freezeContract,
   nonEmptyString,
 } from './canonical-contract.mjs';
+import { sealPublicationText } from './publication-text-policy.mjs';
 
 export const RISK_SOURCE_PRODUCERS = Object.freeze(['visual', 'baseline', 'evidence-pipeline']);
 export const RISK_SOURCE_PRODUCER_STATES = Object.freeze(['COMPLETE', 'NOT_APPLICABLE', 'UNAVAILABLE']);
@@ -84,7 +85,7 @@ function parseObservation(value, index, identity, producerStates) {
   exactKeys(value.source, ['kind', 'id'], `observations[${index}].source`);
   const source = {
     kind: bounded(value.source.kind, `observations[${index}].source.kind`, 128),
-    id: bounded(value.source.id, `observations[${index}].source.id`, 512),
+    id: sealPublicationText(value.source.id, { maximum: 512 }),
   };
   if (value.category !== contract.category || source.kind !== contract.sourceKind
     || value.reviewState !== contract.reviewState || !source.id.startsWith(`${identity.workItemId}:`)) {
@@ -98,8 +99,8 @@ function parseObservation(value, index, identity, producerStates) {
     category: value.category,
     severity: value.severity,
     source,
-    explanation: bounded(value.explanation, `observations[${index}].explanation`),
-    recommendedAction: bounded(value.recommendedAction, `observations[${index}].recommendedAction`),
+    explanation: sealPublicationText(value.explanation),
+    recommendedAction: sealPublicationText(value.recommendedAction),
     reviewState: value.reviewState,
     observedAt: timestamp(value.observedAt, `observations[${index}].observedAt`),
   };
@@ -177,8 +178,8 @@ function parseManualObligation(value, index) {
   return {
     id: safeId(value.id, `manualObligations[${index}].id`),
     severity: value.severity,
-    explanation: bounded(value.explanation, `manualObligations[${index}].explanation`),
-    recommendedAction: bounded(value.recommendedAction, `manualObligations[${index}].recommendedAction`),
+    explanation: sealPublicationText(value.explanation),
+    recommendedAction: sealPublicationText(value.recommendedAction),
   };
 }
 

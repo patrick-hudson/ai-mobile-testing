@@ -2,7 +2,7 @@
 import { resolve } from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { pipelineOnlyOutcome, readChecklistRelease, releaseOutcome } from './lib/release-truth.mjs';
-import { readCredentialFile } from './lib/credential-file.mjs';
+import { openPromotionClaimOutput, readCredentialFile } from './lib/credential-file.mjs';
 import { CONTROL_EXIT_CODES, controlExitCode } from '../shared/control-client-contract.mjs';
 
 await main().catch((error) => {
@@ -21,41 +21,57 @@ async function main() {
 
 async function assertLiveRelease(options) {
   if (!options.tokenFile) throw usage('--token-file is required for API release assertion.');
+  if (!options.claimTokenFile) throw usage('--claim-token-file is required for API release assertion.');
   const token = await readCredentialFile(options.tokenFile, { label: 'Delivery credential' });
-  const response = await fetch(new URL(`/api/control/v1/runs/${encodeURIComponent(options.run)}/release/assert`, options.server), {
-    method: 'POST',
-    headers: {
-      authorization: `Bearer ${token}`,
-      'content-type': 'application/json',
-      'idempotency-key': options.requestId,
-    },
-    body: JSON.stringify({
-      expected: {
-        projectId: options.project,
-        subjectDigest: options.subject,
-        authority: options.authority,
-        executionSetDigest: options.executionSetDigest,
-        runRevision: options.runRevision,
-        decisionRevision: options.decisionRevision,
+  const claimOutput = await openPromotionClaimOutput(options.claimTokenFile);
+  try {
+    const response = await fetch(new URL(`/api/control/v1/runs/${encodeURIComponent(options.run)}/release/assert`, options.server), {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`,
+        'content-type': 'application/json',
+        'idempotency-key': options.requestId,
       },
-      ttlMs: options.ttlMs,
-    }),
-  });
-  let document;
-  let validJson = true;
-  try { document = await response.json(); } catch {
-    validJson = false;
-    document = {
-      schemaVersion: 1,
-      error: { code: 'INVALID_RESPONSE', message: 'Shared control API did not return JSON.' },
-    };
-  }
-  writeJson(document);
-  if (!response.ok || !validJson) {
-    process.stderr.write(`[assert-release] ${response.status} ${document.error?.code ?? 'REQUEST_FAILED'}: ${safeMessage(document.error?.message ?? response.statusText)}\n`);
-    process.exitCode = validJson
-      ? controlExitCode({ status: response.status, code: document.error?.code })
-      : CONTROL_EXIT_CODES.REQUEST_FAILED;
+      body: JSON.stringify({
+        expected: {
+          projectId: options.project,
+          subjectDigest: options.subject,
+          authority: options.authority,
+          executionSetDigest: options.executionSetDigest,
+          runRevision: options.runRevision,
+          decisionRevision: options.decisionRevision,
+        },
+        ttlMs: options.ttlMs,
+      }),
+    });
+    let document;
+    let validJson = true;
+    try { document = await response.json(); } catch {
+      validJson = false;
+      document = {
+        schemaVersion: 1,
+        error: { code: 'INVALID_RESPONSE', message: 'Shared control API did not return JSON.' },
+      };
+    }
+    if (response.ok && validJson) {
+      await claimOutput.write(document.data?.token);
+      document = {
+        ...document,
+        data: { ...document.data, token: undefined, claimTokenPath: claimOutput.path },
+      };
+    } else {
+      await claimOutput.abort();
+    }
+    writeJson(document);
+    if (!response.ok || !validJson) {
+      process.stderr.write(`[assert-release] ${response.status} ${document.error?.code ?? 'REQUEST_FAILED'}: ${safeMessage(document.error?.message ?? response.statusText)}\n`);
+      process.exitCode = validJson
+        ? controlExitCode({ status: response.status, code: document.error?.code })
+        : CONTROL_EXIT_CODES.REQUEST_FAILED;
+    }
+  } catch (error) {
+    await claimOutput.abort();
+    throw error;
   }
 }
 
@@ -100,7 +116,7 @@ function parseArguments(argv) {
     if (argument === '--manifest') manifest = requiredValue(argv, ++index, argument);
     else if (argument === '--pipeline-manifest') pipelineManifest = requiredValue(argv, ++index, argument);
     else if (argument === '--pipeline-only') pipelineOnly = true;
-    else if (['--server', '--token-file', '--run', '--project', '--subject', '--authority', '--execution-set-digest', '--request-id'].includes(argument)) {
+    else if (['--server', '--token-file', '--claim-token-file', '--run', '--project', '--subject', '--authority', '--execution-set-digest', '--request-id'].includes(argument)) {
       values[argument.slice(2)] = requiredValue(argv, ++index, argument);
     } else if (argument === '--run-revision' || argument === '--decision-revision' || argument === '--ttl-ms') {
       values[argument.slice(2)] = Number(requiredValue(argv, ++index, argument));
@@ -122,6 +138,7 @@ function parseArguments(argv) {
     pipelineOnly,
     server: values.server ?? null,
     tokenFile: values['token-file'] ?? null,
+    claimTokenFile: values['claim-token-file'] ?? null,
     run: values.run,
     project: values.project,
     subject: values.subject,

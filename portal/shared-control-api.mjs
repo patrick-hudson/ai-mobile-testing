@@ -115,7 +115,8 @@ export function createSharedControlApi({
           const body = recordBody(request.body);
           const token = requireString(body.token, 'token');
           const consume = () => consumePromotionClaim(claimStore, token, {
-            principal, expectedSubjectDigest: requireString(body.expectedSubjectDigest, 'expectedSubjectDigest'),
+            principal, requestId: request.headers['idempotency-key'] ?? body.requestId,
+            expectedSubjectDigest: requireString(body.expectedSubjectDigest, 'expectedSubjectDigest'),
             withCurrentPublication: (callback) => service.withPublicationFence(principal, runId, callback),
           });
           return ok(admissionPolicy

@@ -546,13 +546,72 @@ try {
       riskIdentity: visualRisk.identity, disposition: 'DEFECT_CONFIRMED', rationale: 'Invalid execution must not enter history.',
     },
   }), (error) => error?.code === 'VISUAL_REVIEW_INVALID');
-  await projectionControl.acceptMutation(projectionReviewer, 'run-projection', {
+  const publicationBeforeRejectedText = await readCurrentEnvelope(reopenedStore, 'run-projection');
+  const revisionBeforeRejectedText = projectionState.runRevision;
+  const projectionMutationApi = createSharedControlApi({
+    authority,
+    service: projectionControl,
+    claimStore: await openPromotionClaimStore({ root: path.join(root, 'projection-mutation-claims'), clock }),
+    expectedOrigin: 'https://audit.example.test',
+  });
+  const rejectedApiMutation = await projectionMutationApi.handle({
+    method: 'POST', url: '/api/control/v1/runs/run-projection/visual/disposition',
+    headers: {
+      authorization: `Bearer ${projectionReviewerIssued.credential}`,
+      'content-type': 'application/json',
+      'idempotency-key': 'visual-api-secret-rejected',
+    },
+    body: {
+      expectedRunRevision: revisionBeforeRejectedText,
+      expectedSubjectDigest: projection.finalSubject.digest,
+      executionId: 'oracle-visual', riskIdentity: visualRisk.identity,
+      disposition: 'DEFECT_CONFIRMED',
+      rationale: 'Authorization%3A%20Bearer%20test_api_secret_123456789',
+    },
+  });
+  assert.equal(rejectedApiMutation.status, 400);
+  assert.equal(rejectedApiMutation.body.error.code, 'PUBLICATION_TEXT_REJECTED');
+  assert.doesNotMatch(JSON.stringify(rejectedApiMutation.body), /test_api_secret/u,
+    'the HTTP control response must not reflect rejected publication text');
+  await assert.rejects(() => projectionControl.readOperation(projectionReviewer, 'run-projection', {
+    kind: 'visual-disposition', requestId: 'visual-api-secret-rejected',
+  }), (error) => error?.code === 'OPERATION_NOT_FOUND');
+  for (const [index, rationale] of [
+    'Authorization: Bearer test_control_secret_123456789',
+    'Authorization%3A%20Bearer%20test_control_secret_123456789',
+    Buffer.from('Cookie: session=test_control_secret_123456789').toString('base64'),
+    'Authorization:\r\n Bearer test_control_secret_123456789',
+    'ANTHROPIC_API_KEY=test_control_secret_123456789',
+  ].entries()) {
+    const requestId = `visual-secret-rejected-${index}`;
+    await assert.rejects(() => projectionControl.acceptMutation(projectionReviewer, 'run-projection', {
+      kind: 'visual-disposition', requestId, expectedRunRevision: revisionBeforeRejectedText,
+      body: {
+        expectedSubjectDigest: projection.finalSubject.digest, executionId: 'oracle-visual',
+        riskIdentity: visualRisk.identity, disposition: 'DEFECT_CONFIRMED', rationale,
+      },
+    }), (error) => error?.code === 'PUBLICATION_TEXT_REJECTED'
+      && !String(error.message).includes('test_control_secret'));
+    await assert.rejects(() => projectionControl.readOperation(projectionReviewer, 'run-projection', {
+      kind: 'visual-disposition', requestId,
+    }), (error) => error?.code === 'OPERATION_NOT_FOUND',
+    'rejected publication text must not create a durable operation');
+  }
+  assert.equal((await recoverParentRun(reopenedStore, 'run-projection')).runRevision, revisionBeforeRejectedText,
+    'rejected publication text must not advance the run or its ledgers');
+  assert.equal((await readCurrentEnvelope(reopenedStore, 'run-projection')).digest, publicationBeforeRejectedText.digest,
+    'rejected publication text must not advance the canonical publication head');
+
+  const defectOperation = await projectionControl.acceptMutation(projectionReviewer, 'run-projection', {
     kind: 'visual-disposition', requestId: 'visual-defect-0001', expectedRunRevision: projectionState.runRevision,
     body: {
       expectedSubjectDigest: projection.finalSubject.digest, executionId: 'oracle-visual',
-      riskIdentity: visualRisk.identity, disposition: 'DEFECT_CONFIRMED', rationale: 'Reviewer confirmed a visual defect.',
+      riskIdentity: visualRisk.identity, disposition: 'DEFECT_CONFIRMED',
+      rationale: '\u001b[31mReviewer confirmed a visual defect.\u001b[0m',
     },
   });
+  assert.equal(defectOperation.body.rationale, 'Reviewer confirmed a visual defect.',
+    'terminal controls must be removed before the operation is durably accepted');
   assert.equal((await projectionControl.applyAcceptedOperations(coordinator, 'run-projection'))[0].outcome.status, 'succeeded');
   let projectedHead = await readCurrentEnvelope(reopenedStore, 'run-projection');
   assert.equal(projectedHead.decision.code, 'NOT_READY_TEST_FAILURE');
@@ -624,6 +683,29 @@ try {
     run: projectedHead.runRevision, decision: projectedHead.decisionRevision, risk: projectedHead.riskRevision,
   });
   assert.equal(projectionAssertion.body.data.result.exitCode, CONTROL_EXIT_CODES.SUCCESS);
+  const projectionConsumeRequest = {
+    method: 'POST', url: '/api/control/v1/runs/run-projection/promotion/consume',
+    headers: {
+      authorization: `Bearer ${projectionDeliveryIssued.credential}`,
+      'content-type': 'application/json',
+      'idempotency-key': 'projection-consume-0001',
+    },
+    body: {
+      token: projectionAssertion.body.data.token,
+      expectedSubjectDigest: projectedHead.finalSubjectDigest,
+    },
+  };
+  const projectionConsumption = await projectionApi.handle(projectionConsumeRequest);
+  assert.equal(projectionConsumption.status, 200);
+  const recoveredProjectionConsumption = await projectionApi.handle(projectionConsumeRequest);
+  assert.deepEqual(recoveredProjectionConsumption, projectionConsumption,
+    'the API must recover an exact promotion-consumption retry after response loss');
+  const conflictingProjectionConsumption = await projectionApi.handle({
+    ...projectionConsumeRequest,
+    headers: { ...projectionConsumeRequest.headers, 'idempotency-key': 'projection-consume-conflict-0002' },
+  });
+  assert.equal(conflictingProjectionConsumption.status, 409);
+  assert.equal(conflictingProjectionConsumption.body.error.code, 'IDEMPOTENCY_CONFLICT');
 
   const custodianIssued = await authority.createPrincipal({
     id: 'projection-custodian', kind: 'human', roles: ['custodian'], projectIds: ['project-1'], runIds: ['run-projection'],
@@ -923,6 +1005,7 @@ try {
   let promotionFenceEntered = 0;
   const consumed = await consumePromotionClaim(claimStore, issued.token, {
     principal: delivery,
+    requestId: 'promotion-consume-0001',
     expectedSubjectDigest: head.finalSubjectDigest,
     readCurrentPublication: async () => head,
     withCurrentPublication: async (callback) => {
@@ -932,11 +1015,42 @@ try {
   });
   assert.equal(consumed.consumed, true);
   assert.equal(promotionFenceEntered, 1, 'claim consumption must validate and write its receipt inside the publication fence');
-  await assert.rejects(() => consumePromotionClaim(claimStore, issued.token, {
+  const recoveredConsumption = await consumePromotionClaim(claimStore, issued.token, {
     principal: delivery,
+    requestId: 'promotion-consume-0001',
     expectedSubjectDigest: head.finalSubjectDigest,
     readCurrentPublication: async () => head,
-  }), (error) => error?.code === 'PROMOTION_CLAIM_REPLAYED');
+  });
+  assert.deepEqual(recoveredConsumption, consumed,
+    'an exact consume retry after response loss must return the committed receipt without consuming twice');
+  assert.equal(promotionFenceEntered, 1,
+    'an exact consume retry must recover the receipt without re-entering a potentially changed publication fence');
+  await assert.rejects(() => consumePromotionClaim(claimStore, issued.token, {
+    principal: delivery,
+    requestId: 'promotion-consume-conflict-0002',
+    expectedSubjectDigest: head.finalSubjectDigest,
+    readCurrentPublication: async () => head,
+  }), (error) => error?.code === 'IDEMPOTENCY_CONFLICT');
+
+  const concurrentClaim = await issuePromotionClaim(claimStore, {
+    principal: delivery, publication: head, expected: expectedHead, ttlMs: 60_000,
+    requestId: 'promotion-assertion-concurrent-0002',
+  });
+  const concurrentConsumption = await Promise.allSettled([
+    consumePromotionClaim(claimStore, concurrentClaim.token, {
+      principal: delivery, requestId: 'promotion-consume-concurrent-a',
+      expectedSubjectDigest: head.finalSubjectDigest, readCurrentPublication: async () => head,
+    }),
+    consumePromotionClaim(claimStore, concurrentClaim.token, {
+      principal: delivery, requestId: 'promotion-consume-concurrent-b',
+      expectedSubjectDigest: head.finalSubjectDigest, readCurrentPublication: async () => head,
+    }),
+  ]);
+  assert.equal(concurrentConsumption.filter(({ status }) => status === 'fulfilled').length, 1,
+    'concurrent consumers with different request identities must have exactly one winner');
+  assert.equal(concurrentConsumption.filter((outcome) => (
+    outcome.status === 'rejected' && outcome.reason?.code === 'IDEMPOTENCY_CONFLICT'
+  )).length, 1, 'the losing concurrent consumer must receive an explicit idempotency conflict');
 
   const stale = await issuePromotionClaim(claimStore, {
     principal: delivery, publication: head,
@@ -948,11 +1062,13 @@ try {
   });
   await assert.rejects(() => consumePromotionClaim(claimStore, stale.token, {
     principal: delivery,
+    requestId: 'promotion-consume-stale-0003',
     expectedSubjectDigest: head.finalSubjectDigest,
     readCurrentPublication: async () => ({ ...head, runRevision: head.runRevision + 1 }),
   }), (error) => error?.code === 'PROMOTION_CLAIM_STALE');
   await assert.rejects(() => consumePromotionClaim(claimStore, stale.token, {
     principal: worker,
+    requestId: 'promotion-consume-worker-0004',
     expectedSubjectDigest: head.finalSubjectDigest,
     readCurrentPublication: async () => head,
   }), (error) => error?.code === 'PROMOTION_CLAIM_PRINCIPAL_MISMATCH');
@@ -969,6 +1085,7 @@ try {
   now += 2;
   await assert.rejects(() => consumePromotionClaim(claimStore, expired.token, {
     principal: delivery,
+    requestId: 'promotion-consume-expired-0005',
     expectedSubjectDigest: head.finalSubjectDigest,
     readCurrentPublication: async () => head,
   }), (error) => error?.code === 'PROMOTION_CLAIM_EXPIRED');

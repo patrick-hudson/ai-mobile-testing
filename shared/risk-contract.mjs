@@ -6,6 +6,7 @@ import {
   freezeContract,
   nonEmptyString,
 } from './canonical-contract.mjs';
+import { sealPublicationText } from './publication-text-policy.mjs';
 import { AUDIT_MODES, parseCertifiedScope } from './release-subject.mjs';
 
 export const RISK_AVAILABILITY_STATES = Object.freeze([
@@ -26,7 +27,7 @@ function timestamp(value, label) {
 
 function parseSource(value) {
   exactKeys(value, ['kind', 'id'], 'risk source');
-  return { kind: nonEmptyString(value.kind, 'risk source.kind'), id: nonEmptyString(value.id, 'risk source.id') };
+  return { kind: nonEmptyString(value.kind, 'risk source.kind'), id: sealPublicationText(value.id, { maximum: 512 }) };
 }
 
 function parseActor(value) {
@@ -67,8 +68,8 @@ export function parseRisk(value) {
     mode: value.mode,
     scope: parseCertifiedScope(value.scope),
     source: parseSource(value.source),
-    explanation: nonEmptyString(value.explanation, 'risk explanation'),
-    recommendedAction: nonEmptyString(value.recommendedAction, 'risk recommendedAction'),
+    explanation: sealPublicationText(value.explanation),
+    recommendedAction: sealPublicationText(value.recommendedAction),
     reviewState: value.reviewState,
     releaseEffect: 'non-blocking',
     actor: parseActor(value.actor),

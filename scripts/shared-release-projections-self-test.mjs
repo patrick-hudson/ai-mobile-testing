@@ -3,6 +3,7 @@ import { canonicalDigest } from '../shared/canonical-contract.mjs';
 import { sealExecutionManifest, sealOracleResult, sealWorkItemResult } from '../shared/execution-contract.mjs';
 import { appendPublicationEnvelope } from '../shared/publication-envelope.mjs';
 import { sealFinalReleaseSubject, sealReleaseSubjectCore } from '../shared/release-subject.mjs';
+import { sealRiskSourceObservationSet } from '../shared/risk-source-observation.mjs';
 import {
   appendVisualDisposition,
   projectSharedReleaseView,
@@ -118,6 +119,83 @@ function viewInput(f, overrides = {}) {
 
 const single = fixture('single-site');
 const comparative = fixture('comparative');
+
+const publicationCanaries = [
+  'Authorization: Bearer test_publication_secret_123456789',
+  'Authorization%3A%20Bearer%20test_publication_secret_123456789',
+  Buffer.from('Cookie: session=test_publication_secret_123456789').toString('base64'),
+  'Authorization:\r\n Bearer test_publication_secret_123456789',
+  'X-API-Key: test_publication_secret_123456789',
+];
+for (const canary of publicationCanaries) {
+  assert.throws(() => sealRiskSourceObservationSet({
+    schemaVersion: 1,
+    runId: 'run-publication-policy',
+    workItemId: 'work-publication-policy',
+    subjectCoreDigest: single.core.digest,
+    attempt: 1,
+    workerId: 'worker-publication-policy',
+    producerStates: [
+      { producer: 'visual', status: 'COMPLETE' },
+      { producer: 'baseline', status: 'NOT_APPLICABLE' },
+      { producer: 'evidence-pipeline', status: 'COMPLETE' },
+    ],
+    observations: [{
+      producer: 'visual', category: 'unreviewed-visual-change', severity: 'high',
+      source: { kind: 'visual-result', id: 'work-publication-policy:hero' },
+      explanation: canary,
+      recommendedAction: 'Inspect the visual evidence.',
+      reviewState: 'PENDING_REVIEW', observedAt: '2026-08-28T20:00:00.000Z',
+    }],
+  }), (error) => error?.code === 'PUBLICATION_TEXT_REJECTED'
+    && !String(error.message).includes('test_publication_secret'),
+  'worker publication text must reject raw, encoded, and folded credential canaries without reflecting them');
+}
+assert.throws(() => sealRiskSourceObservationSet({
+  schemaVersion: 1,
+  runId: 'run-publication-policy',
+  workItemId: 'work-publication-policy',
+  subjectCoreDigest: single.core.digest,
+  attempt: 1,
+  workerId: 'worker-publication-policy',
+  producerStates: [
+    { producer: 'visual', status: 'COMPLETE' },
+    { producer: 'baseline', status: 'NOT_APPLICABLE' },
+    { producer: 'evidence-pipeline', status: 'COMPLETE' },
+  ],
+  observations: [{
+    producer: 'visual', category: 'unreviewed-visual-change', severity: 'high',
+    source: { kind: 'visual-result', id: 'work-publication-policy:sk-ant-test_source_secret_123456789' },
+    explanation: 'The hero is clipped.', recommendedAction: 'Inspect the visual evidence.',
+    reviewState: 'PENDING_REVIEW', observedAt: '2026-08-28T20:00:00.000Z',
+  }],
+}), (error) => error?.code === 'PUBLICATION_TEXT_REJECTED'
+  && !String(error.message).includes('test_source_secret'),
+'worker-controlled risk identifiers must not bypass the publication-text boundary');
+
+const sanitizedWorkerText = sealRiskSourceObservationSet({
+  schemaVersion: 1,
+  runId: 'run-publication-policy',
+  workItemId: 'work-publication-policy',
+  subjectCoreDigest: single.core.digest,
+  attempt: 1,
+  workerId: 'worker-publication-policy',
+  producerStates: [
+    { producer: 'visual', status: 'COMPLETE' },
+    { producer: 'baseline', status: 'NOT_APPLICABLE' },
+    { producer: 'evidence-pipeline', status: 'COMPLETE' },
+  ],
+  observations: [{
+    producer: 'visual', category: 'unreviewed-visual-change', severity: 'high',
+    source: { kind: 'visual-result', id: 'work-publication-policy:hero' },
+    explanation: '\u001b[31mThe hero is clipped.\u001b[0m',
+    recommendedAction: 'Inspect\u202E the visual evidence.',
+    reviewState: 'PENDING_REVIEW', observedAt: '2026-08-28T20:00:00.000Z',
+  }],
+});
+assert.equal(sanitizedWorkerText.observations[0].explanation, 'The hero is clipped.');
+assert.equal(sanitizedWorkerText.observations[0].recommendedAction, 'Inspect the visual evidence.');
+
 const singleView = projectSharedReleaseView(viewInput(single));
 const comparativeView = projectSharedReleaseView(viewInput(comparative));
 assert.equal(singleView.decision.code, 'RELEASE_READY');
@@ -159,6 +237,23 @@ const visualRisk = riskSource(single, {
 const pendingVisual = projectSharedReleaseView(viewInput(single, { riskSources: [visualRisk] }));
 const visualRiskIdentity = pendingVisual.riskRegister.risks[0].identity;
 assert.equal(pendingVisual.decision.code, 'RELEASE_READY');
+
+for (const canary of publicationCanaries) {
+  assert.throws(() => appendVisualDisposition([], {
+    schemaVersion: 1,
+    expectedReviewRevision: 0,
+    runId: 'run-single-site',
+    mode: 'single-site',
+    subjectDigest: single.finalSubject.digest,
+    executionId: 'oracle-visual',
+    riskIdentity: visualRiskIdentity,
+    disposition: 'ACCEPTED',
+    actor: { id: 'reviewer-1', kind: 'operator' },
+    rationale: canary,
+    at: '2026-08-28T20:01:00.000Z',
+  }), (error) => error?.code === 'PUBLICATION_TEXT_REJECTED'
+    && !String(error.message).includes('test_publication_secret'));
+}
 
 const acceptedHistory = appendVisualDisposition([], {
   schemaVersion: 1,
@@ -288,6 +383,27 @@ assert.deepEqual(projectConsoleReleasePublication(envelope), golden);
 assert.deepEqual(projectReportReleasePublication(envelope), golden);
 assert.deepEqual(projectSiteHealthRelease(envelope), golden);
 assert.deepEqual(projectArchiveReleasePublication(envelope), golden);
+const controlSanitizedView = projectSharedReleaseView(viewInput(single, {
+  riskSources: [riskSource(single, {
+    explanation: sanitizedWorkerText.observations[0].explanation,
+    recommendedAction: sanitizedWorkerText.observations[0].recommendedAction,
+  })],
+}));
+const controlSanitizedEnvelope = appendPublicationEnvelope(null, {
+  schemaVersion: 1,
+  runId: 'run-single-site',
+  runRevision: 1,
+  decisionRevision: controlSanitizedView.decisionRevision,
+  riskRevision: controlSanitizedView.riskRevision,
+  ledgerSequences: { observations: 1, decisions: 1, risks: 1 },
+  finalSubjectDigest: single.finalSubject.digest,
+  decision: controlSanitizedView.decision,
+  riskRegister: controlSanitizedView.riskRegister,
+});
+const archivePublicationBytes = Buffer.from(JSON.stringify(projectArchiveReleasePublication(controlSanitizedEnvelope)));
+assert.match(archivePublicationBytes.toString('utf8'), /The hero is clipped\./u);
+assert.doesNotMatch(archivePublicationBytes.toString('utf8'), /[\u001b\u202e]/u,
+  'archive publication bytes must contain only the already-sanitized canonical text');
 const globalRunRecord = sharedPublicationToConsoleIndexRecord({
   publication: envelope,
   parentRun: {

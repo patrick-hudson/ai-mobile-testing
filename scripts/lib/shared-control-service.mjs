@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { canonicalJson } from '../../shared/canonical-contract.mjs';
 import { sealOracleResult, sealWorkItemResult } from '../../shared/execution-contract.mjs';
 import { appendPublicationEnvelope } from '../../shared/publication-envelope.mjs';
+import { sealPublicationText } from '../../shared/publication-text-policy.mjs';
 import { appendVisualDisposition, projectSharedReleaseView } from '../../shared/release-projection.mjs';
 import { parseRisk } from '../../shared/risk-contract.mjs';
 import { parseRiskSourceObservationSet } from '../../shared/risk-source-observation.mjs';
@@ -133,6 +134,14 @@ export function createSharedControlService({ store, projectId = 'default', admis
             || typeof body.executionId !== 'string'
             || !state.executionManifest?.oracleExecutions?.some(({ id }) => id === body.executionId)) {
             fail('VISUAL_REVIEW_INVALID', 'Visual disposition value, rationale, or execution identity is invalid.', 400);
+          }
+          try {
+            body = { ...body, rationale: sealPublicationText(body.rationale) };
+          } catch (error) {
+            if (error?.code === 'PUBLICATION_TEXT_REJECTED') {
+              fail('PUBLICATION_TEXT_REJECTED', 'Publication text did not satisfy the safe publication policy.', 400);
+            }
+            throw error;
           }
         }
         const idempotencyKey = namespacedKey(principal, kind, runId, requestId);

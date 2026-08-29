@@ -41,6 +41,31 @@ function parseStoredClaim(value, expectedId) {
   return value;
 }
 
+function parseStoredReceipt(value, claim) {
+  const { digest, ...body } = value ?? {};
+  if (value?.schemaVersion !== 1 || value.kind !== 'promotion-consumption-receipt'
+    || value.claimId !== claim.id || value.principalId !== claim.principalId
+    || value.runId !== claim.runId || value.subjectDigest !== claim.subjectDigest
+    || value.publicationDigest !== claim.publicationDigest
+    || typeof value.requestId !== 'string' || value.requestId.length < 8 || value.requestId.length > 256
+    || !Number.isFinite(Date.parse(value.consumedAt)) || digest !== canonicalDigest(body)) {
+    fail('PROMOTION_CLAIM_CORRUPT', 'Promotion consumption receipt is corrupt.', 500);
+  }
+  return value;
+}
+
+function consumptionResult(receipt) {
+  return Object.freeze({
+    consumed: true,
+    claimId: receipt.claimId,
+    runId: receipt.runId,
+    subjectDigest: receipt.subjectDigest,
+    publicationDigest: receipt.publicationDigest,
+    consumedAt: receipt.consumedAt,
+    receiptDigest: receipt.digest,
+  });
+}
+
 function validateAuthorityContext(value) {
   const selector = value?.selector;
   const binding = value?.binding;
@@ -149,9 +174,14 @@ export async function issuePromotionClaim(store, { principal, publication, autho
   return claimResult(body, secret);
 }
 
-export async function consumePromotionClaim(store, token, { principal, expectedSubjectDigest, withCurrentPublication = null }) {
+export async function consumePromotionClaim(store, token, {
+  principal, requestId, expectedSubjectDigest, withCurrentPublication = null,
+}) {
   if (typeof withCurrentPublication !== 'function') {
     fail('PROMOTION_FENCE_REQUIRED', 'Promotion claim consumption requires the live publication and authority fence.', 500);
+  }
+  if (typeof requestId !== 'string' || requestId.length < 8 || requestId.length > 256) {
+    fail('IDEMPOTENCY_KEY_INVALID', 'Promotion consumption request id is invalid.', 400);
   }
   const parsed = /^amtp\.([a-f0-9]{32})\.([A-Za-z0-9_-]{32,})$/.exec(String(token));
   if (!parsed) fail('PROMOTION_CLAIM_INVALID', 'Promotion claim is invalid.', 401);
@@ -165,7 +195,15 @@ export async function consumePromotionClaim(store, token, { principal, expectedS
     if (claim.principalId !== principal?.id) fail('PROMOTION_CLAIM_PRINCIPAL_MISMATCH', 'Promotion claim belongs to another delivery principal.', 403);
     assertPrincipalAuthorized(principal, CONTROL_ACTIONS.PROMOTION_CONSUME, { projectId: claim.projectId, runId: claim.runId });
     const receiptPath = path.join(store.root, `${claim.id}.consumed.json`);
-    if (await fs.stat(receiptPath).catch(() => null)) fail('PROMOTION_CLAIM_REPLAYED', 'Promotion claim was already consumed.');
+    const existingReceipt = await fs.readFile(receiptPath, 'utf8')
+      .then((value) => parseStoredReceipt(JSON.parse(value), claim))
+      .catch((error) => error?.code === 'ENOENT' ? null : Promise.reject(error));
+    if (existingReceipt) {
+      if (existingReceipt.requestId !== requestId) {
+        fail('IDEMPOTENCY_CONFLICT', 'Promotion claim was already consumed by a different request.');
+      }
+      return consumptionResult(existingReceipt);
+    }
     if (Date.parse(claim.expiresAt) <= store.clock()) fail('PROMOTION_CLAIM_EXPIRED', 'Promotion claim expired.');
     if (claim.subjectDigest !== expectedSubjectDigest) fail('PROMOTION_SUBJECT_MISMATCH', 'Promotion claim subject does not match delivery subject.');
     const consumeAgainst = async (current, authorityContext) => {
@@ -183,19 +221,26 @@ export async function consumePromotionClaim(store, token, { principal, expectedS
       }
       const receipt = {
         schemaVersion: 1, kind: 'promotion-consumption-receipt', claimId: claim.id,
-        principalId: principal.id, publicationDigest: claim.publicationDigest,
+        requestId, principalId: principal.id, runId: claim.runId,
+        subjectDigest: claim.subjectDigest, publicationDigest: claim.publicationDigest,
         consumedAt: new Date(store.clock()).toISOString(),
       };
       receipt.digest = canonicalDigest(receipt);
       try {
         await atomicWriteJson(store.storage, receiptPath, receipt, { mode: 0o600, exclusive: true });
       } catch (error) {
-        if (error?.code === 'ATOMIC_ALREADY_EXISTS') fail('PROMOTION_CLAIM_REPLAYED', 'Promotion claim was already consumed.');
+        if (error?.code === 'ATOMIC_ALREADY_EXISTS') {
+          const raced = parseStoredReceipt(JSON.parse(await fs.readFile(receiptPath, 'utf8')), claim);
+          if (raced.requestId !== requestId) {
+            fail('IDEMPOTENCY_CONFLICT', 'Promotion claim was concurrently consumed by a different request.');
+          }
+          return raced;
+        }
         throw error;
       }
       return receipt;
     };
     const receipt = await withCurrentPublication(consumeAgainst);
-    return Object.freeze({ consumed: true, claimId: claim.id, runId: claim.runId, subjectDigest: claim.subjectDigest, consumedAt: receipt.consumedAt });
+    return consumptionResult(receipt);
   })();
 }
