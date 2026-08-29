@@ -50,6 +50,8 @@ try {
   const portalComposeBlock = compose.match(/\n  portal:[\s\S]*?(?=\n  [a-z][a-z0-9-]+:)/u)?.[0] ?? '';
   assert.match(portalComposeBlock, /shared-parent-runs:\/var\/lib\/ai-mobile-testing\/shared\/canonical/u);
   assert.match(portalComposeBlock, /shared-control-identities:\/var\/lib\/ai-mobile-testing\/shared\/credentials/u);
+  assert.match(portalComposeBlock, /PORTAL_SHARED_CONTROL: \$\{PORTAL_SHARED_CONTROL:-0\}/u,
+    'the Compose portal must expose an explicit fail-closed shared-control switch');
   assert.match(compose, /shared-worker-ordinary-a:/u);
   assert.match(compose, /shared-worker-ordinary-b:/u);
   assert.match(compose, /shared-worker-ordinary-a-secret:\/run\/secrets\/shared-worker:ro/u);
@@ -115,6 +117,12 @@ try {
     publishedOrigin: 'http://127.0.0.1:4173',
     sessionSecure: false,
   }));
+  assert.doesNotThrow(() => validateMutationDeployment({
+    bindHost: '0.0.0.0',
+    acceptedSocketHost: '127.0.0.1',
+    publishedOrigin: 'http://127.0.0.1:4173',
+    sessionSecure: false,
+  }), 'a wildcard container listener is local when the externally accepted socket and published origin are loopback-only');
   assert.doesNotThrow(() => validateMutationDeployment({
     bindHost: '0.0.0.0',
     publishedOrigin: 'https://audit.example.test',

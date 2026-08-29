@@ -6,10 +6,11 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { openScopedCredentialAuthority } from '../portal/scoped-credential-authority.mjs';
-import { openParentRunStore } from './lib/parent-run-store.mjs';
+import { createParentRun, openParentRunStore } from './lib/parent-run-store.mjs';
 
 const root = await mkdtemp(path.join(tmpdir(), 'shared-portal-read-auth-'));
 let portal = null;
+let coordinator = null;
 try {
   const port = await availablePort();
   const origin = `http://127.0.0.1:${port}`;
@@ -42,11 +43,20 @@ try {
     await writeFile(path.join(directory, 'active.html'), `<script>document.body.textContent='active-${runId}'</script>`);
     await writeFile(path.join(directory, 'logs', 'runner.log'), `${timestamp} [playwright:stdout] ${runId} safe log\n`);
   }
-  await openParentRunStore({
+  const sharedStore = await openParentRunStore({
     root: store,
     deploymentIdentity: 'self-test:shared-portal',
     volumeIdentity: 'named-volume:self-test-shared-portal',
     verifyStorage: false,
+  });
+  const sharedRunId = 'shared-op-0001';
+  await createParentRun(sharedStore, {
+    runId: sharedRunId,
+    subjectCoreDigest: `sha256:${'a'.repeat(64)}`,
+    workItems: [{
+      id: 'work-shared-op-0001', maxAttempts: 1,
+      capability: 'browser:chromium', targetId: 'candidate',
+    }],
   });
   const authority = await openScopedCredentialAuthority({ root: credentials });
   const viewerA = await authority.createPrincipal({
@@ -58,6 +68,13 @@ try {
   const delivery = await authority.createPrincipal({
     id: 'delivery-a', kind: 'service', roles: ['delivery'], projectIds: ['project-1'], runIds: ['run-a-0001'],
   });
+  const operator = await authority.createPrincipal({
+    id: 'operator-a', kind: 'human', roles: ['operator'], projectIds: ['project-1'], runIds: [sharedRunId],
+  });
+  const operatorTokenFile = path.join(root, 'operator.token');
+  const cancelBodyFile = path.join(root, 'cancel.json');
+  await writeFile(operatorTokenFile, `${operator.credential}\n`, { mode: 0o600 });
+  await writeFile(cancelBodyFile, `${JSON.stringify({ expectedRunRevision: 1, reason: 'CLI restart integration proof.' })}\n`, { mode: 0o600 });
   const environment = {
     ...process.env,
     HOST: '127.0.0.1',
@@ -178,8 +195,58 @@ try {
   assert.equal(afterRestart.status, 200, afterRestartBody);
   assert.deepEqual(JSON.parse(afterRestartBody).runs.map(({ id }) => id).sort(), ['run-a-0001', 'run-b-0002']);
 
-  console.log('Shared portal read-auth self-test passed: legacy run, log, artifact, range, report, gallery, aggregate, revocation, active-content, and restart reads fail closed.');
+  const requestId = 'cancel-restart-0001';
+  const accepted = await runAuditControl([
+    'cancel', '--server', origin, '--token-file', operatorTokenFile, '--run', sharedRunId,
+    '--request-id', requestId, '--body', cancelBodyFile,
+  ]);
+  assert.equal(accepted.code, 0, accepted.stderr);
+  assert.equal(accepted.document.data.state, 'accepted');
+  const acceptedOperationId = accepted.document.data.operationId;
+
+  await stopPortal(portal);
+  portal = null;
+  portal = await startPortal({ environment, origin });
+  const persisted = await runAuditControl([
+    'operation', '--server', origin, '--token-file', operatorTokenFile, '--run', sharedRunId,
+    '--kind', 'cancel', '--request-id', requestId,
+  ]);
+  assert.equal(persisted.code, 0, persisted.stderr);
+  assert.equal(persisted.document.data.operationId, acceptedOperationId);
+  assert.equal(persisted.document.data.state, 'accepted');
+
+  const coordinatorPort = await availablePort();
+  coordinator = await startCoordinator({
+    port: coordinatorPort,
+    environment: {
+      ...environment,
+      AUDIT_SHARED_RUN_ID: sharedRunId,
+      AUDIT_SHARED_COORDINATOR_PORT: String(coordinatorPort),
+      AUDIT_SHARED_CREDENTIAL_ROOT: credentials,
+      AUDIT_SHARED_EXCHANGE_ROOT: path.join(root, 'exchange'),
+      AUDIT_SHARED_LEASE_MS: '1000',
+      AUDIT_SHARED_COORDINATOR_LEASE_MS: '5000',
+    },
+  });
+  let completed = null;
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const result = await runAuditControl([
+      'operation', '--server', origin, '--token-file', operatorTokenFile, '--run', sharedRunId,
+      '--kind', 'cancel', '--request-id', requestId,
+    ]);
+    assert.equal(result.code, 0, result.stderr);
+    if (result.document.data.state === 'completed') {
+      completed = result.document.data;
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  assert.equal(completed?.operationId, acceptedOperationId);
+  assert.equal(completed?.outcome?.status, 'succeeded');
+
+  console.log('Shared portal read-auth self-test passed: authorized reads, CLI mutation persistence, coordinator completion, revocation, active-content isolation, and portal restart fail closed.');
 } finally {
+  if (coordinator) await stopProcess(coordinator);
   if (portal) await stopPortal(portal);
   await rm(root, { recursive: true, force: true });
 }
@@ -217,12 +284,49 @@ async function startPortal({ environment, origin }) {
 }
 
 async function stopPortal(portal) {
-  if (!portal || portal.child.exitCode !== null) return;
-  portal.child.kill('SIGTERM');
-  await Promise.race([once(portal.child, 'exit'), new Promise((resolve) => setTimeout(resolve, 3_000))]);
-  if (portal.child.exitCode === null) {
-    portal.child.kill('SIGKILL');
-    await once(portal.child, 'exit');
+  await stopProcess(portal);
+}
+
+async function startCoordinator({ port, environment }) {
+  const child = spawn(process.execPath, ['scripts/run-shared-coordinator.mjs'], {
+    cwd: new URL('..', import.meta.url), env: environment, stdio: ['ignore', 'ignore', 'pipe'],
+  });
+  let stderr = '';
+  child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+  const origin = `http://127.0.0.1:${port}`;
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    if (child.exitCode !== null) throw new Error(`Coordinator exited ${child.exitCode}: ${stderr.slice(-4_000)}`);
+    try {
+      const response = await fetch(`${origin}/healthz`);
+      if (response.ok) return { child, stderr: () => stderr };
+    } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  child.kill('SIGKILL');
+  throw new Error(`Coordinator did not become healthy: ${stderr.slice(-4_000)}`);
+}
+
+async function runAuditControl(arguments_) {
+  const child = spawn(process.execPath, ['scripts/audit-control.mjs', ...arguments_], {
+    cwd: new URL('..', import.meta.url), stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
+  child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+  const [code] = await once(child, 'exit');
+  const lines = stdout.trim().split('\n').filter(Boolean);
+  return { code, stdout, stderr, document: JSON.parse(lines.at(-1) ?? '{}') };
+}
+
+async function stopProcess(process_) {
+  if (!process_ || process_.child.exitCode !== null) return;
+  process_.child.kill('SIGTERM');
+  await Promise.race([once(process_.child, 'exit'), new Promise((resolve) => setTimeout(resolve, 3_000))]);
+  if (process_.child.exitCode === null) {
+    process_.child.kill('SIGKILL');
+    await once(process_.child, 'exit');
   }
 }
 

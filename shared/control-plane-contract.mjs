@@ -93,8 +93,13 @@ export function validateMutationDeployment({ bindHost, acceptedSocketHost = bind
     || origin.pathname !== '/' || origin.search || origin.hash || origin.origin !== publishedOrigin) {
     fail('INSECURE_MUTATION_DEPLOYMENT', 'Mutation service requires an exact published HTTP(S) origin.', 503);
   }
-  const local = LOOPBACKS.has(String(bindHost).replace(/^\[|\]$/g, '').toLowerCase())
-    && LOOPBACKS.has(String(acceptedSocketHost).replace(/^\[|\]$/g, '').toLowerCase())
+  const listenerHost = String(bindHost).replace(/^\[|\]$/g, '').toLowerCase();
+  const acceptedHost = String(acceptedSocketHost).replace(/^\[|\]$/g, '').toLowerCase();
+  const acceptedSocketIsExplicit = acceptedSocketHost !== bindHost;
+  const listenerIsLocalOrContainerWildcard = LOOPBACKS.has(listenerHost)
+    || (acceptedSocketIsExplicit && ['0.0.0.0', '::'].includes(listenerHost));
+  const local = listenerIsLocalOrContainerWildcard
+    && LOOPBACKS.has(acceptedHost)
     && LOOPBACKS.has(origin.hostname.replace(/^\[|\]$/g, '').toLowerCase());
   if (!local && (origin.protocol !== 'https:' || sessionSecure !== true)) {
     fail('INSECURE_MUTATION_DEPLOYMENT', 'Shared mutation mode requires HTTPS and Secure host-only sessions.', 503);
