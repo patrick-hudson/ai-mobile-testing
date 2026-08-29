@@ -11,6 +11,7 @@ import { parseSingleSiteInventoryBarrier } from '../../shared/execution-graph-co
 import { parseFinalReleaseSubject, parseReleaseSubjectCore } from '../../shared/release-subject.mjs';
 import { parseWorkExecutionDescriptor } from '../../shared/work-execution-descriptor.mjs';
 import { sealWorkItemEvidenceMember } from '../../shared/work-item-evidence-index.mjs';
+import { openContainedArtifactFile } from '../../portal/safe-artifact-open.mjs';
 import {
   atomicWriteJson,
   atomicWriteFile,
@@ -50,6 +51,9 @@ const OPERATION_RETRY_WINDOW_MS = 24 * 60 * 60 * 1_000;
 const MAX_DISCOVERED_PARENT_RUNS = 2_048;
 const MAX_BUFFERED_ATTEMPT_ARTIFACT_BYTES = 8 * 1_048_576;
 const MAX_BUFFERED_ATTEMPT_EVIDENCE_BYTES = 16 * 1_048_576;
+const ARTIFACT_INTEGRITY_CACHES = new WeakMap();
+export const ARTIFACT_READ_LEASE_MS = 15_000;
+const ARTIFACT_PURGE_DRAIN_MS = 20_000;
 
 export class ParentRunStoreError extends Error {
   constructor(code, message, details = undefined) {
@@ -389,6 +393,10 @@ function lockPath(store, runId) {
   return path.join(runDirectory(store, runId), '.mutation-lock');
 }
 
+function artifactReadLeaseDirectory(store, runId) {
+  return path.join(runDirectory(store, runId), '.artifact-read-leases');
+}
+
 function globalLockPath(store) {
   return containedPath(store.root, '.coordinator-mutation-lock');
 }
@@ -699,6 +707,7 @@ export async function openParentRunStore({
   const manifestPath = containedPath(storage.root, 'store-manifest.json');
   const schedulerPath = containedPath(storage.root, 'performance-scheduler.json');
   const store = { root: storage.root, storage, clock, manifest: null };
+  ARTIFACT_INTEGRITY_CACHES.set(store, new Map());
   await withDirectoryLock(storage, containedPath(storage.root, '.store-initialization.lock'), async () => {
     const existingStore = await pathExists(storage.fs, manifestPath);
     if (existingStore) {
@@ -851,6 +860,20 @@ export async function recoverParentRun(store, runId) {
 }
 
 export const readParentRun = recoverParentRun;
+
+export async function parentRunExists(store, runId) {
+  safeId(runId, 'runId');
+  try {
+    const metadata = await store.storage.fs.lstat(runDirectory(store, runId));
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+      fail('STORE_CORRUPT', `Parent run ${runId} is not a real directory.`);
+    }
+    return true;
+  } catch (error) {
+    if (error?.code === 'ENOENT') return false;
+    throw error;
+  }
+}
 
 export async function listParentRunIds(store, { limit = MAX_DISCOVERED_PARENT_RUNS } = {}) {
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_DISCOVERED_PARENT_RUNS) {
@@ -1962,36 +1985,314 @@ export async function adoptAttemptEvidence(store, runId, coordinator, inbox) {
 }
 
 export async function readAdoptedAttemptArtifactJson(store, runId, input) {
-  const state = await recoverUnlocked(store, runId, { repairCache: false });
-  const workItemId = safeId(input?.workItemId, 'workItemId');
-  const name = artifactName(input?.name);
+  const descriptor = await resolveAdoptedAttemptArtifact(store, runId, input);
   const maximumBytes = input?.maximumBytes ?? MAX_ATTEMPT_ARTIFACT_BYTES;
   if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 2 || maximumBytes > MAX_ATTEMPT_ARTIFACT_BYTES) {
     fail('STORE_SCHEMA_INVALID', 'Adopted artifact JSON byte bound is invalid.');
   }
-  const item = state.workItems[workItemId] ?? (state.compilationBarrier?.id === workItemId ? state.compilationBarrier : null);
-  const attempt = item?.attempts?.at(-1);
-  if (!item || !['completed_pass', 'completed_product_failure'].includes(item.state)
-    || !attempt || attempt.outcome !== item.state) {
-    fail('ATTEMPT_ARTIFACT_UNAVAILABLE', `Work item ${workItemId} has no adopted terminal artifact.`);
-  }
-  const artifact = attempt.artifacts.find((entry) => entry.name === name);
-  if (!artifact) fail('ATTEMPT_ARTIFACT_UNAVAILABLE', `Work item ${workItemId} did not adopt artifact ${name}.`);
-  validateArtifactRecord(artifact, {
-    runId,
-    workItemId,
-    attempt: attempt.attempt,
-    leaseToken: artifact.relativePath.split('/')[2]?.replace(/^\d{6}-/, ''),
+  const bytes = await readBoundedFile(store.storage, descriptor.absolutePath, {
+    label: `adopted artifact ${descriptor.name}`, maximumBytes,
   });
-  const file = containedPath(runDirectory(store, runId), ...artifact.relativePath.split('/'));
-  const bytes = await readBoundedFile(store.storage, file, { label: `adopted artifact ${name}`, maximumBytes });
   const digest = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
-  if (bytes.length !== artifact.sizeBytes || digest !== artifact.digest) {
-    fail('ARTIFACT_DIGEST_MISMATCH', `Adopted artifact ${name} no longer matches its immutable record.`);
+  if (bytes.length !== descriptor.sizeBytes || digest !== descriptor.digest) {
+    fail('ARTIFACT_DIGEST_MISMATCH', `Adopted artifact ${descriptor.name} no longer matches its immutable record.`);
   }
   try { return JSON.parse(bytes.toString('utf8')); } catch {
-    fail('STORE_CORRUPT', `Adopted artifact ${name} is not valid JSON.`);
+    fail('STORE_CORRUPT', `Adopted artifact ${descriptor.name} is not valid JSON.`);
   }
+}
+
+export async function listAdoptedAttemptArtifacts(store, runId, { offset = 0, limit = 100 } = {}) {
+  safeId(runId, 'runId');
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset > 1_000_000
+    || !Number.isSafeInteger(limit) || limit < 1 || limit > 500) {
+    fail('STORE_SCHEMA_INVALID', 'Adopted artifact page bounds are invalid.');
+  }
+  const state = await recoverUnlocked(store, runId, { repairCache: false });
+  if (state.authorityTombstone !== null) fail('RELEASE_AUTHORITY_TOMBSTONED', 'Tombstoned run evidence is unavailable.');
+  const descriptors = [];
+  let visibleCount = 0;
+  let hasMore = false;
+  const items = [
+    ...(state.compilationBarrier ? [state.compilationBarrier] : []),
+    ...Object.values(state.workItems),
+  ].sort((left, right) => left.id.localeCompare(right.id));
+  for (const item of items) {
+    const attempt = canonicalTerminalAttempt(item);
+    if (!attempt) continue;
+    for (let ordinal = 0; ordinal < attempt.artifacts.length; ordinal += 1) {
+      const value = attempt.artifacts[ordinal];
+      const artifact = validateArtifactRecord(value, {
+        runId, workItemId: item.id, attempt: attempt.attempt, leaseToken: attempt.leaseToken,
+      });
+      if (isRawAttemptLogArtifact(artifact.name)) continue;
+      if (visibleCount >= offset && descriptors.length < limit) {
+        descriptors.push(publicArtifactDescriptor(runId, item, attempt, artifact, ordinal + 1));
+      } else if (visibleCount >= offset + limit) {
+        hasMore = true;
+        break;
+      }
+      visibleCount += 1;
+    }
+    if (hasMore) break;
+  }
+  const knownTotal = hasMore ? offset + descriptors.length + 1 : visibleCount;
+  return Object.freeze({
+    runId,
+    files: descriptors,
+    total: knownTotal,
+    knownTotal,
+    totalComplete: !hasMore,
+    offset,
+    limit,
+    nextOffset: offset + descriptors.length,
+    hasMore,
+  });
+}
+
+function isRawAttemptLogArtifact(name) {
+  const segments = String(name).replaceAll('\\', '/').split('/').filter(Boolean).map((segment) => segment.toLowerCase());
+  return segments.includes('logs') || segments.some((segment) => segment.endsWith('.log'));
+}
+
+export async function openAdoptedAttemptArtifact(store, runId, input) {
+  const transferLease = await acquireArtifactReadLease(store, runId);
+  let opened;
+  try {
+    const descriptor = await resolveAdoptedAttemptArtifact(store, runId, input);
+    opened = await openContainedArtifactFile(store.storage.fs, runDirectory(store, runId), descriptor.relativePath, {
+      requireDescriptorContainment: process.platform === 'linux',
+    });
+    const { handle, stat } = opened;
+    if (!stat.isFile() || stat.nlink !== 1 || stat.size !== descriptor.sizeBytes) {
+      fail('ARTIFACT_DIGEST_MISMATCH', `Adopted artifact ${descriptor.name} no longer matches its immutable record.`);
+    }
+    const integrityFingerprint = await verifyOpenedArtifactIntegrity(store, handle, stat, descriptor, transferLease);
+    return {
+      descriptor: publicArtifactDescriptor(runId, descriptor.item, descriptor.attempt, descriptor, descriptor.ordinal),
+      opened: {
+        handle,
+        stat,
+        path: opened.path,
+        relativePath: descriptor.name,
+        transferLease,
+        integrityFingerprint,
+      },
+    };
+  } catch (error) {
+    await opened?.handle?.close().catch(() => undefined);
+    await transferLease.release().catch(() => undefined);
+    if (['ENOENT', 'ENOTDIR', 'ELOOP', 'UNSAFE_ARTIFACT_PATH'].includes(error?.code)) {
+      fail('ATTEMPT_ARTIFACT_UNAVAILABLE', 'Adopted artifact bytes are unavailable.');
+    }
+    throw error;
+  }
+}
+
+async function acquireArtifactReadLease(store, runId) {
+  safeId(runId, 'runId');
+  return withDirectoryLock(store.storage, lockPath(store, runId), async () => {
+    const state = await recoverUnlocked(store, runId, { repairCache: false });
+    if (state.authorityTombstone !== null) fail('RELEASE_AUTHORITY_TOMBSTONED', 'Tombstoned run evidence is unavailable.');
+    const token = safeId(`reader-${store.storage.nonce()}`, 'artifact read lease token');
+    const file = path.join(artifactReadLeaseDirectory(store, runId), `${token}.json`);
+    const write = (expiresAt) => atomicWriteJson(store.storage, file, {
+      schemaVersion: 1,
+      kind: 'artifact-read-lease',
+      runId,
+      token,
+      expiresAt,
+    });
+    await write(new Date(store.clock() + ARTIFACT_READ_LEASE_MS).toISOString());
+    let released = false;
+    let maintenance = Promise.resolve();
+    return Object.freeze({
+      token,
+      renew() {
+        const operation = async () => {
+          if (released) fail('ARTIFACT_READ_LEASE_EXPIRED', 'Artifact read lease was already released.');
+          const current = await recoverUnlocked(store, runId, { repairCache: false });
+          if (current.authorityTombstone !== null) fail('RELEASE_AUTHORITY_TOMBSTONED', 'Tombstoned run evidence is unavailable.');
+          await write(new Date(store.clock() + ARTIFACT_READ_LEASE_MS).toISOString());
+        };
+        maintenance = maintenance.then(operation, operation);
+        return maintenance;
+      },
+      release() {
+        if (released) return maintenance.catch(() => undefined);
+        released = true;
+        const operation = () => store.storage.fs.rm(file, { force: true });
+        maintenance = maintenance.then(operation, operation);
+        return maintenance;
+      },
+    });
+  });
+}
+
+async function activeArtifactReadLeases(store, runId) {
+  const directory = artifactReadLeaseDirectory(store, runId);
+  const names = await store.storage.fs.readdir(directory).catch((error) => error?.code === 'ENOENT' ? [] : Promise.reject(error));
+  let active = 0;
+  for (const name of names) {
+    if (name.startsWith('.') && name.endsWith('.tmp')) {
+      await store.storage.fs.rm(path.join(directory, name), { force: true });
+      continue;
+    }
+    if (!/^reader-[A-Za-z0-9._-]+\.json$/u.test(name)) {
+      active += 1;
+      continue;
+    }
+    const file = path.join(directory, name);
+    try {
+      const lease = await readBoundedJson(store.storage, file, { label: 'artifact read lease', maximumBytes: 4_096 });
+      if (lease.schemaVersion !== 1 || lease.kind !== 'artifact-read-lease' || lease.runId !== runId
+        || `${lease.token}.json` !== name || !SAFE_ID.test(lease.token)
+        || !Number.isFinite(Date.parse(lease.expiresAt))) {
+        active += 1;
+      } else if (Date.parse(lease.expiresAt) <= store.clock()) {
+        await store.storage.fs.rm(file, { force: true });
+      } else {
+        active += 1;
+      }
+    } catch {
+      active += 1;
+    }
+  }
+  return active;
+}
+
+async function resolveAdoptedAttemptArtifact(store, runId, input) {
+  safeId(runId, 'runId');
+  const state = await recoverUnlocked(store, runId, { repairCache: false });
+  if (state.authorityTombstone !== null) fail('RELEASE_AUTHORITY_TOMBSTONED', 'Tombstoned run evidence is unavailable.');
+  const workItemId = safeId(input?.workItemId, 'workItemId');
+  const requestedName = input?.name === undefined ? null : artifactName(input.name);
+  const artifactKey = input?.artifactKey === undefined ? null : input.artifactKey;
+  if ((requestedName === null) === (artifactKey === null)
+    || (artifactKey !== null && !DIGEST_PATTERN.test(artifactKey))) {
+    fail('STORE_SCHEMA_INVALID', 'Adopted artifact lookup requires exactly one valid name or artifact key.');
+  }
+  const item = state.workItems[workItemId]
+    ?? (state.compilationBarrier?.id === workItemId ? state.compilationBarrier : null);
+  const attempt = canonicalTerminalAttempt(item);
+  if (!item || !attempt) {
+    fail('ATTEMPT_ARTIFACT_UNAVAILABLE', `Work item ${workItemId} has no adopted terminal artifact.`);
+  }
+  let artifact = null;
+  let ordinal = null;
+  for (let index = 0; index < attempt.artifacts.length; index += 1) {
+    const candidate = validateArtifactRecord(attempt.artifacts[index], {
+      runId, workItemId, attempt: attempt.attempt, leaseToken: attempt.leaseToken,
+    });
+    if ((requestedName !== null && candidate.name === requestedName)
+      || (artifactKey !== null && artifactAccessKey(item, attempt, candidate, index + 1) === artifactKey)) {
+      artifact = candidate;
+      ordinal = index + 1;
+      break;
+    }
+  }
+  if (!artifact) fail('ATTEMPT_ARTIFACT_UNAVAILABLE', `Work item ${workItemId} did not adopt the requested artifact.`);
+  if (isRawAttemptLogArtifact(artifact.name)) {
+    fail('ATTEMPT_ARTIFACT_UNAVAILABLE', 'Raw attempt logs are unavailable through the canonical artifact API.');
+  }
+  return {
+    ...artifact,
+    runId,
+    workItemId,
+    attemptNumber: attempt.attempt,
+    completedAt: attempt.completedAt,
+    absolutePath: containedPath(runDirectory(store, runId), ...artifact.relativePath.split('/')),
+    item,
+    attempt,
+    ordinal,
+  };
+}
+
+function canonicalTerminalAttempt(item) {
+  if (!item || !['completed_pass', 'completed_product_failure'].includes(item.state)
+    || !item.canonicalResult?.digest || !Array.isArray(item.attempts)) return null;
+  for (let index = item.attempts.length - 1; index >= 0; index -= 1) {
+    const attempt = item.attempts[index];
+    const canonicalMatch = attempt.canonicalResultDigest === item.canonicalResult.digest
+      || (attempt.canonicalResultDigest === undefined
+        && canonicalJson(attempt.evidenceDigests) === canonicalJson(item.canonicalResult.evidenceDigests));
+    if (attempt.outcome !== item.state || !canonicalMatch) continue;
+    const directory = attempt.artifacts?.[0]?.relativePath?.split('/')[2] ?? '';
+    const derivedLeaseToken = directory.replace(/^\d{6}-/u, '');
+    const leaseToken = typeof attempt.leaseToken === 'string' ? attempt.leaseToken : derivedLeaseToken;
+    if (SAFE_ID.test(leaseToken)) return { ...attempt, leaseToken };
+  }
+  return null;
+}
+
+function publicArtifactDescriptor(runId, item, attempt, artifact, ordinal) {
+  return Object.freeze({
+    runId,
+    workItemId: item.id,
+    attempt: attempt.attempt,
+    completedAt: attempt.completedAt,
+    name: artifact.name,
+    logicalName: artifact.logicalName,
+    purpose: artifact.purpose,
+    mediaType: artifact.mediaType,
+    sizeBytes: artifact.sizeBytes,
+    digest: artifact.digest,
+    memberDigest: artifact.memberDigest,
+    artifactKey: artifactAccessKey(item, attempt, artifact, ordinal),
+  });
+}
+
+function artifactAccessKey(item, attempt, artifact, ordinal) {
+  return canonicalDigest({
+    schemaVersion: 1,
+    kind: 'adopted-artifact-access-key',
+    workItemId: item.id,
+    canonicalResultDigest: item.canonicalResult.digest,
+    attempt: attempt.attempt,
+    ordinal,
+    name: artifact.name,
+    contentDigest: artifact.digest,
+    memberDigest: artifact.memberDigest,
+  });
+}
+
+async function verifyOpenedArtifactIntegrity(store, handle, initialStat, descriptor, transferLease) {
+  const fingerprint = [
+    initialStat.dev, initialStat.ino, initialStat.size, initialStat.mtimeMs, initialStat.ctimeMs,
+  ].join(':');
+  const integrityCache = ARTIFACT_INTEGRITY_CACHES.get(store);
+  if (!integrityCache) fail('STORE_CORRUPT', 'Parent-run artifact integrity cache is unavailable.');
+  const cached = integrityCache.get(descriptor.digest);
+  if (cached === fingerprint) return fingerprint;
+  const hash = createHash('sha256');
+  const chunk = Buffer.allocUnsafe(64 * 1_024);
+  let sizeBytes = 0;
+  let renewedAt = Date.now();
+  while (true) {
+    const { bytesRead } = await handle.read(chunk, 0, chunk.length, sizeBytes);
+    if (bytesRead === 0) break;
+    sizeBytes += bytesRead;
+    if (sizeBytes > descriptor.sizeBytes) break;
+    hash.update(chunk.subarray(0, bytesRead));
+    if (Date.now() - renewedAt >= Math.floor(ARTIFACT_READ_LEASE_MS / 3)) {
+      await transferLease.renew();
+      renewedAt = Date.now();
+    }
+  }
+  const finalStat = await handle.stat();
+  const finalFingerprint = [
+    finalStat.dev, finalStat.ino, finalStat.size, finalStat.mtimeMs, finalStat.ctimeMs,
+  ].join(':');
+  const digest = `sha256:${hash.digest('hex')}`;
+  if (fingerprint !== finalFingerprint || sizeBytes !== descriptor.sizeBytes || digest !== descriptor.digest) {
+    fail('ARTIFACT_DIGEST_MISMATCH', `Adopted artifact ${descriptor.name} no longer matches its immutable record.`);
+  }
+  integrityCache.delete(descriptor.digest);
+  integrityCache.set(descriptor.digest, fingerprint);
+  while (integrityCache.size > 1_024) {
+    integrityCache.delete(integrityCache.keys().next().value);
+  }
+  return fingerprint;
 }
 
 export async function cancelParentRun(store, runId, coordinator, input) {
@@ -2195,16 +2496,37 @@ export async function tombstoneParentRunAuthority(store, runId, coordinator, inp
 }
 
 export async function purgeParentRunEvidence(store, runId) {
-  return withDirectoryLock(store.storage, globalLockPath(store), () => withDirectoryLock(store.storage, lockPath(store, runId), async () => {
+  const tombstone = await withDirectoryLock(store.storage, globalLockPath(store), () => withDirectoryLock(store.storage, lockPath(store, runId), async () => {
     const state = await recoverUnlocked(store, runId);
     if (state.authorityTombstone === null) fail('PURGE_REQUIRES_TOMBSTONE', 'Evidence cannot be purged before release authority is tombstoned.');
+    return clone(state.authorityTombstone);
+  }));
+
+  // The authority tombstone prevents new read leases. Drain existing readers
+  // without holding the coordinator-wide mutation lock so unrelated runs keep
+  // claiming, heartbeating, and adopting work normally.
+  const deadline = Date.now() + ARTIFACT_PURGE_DRAIN_MS;
+  while (await activeArtifactReadLeases(store, runId) > 0) {
+    if (Date.now() >= deadline) fail('ARTIFACT_READERS_ACTIVE', 'Evidence purge could not drain active artifact readers within its bound.');
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+
+  return withDirectoryLock(store.storage, globalLockPath(store), () => withDirectoryLock(store.storage, lockPath(store, runId), async () => {
+    const state = await recoverUnlocked(store, runId);
+    if (state.authorityTombstone === null || state.authorityTombstone.tombstonedAt !== tombstone.tombstonedAt) {
+      fail('STORE_CORRUPT', 'Evidence purge authority changed while artifact readers drained.');
+    }
+    if (await activeArtifactReadLeases(store, runId) > 0) {
+      fail('ARTIFACT_READERS_ACTIVE', 'An artifact reader remained active at the purge commit boundary.');
+    }
     const directory = runDirectory(store, runId);
     for (const relative of ['evidence', 'inboxes']) {
       const target = containedPath(directory, relative);
       await store.storage.fs.rm(target, { recursive: true, force: true });
     }
     await store.storage.fs.mkdir(path.join(directory, 'inboxes'), { recursive: true, mode: 0o2770 });
-    return clone(state.authorityTombstone);
+    await store.storage.fs.rm(artifactReadLeaseDirectory(store, runId), { recursive: true, force: true });
+    return clone(tombstone);
   }));
 }
 

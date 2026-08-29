@@ -21,11 +21,15 @@ import {
   heartbeatWorkItem,
   MAX_ATTEMPT_ARTIFACT_BYTES,
   adoptWorkHeartbeat,
+  listAdoptedAttemptArtifacts,
+  openAdoptedAttemptArtifact,
   openParentRunStore,
   publishAttemptEvidence,
+  purgeParentRunEvidence,
   readParentRun,
   requeueExpiredWork,
   requestPerformanceDrain,
+  tombstoneParentRunAuthority,
   uploadAttemptEvidenceArtifact,
 } from './lib/parent-run-store.mjs';
 
@@ -188,7 +192,11 @@ try {
   }), chromiumInbox, 'an exact artifact upload retry is idempotent even when wall-clock time advances');
   await adoptAttemptEvidence(store, 'capability-run', coordinator, chromiumInbox);
   const firefoxInbox = await publishAttemptEvidence(store, 'capability-run', firefox, {
-    outcome: 'completed_product_failure', artifacts: [upload('logs/failure.txt', 'firefox-failure')],
+    outcome: 'completed_product_failure', artifacts: [
+      upload('logs/failure.txt', 'firefox-failure'),
+      upload('Logs/stdout.txt', 'firefox-uppercase-log'),
+      upload('evidence/worker.LOG', 'firefox-suffix-log'),
+    ],
   });
   await adoptAttemptEvidence(store, 'capability-run', coordinator, firefoxInbox);
 
@@ -210,6 +218,106 @@ try {
     upload('ignored', 'chromium-home', 'image/png').digest, 'content integrity retains its independent byte digest');
   assert.equal(capabilityState.resourceScheduling.exclusiveLease, null);
   assert.equal(capabilityState.resourceScheduling.performanceDrain, null);
+  const firstArtifactPage = await listAdoptedAttemptArtifacts(store, 'capability-run', { offset: 0, limit: 1 });
+  const secondArtifactPage = await listAdoptedAttemptArtifacts(store, 'capability-run', { offset: 1, limit: 1 });
+  assert.deepEqual(firstArtifactPage.files.map(({ workItemId, name }) => [workItemId, name]), [
+    ['chromium-a', 'screens/home.png'],
+  ], 'canonical artifact paging is deterministic by work item and adopted member order');
+  assert.deepEqual(secondArtifactPage.files.map(({ workItemId, name }) => [workItemId, name]), [
+    ['performance-c', 'performance/lighthouse.json'],
+  ]);
+  assert.equal(firstArtifactPage.total, 2, 'raw execution logs remain available only through the bounded redacting log API');
+  assert.equal(firstArtifactPage.totalComplete, false);
+  assert.equal(secondArtifactPage.totalComplete, true);
+  assert.equal(firstArtifactPage.hasMore, true);
+  assert.equal(secondArtifactPage.hasMore, false);
+  assert.equal(firstArtifactPage.files.some((artifact) => 'relativePath' in artifact || 'leaseToken' in artifact), false,
+    'public descriptors never disclose canonical store paths or lease tokens');
+  const firefoxAttempt = capabilityState.workItems['firefox-b'].attempts[0];
+  for (let index = 0; index < firefoxAttempt.artifacts.length; index += 1) {
+    const logArtifact = firefoxAttempt.artifacts[index];
+    const logArtifactKey = canonicalDigest({
+      schemaVersion: 1,
+      kind: 'adopted-artifact-access-key',
+      workItemId: 'firefox-b',
+      canonicalResultDigest: capabilityState.workItems['firefox-b'].canonicalResult.digest,
+      attempt: firefoxAttempt.attempt,
+      ordinal: index + 1,
+      name: logArtifact.name,
+      contentDigest: logArtifact.digest,
+      memberDigest: logArtifact.memberDigest,
+    });
+    await assert.rejects(
+      openAdoptedAttemptArtifact(store, 'capability-run', {
+        workItemId: 'firefox-b', artifactKey: logArtifactKey,
+      }),
+      (error) => error?.code === 'ATTEMPT_ARTIFACT_UNAVAILABLE',
+      `${logArtifact.name} must be denied even when its canonical access key is known`,
+    );
+  }
+  const chromiumArtifact = capabilityState.workItems['chromium-a'].attempts[0].artifacts[0];
+  const chromiumArtifactKey = firstArtifactPage.files[0].artifactKey;
+  const openedChromium = await openAdoptedAttemptArtifact(store, 'capability-run', {
+    workItemId: 'chromium-a', artifactKey: chromiumArtifactKey,
+  });
+  assert.equal(await openedChromium.opened.handle.readFile('utf8'), 'chromium-home');
+  await openedChromium.opened.handle.close();
+  await openedChromium.opened.transferLease.release();
+  const chromiumArtifactPath = path.join(root, 'runs', 'capability-run', chromiumArtifact.relativePath);
+  await fs.writeFile(chromiumArtifactPath, Buffer.alloc(chromiumArtifact.sizeBytes, 0x78));
+  await assert.rejects(
+    openAdoptedAttemptArtifact(store, 'capability-run', {
+      workItemId: 'chromium-a', artifactKey: chromiumArtifactKey,
+    }),
+    (error) => error?.code === 'ARTIFACT_DIGEST_MISMATCH',
+    'post-adoption same-size tampering must fail before a descriptor can stream bytes',
+  );
+
+  await createParentRun(store, {
+    runId: 'purge-read-run', subjectCoreDigest: digest('b'), runnerRevision: 'runner-u4',
+    workItems: [{
+      id: 'purge-read-item', maxAttempts: 1, capability: 'browser:chromium', resourceClass: 'ordinary',
+      targetId: 'candidate-desktop-chromium', specAffinity: null,
+    }],
+  });
+  const purgeReadLease = await claimWorkItem(store, 'purge-read-run', coordinator, {
+    workerId: 'worker-purge-read', capabilities: ['browser:chromium'], resourceClasses: ['ordinary'], leaseMs: 10_000,
+  });
+  const purgeReadInbox = await publishAttemptEvidence(store, 'purge-read-run', purgeReadLease, {
+    outcome: 'completed_pass', artifacts: [upload('screens/purge.png', 'purge-reader', 'image/png')],
+  });
+  await adoptAttemptEvidence(store, 'purge-read-run', coordinator, purgeReadInbox);
+  const purgeReadDescriptor = (await listAdoptedAttemptArtifacts(store, 'purge-read-run')).files[0];
+  const openDuringPurge = await openAdoptedAttemptArtifact(store, 'purge-read-run', {
+    workItemId: purgeReadDescriptor.workItemId, artifactKey: purgeReadDescriptor.artifactKey,
+  });
+  await tombstoneParentRunAuthority(store, 'purge-read-run', coordinator, {
+    actor: { id: 'operator-purge-proof', kind: 'human' }, reason: 'Prove shared artifact transfer drain.',
+  });
+  let purgeSettled = false;
+  const drainingPurge = purgeParentRunEvidence(store, 'purge-read-run').then((value) => {
+    purgeSettled = true;
+    return value;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(purgeSettled, false, 'shared purge waits for an already-open canonical artifact transfer');
+  await createParentRun(store, {
+    runId: 'purge-unrelated-run', subjectCoreDigest: digest('c'), runnerRevision: 'runner-u4',
+    workItems: [{
+      id: 'unrelated-item', maxAttempts: 1, capability: 'browser:chromium', resourceClass: 'ordinary',
+      targetId: 'candidate-desktop-chromium', specAffinity: null,
+    }],
+  });
+  assert.equal((await readParentRun(store, 'purge-unrelated-run')).status, 'active',
+    'reader draining never holds the store-wide lock needed by an unrelated run');
+  await openDuringPurge.opened.handle.close();
+  await openDuringPurge.opened.transferLease.release();
+  await drainingPurge;
+  await assert.rejects(
+    listAdoptedAttemptArtifacts(store, 'purge-read-run'),
+    (error) => error?.code === 'RELEASE_AUTHORITY_TOMBSTONED',
+    'tombstoning makes new canonical artifact lists unavailable before bytes are deleted',
+  );
 
   assert.deepEqual(classifyExecutionFailure({ kind: 'assertion_timeout' }), {
     outcome: 'completed_product_failure', reason: 'assertion_timeout', retryable: false,
@@ -359,6 +467,17 @@ try {
   assert.equal(legacyState.workItems['evidence-9'].canonicalResult.evidenceDigests[0],
     legacyState.workItems['evidence-9'].attempts[0].artifacts[0].digest,
     'legacy durable inbox records remain adoptable with their original content-digest identity');
+  const boundaryArtifacts = await listAdoptedAttemptArtifacts(store, 'evidence-boundary-run');
+  assert.deepEqual(boundaryArtifacts.files.map(({ workItemId }) => workItemId), ['evidence-7', 'evidence-7', 'evidence-9'],
+    'artifact reads expose adopted canonical attempts only and never an unadopted or running attempt');
+  const legacyArtifactDescriptor = boundaryArtifacts.files.find(({ workItemId }) => workItemId === 'evidence-9');
+  const openedLegacyArtifact = await openAdoptedAttemptArtifact(store, 'evidence-boundary-run', {
+    workItemId: 'evidence-9', artifactKey: legacyArtifactDescriptor.artifactKey,
+  });
+  assert.deepEqual(JSON.parse(await openedLegacyArtifact.opened.handle.readFile('utf8')), { ok: true },
+    'a legacy-format adopted row opens through its unique advertised artifact key');
+  await openedLegacyArtifact.opened.handle.close();
+  await openedLegacyArtifact.opened.transferLease.release();
 
   await createParentRun(store, {
     runId: 'streaming-evidence-run', subjectCoreDigest: digest('4'), runnerRevision: 'runner-u4',

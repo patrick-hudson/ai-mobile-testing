@@ -1,4 +1,4 @@
-import { constants as fsConstants, createWriteStream, promises as fs } from 'node:fs';
+import { constants as fsConstants, createWriteStream, fstatSync, promises as fs } from 'node:fs';
 import { createServer } from 'node:http';
 import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -24,7 +24,13 @@ import { rejectRetiredLegacyMutation } from './shared-legacy-mutation-policy.mjs
 import { openScopedCredentialAuthority } from './scoped-credential-authority.mjs';
 import { ControlPlaneError, validateMutationDeployment } from '../shared/control-plane-contract.mjs';
 import { assertSharedListScope, classifySharedReadRequest } from './shared-read-policy.mjs';
-import { openParentRunStore } from '../scripts/lib/parent-run-store.mjs';
+import {
+  ARTIFACT_READ_LEASE_MS,
+  listAdoptedAttemptArtifacts,
+  openAdoptedAttemptArtifact,
+  openParentRunStore,
+  parentRunExists,
+} from '../scripts/lib/parent-run-store.mjs';
 import { createSharedControlService } from '../scripts/lib/shared-control-service.mjs';
 import { openPromotionClaimStore } from '../scripts/lib/promotion-claim-store.mjs';
 import {
@@ -219,7 +225,12 @@ const MAX_SSE_REPLAY_BYTES = 512 * 1024;
 const MAX_GALLERY_SSE_REPLAY_BYTES = 64 * 1024;
 const MAX_SSE_CLIENTS_PER_RUN = parseInteger(process.env.PORTAL_MAX_SSE_CLIENTS_PER_RUN, 8, 1, 64);
 const MAX_SSE_CLIENTS_TOTAL = parseInteger(process.env.PORTAL_MAX_SSE_CLIENTS_TOTAL, 64, 1, 512);
-const SHARED_READ_REAUTH_MS = parseInteger(process.env.PORTAL_SHARED_READ_REAUTH_MS, 5_000, 250, 60_000);
+const SHARED_READ_REAUTH_MS = parseInteger(
+  process.env.PORTAL_SHARED_READ_REAUTH_MS,
+  Math.floor(ARTIFACT_READ_LEASE_MS / 3),
+  250,
+  Math.floor(ARTIFACT_READ_LEASE_MS / 3),
+);
 const MAX_CONSOLE_TIMELINE_RECORDS_PER_RUN = 99;
 const GALLERY_SSE_EVENT_TYPES = new Set(['gallery', 'gallery-flag', 'snapshot', 'stage', 'status']);
 const sseCapacityDiagnostics = { refused: 0, peak: 0 };
@@ -467,6 +478,7 @@ let consoleComparativeReportWatermark = 0;
 let consoleSingleSiteReportWatermark = 0;
 let sharedControlApi = null;
 let sharedRequestAuthorizer = null;
+let sharedParentRunStore = null;
 let sharedProjectId = null;
 let legacyOperatorEnabled = true;
 
@@ -523,6 +535,7 @@ if (process.env.PORTAL_SHARED_CONTROL === '1') {
     deploymentIdentity: process.env.AUDIT_SHARED_DEPLOYMENT_IDENTITY,
     volumeIdentity: process.env.AUDIT_SHARED_VOLUME_IDENTITY,
   });
+  sharedParentRunStore = controlStore;
   const credentialAuthority = await openScopedCredentialAuthority({
     root: process.env.PORTAL_SHARED_CREDENTIAL_ROOT ?? join(SECRET_ROOT, 'control-identities'),
   });
@@ -2171,19 +2184,24 @@ async function routeRequest(request, response) {
 
   const artifactListMatch = pathname.match(/^\/api\/runs\/([^/]+)\/artifacts$/);
   if (request.method === 'GET' && artifactListMatch) {
-    const run = requireRun(decodeURIComponent(artifactListMatch[1]));
+    const runId = decodeURIComponent(artifactListMatch[1]);
     const offset = queryInteger(requestUrl.searchParams.get('offset'), 'offset', 0, 0, 1_000_000);
     const limit = queryInteger(requestUrl.searchParams.get('limit'), 'limit', DEFAULT_ARTIFACT_PAGE_SIZE, 1, MAX_ARTIFACT_PAGE_SIZE);
+    const sharedArtifacts = await listSharedArtifactsForPortal(runId, offset, limit, request);
+    if (sharedArtifacts !== null) return sendJson(response, 200, sharedArtifacts);
+    const run = requireRun(runId);
     return sendJson(response, 200, await listArtifacts(run.directory, run.manifest.id, offset, limit, request));
   }
 
   const singleSiteArtifactListMatch = pathname.match(/^\/api\/single-site\/runs\/([^/]+)\/artifacts$/);
   if (request.method === 'GET' && singleSiteArtifactListMatch) {
     const jobId = decodeURIComponent(singleSiteArtifactListMatch[1]);
-    const state = await readSingleSiteJob(singleSiteQueue, jobId);
-    const attemptRoot = singleSiteAttemptArtifactDirectory(state);
     const offset = queryInteger(requestUrl.searchParams.get('offset'), 'offset', 0, 0, 1_000_000);
     const limit = queryInteger(requestUrl.searchParams.get('limit'), 'limit', DEFAULT_ARTIFACT_PAGE_SIZE, 1, MAX_ARTIFACT_PAGE_SIZE);
+    const sharedArtifacts = await listSharedArtifactsForPortal(jobId, offset, limit, request);
+    if (sharedArtifacts !== null) return sendJson(response, 200, sharedArtifacts);
+    const state = await readSingleSiteJob(singleSiteQueue, jobId);
+    const attemptRoot = singleSiteAttemptArtifactDirectory(state);
     return sendJson(response, 200, await listArtifacts(
       attemptRoot,
       state.jobId,
@@ -2502,25 +2520,31 @@ async function routeRequest(request, response) {
   const artifactMatch = pathname.match(/^\/artifacts\/([^/]+)(?:\/(.*))?$/);
   if ((request.method === 'GET' || request.method === 'HEAD') && artifactMatch) {
     const runId = decodeURIComponent(artifactMatch[1]);
-    return withRunScopedTransfer('comparative', runId, response, () => serveArtifact(
-      request,
-      response,
-      runId,
-      artifactMatch[2] ? decodeURIComponent(artifactMatch[2]) : '',
-    ));
+    const requestedPath = artifactMatch[2] ? decodeURIComponent(artifactMatch[2]) : '';
+    if (await sharedParentRunExists(runId)) {
+      return withRunScopedTransfer('shared', runId, response,
+        () => serveSharedArtifact(request, response, runId, requestedPath));
+    }
+    return withRunScopedTransfer('comparative', runId, response,
+      () => serveArtifact(request, response, runId, requestedPath));
   }
 
 
   const singleSiteArtifactMatch = pathname.match(/^\/single-site-artifacts\/([^/]+)(?:\/(.*))?$/);
   if ((request.method === 'GET' || request.method === 'HEAD') && singleSiteArtifactMatch) {
     const jobId = decodeURIComponent(singleSiteArtifactMatch[1]);
+    const requestedPath = singleSiteArtifactMatch[2] ? decodeURIComponent(singleSiteArtifactMatch[2]) : '';
+    if (await sharedParentRunExists(jobId)) {
+      return withRunScopedTransfer('shared', jobId, response,
+        () => serveSharedArtifact(request, response, jobId, requestedPath));
+    }
     return withRunScopedTransfer('single-site', jobId, response, async () => {
       const state = await readSingleSiteJob(singleSiteQueue, jobId);
       return serveArtifactFromDirectory(
         request,
         response,
         singleSiteAttemptArtifactDirectory(state),
-        singleSiteArtifactMatch[2] ? decodeURIComponent(singleSiteArtifactMatch[2]) : '',
+        requestedPath,
       );
     });
   }
@@ -4901,35 +4925,131 @@ async function serveArtifactFromDirectory(request, response, artifactRoot, reque
     throw error;
   }
   try {
-    const verifiedFile = opened.path;
-    const relativeArtifactPath = opened.relativePath;
-    // Revision-pinned archive wrappers are inert data envelopes loaded into a
-    // second sandboxed opaque-origin iframe. They must accept that opaque parent;
-    // every other artifact document retains frame-ancestors 'self'.
-    const opaqueArchiveWrapper = /(?:^|\/)checklist\/gallery\/revisions\/export_[a-f0-9]{16}\/(?:flags\.html|(?:query|items|raw)\/.+\.html)$/.test(relativeArtifactPath);
-    const opaqueArchiveSurface = /(?:^|\/)checklist\/gallery\.html$/.test(relativeArtifactPath);
-    const sandboxSources = opaqueArchiveSurface
-      ? `default-src 'self' data: blob:; connect-src 'self'; img-src 'self' data: blob: ${artifactOrigin}; media-src 'self' data: blob: ${artifactOrigin}; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; worker-src 'self' blob:; frame-src 'self' blob: ${artifactOrigin}; font-src 'self' data:; base-uri 'none'`
-      : "default-src 'self' data: blob:; connect-src 'self'; img-src 'self' data: blob:; media-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; worker-src 'self' blob:; frame-src 'self' blob:; font-src 'self' data:; base-uri 'none'";
-    const artifactExtension = extname(verifiedFile).toLowerCase();
-    const downloadOnly = Boolean(sharedRequestAuthorizer)
-      && new Set(['.htm', '.html', '.js', '.mjs', '.pdf', '.svg', '.xhtml', '.xml']).has(artifactExtension);
-    const activeContentIsolation = downloadOnly
-      ? "default-src 'none'; frame-ancestors 'none'; sandbox"
-      : artifactExtension === '.html'
-      ? `sandbox allow-scripts allow-forms allow-downloads allow-popups; ${sandboxSources}${opaqueArchiveWrapper ? '' : "; frame-ancestors 'self'"}`
-      : "default-src 'none'; frame-ancestors 'self'";
-    const opaqueArchiveModule = /(?:^|\/)checklist\/assets\/gallery-(?:archive|core)\.js$/.test(relativeArtifactPath);
-    const transfer = sendFile(request, response, verifiedFile, activeContentIsolation, {
-      opaqueArchiveModule: opaqueArchiveModule && !downloadOnly,
-      downloadOnly,
-      opened,
-    });
+    const transfer = serveOpenedArtifact(request, response, opened, { artifactOrigin });
     opened = null;
     return await transfer;
   } finally {
     await opened?.handle?.close().catch(() => undefined);
   }
+}
+
+async function serveOpenedArtifact(request, response, opened, {
+  artifactOrigin = `http://${assertAllowedRequestHost(request)}`,
+  contentType = null,
+  etag = null,
+  forceInert = false,
+  reauthorize = true,
+} = {}) {
+  const verifiedFile = opened.path;
+  const relativeArtifactPath = opened.relativePath;
+  const opaqueArchiveWrapper = /(?:^|\/)checklist\/gallery\/revisions\/export_[a-f0-9]{16}\/(?:flags\.html|(?:query|items|raw)\/.+\.html)$/.test(relativeArtifactPath);
+  const opaqueArchiveSurface = /(?:^|\/)checklist\/gallery\.html$/.test(relativeArtifactPath);
+  const sandboxSources = opaqueArchiveSurface
+    ? `default-src 'self' data: blob:; connect-src 'self'; img-src 'self' data: blob: ${artifactOrigin}; media-src 'self' data: blob: ${artifactOrigin}; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; worker-src 'self' blob:; frame-src 'self' blob: ${artifactOrigin}; font-src 'self' data:; base-uri 'none'`
+    : "default-src 'self' data: blob:; connect-src 'self'; img-src 'self' data: blob:; media-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; worker-src 'self' blob:; frame-src 'self' blob:; font-src 'self' data:; base-uri 'none'";
+  const artifactExtension = extname(verifiedFile).toLowerCase();
+  const declaredActive = /^(?:application\/(?:javascript|pdf|xhtml\+xml|xml)|image\/svg\+xml|text\/(?:html|javascript|xml))(?:;|$)/iu.test(contentType ?? '');
+  const activeExtension = new Set(['.htm', '.html', '.js', '.mjs', '.pdf', '.svg', '.xhtml', '.xml']).has(artifactExtension);
+  const downloadOnly = forceInert || (Boolean(sharedRequestAuthorizer) && (activeExtension || declaredActive));
+  const activeContentIsolation = downloadOnly
+    ? "default-src 'none'; frame-ancestors 'none'; sandbox"
+    : artifactExtension === '.html'
+      ? `sandbox allow-scripts allow-forms allow-downloads allow-popups; ${sandboxSources}${opaqueArchiveWrapper ? '' : "; frame-ancestors 'self'"}`
+      : "default-src 'none'; frame-ancestors 'self'";
+  const opaqueArchiveModule = /(?:^|\/)checklist\/assets\/gallery-(?:archive|core)\.js$/.test(relativeArtifactPath);
+  if (reauthorize) await request.auditSharedReadGuard?.();
+  return sendFile(request, response, verifiedFile, activeContentIsolation, {
+    opaqueArchiveModule: opaqueArchiveModule && !downloadOnly,
+    downloadOnly,
+    opened,
+    contentType,
+    etag,
+    transferLease: opened.transferLease ?? null,
+    integrityFingerprint: opened.integrityFingerprint ?? null,
+  });
+}
+
+async function listSharedArtifactsForPortal(runId, offset, limit, request) {
+  if (!sharedParentRunStore) return null;
+  await request.auditSharedReadGuard?.();
+  let page;
+  try {
+    page = await listAdoptedAttemptArtifacts(sharedParentRunStore, runId, { offset, limit });
+  } catch (error) {
+    if (error?.code === 'RUN_NOT_FOUND') return null;
+    if (error?.code === 'RELEASE_AUTHORITY_TOMBSTONED') throw httpError(410, 'Run evidence has been purged.');
+    throw error;
+  }
+  const files = page.files
+    .filter(({ name }) => !isRawLogArtifactPath(name))
+    .map((artifact) => ({
+      path: artifact.logicalName,
+      name: artifact.name,
+      logicalName: artifact.logicalName,
+      purpose: artifact.purpose,
+      workItemId: artifact.workItemId,
+      attempt: artifact.attempt,
+      bytes: artifact.sizeBytes,
+      digest: artifact.digest,
+      memberDigest: artifact.memberDigest,
+      artifactKey: artifact.artifactKey,
+      modifiedAt: artifact.completedAt,
+      kind: artifactKind(artifact.name),
+      mediaType: artifact.mediaType,
+      url: sharedArtifactUrl(artifact),
+    }));
+  return { ...page, files };
+}
+
+async function sharedParentRunExists(runId) {
+  if (!sharedParentRunStore) return false;
+  return parentRunExists(sharedParentRunStore, runId);
+}
+
+async function serveSharedArtifact(request, response, runId, requestedPath) {
+  const match = /^work-items\/([A-Za-z0-9][A-Za-z0-9._-]{0,127})\/(sha256:[a-f0-9]{64})$/u.exec(requestedPath);
+  if (!match) throw httpError(404, 'Artifact not found.');
+  const workItemId = match[1];
+  await request.auditSharedReadGuard?.();
+  let result;
+  try {
+    result = await openAdoptedAttemptArtifact(sharedParentRunStore, runId, {
+      workItemId,
+      artifactKey: match[2],
+    });
+  } catch (error) {
+    if (error?.code === 'ATTEMPT_ARTIFACT_UNAVAILABLE') throw httpError(404, 'Artifact not found.');
+    if (error?.code === 'RELEASE_AUTHORITY_TOMBSTONED') throw httpError(410, 'Run evidence has been purged.');
+    throw error;
+  }
+  if (isRawLogArtifactPath(result.descriptor.name)) {
+    await result.opened.handle.close().catch(() => undefined);
+    await result.opened.transferLease?.release?.().catch(() => undefined);
+    throw httpError(404, 'Artifact not found.');
+  }
+  try {
+    const value = await serveOpenedArtifact(request, response, result.opened, {
+      contentType: result.descriptor.mediaType,
+      etag: `"${result.descriptor.digest}"`,
+      forceInert: isActiveArtifact(result.descriptor),
+      reauthorize: false,
+    });
+    result.opened = null;
+    return value;
+  } finally {
+    await result.opened?.handle?.close().catch(() => undefined);
+    await result.opened?.transferLease?.release?.().catch(() => undefined);
+  }
+}
+
+function sharedArtifactUrl(artifact) {
+  return `/artifacts/${encodeURIComponent(artifact.runId)}/work-items/${encodeURIComponent(artifact.workItemId)}/${encodeURIComponent(artifact.artifactKey)}`;
+}
+
+function isActiveArtifact(artifact) {
+  const extension = extname(artifact.name).toLowerCase();
+  return new Set(['.htm', '.html', '.js', '.mjs', '.pdf', '.svg', '.xhtml', '.xml']).has(extension)
+    || /^(?:application\/(?:javascript|pdf|xhtml\+xml|xml)|image\/svg\+xml|text\/(?:html|javascript|xml))(?:;|$)/iu.test(artifact.mediaType);
 }
 
 async function sendFile(request, response, file, contentSecurityPolicy, {
@@ -4938,6 +5058,8 @@ async function sendFile(request, response, file, contentSecurityPolicy, {
   opened = null,
   contentType = null,
   etag = null,
+  transferLease = null,
+  integrityFingerprint = null,
 } = {}) {
   let handle = opened?.handle;
   let stat = opened?.stat;
@@ -4950,14 +5072,21 @@ async function sendFile(request, response, file, contentSecurityPolicy, {
     }
   }
   let stream = null;
+  let transferHeartbeat = null;
+  let transferHeartbeatPending = false;
   let closeStarted = false;
   let resolveClosed;
   const closed = new Promise((resolveClose) => { resolveClosed = resolveClose; });
   const closeOwnedHandle = () => {
     if (closeStarted) return closed;
     closeStarted = true;
+    if (transferHeartbeat) clearInterval(transferHeartbeat);
+    transferHeartbeat = null;
     stream?.destroy();
-    void handle.close().catch(() => undefined).finally(resolveClosed);
+    void handle.close().catch(() => undefined)
+      .then(() => transferLease?.release?.())
+      .catch(() => undefined)
+      .finally(resolveClosed);
     return closed;
   };
   // Own the descriptor before any further await or response setup. Browser
@@ -4965,6 +5094,16 @@ async function sendFile(request, response, file, contentSecurityPolicy, {
   // `close` listener misses that event and leaves autoClose:false handles for GC.
   response.once('finish', closeOwnedHandle);
   response.once('close', closeOwnedHandle);
+  if (transferLease) {
+    transferHeartbeat = setInterval(() => {
+      if (transferHeartbeatPending || response.destroyed || response.writableEnded) return;
+      transferHeartbeatPending = true;
+      void Promise.all([request.auditSharedReadGuard?.(), transferLease.renew()])
+        .catch(() => response.destroy())
+        .finally(() => { transferHeartbeatPending = false; });
+    }, SHARED_READ_REAUTH_MS);
+    transferHeartbeat.unref?.();
+  }
   try {
     if (response.destroyed || response.writableEnded) {
       await closeOwnedHandle();
@@ -5002,12 +5141,21 @@ async function sendFile(request, response, file, contentSecurityPolicy, {
     const injectedDelay = process.env.PORTAL_E2E_FAILURE_INJECTION === '1'
       ? Number(request.headers['x-portal-e2e-send-file-delay-ms'] ?? 0)
       : 0;
-    if (Number.isInteger(injectedDelay) && injectedDelay > 0 && injectedDelay <= 1_000) {
+    if (Number.isInteger(injectedDelay) && injectedDelay > 0 && injectedDelay <= 20_000) {
       await new Promise((resolveDelay) => setTimeout(resolveDelay, injectedDelay));
     }
     if (response.destroyed || response.writableEnded) {
       await closeOwnedHandle();
       return;
+    }
+    if (integrityFingerprint !== null) {
+      const currentStat = fstatSync(handle.fd);
+      const currentFingerprint = [
+        currentStat.dev, currentStat.ino, currentStat.size, currentStat.mtimeMs, currentStat.ctimeMs,
+      ].join(':');
+      if (currentFingerprint !== integrityFingerprint) {
+        throw httpError(409, 'Artifact changed after its canonical integrity check.');
+      }
     }
     response.writeHead(range ? 206 : 200, headers);
     if (request.method === 'HEAD') {
@@ -5220,8 +5368,8 @@ function ignoredArtifactPath(value) {
 }
 
 function isRawLogArtifactPath(value) {
-  const segments = String(value).replaceAll('\\', '/').split('/').filter(Boolean);
-  return segments.includes('logs') || segments.some((segment) => segment.toLowerCase().endsWith('.log'));
+  const segments = String(value).replaceAll('\\', '/').split('/').filter(Boolean).map((segment) => segment.toLowerCase());
+  return segments.includes('logs') || segments.some((segment) => segment.endsWith('.log'));
 }
 
 function artifactKind(path) {

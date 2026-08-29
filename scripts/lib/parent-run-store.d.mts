@@ -6,6 +6,7 @@ export const PARENT_RUN_WRITER_PROTOCOL: 'single-coordinator-global-performance-
 export const MAX_ATTEMPT_ARTIFACTS: 64;
 export const MAX_ATTEMPT_ARTIFACT_BYTES: number;
 export const MAX_ATTEMPT_EVIDENCE_BYTES: number;
+export const ARTIFACT_READ_LEASE_MS: number;
 export interface ParentRunStore { root: string; clock(): number; manifest: any }
 export interface CoordinatorFence { ownerId: string; epoch: number; token: string; acquiredAt: string; expiresAt: string }
 export interface WorkLease { runId: string; workItemId: string; workerId: string; attempt: number; epoch: number; token: string; claimedAt: string; expiresAt: string; subjectCoreDigest: string; runnerRevision: string; capability: string; resourceClass: 'ordinary' | 'performance'; targetId: string; specAffinity: string | null; executionDescriptor: WorkExecutionDescriptor | null; executionDescriptorDigest: string | null }
@@ -16,6 +17,7 @@ export function openParentRunStore(options: any): Promise<ParentRunStore>;
 export function createParentRun(store: ParentRunStore, input: any): Promise<any>;
 export function recoverParentRun(store: ParentRunStore, runId: string): Promise<any>;
 export function readParentRun(store: ParentRunStore, runId: string): Promise<any>;
+export function parentRunExists(store: ParentRunStore, runId: string): Promise<boolean>;
 export function listParentRunIds(store: ParentRunStore, options?: { limit?: number }): Promise<string[]>;
 export function sealParentRunGraph(store: ParentRunStore, runId: string, coordinator: CoordinatorFence, input: {
   subjectCore?: unknown;
@@ -50,6 +52,19 @@ export function finalizeAttemptEvidenceUpload(store: ParentRunStore, runId: stri
 export function appendAttemptLog(store: ParentRunStore, runId: string, lease: WorkLease, entry: { sequence: number; level: 'debug' | 'info' | 'warn' | 'error'; message: string }): Promise<any>;
 export function adoptAttemptEvidence(store: ParentRunStore, runId: string, coordinator: CoordinatorFence, inbox: any): Promise<any>;
 export function readAdoptedAttemptArtifactJson(store: ParentRunStore, runId: string, input: { workItemId: string; name: string; maximumBytes?: number }): Promise<any>;
+export interface AdoptedAttemptArtifactDescriptor {
+  runId: string; workItemId: string; attempt: number; completedAt: string;
+  name: string; logicalName: string; purpose: 'structured' | 'primary' | 'diagnostic';
+  mediaType: string; sizeBytes: number; digest: string; memberDigest: string; artifactKey: string;
+}
+export function listAdoptedAttemptArtifacts(store: ParentRunStore, runId: string, options?: { offset?: number; limit?: number }): Promise<{
+  runId: string; files: AdoptedAttemptArtifactDescriptor[]; total: number; knownTotal: number;
+  totalComplete: boolean; offset: number; limit: number; nextOffset: number; hasMore: boolean;
+}>;
+export function openAdoptedAttemptArtifact(store: ParentRunStore, runId: string, input: { workItemId: string; artifactKey: string }): Promise<{
+  descriptor: AdoptedAttemptArtifactDescriptor;
+  opened: { handle: any; stat: any; path: string; relativePath: string; integrityFingerprint: string; transferLease: { token: string; renew(): Promise<void>; release(): Promise<void> } };
+}>;
 export function cancelParentRun(store: ParentRunStore, runId: string, coordinator: CoordinatorFence, input: any): Promise<any>;
 export function acceptOperation(store: ParentRunStore, runId: string, request: any): Promise<any>;
 export function getOperation(store: ParentRunStore, runId: string, idempotencyKey: string): Promise<any>;

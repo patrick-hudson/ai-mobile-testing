@@ -190,6 +190,12 @@ export function createSharedControlService({ store, projectId = 'default' } = {}
           const completed = await completeOperation(store, runId, coordinator, operation.operationId, { status: 'succeeded' });
           applied.push(completed);
         } catch (error) {
+          if (operation.kind === 'purge' && error?.code === 'ARTIFACT_READERS_ACTIVE') {
+            // The authority tombstone already prevents new reads. Keep the
+            // durable purge operation accepted so coordinator maintenance can
+            // retry after a crashed or slow reader lease drains.
+            continue;
+          }
           const completed = await completeOperation(store, runId, coordinator, operation.operationId, {
             status: 'failed', code: error?.code ?? 'CONTROL_OPERATION_FAILED', message: String(error?.message ?? error).slice(0, 1_024),
           });

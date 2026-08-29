@@ -174,7 +174,11 @@ export function createSharedCoordinatorSupervisor({
     for (const runId of runIds) {
       try {
         const state = await recoverParentRun(store, runId);
-        if (state.authorityTombstone !== null) continue;
+        if (state.authorityTombstone !== null) {
+          const operations = await controlService.applyAcceptedOperations(active, runId);
+          completedOperations += operations.filter(({ state: operationState }) => operationState === 'completed').length;
+          continue;
+        }
         requeued += await requeueExpiredWork(store, runId, active);
         if (await sealCompletedInventory(runId, state, active)) sealedGraphs += 1;
         const operations = await controlService.applyAcceptedOperations(active, runId);
