@@ -55,9 +55,13 @@ fi
 
 if [[ -d /var/lib/ai-mobile-testing/shared/canonical ]]; then
   node scripts/init-shared-admission.mjs /var/lib/ai-mobile-testing/shared/canonical
+  node scripts/init-legacy-authority-fence.mjs /var/lib/ai-mobile-testing/shared/canonical/legacy-authority
   chown -R pwuser:pwuser /var/lib/ai-mobile-testing/shared/canonical/cutover-admission
+  chown -R pwuser:pwuser /var/lib/ai-mobile-testing/shared/canonical/legacy-authority
   find /var/lib/ai-mobile-testing/shared/canonical/cutover-admission -xdev -type d -exec chmod 2770 {} +
   find /var/lib/ai-mobile-testing/shared/canonical/cutover-admission -xdev -type f -exec chmod 0660 {} +
+  find /var/lib/ai-mobile-testing/shared/canonical/legacy-authority -xdev -type d -exec chmod 2770 {} +
+  find /var/lib/ai-mobile-testing/shared/canonical/legacy-authority -xdev -type f -exec chmod 0660 {} +
 fi
 
 for volume_root in "${sensitive_roots[@]}"; do

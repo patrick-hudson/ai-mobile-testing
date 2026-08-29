@@ -19,12 +19,15 @@ import {
   loadComparativeReportPublication,
   loadSingleSiteReportPublication,
 } from '../portal/report-publication.mjs';
+import { initializeLegacyAuthorityFence } from './lib/legacy-authority-fence.mjs';
 
 const generatedAt = '2026-08-26T15:00:00.000Z';
 const temporary = await fs.mkdtemp(path.join(tmpdir(), 'portal-console-server-api-'));
 let child;
 
 try {
+  const legacyAuthorityFenceRoot = path.join(temporary, 'legacy-authority');
+  await initializeLegacyAuthorityFence({ root: legacyAuthorityFenceRoot, verifyStorage: false });
   const runRoot = path.join(temporary, 'runs');
   const shardedRoot = path.join(temporary, 'sharded');
   const queueRoot = path.join(temporary, 'queue');
@@ -113,6 +116,7 @@ try {
       PORTAL_SECRET_ROOT: path.join(temporary, 'secrets'),
       PORTAL_E2E_FAILURE_INJECTION: '1',
       PORTAL_E2E_OPERATOR_TOKEN: operatorToken,
+      AUDIT_LEGACY_AUTHORITY_FENCE_ROOT: legacyAuthorityFenceRoot,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });

@@ -31,6 +31,7 @@ import {
   portalExecutionProvenance,
   releaseReviewReasons,
 } from '../portal/release-eligibility.mjs';
+import { initializeLegacyAuthorityFence } from './lib/legacy-authority-fence.mjs';
 
 const fullProjects = 7;
 const ready = {
@@ -576,6 +577,8 @@ function assertBoundedReportCache() {
 }
 
 async function assertPortalRestartReadsLargeExternalLog(temporary) {
+  const legacyAuthorityFenceRoot = join(temporary, 'legacy-authority');
+  await initializeLegacyAuthorityFence({ root: legacyAuthorityFenceRoot, verifyStorage: false });
   const operatorToken = 'portal-e2e-operator-capability-0123456789abcdef';
   const artifacts = join(temporary, 'restart-runs');
   const sharded = join(temporary, 'restart-sharded');
@@ -677,6 +680,7 @@ async function assertPortalRestartReadsLargeExternalLog(temporary) {
     PORTAL_SECRET_ROOT: secrets,
     PORTAL_E2E_FAILURE_INJECTION: '1',
     PORTAL_E2E_OPERATOR_TOKEN: operatorToken,
+    AUDIT_LEGACY_AUTHORITY_FENCE_ROOT: legacyAuthorityFenceRoot,
   };
   delete portalEnvironment.PORTAL_RUNNER_UID;
   delete portalEnvironment.PORTAL_RUNNER_GID;

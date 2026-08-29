@@ -3,6 +3,7 @@ import * as fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { sha256 } from './lib/job-queue.mjs';
+import { initializeLegacyAuthorityFence } from './lib/legacy-authority-fence.mjs';
 import { visualBaselineDigest } from '../shared/visual-baseline-contract.mjs';
 import { validateCompleteReportPublication } from '../portal/report-publication.mjs';
 import {
@@ -177,7 +178,11 @@ async function readJson(file) {
 }
 
 const temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'single-site-pools-'));
+const previousFenceRoot = process.env.AUDIT_LEGACY_AUTHORITY_FENCE_ROOT;
 try {
+  const fenceRoot = path.join(temporaryRoot, 'legacy-authority');
+  await initializeLegacyAuthorityFence({ root: fenceRoot, verifyStorage: false });
+  process.env.AUDIT_LEGACY_AUTHORITY_FENCE_ROOT = fenceRoot;
   assert.equal(defaultWorkerId('worker_host.example'), 'worker-worker_host.example');
   assert.equal(defaultFinalizerId('finalizer_host.example'), 'finalizer-finalizer_host.example');
   assert.equal(parsePollMilliseconds('250'), 250);
@@ -333,6 +338,7 @@ try {
     revalidatePublicationCheckpoint: async () => ({ matched: true }),
   };
   const reportDependencies = {
+    legacyAuthorityFence: Object.freeze({ withAuthority: (_capability, operation) => operation() }),
     ...visualDependencies,
     ...mediaDependencies,
     preparePublicationInput: async () => ({
@@ -813,5 +819,7 @@ try {
   console.log('  incomplete/deadline/invalid states: visibly recorded');
   console.log('  tampered output and secret-bearing errors: contained');
 } finally {
+  if (previousFenceRoot === undefined) delete process.env.AUDIT_LEGACY_AUTHORITY_FENCE_ROOT;
+  else process.env.AUDIT_LEGACY_AUTHORITY_FENCE_ROOT = previousFenceRoot;
   await fs.rm(temporaryRoot, { recursive: true, force: true });
 }

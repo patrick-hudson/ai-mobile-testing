@@ -14,11 +14,14 @@ import {
   sha256,
   submitJob,
 } from './lib/job-queue.mjs';
+import { initializeLegacyAuthorityFence } from './lib/legacy-authority-fence.mjs';
 
 const temporary = await fs.mkdtemp(join(tmpdir(), 'portal-single-site-ai-api-'));
 const operatorToken = 'portal-single-site-ai-api-operator-token-0000000000000001';
 let child;
 try {
+  const legacyAuthorityFenceRoot = join(temporary, 'legacy-authority');
+  await initializeLegacyAuthorityFence({ root: legacyAuthorityFenceRoot, verifyStorage: false });
   const queueRoot = join(temporary, 'jobs');
   const finalizationRoot = join(temporary, 'finalizations');
   const queue = await openJobQueue({ root: queueRoot, verifyStorage: false });
@@ -102,22 +105,28 @@ try {
 
   const port = await availablePort();
   const baseUrl = `http://127.0.0.1:${port}`;
+  const portalEnvironment = {
+    ...process.env,
+    HOST: '127.0.0.1',
+    PORT: String(port),
+    PORTAL_ARTIFACT_ROOT: join(temporary, 'runs'),
+    PORTAL_SHARDED_ARTIFACT_ROOT: join(temporary, 'sharded'),
+    PORTAL_SINGLE_SITE_QUEUE_ROOT: queueRoot,
+    PORTAL_SINGLE_SITE_FINALIZATION_ROOT: finalizationRoot,
+    PORTAL_VISUAL_BASELINE_ROOT: join(temporary, 'baselines'),
+    PORTAL_SECRET_ROOT: join(temporary, 'secrets'),
+    PORTAL_E2E_FAILURE_INJECTION: '1',
+    PORTAL_E2E_OPERATOR_TOKEN: operatorToken,
+    AUDIT_LEGACY_AUTHORITY_FENCE_ROOT: legacyAuthorityFenceRoot,
+    AI_REVIEW_DRY_RUN: '1',
+  };
+  for (const name of [
+    'PORTAL_RUNNER_UID', 'PORTAL_RUNNER_GID', 'PORTAL_AI_WORKER_UID', 'PORTAL_AI_WORKER_GID',
+    'PORTAL_REPORT_WORKER_UID', 'PORTAL_REPORT_WORKER_GID',
+  ]) delete portalEnvironment[name];
   child = spawn(process.execPath, ['portal/server.mjs'], {
     cwd: new URL('..', import.meta.url),
-    env: {
-      ...process.env,
-      HOST: '127.0.0.1',
-      PORT: String(port),
-      PORTAL_ARTIFACT_ROOT: join(temporary, 'runs'),
-      PORTAL_SHARDED_ARTIFACT_ROOT: join(temporary, 'sharded'),
-      PORTAL_SINGLE_SITE_QUEUE_ROOT: queueRoot,
-      PORTAL_SINGLE_SITE_FINALIZATION_ROOT: finalizationRoot,
-      PORTAL_VISUAL_BASELINE_ROOT: join(temporary, 'baselines'),
-      PORTAL_SECRET_ROOT: join(temporary, 'secrets'),
-      PORTAL_E2E_FAILURE_INJECTION: '1',
-      PORTAL_E2E_OPERATOR_TOKEN: operatorToken,
-      AI_REVIEW_DRY_RUN: '1',
-    },
+    env: portalEnvironment,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let stderr = '';
@@ -160,7 +169,13 @@ try {
     confirmation: `RETRY AI ${state.jobId}`,
   });
   assert.equal(retry.status, 202, await retry.clone().text());
-  const retried = await retry.json();
+  let retried = await retry.json();
+  for (let attempt = 0; retried.state === 'pending' && attempt < 100; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const statusResponse = await fetch(`${baseUrl}${endpoint}`);
+    assert.equal(statusResponse.status, 200);
+    retried = await statusResponse.json();
+  }
   assert.equal(retried.state, 'unavailable');
   assert.equal(retried.stateRevision, 4);
   assert.equal(retried.error.code, 'isolated-worker-unavailable');

@@ -22,6 +22,7 @@ import {
   submitJob,
 } from './lib/job-queue.mjs';
 import { verifyVisualComparatorCalibration } from './lib/visual-comparator-calibration.mjs';
+import { initializeLegacyAuthorityFence } from './lib/legacy-authority-fence.mjs';
 
 const temporary = await fs.mkdtemp(join(tmpdir(), 'portal-visual-baseline-api-'));
 const operatorToken = 'portal-visual-baseline-self-test-operator-token-0000000000000001';
@@ -29,6 +30,8 @@ const comparatorCalibration = await verifyVisualComparatorCalibration();
 let child;
 
 try {
+  const legacyAuthorityFenceRoot = join(temporary, 'legacy-authority');
+  await initializeLegacyAuthorityFence({ root: legacyAuthorityFenceRoot, verifyStorage: false });
   const baselineRoot = join(temporary, 'baselines');
   const queueRoot = join(temporary, 'jobs');
   const finalizationRoot = join(temporary, 'finalizations');
@@ -109,6 +112,7 @@ try {
       PORTAL_SECRET_ROOT: join(temporary, 'secrets'),
       PORTAL_E2E_FAILURE_INJECTION: '1',
       PORTAL_E2E_OPERATOR_TOKEN: operatorToken,
+      AUDIT_LEGACY_AUTHORITY_FENCE_ROOT: legacyAuthorityFenceRoot,
       AI_REVIEW_DRY_RUN: '1',
       FFPROBE_PATH: fakeFfprobe,
       FFMPEG_PATH: fakeFfmpeg,

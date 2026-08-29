@@ -36,4 +36,4 @@ export function openLegacyAuthorityFence(options: {
 
 export function openLegacyAuthorityFenceFromEnvironment(
   environment?: Record<string, string | undefined>,
-): Promise<LegacyAuthorityFence | null>;
+): Promise<LegacyAuthorityFence>;

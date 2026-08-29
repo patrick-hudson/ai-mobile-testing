@@ -18,6 +18,7 @@ import {
   DEFAULT_RELEASE_SHARD_TOTAL,
   DEFAULT_RELEASE_SHARD_WORKERS,
 } from './lib/sharded-defaults.mjs';
+import { initializeLegacyAuthorityFence } from './lib/legacy-authority-fence.mjs';
 
 const repositoryRoot = fileURLToPath(new URL('..', import.meta.url));
 const temporaryRoot = await fs.mkdtemp(join(tmpdir(), 'audit-sharded-isolation-'));
@@ -113,6 +114,8 @@ async function assertShardedCoordinatorStopsAndTimesOut(temporaryRoot) {
   const fakeDocker = join(fakeBin, 'docker');
   const invocations = join(temporaryRoot, 'docker-invocations.log');
   const isolatedShardedRoot = join(temporaryRoot, 'sharded-artifacts');
+  const legacyAuthorityFenceRoot = join(temporaryRoot, 'legacy-authority');
+  await initializeLegacyAuthorityFence({ root: legacyAuthorityFenceRoot, verifyStorage: false });
   await fs.mkdir(fakeBin, { recursive: true });
   await fs.writeFile(fakeDocker, `#!/bin/sh
 printf '%s\\n' "$*" >> "$FAKE_DOCKER_INVOCATIONS"
@@ -137,6 +140,7 @@ wait $!
     AUDIT_COMMAND_STOP_GRACE_MS: '1000',
     AUDIT_SHARDED_HOST_ROOT: isolatedShardedRoot,
     AUDIT_SHARDED_CONTAINER_ROOT: '/work/isolated-sharded-artifacts',
+    AUDIT_LEGACY_AUTHORITY_FENCE_ROOT: legacyAuthorityFenceRoot,
   };
 
   const cancelledId = `cancel-test-${process.pid}`;

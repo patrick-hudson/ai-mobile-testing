@@ -6,6 +6,7 @@ import path from 'node:path';
 import {
   initializeLegacyAuthorityFence,
   openLegacyAuthorityFence,
+  openLegacyAuthorityFenceFromEnvironment,
 } from './lib/legacy-authority-fence.mjs';
 
 const root = await mkdtemp(path.join(tmpdir(), 'shared-cutover-reopen-fence-'));
@@ -17,8 +18,15 @@ async function expectCode(code, operation) {
 }
 
 try {
+  await expectCode('LEGACY_AUTHORITY_UNAVAILABLE', () => openLegacyAuthorityFenceFromEnvironment({}));
+  await expectCode('LEGACY_AUTHORITY_INPUT_INVALID', () => openLegacyAuthorityFenceFromEnvironment({
+    AUDIT_LEGACY_AUTHORITY_FENCE_ROOT: 'relative/fence',
+  }));
   const fenceRoot = path.join(root, 'legacy-authority');
   const fence = await initializeLegacyAuthorityFence({ root: fenceRoot, verifyStorage: false, clock });
+  assert.equal((await openLegacyAuthorityFenceFromEnvironment({
+    AUDIT_LEGACY_AUTHORITY_FENCE_ROOT: fenceRoot,
+  })).root, fence.root);
   assert.equal((await fence.read()).state, 'OPEN');
 
   let launchEntered;

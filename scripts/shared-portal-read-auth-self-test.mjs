@@ -19,6 +19,7 @@ import {
   readParentRun,
 } from './lib/parent-run-store.mjs';
 import { initializeCutoverAdmissionGate } from './lib/shared-cutover-orchestrator.mjs';
+import { initializeLegacyAuthorityFence } from './lib/legacy-authority-fence.mjs';
 
 const root = await mkdtemp(path.join(tmpdir(), 'shared-portal-read-auth-'));
 let portal = null;
@@ -34,6 +35,7 @@ try {
   const queue = path.join(root, 'queue');
   const finalizations = path.join(root, 'finalizations');
   const baselines = path.join(root, 'baselines');
+  const legacyAuthorityFenceRoot = path.join(store, 'legacy-authority');
   const sharedStoreMarker = '12'.repeat(32);
   const sharedBackupMarker = '34'.repeat(32);
   const sharedStoreMarkerFile = path.join(store, '.trusted-store-marker');
@@ -42,6 +44,7 @@ try {
   await Promise.all([artifacts, sharded, secrets, queue, finalizations, baselines, store].map((directory) => mkdir(directory, { recursive: true })));
   await writeFile(sharedStoreMarkerFile, `${sharedStoreMarker}\n`, { mode: 0o600 });
   await writeFile(sharedBackupMarkerFile, `${sharedBackupMarker}\n`, { mode: 0o600 });
+  await initializeLegacyAuthorityFence({ root: legacyAuthorityFenceRoot, verifyStorage: false });
   for (const runId of ['run-a-0001', 'run-b-0002']) {
     const directory = path.join(artifacts, runId);
     await mkdir(path.join(directory, 'logs'), { recursive: true });
@@ -183,6 +186,7 @@ try {
     AUDIT_SHARED_DEPLOYMENT_IDENTITY: 'self-test:shared-portal',
     AUDIT_SHARED_VOLUME_IDENTITY: 'named-volume:self-test-shared-portal',
     AUDIT_SHARED_PROJECT_ID: 'project-1',
+    AUDIT_LEGACY_AUTHORITY_FENCE_ROOT: legacyAuthorityFenceRoot,
     PORTAL_EXTERNAL_RUN_SYNC_MS: '60000',
     PORTAL_SHARED_READ_REAUTH_MS: '60000',
     PORTAL_E2E_FAILURE_INJECTION: '1',

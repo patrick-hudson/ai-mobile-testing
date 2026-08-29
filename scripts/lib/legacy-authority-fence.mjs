@@ -195,7 +195,12 @@ export async function openLegacyAuthorityFence(options = {}) {
 
 export async function openLegacyAuthorityFenceFromEnvironment(environment = process.env) {
   const root = environment.AUDIT_LEGACY_AUTHORITY_FENCE_ROOT;
-  if (typeof root !== 'string' || !root) return null;
+  if (typeof root !== 'string' || !root) {
+    fail(
+      'LEGACY_AUTHORITY_UNAVAILABLE',
+      'AUDIT_LEGACY_AUTHORITY_FENCE_ROOT is required for every legacy authority-bearing process.',
+    );
+  }
   if (!root.startsWith('/')) {
     fail('LEGACY_AUTHORITY_INPUT_INVALID', 'AUDIT_LEGACY_AUTHORITY_FENCE_ROOT must be absolute.');
   }
