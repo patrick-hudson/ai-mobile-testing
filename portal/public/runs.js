@@ -1,4 +1,5 @@
 import { createRecordTable, field, formatDuration, formatTime, mountConsoleIndexPage, renderRecordInspector } from './console-index-page.js';
+import { runListRefreshInterval } from './console-index-refresh.js';
 
 if (document.getElementById('runs-console')) mountConsoleIndexPage({
   rootId: 'runs-console', routeId: 'runs', title: 'Runs',
@@ -16,6 +17,7 @@ if (document.getElementById('runs-console')) mountConsoleIndexPage({
     ] },
   ],
   query: (state) => ({ mode: state.mode, scope: state.scope ?? 'all', q: state.q, state: state.state, sort: state.sort, limit: 50 }),
+  refreshIntervalFor: runListRefreshInterval,
   selectionKey: 'run', selectedId: (record) => record.runId,
   renderContent: ({ document, content, result, state, select }) => content.append(createRecordTable({
     document, records: result.page.items, state, selectionKey: 'run', selectedId: (record) => record.runId, select,

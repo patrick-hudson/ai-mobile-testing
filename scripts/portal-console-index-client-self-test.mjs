@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { createConsoleIndexClient, ConsoleIndexClientError, unsupportedConsoleQuery } from '../portal/public/console-index-client.js';
+import {
+  createConsoleIndexRefreshController,
+  overviewRefreshInterval,
+  runListRefreshInterval,
+} from '../portal/public/console-index-refresh.js';
 
 const record = Object.freeze({
   schemaVersion: 1,
@@ -135,5 +140,54 @@ for (const page of ['overview', 'runs', 'findings', 'evidence']) {
   assert.match(html, /aria-live=["']polite["']/u);
   assert.match(html, new RegExp(`src=["']/${page}\\.js["']`, 'u'));
 }
+
+const refreshTimers = new Map();
+const refreshListeners = new Map();
+let refreshTimerSequence = 0;
+let refreshHidden = false;
+let refreshCalls = 0;
+const refreshDocument = {
+  get hidden() { return refreshHidden; },
+  addEventListener(name, listener) { refreshListeners.set(name, listener); },
+  removeEventListener(name, listener) {
+    if (refreshListeners.get(name) === listener) refreshListeners.delete(name);
+  },
+};
+const refreshController = createConsoleIndexRefreshController({
+  document: refreshDocument,
+  refresh: async () => { refreshCalls += 1; },
+  intervalFor: (result) => overviewRefreshInterval(result?.page),
+  setTimer(callback, milliseconds) {
+    const id = ++refreshTimerSequence;
+    refreshTimers.set(id, { callback, milliseconds });
+    return id;
+  },
+  clearTimer(id) { refreshTimers.delete(id); },
+});
+refreshController.accept({ page: { overview: { activeRuns: { total: 7 } } } });
+assert.deepEqual([...refreshTimers.values()].map(({ milliseconds }) => milliseconds), [5_000],
+  'An Overview containing active runs must reconcile on the active cadence.');
+refreshHidden = true;
+refreshListeners.get('visibilitychange')();
+assert.equal(refreshTimers.size, 0, 'Hidden console pages must not retain background polling timers.');
+refreshHidden = false;
+refreshListeners.get('visibilitychange')();
+await Promise.resolve();
+assert.equal(refreshCalls, 1, 'A visible console page must immediately reconcile after being hidden.');
+refreshController.accept({ page: { overview: { activeRuns: { total: 0 } } } });
+assert.deepEqual([...refreshTimers.values()].map(({ milliseconds }) => milliseconds), [30_000],
+  'An idle Overview must continue bounded reconciliation on the slower cadence.');
+assert.equal(runListRefreshInterval({ items: [{ fields: { terminal: false } }] }), 5_000,
+  'A Runs page containing nonterminal work must reconcile on the active cadence.');
+assert.equal(runListRefreshInterval({ items: [{ fields: { terminal: true } }] }), 30_000,
+  'A terminal-only Runs page must reconcile on the idle cadence.');
+const scheduled = [...refreshTimers.values()][0];
+refreshTimers.clear();
+scheduled.callback();
+await Promise.resolve();
+assert.equal(refreshCalls, 2, 'The scheduled refresh must execute exactly once.');
+refreshController.destroy();
+assert.equal(refreshTimers.size, 0);
+assert.equal(refreshListeners.has('visibilitychange'), false);
 
 console.log('Portal bounded console index client self-test passed.');

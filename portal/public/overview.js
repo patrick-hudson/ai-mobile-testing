@@ -1,4 +1,5 @@
 import { mountConsoleIndexPage, field, formatTime, runHref } from './console-index-page.js';
+import { overviewRefreshInterval } from './console-index-refresh.js';
 
 const root = document.getElementById('overview-console');
 if (root) mountConsoleIndexPage({
@@ -16,6 +17,7 @@ if (root) mountConsoleIndexPage({
     ] },
   ],
   query: (state) => ({ mode: state.mode, scope: state.scope ?? 'all', sort: 'attention', limit: 100 }),
+  refreshIntervalFor: overviewRefreshInterval,
   renderContent: renderOverview,
   renderInspector: () => undefined,
   emptyText: 'No indexed runs or attention records exist for this scope.',

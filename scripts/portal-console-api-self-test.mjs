@@ -113,14 +113,17 @@ const api = createConsoleApi({
       identity,
       contextId: identity.mode === 'comparative' ? 'comparative-live' : 'single-site-live',
       authorityRevision: `authority-${capabilityCalls}`,
-      actions: [{
-        actionId: identity.mode === 'comparative' ? 'stop' : 'cancel',
+      actions: [
+        'stop', 'cancel', 'purge', 'manualEvidence', 'rekick', 'riskAcknowledge',
+        'riskResolve', 'visualDisposition', 'baseline', 'aiReview', 'settings',
+      ].map((actionId) => ({
+        actionId,
         supported: true,
         authorized: true,
         eligible: true,
         available: true,
         unavailableReason: null,
-      }],
+      })),
     }));
   },
 });
@@ -140,6 +143,14 @@ assert.equal(bounded.body.query.limit, 100, 'Limits above the route maximum must
 assert.deepEqual(bounded.body.query.filters, { state: ['queued', 'running'] });
 assert.equal(bounded.body.data.items.length, 2);
 assert.equal(bounded.body.capabilities.items.length, 2);
+assert.deepEqual(
+  bounded.body.capabilities.items[0].actions.map(({ actionId }) => actionId),
+  [
+    'stop', 'cancel', 'purge', 'manualEvidence', 'rekick', 'riskAcknowledge',
+    'riskResolve', 'visualDisposition', 'baseline', 'aiReview', 'settings',
+  ],
+  'The complete live action contract must survive capability sanitization.',
+);
 assert.equal(capabilityCalls, 1);
 assert.equal(calls[0].request.limit, 100);
 assert.deepEqual(Object.keys(calls[0].request).sort(), ['cursor', 'limit', 'mode', 'normalizedFilterKey', 'orderBy', 'recordTypes', 'scopeKey']);

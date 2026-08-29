@@ -41,7 +41,10 @@ const RESIDUAL_ESCAPE = /%[0-9A-Fa-f]{2}/u;
 const PROTOTYPE_KEY = /^(?:__proto__|prototype|constructor)$/iu;
 const SECRET_KEY = /(?:authorization|cookie|credential|password|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|bearer)/iu;
 const SECRET_VALUE = /(?:\bauthorization\s*:|\bbearer\s+[A-Za-z0-9._~+/=-]{8,}|\bsk-(?:ant-)?[A-Za-z0-9_-]{12,}|\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|cookie)\s*[=:]\s*[^\s,;]{4,}|https?:\/\/[^\s/@:]+:[^\s/@]+@)/iu;
-const ACTION_IDS = new Set(['stop', 'cancel', 'purge', 'manualEvidence', 'visualDisposition', 'baseline', 'aiReview', 'settings']);
+const ACTION_IDS = new Set([
+  'stop', 'cancel', 'purge', 'manualEvidence', 'rekick', 'riskAcknowledge', 'riskResolve',
+  'visualDisposition', 'baseline', 'aiReview', 'settings',
+]);
 const CONTEXT_IDS = new Set(['comparative-live', 'single-site-live', 'sealed-archive']);
 const ORIGIN_FIELDS = new Set(['productionOrigin', 'candidateOrigin', 'auditedOrigin']);
 const ABSOLUTE_URL = /^[A-Za-z][A-Za-z0-9+.-]*:\/\//u;

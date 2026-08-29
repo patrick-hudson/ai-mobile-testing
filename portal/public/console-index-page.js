@@ -3,6 +3,7 @@ import { createAsyncRegion } from './console-async.js';
 import { createAsyncStateBlock } from './console-components.js';
 import { createRunInvalidationBus } from './console-invalidation.js';
 import { createConsoleIndexClient, unsupportedConsoleQuery } from './console-index-client.js';
+import { createConsoleIndexRefreshController } from './console-index-refresh.js';
 import { CONSOLE_NAVIGATION_ITEMS, createConsoleShell, createConsoleSplitter } from './console-shell.js';
 import { createConsoleUrlState } from './console-url-state.js';
 
@@ -22,6 +23,7 @@ export function mountConsoleIndexPage({
   selectedId = (record) => record.recordId,
   emptyText = 'No matching records.',
   unsupportedText,
+  refreshIntervalFor = null,
 }) {
   const root = document.getElementById(rootId);
   if (!root) throw new Error(`Missing #${rootId}.`);
@@ -43,6 +45,7 @@ export function mountConsoleIndexPage({
   let pageNumber = 1;
   let cursor = null;
   let inspectorCleanup = null;
+  let refreshController = null;
 
   const region = createAsyncRegion({
     root: asyncBlock.section,
@@ -82,6 +85,17 @@ export function mountConsoleIndexPage({
     },
     isEmpty: (result) => result.blocked === true || result.page.items.length === 0,
   });
+
+  if (refreshIntervalFor !== null) {
+    if (typeof refreshIntervalFor !== 'function') throw new TypeError('Console index refresh cadence must be a function.');
+    refreshController = createConsoleIndexRefreshController({
+      document,
+      refresh: () => requestPage(null, 1),
+      intervalFor: (result) => refreshIntervalFor(result.page),
+      setTimer: window.setTimeout.bind(window),
+      clearTimer: window.clearTimeout.bind(window),
+    });
+  }
 
   const urlState = createConsoleUrlState({
     window,
@@ -160,6 +174,7 @@ export function mountConsoleIndexPage({
   }
 
   function requestPage(nextCursor, nextPageNumber) {
+    refreshController?.begin();
     cursor = nextCursor;
     pageNumber = nextPageNumber;
     const key = Object.freeze({ query: query(urlState.current.state), queryKey: requestKey, cursor, pageNumber });
@@ -167,6 +182,7 @@ export function mountConsoleIndexPage({
       if (result && (!result.page.complete || result.page.limitations.length > 0)) {
         region.setState('partial', limitationSummary(result.page));
       }
+      refreshController?.accept(result);
       return result;
     });
   }
@@ -240,6 +256,7 @@ export function mountConsoleIndexPage({
     urlState,
     destroy() {
       inspectorCleanup?.();
+      refreshController?.destroy();
       invalidation.destroy();
       region.destroy();
       urlState.destroy();

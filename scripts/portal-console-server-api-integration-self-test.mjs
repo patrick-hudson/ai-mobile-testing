@@ -125,8 +125,9 @@ try {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const responses = await Promise.all(endpoints.map(async (endpoint) => {
       const response = await fetch(`${baseUrl}/api/console/v1/${endpoint}?mode=all&scope=all&limit=100`);
-      assert.equal(response.status, 200, `${endpoint} must be served by the real console API.`);
-      return response.json();
+      const body = await response.text();
+      assert.equal(response.status, 200, `${endpoint} must be served by the real console API. ${body}`);
+      return JSON.parse(body);
     }));
     const [overview, runs, attention, evidence] = responses;
     const allItems = responses.flatMap((body) => body.data.items);
