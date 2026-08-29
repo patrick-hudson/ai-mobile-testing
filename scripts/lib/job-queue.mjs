@@ -1,6 +1,12 @@
 import { createHash, randomBytes } from 'node:crypto';
 import * as nativeFs from 'node:fs/promises';
 import path from 'node:path';
+import {
+  atomicWriteJson as durableAtomicWriteJson,
+  fsyncDirectory as durableFsyncDirectory,
+  pathExists as durablePathExists,
+  readBoundedJson as durableReadBoundedJson,
+} from './atomic-filesystem.mjs';
 
 export const JOB_QUEUE_SCHEMA_VERSION = 1;
 export const DEFAULT_HEARTBEAT_MS = 5_000;
@@ -225,14 +231,10 @@ function queuePath(queue, ...parts) {
 }
 
 async function fsyncDirectory(filesystem, directory) {
-  let handle;
   try {
-    handle = await filesystem.open(directory, 'r');
-    await handle.sync();
+    await durableFsyncDirectory(filesystem, directory);
   } catch (error) {
     fail('QUEUE_FSYNC_UNSUPPORTED', `Queue directory fsync failed for ${directory}.`, { cause: error?.code ?? String(error) });
-  } finally {
-    await handle?.close();
   }
 }
 
@@ -257,23 +259,13 @@ async function ensureSharedDirectory(filesystem, directory, { recursive = false 
 async function atomicWriteJson(queue, file, value, { exclusive = false } = {}) {
   const directory = path.dirname(file);
   await ensureSharedDirectory(queue.fs, directory, { recursive: true });
-  const temporary = path.join(directory, `.${path.basename(file)}.${process.pid}.${queue.nonce()}.tmp`);
-  let handle;
   try {
-    handle = await queue.fs.open(temporary, 'wx', SHARED_FILE_MODE);
-    await handle.chmod(SHARED_FILE_MODE);
-    await handle.writeFile(`${canonicalJson(value)}\n`, 'utf8');
-    await handle.sync();
-    await handle.close();
-    handle = null;
-    if (exclusive && await pathExists(queue.fs, file)) {
+    await durableAtomicWriteJson(queue, file, value, { exclusive, mode: SHARED_FILE_MODE });
+  } catch (error) {
+    if (error?.code === 'ATOMIC_ALREADY_EXISTS') {
       fail('QUEUE_ALREADY_EXISTS', `Queue document ${path.basename(file)} already exists.`);
     }
-    await queue.fs.rename(temporary, file);
-    await fsyncDirectory(queue.fs, directory);
-  } finally {
-    await handle?.close();
-    await queue.fs.rm(temporary, { force: true });
+    throw error;
   }
 }
 
@@ -285,20 +277,12 @@ async function atomicMove(queue, source, destination) {
 }
 
 async function readBoundedJson(queue, file, label, maxBytes = MAX_STATE_BYTES) {
-  let stat;
   try {
-    stat = await queue.fs.lstat(file);
+    return await durableReadBoundedJson(queue, file, { label, maximumBytes: maxBytes });
   } catch (error) {
-    if (error?.code === 'ENOENT') fail('QUEUE_NOT_FOUND', `${label} was not found.`);
+    if (error?.code === 'ATOMIC_NOT_FOUND') fail('QUEUE_NOT_FOUND', `${label} was not found.`);
+    if (error?.code === 'ATOMIC_CORRUPT') fail('QUEUE_CORRUPT', `${label} is corrupt.`, error.details);
     throw error;
-  }
-  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > maxBytes) {
-    fail('QUEUE_CORRUPT', `${label} is not a bounded regular file.`);
-  }
-  try {
-    return JSON.parse(await queue.fs.readFile(file, 'utf8'));
-  } catch (error) {
-    fail('QUEUE_CORRUPT', `${label} is not valid JSON.`, { cause: error?.message });
   }
 }
 
@@ -618,13 +602,7 @@ export async function readJob(queue, jobId) {
 }
 
 async function pathExists(filesystem, candidate) {
-  try {
-    await filesystem.lstat(candidate);
-    return true;
-  } catch (error) {
-    if (error?.code === 'ENOENT') return false;
-    throw error;
-  }
+  return durablePathExists(filesystem, candidate);
 }
 
 export async function verifyQueueStorageSemantics({ root, filesystem = nativeFs, nonce = () => randomBytes(8).toString('hex') }) {

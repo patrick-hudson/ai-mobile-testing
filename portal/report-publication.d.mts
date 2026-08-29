@@ -22,6 +22,11 @@ export interface ReportPublicationReadOptions {
   maximumAuditDetailBytes?: number;
   maximumPageBytes?: number;
 }
+export function loadSharedReleasePublication(
+  storeRoot: string,
+  runId: string,
+  options?: { filesystem?: typeof import('node:fs/promises'); verifyStorage?: boolean },
+): Promise<import('../shared/publication-envelope.mjs').PublicationEnvelope>;
 
 export function loadReportPublication(
   runDirectory: string,

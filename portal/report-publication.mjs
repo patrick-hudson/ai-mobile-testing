@@ -6,9 +6,22 @@ import {
   parseSingleSiteReportPage,
   parseSingleSiteReportSummary,
 } from '../scripts/lib/site-health-report.mjs';
+import { openParentRunStore, readCurrentEnvelope } from '../scripts/lib/parent-run-store.mjs';
 
 const REVISION_PATTERN = /^[a-f0-9]{32}$/;
 const REPORT_PATH_PATTERN = /^(?:summary\.json|audits\.json|audits\/[A-Z0-9-]{3,160}\.json|(?:audits|coverage|scope\/(?:selected|omitted|outside-mode))\/page-\d{6}\.json)$/;
+
+// Shared release publications are read from the store's single current head.
+// Existing compact report publications remain available through the legacy
+// readers below and cannot be mistaken for shared release authority.
+export async function loadSharedReleasePublication(storeRoot, runId, options = {}) {
+  const store = await openParentRunStore({
+    root: storeRoot,
+    filesystem: options.filesystem,
+    verifyStorage: options.verifyStorage ?? false,
+  });
+  return readCurrentEnvelope(store, runId);
+}
 
 export async function loadReportPublication(runDirectoryValue, requestedRevision = null, options = {}) {
   const runDirectory = resolve(runDirectoryValue);
