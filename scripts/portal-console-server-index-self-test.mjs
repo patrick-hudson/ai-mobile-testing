@@ -73,6 +73,8 @@ assert.match(source, /sharedPublicationToConsoleIndexRecord/u,
   'Shared parent runs must enter the global index through the canonical publication projection.');
 assert.match(source, /readStoreCoordinator/u,
   'Shared run activity must be qualified by the live durable coordinator lease.');
+assert.match(source, /readStoreCoordinator\(sharedParentRunStore\)\.catch\(\(\) => null\)/u,
+  'An unavailable coordinator snapshot must degrade activity trust without discarding readable run state.');
 assert.match(source, /projectSharedParentTimeline/u,
   'Shared parent runs must publish bounded work and recovery timeline records.');
 assert.doesNotMatch(source, /upsertConsoleRecordSet\(await sharedParentRunConsoleIndexRecord\(runId\), \[\]\)/u,

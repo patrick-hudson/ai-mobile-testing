@@ -1470,7 +1470,7 @@ async function backfillSingleSiteConsoleIndexSlice() {
 async function sharedParentRunConsoleRecordSet(runId) {
   const [parentRun, coordinator] = await Promise.all([
     readParentRun(sharedParentRunStore, runId),
-    readStoreCoordinator(sharedParentRunStore),
+    readStoreCoordinator(sharedParentRunStore).catch(() => null),
   ]);
   const observedAt = new Date().toISOString();
   const record = !parentRun.currentPublicationDigest
