@@ -7,6 +7,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const artifactRoot = path.join(repositoryRoot, 'artifacts');
 const ACTION = 'prequalify-handoff-target';
+const COORDINATOR_WAIT_TIMEOUT_SECONDS = '300';
 
 function parseArguments(argv) {
   if (argv.length !== 3 || argv[0] !== ACTION || argv[1] !== '--config'
@@ -19,13 +20,15 @@ function parseArguments(argv) {
 async function validateConfigFile(file) {
   let handle;
   let resilienceProofFile;
+  let configBytes;
   try {
     handle = await fs.open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
     const stat = await handle.stat();
     if (!stat.isFile() || stat.size < 2 || stat.size > 4 * 1_048_576) {
       throw new TypeError('Operator config must be a bounded non-empty regular file.');
     }
-    const config = JSON.parse(await handle.readFile('utf8'));
+    configBytes = await handle.readFile();
+    const config = JSON.parse(configBytes.toString('utf8'));
     if (config?.schemaVersion !== 1 || typeof config?.handoff?.resilienceProofFile !== 'string'
       || !config.handoff.resilienceProofFile.startsWith('/work/artifacts/')) {
       throw new TypeError('Operator config must use schemaVersion 1 and reference its resilience proof below /work/artifacts/.');
@@ -42,16 +45,39 @@ async function validateConfigFile(file) {
     throw new TypeError('Resilience proof must resolve to a file below the repository artifact root.');
   }
   let proofHandle;
+  let proofBytes;
   try {
     proofHandle = await fs.open(hostProofFile, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
     const stat = await proofHandle.stat();
     if (!stat.isFile() || stat.size < 2 || stat.size > 4 * 1_048_576) {
       throw new TypeError('Resilience proof must be a bounded non-empty regular file.');
     }
+    proofBytes = await proofHandle.readFile();
   } finally {
     await proofHandle?.close();
   }
-  return { hostProofFile, resilienceProofFile };
+  return { configBytes, proofBytes, resilienceProofFile };
+}
+
+async function stageContainerReadableInputs(configBytes, proofBytes) {
+  const directory = await fs.mkdtemp(path.join(artifactRoot, '.shared-authority-maintenance-'));
+  const stagedConfigFile = path.join(directory, 'operator-config.json');
+  const stagedProofFile = path.join(directory, 'resilience-proof.json');
+  try {
+    await Promise.all([
+      fs.writeFile(stagedConfigFile, configBytes, { flag: 'wx', mode: 0o444 }),
+      fs.writeFile(stagedProofFile, proofBytes, { flag: 'wx', mode: 0o444 }),
+    ]);
+    await Promise.all([fs.chmod(stagedConfigFile, 0o444), fs.chmod(stagedProofFile, 0o444)]);
+    return Object.freeze({
+      configFile: stagedConfigFile,
+      proofFile: stagedProofFile,
+      cleanup: () => fs.rm(directory, { recursive: true, force: true }),
+    });
+  } catch (error) {
+    await fs.rm(directory, { recursive: true, force: true });
+    throw error;
+  }
 }
 
 function renderCommand(command, args) {
@@ -78,33 +104,56 @@ export async function runSharedAuthorityMaintenance(argv, {
   errorOutput = process.stderr,
 } = {}) {
   const { action, configFile } = parseArguments(argv);
-  const { hostProofFile, resilienceProofFile } = await validateConfigFile(configFile);
+  const { configBytes, proofBytes, resilienceProofFile } = await validateConfigFile(configFile);
+  const staged = await stageContainerReadableInputs(configBytes, proofBytes);
   const mountedConfig = '/tmp/shared-authority-operator-config.json';
-  let coordinatorStopped = false;
+  let primaryError = null;
+  let recoveryError = null;
+  let cleanupError = null;
   try {
-    await run('docker', ['compose', 'stop', 'shared-coordinator'], {
-      cwd: repositoryRoot, output, errorOutput,
-    });
-    coordinatorStopped = true;
-    await run('docker', [
-      'compose', 'run', '--rm', '--no-deps',
-      '--volume', `${configFile}:${mountedConfig}:ro`,
-      '--volume', `${hostProofFile}:${resilienceProofFile}:ro`,
-      'shared-coordinator',
-      'node', 'scripts/run-shared-authority-cutover.mjs', action, '--config', mountedConfig,
-    ], { cwd: repositoryRoot, output, errorOutput });
-  } finally {
-    if (coordinatorStopped) {
+    try {
+      await run('docker', ['compose', 'stop', '--timeout', COORDINATOR_WAIT_TIMEOUT_SECONDS, 'shared-coordinator'], {
+        cwd: repositoryRoot, output, errorOutput,
+      });
       await run('docker', [
-        'compose', 'up', '-d', '--wait', '--wait-timeout', '60', 'shared-coordinator',
+        'compose', 'run', '--rm', '--no-deps',
+        '--volume', `${staged.configFile}:${mountedConfig}:ro`,
+        '--volume', `${staged.proofFile}:${resilienceProofFile}:ro`,
+        'shared-coordinator',
+        'node', 'scripts/run-shared-authority-cutover.mjs', action, '--config', mountedConfig,
+      ], { cwd: repositoryRoot, output, errorOutput });
+    } catch (error) {
+      primaryError = error;
+    }
+    try {
+      await run('docker', [
+        'compose', 'up', '-d', '--wait', '--wait-timeout', COORDINATOR_WAIT_TIMEOUT_SECONDS, 'shared-coordinator',
       ], {
         cwd: repositoryRoot, output, errorOutput,
       });
       await run('docker', ['compose', 'ps', 'shared-coordinator'], {
         cwd: repositoryRoot, output, errorOutput,
       });
+    } catch (error) {
+      recoveryError = error;
+    }
+  } finally {
+    try {
+      await staged.cleanup();
+    } catch (error) {
+      cleanupError = error;
     }
   }
+  if (primaryError) {
+    if (recoveryError) errorOutput.write(`[shared-authority-maintenance] Coordinator recovery also failed: ${recoveryError.message}\n`);
+    if (cleanupError) errorOutput.write(`[shared-authority-maintenance] Staging cleanup also failed: ${cleanupError.message}\n`);
+    throw primaryError;
+  }
+  if (recoveryError) {
+    if (cleanupError) errorOutput.write(`[shared-authority-maintenance] Staging cleanup also failed: ${cleanupError.message}\n`);
+    throw recoveryError;
+  }
+  if (cleanupError) throw cleanupError;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {

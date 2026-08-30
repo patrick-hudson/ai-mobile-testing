@@ -735,7 +735,7 @@ try {
   });
   const longLease = await claimWorkItem(store, 'heartbeat-run', recoveryCoordinator, {
     workerId: 'worker-long-running', workItemId: 'long-running-item',
-    capabilities: ['browser:chromium'], resourceClasses: ['ordinary'], leaseMs: 100,
+    capabilities: ['browser:chromium'], resourceClasses: ['ordinary'], leaseMs: 10_000,
   });
   let heartbeatCount = 0;
   let heartbeatTurn = 0;
@@ -752,8 +752,8 @@ try {
       await new Promise((resolve) => signal.addEventListener('abort', resolve, { once: true }));
     },
     heartbeat: async (lease) => {
-      now += 75;
-      const receipt = await heartbeatWorkItem(store, 'heartbeat-run', lease, { leaseMs: 100 });
+      now += 6_000;
+      const receipt = await heartbeatWorkItem(store, 'heartbeat-run', lease, { leaseMs: 10_000 });
       const renewed = await adoptWorkHeartbeat(store, 'heartbeat-run', recoveryCoordinator, receipt);
       assert.equal(await requeueExpiredWork(store, 'heartbeat-run', recoveryCoordinator), 0,
         'coordinator maintenance must not requeue a heartbeating long-running lease');

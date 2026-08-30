@@ -3,9 +3,15 @@ set -euo pipefail
 
 queue_root=/var/lib/ai-mobile-testing/jobs
 volume_roots=("$queue_root")
-for optional_root in /var/lib/ai-mobile-testing/shared/canonical /var/lib/ai-mobile-testing/shared/exchange; do
+for optional_root in \
+  /var/lib/ai-mobile-testing/shared/canonical \
+  /var/lib/ai-mobile-testing/shared/exchange; do
   if [[ -e "$optional_root" ]]; then volume_roots+=("$optional_root"); fi
 done
+cutover_roots=(
+  /var/lib/ai-mobile-testing/shared/backups
+  /var/lib/ai-mobile-testing/shared/restores
+)
 sensitive_roots=()
 for optional_root in \
   /var/lib/ai-mobile-testing/shared/credentials \
@@ -32,6 +38,16 @@ for volume_root in "${volume_roots[@]}"; do
   chown -R pwuser:pwuser "$volume_root"
   find "$volume_root" -xdev -type d -exec chmod 2770 {} +
   find "$volume_root" -xdev -type f -exec chmod 0660 {} +
+done
+
+for cutover_root in "${cutover_roots[@]}"; do
+  if [[ ! -e "$cutover_root" ]]; then continue; fi
+  if [[ ! -d "$cutover_root" || -L "$cutover_root" ]]; then
+    printf '[SINGLE_SITE_VOLUME_INIT] Durable cutover volume must be a real directory: %s\n' "$cutover_root" >&2
+    exit 2
+  fi
+  chown pwuser:pwuser "$cutover_root"
+  chmod 2770 "$cutover_root"
 done
 
 shared_trust_root=/var/lib/ai-mobile-testing/shared/trust

@@ -181,6 +181,19 @@ try {
   assert.match(resilienceProof, /PORTAL_ALLOWED_HOSTS: 'portal'/u,
     'only the isolated mutation-boundary proof opts the Docker service hostname into portal requests');
   assert.match(initScript, /node scripts\/init-shared-authority-floor\.mjs/u);
+  const cutoverRootBlock = initScript.slice(
+    initScript.indexOf('cutover_roots=('),
+    initScript.indexOf('shared_trust_root='),
+  );
+  for (const durableRoot of [
+    '/var/lib/ai-mobile-testing/shared/backups',
+    '/var/lib/ai-mobile-testing/shared/restores',
+  ]) {
+    assert(cutoverRootBlock.includes(durableRoot),
+      `trusted init must initialize the durable cutover volume ${durableRoot} for the non-root coordinator`);
+  }
+  assert.match(cutoverRootBlock, /chown pwuser:pwuser "\$cutover_root"[\s\S]*?chmod 2770 "\$cutover_root"/u,
+    'trusted init must change only each durable cutover volume root, not its sealed contents');
   assert.match(compose, /\n  shared-authority-floor:\s*$/mu);
   assert.match(compose, /\n  shared-store-backups:\s*$/mu);
   assert.match(compose, /\n  shared-store-restores:\s*$/mu);
