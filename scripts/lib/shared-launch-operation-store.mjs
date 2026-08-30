@@ -124,6 +124,24 @@ function validateOperation(value, expectedOperationId = null) {
   return Object.freeze(structuredClone(value));
 }
 
+export function sharedLaunchOperationIdentity({ principal, projectId, requestId } = {}) {
+  const actor = validatePrincipal(principal);
+  if (typeof projectId !== 'string' || !SAFE_PROJECT_ID.test(projectId)) {
+    fail('LAUNCH_PROJECT_INVALID', 'Server launch project is invalid.', 500);
+  }
+  if (typeof requestId !== 'string' || !SAFE_REQUEST_ID.test(requestId)) {
+    fail('IDEMPOTENCY_KEY_INVALID', 'Launch requires a 16-128 character idempotency key.', 400);
+  }
+  const operationId = canonicalDigest({
+    schemaVersion: 1,
+    kind: 'shared-launch-operation-identity',
+    projectId,
+    actor,
+    requestId,
+  }).slice('sha256:'.length);
+  return Object.freeze({ actor: Object.freeze(actor), operationId, runId: `run-${operationId.slice(0, 32)}` });
+}
+
 export async function openSharedLaunchOperationStore({
   root, clock = Date.now, verifyStorage = false, requireExisting = false,
 } = {}) {
@@ -146,23 +164,10 @@ export async function openSharedLaunchOperationStore({
 export async function acceptSharedLaunchOperation(store, {
   principal, projectId, requestId, intent, compiledPlan: rawCompiledPlan,
 } = {}) {
-  const actor = validatePrincipal(principal);
-  if (typeof projectId !== 'string' || !SAFE_PROJECT_ID.test(projectId)) {
-    fail('LAUNCH_PROJECT_INVALID', 'Server launch project is invalid.', 500);
-  }
-  if (typeof requestId !== 'string' || !SAFE_REQUEST_ID.test(requestId)) {
-    fail('IDEMPOTENCY_KEY_INVALID', 'Launch requires a 16-128 character idempotency key.', 400);
-  }
+  const { actor, operationId, runId } = sharedLaunchOperationIdentity({ principal, projectId, requestId });
   const durableIntent = structuredClone(validateIntent(intent));
   const compiledPlan = structuredClone(validateCompiledPlan(rawCompiledPlan));
   const requestDigest = canonicalDigest(durableIntent);
-  const operationId = canonicalDigest({
-    schemaVersion: 1,
-    kind: 'shared-launch-operation-identity',
-    projectId,
-    actor,
-    requestId,
-  }).slice('sha256:'.length);
   return withDirectoryLock(store, containedPath(store.root, '.launch-operations.lock'), async () => {
     const file = operationFile(store, operationId);
     let existing = null;
@@ -219,7 +224,7 @@ export async function acceptSharedLaunchOperation(store, {
       planDigest: compiledPlan.digest,
       compiledPlan,
       state: 'accepted',
-      runId: `run-${operationId.slice(0, 32)}`,
+      runId,
       outcome: null,
       acceptedAt,
       updatedAt: acceptedAt,
@@ -241,15 +246,8 @@ export async function getSharedLaunchOperation(store, operationId) {
 }
 
 export async function findSharedLaunchOperation(store, { principal, projectId, requestId, intent } = {}) {
-  const actor = validatePrincipal(principal);
-  if (typeof projectId !== 'string' || !SAFE_PROJECT_ID.test(projectId)
-    || typeof requestId !== 'string' || !SAFE_REQUEST_ID.test(requestId)) {
-    fail('IDEMPOTENCY_KEY_INVALID', 'Launch lookup identity is invalid.', 400);
-  }
+  const { operationId } = sharedLaunchOperationIdentity({ principal, projectId, requestId });
   const durableIntent = validateIntent(intent);
-  const operationId = canonicalDigest({
-    schemaVersion: 1, kind: 'shared-launch-operation-identity', projectId, actor, requestId,
-  }).slice('sha256:'.length);
   let operation;
   try { operation = await getSharedLaunchOperation(store, operationId); } catch (error) {
     if (error?.code === 'LAUNCH_OPERATION_NOT_FOUND') return null;

@@ -72,6 +72,7 @@ const consumePromotionClaim = (store, token, input) => consumePromotionClaimRaw(
 import { sealCompileRiskInputs, sealRiskSourceObservationSet } from '../shared/risk-source-observation.mjs';
 import {
   openSharedLaunchOperationStore,
+  sharedLaunchOperationIdentity,
 } from './lib/shared-launch-operation-store.mjs';
 import { createSharedLaunchService } from './lib/shared-launch-service.mjs';
 
@@ -424,6 +425,16 @@ try {
   });
   const launchOperatorIssued = await authority.createPrincipal({
     id: 'launch-operator', kind: 'human', roles: ['operator'], projectIds: ['project-1'], runIds: ['*'],
+  });
+  const exactLaunchRequestId = 'exact-scoped-launch-0001';
+  const exactLaunchIdentity = sharedLaunchOperationIdentity({
+    principal: { id: 'exact-launch-operator', kind: 'human' },
+    projectId: 'project-1',
+    requestId: exactLaunchRequestId,
+  });
+  const exactLaunchOperatorIssued = await authority.createPrincipal({
+    id: 'exact-launch-operator', kind: 'human', roles: ['operator'], projectIds: ['project-1'],
+    runIds: [exactLaunchIdentity.runId],
   });
   const operator = await authority.authenticateCredential(operatorIssued.credential);
   const control = createSharedControlService({ store: parentStore, projectId: 'project-1' });
@@ -857,6 +868,18 @@ try {
   });
   assert.equal(narrowlyScopedLaunch.status, 403,
     'a principal scoped only to existing run IDs cannot launch a new server-derived run it would be unable to inspect');
+  const exactScopedLaunch = await api.handle({
+    method: 'POST', url: '/api/control/v1/runs',
+    headers: {
+      authorization: `Bearer ${exactLaunchOperatorIssued.credential}`,
+      'content-type': 'application/json',
+      'idempotency-key': exactLaunchRequestId,
+    },
+    body: launchIntent,
+  });
+  assert.equal(exactScopedLaunch.status, 202,
+    'a principal explicitly scoped to the deterministic server-derived run may consume its one launch');
+  assert.equal(exactScopedLaunch.body.data.runId, exactLaunchIdentity.runId);
   const acceptedLaunch = await api.handle({
     method: 'POST', url: '/api/control/v1/runs',
     headers: {
@@ -875,6 +898,7 @@ try {
   assert.equal(acceptedLaunch.headers.location, acceptedLaunch.body.data.statusUrl);
   assert.equal('intent' in acceptedLaunch.body.data, false, 'launch status must not echo the full intent');
   assert.equal('compiledPlan' in acceptedLaunch.body.data, false, 'launch status must not return the internal execution plan');
+  const compileCallsBeforeDuplicate = launchCompileCalls;
   const duplicateLaunch = await api.handle({
     method: 'POST', url: '/api/control/v1/runs',
     headers: {
@@ -886,7 +910,8 @@ try {
   });
   assert.deepEqual(duplicateLaunch.body.data, acceptedLaunch.body.data,
     'an exact launch retry must return the same durable operation');
-  assert.equal(launchCompileCalls, 1, 'an exact retry must recover the pinned plan without recompiling live server state');
+  assert.equal(launchCompileCalls, compileCallsBeforeDuplicate,
+    'an exact retry must recover the pinned plan without recompiling live server state');
   const conflictingLaunch = await api.handle({
     method: 'POST', url: '/api/control/v1/runs',
     headers: {
@@ -926,9 +951,13 @@ try {
   assert.equal(narrowLaunchRead.status, 403,
     'launch-operation reads must enforce the reserved run identity as well as project scope');
   const recoveredMaterializations = await restartedLaunchService.recover();
-  assert.equal(recoveredMaterializations.completed.length, 1);
-  assert.equal(recoveredMaterializations.completed[0].state, 'completed');
-  assert.equal(recoveredMaterializations.completed[0].outcome.status, 'succeeded');
+  assert.deepEqual(
+    recoveredMaterializations.completed.map(({ runId }) => runId).sort(),
+    [acceptedLaunch.body.data.runId, exactScopedLaunch.body.data.runId].sort(),
+    'restart recovery must materialize both project-wide and exact-derived-run launches exactly once',
+  );
+  assert(recoveredMaterializations.completed.every(({ state }) => state === 'completed'));
+  assert(recoveredMaterializations.completed.every(({ outcome }) => outcome.status === 'succeeded'));
   const materializedParent = await recoverParentRun(reopenedStore, acceptedLaunch.body.data.runId);
   assert.equal(materializedParent.subjectCoreDigest, canonicalDigest(launchIntent));
   assert.deepEqual(Object.keys(materializedParent.workItems), ['inventory-launch']);

@@ -18,6 +18,11 @@ export interface SharedLaunchOperation {
 }
 export class SharedLaunchOperationError extends Error { code: string; statusCode: number }
 export const SHARED_LAUNCH_OPERATION_SCHEMA_VERSION: 1;
+export function sharedLaunchOperationIdentity(input: {
+  principal: { id: string; kind: 'human' | 'service' };
+  projectId: string;
+  requestId: string;
+}): Readonly<{ actor: Readonly<{ id: string; kind: 'human' | 'service' }>; operationId: string; runId: string }>;
 export function openSharedLaunchOperationStore(options: {
   root: string; clock?: () => number; verifyStorage?: boolean; requireExisting?: boolean;
 }): Promise<SharedLaunchOperationStore>;

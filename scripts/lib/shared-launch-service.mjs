@@ -7,6 +7,7 @@ import {
   findSharedLaunchOperation,
   getSharedLaunchOperation,
   listRecoverableSharedLaunchOperations,
+  sharedLaunchOperationIdentity,
 } from './shared-launch-operation-store.mjs';
 
 function fail(code, message, statusCode = 500) {
@@ -39,8 +40,10 @@ export function createSharedLaunchService({
 
   async function accept(principal, { requestId, intent } = {}) {
     assertPrincipalAuthorized(principal, CONTROL_ACTIONS.RUN_LAUNCH, { projectId });
-    if (!Array.isArray(principal.runIds) || !principal.runIds.includes('*')) {
-      fail('AUTHORIZATION_DENIED', 'Launching a server-derived run requires project-wide run scope.', 403);
+    const launchIdentity = sharedLaunchOperationIdentity({ principal, projectId, requestId });
+    if (!Array.isArray(principal.runIds)
+      || (!principal.runIds.includes('*') && !principal.runIds.includes(launchIdentity.runId))) {
+      fail('AUTHORIZATION_DENIED', 'Launching a server-derived run requires project-wide or exact derived-run scope.', 403);
     }
     const existing = await findSharedLaunchOperation(operationStore, {
       principal, projectId, requestId, intent,
