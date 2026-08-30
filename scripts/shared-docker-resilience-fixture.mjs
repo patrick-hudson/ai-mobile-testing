@@ -51,20 +51,25 @@ if (!Number.isSafeInteger(workItemCount) || workItemCount < 2 || workItemCount >
 if (performanceWorkItemId !== null && !/^proof-00[1-8]$/u.test(performanceWorkItemId)) {
   throw new Error('AUDIT_SHARED_PROOF_PERFORMANCE_WORK_ITEM_ID must identify one frozen proof item.');
 }
-const storeMarker = await readTrustedStoreMarker(required('AUDIT_SHARED_STORE_MARKER_FILE'));
-const backupMarker = await readTrustedStoreMarker(required('AUDIT_SHARED_BACKUP_MARKER_FILE'), 'shared backup marker');
-const buildIdentity = sharedStoreBuildIdentity();
-const store = await openParentRunStore({
-  root: required('AUDIT_SHARED_STORE_ROOT'),
-  deploymentIdentity: required('AUDIT_SHARED_DEPLOYMENT_IDENTITY'),
-  volumeIdentity: required('AUDIT_SHARED_VOLUME_IDENTITY'),
-  storeMarker,
-  storeGeneration: sharedStoreGeneration(),
-  expectedStoreGeneration: sharedStoreGeneration(),
-  buildIdentity,
-  backupMarker,
-  prequalifiedRollbackBuilds: sharedStoreRollbackBuilds(process.env, buildIdentity),
-});
+const CONTROL_CLIENT_ACTIONS = new Set(['provision-operator', 'probe-portal', 'accept-mutation']);
+let buildIdentity = null;
+let store = null;
+if (!CONTROL_CLIENT_ACTIONS.has(action)) {
+  const storeMarker = await readTrustedStoreMarker(required('AUDIT_SHARED_STORE_MARKER_FILE'));
+  const backupMarker = await readTrustedStoreMarker(required('AUDIT_SHARED_BACKUP_MARKER_FILE'), 'shared backup marker');
+  buildIdentity = sharedStoreBuildIdentity();
+  store = await openParentRunStore({
+    root: required('AUDIT_SHARED_STORE_ROOT'),
+    deploymentIdentity: required('AUDIT_SHARED_DEPLOYMENT_IDENTITY'),
+    volumeIdentity: required('AUDIT_SHARED_VOLUME_IDENTITY'),
+    storeMarker,
+    storeGeneration: sharedStoreGeneration(),
+    expectedStoreGeneration: sharedStoreGeneration(),
+    buildIdentity,
+    backupMarker,
+    prequalifiedRollbackBuilds: sharedStoreRollbackBuilds(process.env, buildIdentity),
+  });
+}
 
 if (action === 'seed') {
   const runnerRevision = runnerRevisionDigest(await resolveRunnerRevision({

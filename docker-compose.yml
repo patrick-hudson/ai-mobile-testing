@@ -217,10 +217,22 @@ services:
       AUDIT_SHARED_BUILD_IDENTITY: ${AUDIT_SHARED_BUILD_IDENTITY:-build:quitting7oh-release-audit-local}
       AUDIT_SHARED_PREQUALIFIED_ROLLBACK_BUILDS: ${AUDIT_SHARED_PREQUALIFIED_ROLLBACK_BUILDS:-build:quitting7oh-release-audit-local}
       AUDIT_SHARED_STORE_GENERATION: ${AUDIT_SHARED_STORE_GENERATION:-1}
-      AUDIT_SHARED_CREDENTIAL_ROOT: /var/lib/ai-mobile-testing/shared/credentials
     volumes:
       - shared-parent-runs:/var/lib/ai-mobile-testing/shared/canonical
       - shared-store-trust:/var/lib/ai-mobile-testing/shared/trust:ro
+
+  shared-resilience-control-client:
+    <<: *audit-base
+    profiles: [shared-proof]
+    user: pwuser
+    healthcheck:
+      disable: true
+    command: ["node", "scripts/shared-docker-resilience-fixture.mjs"]
+    restart: "no"
+    environment:
+      AUDIT_SHARED_CREDENTIAL_ROOT: /var/lib/ai-mobile-testing/shared/credentials
+      AUDIT_SHARED_PROJECT_ID: ${AUDIT_SHARED_PROJECT_ID:-default}
+    volumes:
       - shared-control-identities:/var/lib/ai-mobile-testing/shared/credentials
 
   shadow-validation:

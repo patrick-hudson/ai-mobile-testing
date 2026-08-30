@@ -869,6 +869,11 @@ try {
   assert.match(proofDriverBlock, /shared-parent-runs:/);
   assert.doesNotMatch(proofDriverBlock, /shared-control-identities|shared-worker-exchange|docker\.sock|PORTAL_SECRET|TOKEN_FILE/,
     'the proof driver may read the isolated canonical volume but must not receive control credentials, exchange storage, or host control');
+  const proofControlClientBlock = compose.match(/shared-resilience-control-client:[\s\S]*?(?=\n  [a-z][a-z0-9-]+:|\nvolumes:)/)?.[0] ?? '';
+  assert.match(proofControlClientBlock, /shared-control-identities:/,
+    'the isolated control client must receive only the scoped credential authority needed to emulate an operator');
+  assert.doesNotMatch(proofControlClientBlock, /shared-parent-runs|shared-worker-exchange|docker\.sock|PORTAL_SECRET|TOKEN_FILE/,
+    'the control client must not combine operator credentials with canonical-store, worker-exchange, or host authority');
   assert.match(sharedDispatcherSource, /AUDIT_SHARED_EVIDENCE_DIR/);
   assert.doesNotMatch(compose, /AUDIT_SHARED_(?:PERFORMANCE_)?EXECUTOR_JSON/,
     'Compose workers must use only the fixed repository-owned dispatcher.');

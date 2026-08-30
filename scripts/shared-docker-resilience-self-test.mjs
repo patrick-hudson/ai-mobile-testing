@@ -254,13 +254,16 @@ function driver(project, action, runId, {
   extraEnvironment = {},
   allowFailure = false,
 } = {}) {
+  const service = ['provision-operator', 'probe-portal', 'accept-mutation'].includes(action)
+    ? 'shared-resilience-control-client'
+    : 'shared-resilience-driver';
   const result = compose(project, ['run', '--rm', '--no-deps',
     '-e', `AUDIT_SHARED_PROOF_ACTION=${action}`,
     '-e', `AUDIT_SHARED_PROOF_RUN_ID=${runId}`,
     '-e', `AUDIT_SHARED_PROOF_WORK_ITEMS=${workItemCount}`,
     ...(performanceWorkItemId === null ? [] : ['-e', `AUDIT_SHARED_PROOF_PERFORMANCE_WORK_ITEM_ID=${performanceWorkItemId}`]),
     ...Object.entries(extraEnvironment).flatMap(([key, value]) => ['-e', `${key}=${value}`]),
-    'shared-resilience-driver'], { environment: { ...environment }, allowFailure });
+    service], { environment: { ...environment }, allowFailure });
   if (allowFailure && result.status !== 0) return { failed: true, ...result };
   const event = jsonLine(result.stdout, driverEvents[action]);
   if (action === 'inspect') {
