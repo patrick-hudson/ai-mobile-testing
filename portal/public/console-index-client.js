@@ -69,8 +69,9 @@ export function createConsoleIndexClient({
     let body;
     try { body = JSON.parse(text); } catch { throw fail('CONSOLE_RESPONSE_INVALID', 'The console response is not valid JSON.', response.status, true); }
     if (!response.ok) {
-      const code = safeErrorCode(body?.error?.code) ?? 'CONSOLE_REQUEST_FAILED';
-      throw fail(code, safeErrorMessage(body?.error?.message), response.status, response.status >= 500 || response.status === 409);
+      const code = safeErrorCode(body?.error?.code ?? body?.code) ?? 'CONSOLE_REQUEST_FAILED';
+      const message = typeof body?.error === 'string' ? body.error : body?.error?.message;
+      throw fail(code, safeErrorMessage(message), response.status, response.status >= 500 || response.status === 409);
     }
     return normalizeResponse(body, route);
   }

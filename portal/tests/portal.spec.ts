@@ -506,6 +506,74 @@ test('u5: Settings sections use bounded read-only runtime data and canonical sec
   await expect(page.locator('link[href="/styles.css"]')).toHaveCount(0);
 });
 
+test('u5: Settings reauthorizes inline, replaces a stale credential read, and restores focus', async ({ page }) => {
+  let authorized = false;
+  let keyReads = 0;
+  let releaseFirstKeyRead = () => {};
+  const firstKeyReadGate = new Promise<void>((resolve) => { releaseFirstKeyRead = resolve; });
+  await page.route('**/api/control/v1/session', async (route) => {
+    if (route.request().method() === 'POST') {
+      expect(route.request().postDataJSON()).toEqual({ credential: 'settings-operator-credential' });
+      authorized = true;
+      await route.fulfill({ status: 200, json: { schemaVersion: 1, data: {
+        principal: { id: 'settings-operator', roles: ['operator'] },
+        csrfToken: 'settings-csrf',
+        idleExpiresAt: '2026-08-30T23:30:00.000Z',
+        absoluteExpiresAt: '2026-08-31T07:00:00.000Z',
+      } } });
+      return;
+    }
+    await route.fulfill({
+      status: authorized ? 200 : 401,
+      json: authorized
+        ? { schemaVersion: 1, data: { principal: { id: 'settings-operator', roles: ['operator'] }, csrfToken: 'settings-csrf', idleExpiresAt: '2026-08-30T23:30:00.000Z', absoluteExpiresAt: '2026-08-31T07:00:00.000Z' } }
+        : { schemaVersion: 1, error: { code: 'SESSION_EXPIRED', message: 'Browser session has expired.' } },
+    });
+  });
+  await page.route('**/api/settings/anthropic-key', async (route) => {
+    keyReads += 1;
+    if (keyReads === 1) {
+      await firstKeyReadGate;
+      await route.fulfill({ status: 401, json: { error: 'Browser session has expired.', code: 'SESSION_EXPIRED' } }).catch(() => {});
+      return;
+    }
+    releaseFirstKeyRead();
+    await route.fulfill({ json: { configured: false, fingerprint: null, storageEnabled: true, unavailableReason: null } });
+  });
+
+  await page.goto('/settings.html?section=credentials');
+  const banner = page.locator('[data-console-session-banner]');
+  await expect(banner).toBeVisible();
+  await expect(page.locator('#system-status')).toHaveText('Shared session expired');
+  await expect(page.locator('#console-inspector')).toContainText('Expired — authorization required');
+  await expect(page.locator('#console-inspector')).not.toContainText('Authenticated operator session');
+  await banner.getByRole('button', { name: 'Authorize' }).click();
+  await banner.getByLabel('Operator credential').fill('settings-operator-credential');
+  await banner.getByRole('button', { name: 'Unlock console' }).click();
+  await expect(page.locator('#anthropic-key-state')).toHaveText('Not configured');
+  await expect(page.locator('#system-status')).toHaveText('Shared session active');
+  await expect(page.locator('#console-inspector')).toContainText('Authenticated as settings-operator');
+  await expect(banner).toBeHidden();
+  await expect(page.getByRole('heading', { name: 'Settings', exact: true })).toBeFocused();
+  expect(keyReads).toBe(2);
+});
+
+test('u5: Settings exposes inline authorization when a later Baselines read expires', async ({ page }) => {
+  await page.route('**/api/control/v1/session', (route) => route.fulfill({
+    status: 200,
+    json: { schemaVersion: 1, data: { principal: { id: 'settings-operator', roles: ['operator'] }, csrfToken: 'settings-csrf', idleExpiresAt: '2026-08-30T23:30:00.000Z', absoluteExpiresAt: '2026-08-31T07:00:00.000Z' } },
+  }));
+  await page.route('**/api/single-site/visual-baselines?*', (route) => route.fulfill({
+    status: 401,
+    json: { error: 'Browser session has expired.', code: 'SESSION_EXPIRED' },
+  }));
+
+  await page.goto('/settings.html?section=test-catalog');
+  await page.getByRole('button', { name: 'Baselines' }).click();
+  await expect(page.locator('[data-console-session-banner]')).toBeVisible();
+  await expect(page.locator('[data-console-session-banner]')).toContainText('session expired');
+});
+
 test('aborted file responses release their owned descriptors immediately', async () => {
   test.skip(process.platform !== 'linux', 'Descriptor accounting uses the Linux process filesystem inside Docker.');
   const portalBaseUrl = process.env.PORTAL_E2E_BASE_URL;

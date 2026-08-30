@@ -1,5 +1,6 @@
 import { parseConsoleUrlState, serializeConsoleUrlState } from '/console-contracts.mjs';
 import { createAsyncRegion } from './console-async.js';
+import { createConsoleSessionBanner } from './console-session-banner.js';
 import { CONSOLE_NAVIGATION_ITEMS, createConsoleShell, createFocusManager } from './console-shell.js';
 import { createConsoleUrlState } from './console-url-state.js';
 
@@ -30,7 +31,7 @@ inspectorCopy.textContent = 'Catalog and environment data are runtime-managed. B
 const inspectorList = document.createElement('dl');
 inspectorList.className = 'console-definition-list';
 appendInspectorDefinition('Credential secret', 'Never returned');
-appendInspectorDefinition('Credential actor', 'Authenticated operator session');
+const credentialActor = appendInspectorDefinition('Credential actor', 'Checking browser session…');
 appendInspectorDefinition('Baselines', 'Read-only inventory');
 appendInspectorDefinition('Environment edits', 'Runtime-managed');
 shell.inspector.append(inspectorHeading, inspectorCopy, inspectorList);
@@ -53,6 +54,7 @@ const state = {
   pending: new Set(),
   config: null,
   configPromise: null,
+  keyLoadController: null,
   keySettings: { known: false, configured: false, fingerprint: null, storageEnabled: false, unavailableReason: null },
   keyDeleteArmed: false,
   keyDeleteBinding: null,
@@ -76,12 +78,35 @@ const baselineRegion = createAsyncRegion({
   load: ({ signal }) => requestJson('/api/single-site/visual-baselines?offset=0&limit=50', { signal }),
   render: renderBaselines,
   isEmpty: (value) => value.items.length === 0,
+  onError: handleProtectedRegionError,
 });
 const environmentRegion = createAsyncRegion({
   root: elements.sectionRegions.get('environments'),
   load: ({ signal }) => loadConfig(signal),
   render: renderEnvironments,
   isEmpty: () => false,
+});
+const sessionBanner = createConsoleSessionBanner({
+  document,
+  shell,
+  onAuthorized: reloadAfterAuthorization,
+  onStateChange({ state: sessionState, session }) {
+    if (sessionState === 'authorized') {
+      connection.textContent = 'Shared session active';
+      credentialActor.textContent = session?.principal?.id
+        ? `Authenticated as ${bounded(session.principal.id, 120)}`
+        : 'Authenticated shared session';
+    } else if (sessionState === 'expired') {
+      connection.textContent = 'Shared session expired';
+      credentialActor.textContent = 'Expired — authorization required';
+    } else if (sessionState === 'required') {
+      connection.textContent = 'Shared authorization required';
+      credentialActor.textContent = 'Not authenticated';
+    } else if (sessionState === 'unavailable') {
+      connection.textContent = 'Settings ready';
+      credentialActor.textContent = 'Shared authorization is not enabled';
+    }
+  },
 });
 
 bindEvents();
@@ -95,7 +120,6 @@ state.urlState = createConsoleUrlState({
   onRestoreFocus(key) { focus.focus(key, shell.heading); },
 });
 applySection(initial.state.section ?? 'credentials');
-connection.textContent = 'Settings ready';
 
 function bindEvents() {
   for (const [section, button] of elements.sectionButtons) {
@@ -110,10 +134,12 @@ function bindEvents() {
   });
   window.addEventListener('pagehide', () => {
     clearKeyDeleteConfirmation();
+    state.keyLoadController?.abort();
     state.urlState?.destroy();
     catalogRegion.destroy();
     baselineRegion.destroy();
     environmentRegion.destroy();
+    sessionBanner.destroy();
     focus.destroy();
   }, { once: true });
 }
@@ -127,7 +153,7 @@ function applySection(section) {
     elements.sectionButtons.get(id).toggleAttribute('aria-current', selected);
     elements.sectionRegions.get(id).hidden = !selected;
   }
-  if (section === 'credentials' && !state.keySettings.known && !state.pending.has('key-load')) {
+  if (section === 'credentials' && !state.keySettings.known && !state.keyLoadController) {
     void loadAnthropicKeySettings();
   }
   if (section === 'test-catalog' && catalogRegion.snapshot.value === null && catalogRegion.snapshot.key === null) void catalogRegion.request('config');
@@ -141,23 +167,27 @@ async function loadConfig(signal) {
     state.configPromise = requestJson('/api/config', { signal }).then((config) => {
       state.config = config;
       state.configPromise = null;
-      connection.textContent = config.operator?.authorized ? 'Operator ready' : 'Operator authorization required';
       return config;
     }, (error) => {
       state.configPromise = null;
+      if (error?.status === 401 || error?.status === 403) sessionBanner.requireAuthentication(error);
       throw error;
     });
   }
   return state.configPromise;
 }
 
-async function loadAnthropicKeySettings({ announceResult = false } = {}) {
-  if (!beginOperation('key-load')) return;
+async function loadAnthropicKeySettings({ announceResult = false, force = false } = {}) {
+  if (state.keyLoadController && !force) return;
+  state.keyLoadController?.abort();
+  const controller = new AbortController();
+  state.keyLoadController = controller;
   setRegionBusy(elements.keySettings, true);
   elements.keyState.textContent = 'Checking…';
   elements.keyState.className = 'settings-state loading';
   try {
-    const value = await requestJson('/api/settings/anthropic-key');
+    const value = await requestJson('/api/settings/anthropic-key', { signal: controller.signal });
+    if (state.keyLoadController !== controller) return;
     if (state.keyDeleteArmed && credentialBinding(value) !== state.keyDeleteBinding) {
       clearKeyDeleteConfirmation();
       setKeyMessage('Credential capability changed. Review the current state before deleting.', true);
@@ -165,6 +195,8 @@ async function loadAnthropicKeySettings({ announceResult = false } = {}) {
     applyKeySettings(value);
     if (announceResult) announce('Anthropic API key settings refreshed.');
   } catch (error) {
+    if (state.keyLoadController !== controller || error?.name === 'AbortError') return;
+    if (error?.status === 401 || error?.status === 403) sessionBanner.requireAuthentication(error);
     const message = friendlyError(error);
     state.keySettings.known = false;
     elements.keyState.textContent = 'Status unavailable';
@@ -173,9 +205,11 @@ async function loadAnthropicKeySettings({ announceResult = false } = {}) {
     elements.deleteKey.disabled = true;
     if (announceResult) announce(`API key settings could not be loaded. ${message}`);
   } finally {
-    setRegionBusy(elements.keySettings, false);
-    endOperation('key-load');
-    renderKeySettings();
+    if (state.keyLoadController === controller) {
+      state.keyLoadController = null;
+      setRegionBusy(elements.keySettings, false);
+      renderKeySettings();
+    }
   }
 }
 
@@ -477,6 +511,21 @@ function appendInspectorDefinition(label, value) {
   term.textContent = label;
   detail.textContent = value;
   inspectorList.append(term, detail);
+  return detail;
+}
+
+async function reloadAfterAuthorization() {
+  state.config = null;
+  state.configPromise = null;
+  state.keySettings.known = false;
+  if (state.activeSection === 'credentials') await loadAnthropicKeySettings({ announceResult: true, force: true });
+  else if (state.activeSection === 'test-catalog') await catalogRegion.request('config', { refresh: true });
+  else if (state.activeSection === 'baselines') await baselineRegion.request('baselines', { refresh: true });
+  else if (state.activeSection === 'environments') await environmentRegion.request('config', { refresh: true });
+}
+
+function handleProtectedRegionError(error) {
+  if (error?.status === 401 || error?.status === 403) sessionBanner.requireAuthentication(error);
 }
 
 function setKeyMessage(message, error = false, success = false) {
@@ -526,8 +575,10 @@ async function requestJson(url, options = {}) {
   }, timeoutMs);
   const value = await response.json().catch(() => ({ error: `Request failed (${response.status})` }));
   if (!response.ok) {
-    const error = new Error(value.error ?? `Request failed (${response.status})`);
+    const message = typeof value.error === 'string' ? value.error : value.error?.message;
+    const error = new Error(message ?? `Request failed (${response.status})`);
     error.status = response.status;
+    error.code = value.error?.code ?? value.code;
     error.body = value;
     throw error;
   }

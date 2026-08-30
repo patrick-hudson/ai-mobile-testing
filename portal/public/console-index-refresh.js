@@ -25,6 +25,7 @@ export function createConsoleIndexRefreshController({
   let timer = null;
   let destroyed = false;
   let refreshing = false;
+  let paused = false;
   let lastResult = null;
 
   const cancelTimer = () => {
@@ -34,7 +35,7 @@ export function createConsoleIndexRefreshController({
 
   const schedule = () => {
     cancelTimer();
-    if (destroyed || document.hidden || lastResult === null) return;
+    if (destroyed || paused || document.hidden || lastResult === null) return;
     const milliseconds = intervalFor(lastResult);
     if (!Number.isSafeInteger(milliseconds)
       || milliseconds < MINIMUM_REFRESH_MS || milliseconds > MAXIMUM_REFRESH_MS) {
@@ -47,7 +48,7 @@ export function createConsoleIndexRefreshController({
   };
 
   async function trigger() {
-    if (destroyed || document.hidden || refreshing) return false;
+    if (destroyed || paused || document.hidden || refreshing) return false;
     cancelTimer();
     refreshing = true;
     try {
@@ -71,6 +72,11 @@ export function createConsoleIndexRefreshController({
       if (result !== null && result !== undefined) lastResult = result;
       schedule();
     },
+    pause() {
+      paused = true;
+      cancelTimer();
+    },
+    resume() { paused = false; },
     destroy() {
       if (destroyed) return;
       destroyed = true;

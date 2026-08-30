@@ -4,6 +4,7 @@ import { createAsyncStateBlock } from './console-components.js';
 import { createRunInvalidationBus } from './console-invalidation.js';
 import { createConsoleIndexClient, unsupportedConsoleQuery } from './console-index-client.js';
 import { createConsoleIndexRefreshController } from './console-index-refresh.js';
+import { createConsoleSessionBanner } from './console-session-banner.js';
 import { CONSOLE_NAVIGATION_ITEMS, createConsoleShell, createConsoleSplitter } from './console-shell.js';
 import { createConsoleUrlState } from './console-url-state.js';
 
@@ -46,6 +47,15 @@ export function mountConsoleIndexPage({
   let cursor = null;
   let inspectorCleanup = null;
   let refreshController = null;
+  const sessionBanner = createConsoleSessionBanner({
+    document,
+    shell,
+    autoRestore: false,
+    onAuthorized: () => {
+      refreshController?.resume();
+      return requestPage(null, 1);
+    },
+  });
 
   const region = createAsyncRegion({
     root: asyncBlock.section,
@@ -56,6 +66,10 @@ export function mountConsoleIndexPage({
     },
     describeFreshness: (result, loadedAt) => describeIndexFreshness(result?.page, loadedAt),
     onError: (error, context) => {
+      if (error?.status === 401 || error?.status === 403) {
+        refreshController?.pause();
+        sessionBanner.requireAuthentication(error);
+      }
       if (error?.code === 'CONSOLE_CURSOR_STALE' && context.key?.cursor) {
         cursor = null;
         pageNumber = 1;
@@ -258,6 +272,7 @@ export function mountConsoleIndexPage({
       inspectorCleanup?.();
       refreshController?.destroy();
       invalidation.destroy();
+      sessionBanner.destroy();
       region.destroy();
       urlState.destroy();
       splitter.destroy();

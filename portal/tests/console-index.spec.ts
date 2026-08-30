@@ -162,6 +162,50 @@ test.describe('bounded console index surfaces', () => {
     await expect(page.locator('#runs-index [data-async-retry]')).toBeHidden();
   });
 
+  test('expired shared sessions offer inline authorization and retry the blocked Findings region', async ({ page }) => {
+    let authorized = false;
+    let findingReads = 0;
+    await page.route('**/api/control/v1/session', async (route) => {
+      if (route.request().method() === 'POST') {
+        authorized = true;
+        const body = route.request().postDataJSON();
+        expect(body.credential).toBe('scoped-operator-credential');
+        await route.fulfill({ status: 200, json: { schemaVersion: 1, data: {
+          csrfToken: 'csrf-token',
+          idleExpiresAt: '2026-08-30T23:30:00.000Z',
+          absoluteExpiresAt: '2026-08-31T07:00:00.000Z',
+        } } });
+        return;
+      }
+      await route.fulfill({
+        status: authorized ? 200 : 401,
+        json: authorized
+          ? { schemaVersion: 1, data: { principal: { id: 'operator-local-cutover', roles: ['operator'] }, csrfToken: 'csrf-token', idleExpiresAt: '2026-08-30T23:30:00.000Z', absoluteExpiresAt: '2026-08-31T07:00:00.000Z' } }
+          : { schemaVersion: 1, error: { code: 'SESSION_EXPIRED', message: 'Browser session has expired.' } },
+      });
+    });
+    await page.route('**/api/console/v1/attention?*', async (route) => {
+      findingReads += 1;
+      if (!authorized) {
+        await route.fulfill({ status: 401, json: { error: 'Browser session has expired.', code: 'SESSION_EXPIRED' } });
+        return;
+      }
+      await route.fulfill({ status: 200, json: response('attention', [record('attention', 'authenticated-finding')]) });
+    });
+
+    await page.goto('/findings.html');
+    const banner = page.locator('[data-console-session-banner]');
+    await expect(banner).toBeVisible();
+    await expect(banner).toContainText('session expired');
+    await banner.getByRole('button', { name: 'Authorize' }).click();
+    await banner.getByLabel('Operator credential').fill('scoped-operator-credential');
+    await banner.getByRole('button', { name: 'Unlock console' }).click();
+
+    await expect(page.getByRole('button', { name: 'authenticated-finding' })).toBeVisible();
+    await expect(banner).toBeHidden();
+    expect(findingReads).toBeGreaterThanOrEqual(2);
+  });
+
   test('Runs canonicalizes URL state, keeps selection addressable, and replaces bounded pages', async ({ page }) => {
     const apiUrls: string[] = [];
     await page.route('**/api/console/v1/**', (route) => fulfillIndex(route, (routeId, url) => {

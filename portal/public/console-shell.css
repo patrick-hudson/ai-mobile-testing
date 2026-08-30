@@ -74,6 +74,27 @@ button, input, select { font: inherit; }
 .console-context-header > p { align-self: start; margin: 0.2rem 0 0; color: var(--console-muted); font-size: 0.86rem; }
 .console-context-actions { display: flex; grid-row: 1 / span 2; grid-column: 2; gap: 0.65rem; align-items: center; }
 
+.console-session-banner {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.75rem 1rem;
+  align-items: center;
+  padding: 0.75rem 1.25rem;
+  border-bottom: 1px solid #c58a24;
+  border-left: 4px solid #c58a24;
+  background: #fff6df;
+  color: #402f13;
+}
+.console-session-banner[hidden] { display: none; }
+.console-session-summary { display: grid; gap: 0.15rem; }
+.console-session-summary strong { font-size: 0.84rem; }
+.console-session-summary span { font-size: 0.78rem; line-height: 1.4; }
+.console-session-form { display: flex; grid-column: 1 / -1; gap: 0.6rem; align-items: end; }
+.console-session-form[hidden] { display: none; }
+.console-session-form label { display: grid; flex: 1; gap: 0.2rem; font-size: 0.75rem; font-weight: 750; }
+.console-session-form input { min-height: 2.75rem; border: 1px solid var(--console-rule-strong); padding: 0.55rem 0.65rem; background: var(--console-surface); color: var(--console-ink); }
+.console-session-form-status { align-self: center; max-width: 26rem; color: var(--console-muted); font-size: 0.75rem; }
+
 .console-connection-block { display: grid; gap: 0.1rem; text-align: right; }
 .console-connection-block strong { font-size: 0.8rem; }
 .console-connection-block span { color: var(--console-muted); font-size: 0.72rem; }
@@ -152,6 +173,8 @@ button, input, select { font: inherit; }
 
 @media (max-width: 560px) {
   .console-context-header { grid-template-columns: 1fr; padding: 0.8rem; }
+  .console-session-banner { grid-template-columns: 1fr; padding: 0.8rem; }
+  .console-session-form { flex-direction: column; align-items: stretch; }
   .console-context-actions { grid-row: auto; grid-column: auto; justify-content: flex-start; }
   .console-connection-block { text-align: left; }
   .console-main { padding: 0.75rem; }

@@ -144,6 +144,18 @@ const stale = createConsoleIndexClient({
 });
 await assert.rejects(() => stale.runs({}, { cursor: 'cursor_1' }), (error) => error.code === 'CONSOLE_CURSOR_STALE' && error.retryable === true);
 
+const expiredSharedSession = createConsoleIndexClient({
+  fetch: async () => jsonResponse({ error: 'Browser session has expired.', code: 'SESSION_EXPIRED' }, { status: 401 }),
+});
+await assert.rejects(
+  () => expiredSharedSession.findings({}),
+  (error) => error instanceof ConsoleIndexClientError
+    && error.code === 'SESSION_EXPIRED'
+    && error.message === 'Browser session has expired.'
+    && error.status === 401,
+  'Shared read authorization errors must preserve their top-level code and message.',
+);
+
 const evidenceSource = await readFile(new URL('../portal/public/evidence.js', import.meta.url), 'utf8');
 assert.equal(/\bfetch\s*\(/u.test(evidenceSource), false, 'Evidence must not bypass the shared bounded index client.');
 assert.match(evidenceSource, /createElement\(['"]img['"]\)/u, 'The selected inspector must support screenshot evidence.');
@@ -185,6 +197,15 @@ const refreshController = createConsoleIndexRefreshController({
 refreshController.accept({ page: { overview: { activeRuns: { total: 7 } } } });
 assert.deepEqual([...refreshTimers.values()].map(({ milliseconds }) => milliseconds), [5_000],
   'An Overview containing active runs must reconcile on the active cadence.');
+refreshController.pause();
+assert.equal(refreshTimers.size, 0, 'Authorization loss must cancel scheduled console refreshes.');
+refreshListeners.get('visibilitychange')();
+await Promise.resolve();
+assert.equal(refreshCalls, 0, 'A paused console must not retry protected reads on visibility changes.');
+refreshController.resume();
+refreshController.accept({ page: { overview: { activeRuns: { total: 7 } } } });
+assert.deepEqual([...refreshTimers.values()].map(({ milliseconds }) => milliseconds), [5_000],
+  'A reauthorized console must resume its normal refresh cadence.');
 refreshHidden = true;
 refreshListeners.get('visibilitychange')();
 assert.equal(refreshTimers.size, 0, 'Hidden console pages must not retain background polling timers.');
