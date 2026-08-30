@@ -184,7 +184,7 @@ export function validateSharedDockerResilienceProof(report, { expectedWorkspaceR
   assert.equal(report.invariants.performanceIsolation.utilization?.length, 1);
   const performanceSample = report.invariants.performanceIsolation.utilization[0];
   assert(typeof performanceSample?.container === 'string'
-    && performanceSample.container.endsWith('shared-worker-performance'));
+    && performanceSample.container.endsWith('-shared-worker-performance-1'));
   finite(performanceSample.cpuPercent, 'performance cpuPercent');
   finite(performanceSample.memoryPercent, 'performance memoryPercent');
   assert(typeof performanceSample.memoryUsage === 'string' && performanceSample.memoryUsage.length > 0);

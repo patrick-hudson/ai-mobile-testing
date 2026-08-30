@@ -81,7 +81,7 @@ const valid = {
       capability: 'performance:lighthouse', resourceClass: 'performance', runningOrdinaryAtExclusiveBoundary: 0,
       attempts: 1, outcome: 'completed_pass', invariantDigest: digest('9'),
       utilization: [{
-        container: 'proof-performance-isolation-shared-worker-performance', cpuPercent: 75,
+        container: 'proof-performance-isolation-shared-worker-performance-1', cpuPercent: 75,
         memoryPercent: 15, memoryUsage: '600MiB / 4GiB', pids: 40,
         nanoCpus: 2_000_000_000, memoryBytes: 4_294_967_296,
       }],
@@ -130,6 +130,7 @@ const rejected = [
   (report) => { report.invariants.performanceIsolation.runningOrdinaryAtExclusiveBoundary = 1; },
   (report) => { report.invariants.performanceIsolation.attempts = 2; },
   (report) => { delete report.invariants.performanceIsolation.invariantDigest; },
+  (report) => { report.invariants.performanceIsolation.utilization[0].container = 'proof-performance-isolation-shared-worker-performance'; },
   (report) => { report.invariants.performanceIsolation.utilization[0].nanoCpus = 1_000_000_000; },
   (report) => { report.crashBoundaries.pop(); },
   (report) => { report.crashBoundaries[0].boundary = 'generic-coordinator-kill'; resealReceipt(report, 0); },
