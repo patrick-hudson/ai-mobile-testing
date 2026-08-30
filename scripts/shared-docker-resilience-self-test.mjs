@@ -809,8 +809,15 @@ try {
   ]).stdout, 'built image runner revision');
   assert.equal(runnerRevisionDigest(imageRevision), runnerRevisionDigest(workspaceRevision),
     'the shared proof image must contain the exact current runner source revision');
+  const composeConfiguration = JSON.parse(execute('docker', [
+    'compose', '--profile', 'shared-proof', 'config', '--format', 'json',
+  ]).stdout);
+  const proofImage = oneLine(
+    composeConfiguration.services?.['shared-resilience-driver']?.image,
+    'configured proof image name',
+  );
   const imageId = oneLine(execute('docker', [
-    'compose', '--profile', 'shared-proof', 'images', '-q', 'shared-resilience-driver',
+    'image', 'inspect', '--format', '{{.Id}}', proofImage,
   ]).stdout, 'built proof image ID');
   assert.match(imageId, /^sha256:[a-f0-9]{64}$/u, 'the built proof image must have a content-addressed image ID');
   await runSteady('warm-one', 1, 0);
