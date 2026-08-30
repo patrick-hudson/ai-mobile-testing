@@ -28,13 +28,13 @@ import {
   classifyVisualDifference,
   reviewVisualComparison,
   visualComparisonUnavailable,
-} from '../audit/visual-policy.ts';
+} from '../audit/visual-policy.mjs';
 import {
   VisualComparisonDependencyError,
   compareVisualBaselineFiles,
   compareVisualImageBuffers,
   loadVisualComparisonDependencies,
-} from './compare-visual-baselines.ts';
+} from './compare-visual-baselines.mjs';
 
 function digestCharacter(character) {
   return `sha256:${character.repeat(64)}`;

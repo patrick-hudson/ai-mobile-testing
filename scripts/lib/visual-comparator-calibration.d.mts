@@ -25,4 +25,4 @@ export function verifiedVisualComparisonDependencies(
   calibration: VisualComparatorCalibrationBinding,
 ): VisualComparisonDependencies;
 export function visualComparatorCalibrationEqual(left: unknown, right: unknown): boolean;
-import type { VisualComparisonDependencies } from '../compare-visual-baselines.ts';
+import type { VisualComparisonDependencies } from '../compare-visual-baselines.mjs';

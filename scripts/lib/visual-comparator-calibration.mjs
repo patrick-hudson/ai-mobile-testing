@@ -2,9 +2,9 @@ import { constants as fsConstants, promises as fs } from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { VISUAL_COMPARISON_POLICY } from '../../audit/visual-policy.js';
+import { VISUAL_COMPARISON_POLICY } from '../../audit/visual-policy.mjs';
 import { visualBaselineCanonicalJson, visualBaselineDigest } from '../../shared/visual-baseline-contract.mjs';
-import { loadVisualComparisonDependencies } from '../compare-visual-baselines.ts';
+import { loadVisualComparisonDependencies } from '../compare-visual-baselines.mjs';
 
 export const VISUAL_COMPARATOR_CALIBRATION_REVISION = 'visual-comparator-real-png-v1';
 export const VISUAL_COMPARATOR_CALIBRATION_CORPUS_DIGEST = 'sha256:3b5e3f973a74824b92afda18c9d61beaf069ec8cde49163417ebe13a2d86c382';

@@ -5,46 +5,10 @@ import {
   VISUAL_COMPARISON_POLICY,
   classifyVisualDifference,
   visualComparisonUnavailable,
-  type VisualComparisonResult,
-} from '../audit/visual-policy.js';
+} from '../audit/visual-policy.mjs';
 
 const MAX_IMAGE_BYTES = 100 * 1024 * 1024;
 const INSTALL_MESSAGE = 'Visual comparison requires direct dependencies pixelmatch@7.1.0 and pngjs@7.0.0; add them to package.json and the lockfile before enabling production comparisons.';
-
-export interface DecodedVisualImage {
-  width: number;
-  height: number;
-  data: Uint8Array;
-}
-
-export interface VisualComparisonDependencies {
-  decodePng(bytes: Uint8Array): DecodedVisualImage;
-  encodePng(image: DecodedVisualImage): Uint8Array;
-  pixelmatch(
-    baseline: Uint8Array,
-    current: Uint8Array,
-    output: Uint8Array,
-    width: number,
-    height: number,
-    options: {
-      includeAA: boolean;
-      threshold: number;
-      alpha: number;
-      diffColor: readonly [number, number, number];
-      aaColor: readonly [number, number, number];
-    },
-  ): number;
-}
-
-export interface VisualImageComparison {
-  comparison: VisualComparisonResult;
-  width: number;
-  height: number;
-  baselineDimensions: { width: number; height: number };
-  currentDimensions: { width: number; height: number };
-  dimensionChanged: boolean;
-  diffPng: Uint8Array;
-}
 
 export class VisualComparisonDependencyError extends Error {
   constructor(message = INSTALL_MESSAGE) {
@@ -53,7 +17,7 @@ export class VisualComparisonDependencyError extends Error {
   }
 }
 
-function dimensions(image: DecodedVisualImage, label: string): DecodedVisualImage {
+function dimensions(image, label) {
   if (!Number.isSafeInteger(image.width) || image.width < 1 || image.width > 20_000
     || !Number.isSafeInteger(image.height) || image.height < 1 || image.height > 20_000
     || !(image.data instanceof Uint8Array) || image.data.length !== image.width * image.height * 4) {
@@ -62,7 +26,7 @@ function dimensions(image: DecodedVisualImage, label: string): DecodedVisualImag
   return image;
 }
 
-function canvas(image: DecodedVisualImage, width: number, height: number): Uint8Array {
+function canvas(image, width, height) {
   if (image.width === width && image.height === height) return image.data;
   const output = new Uint8Array(width * height * 4);
   for (let row = 0; row < image.height; row += 1) {
@@ -72,20 +36,13 @@ function canvas(image: DecodedVisualImage, width: number, height: number): Uint8
   return output;
 }
 
-export async function loadVisualComparisonDependencies(): Promise<VisualComparisonDependencies> {
+export async function loadVisualComparisonDependencies() {
   try {
-    // Variable specifiers keep these required production dependencies out of the
-    // TypeScript resolver until the package manifest deliberately declares them.
     const pixelmatchName = 'pixelmatch';
     const pngjsName = 'pngjs';
     const [pixelmatchModule, pngModule] = await Promise.all([import(pixelmatchName), import(pngjsName)]);
-    const pixelmatch = pixelmatchModule.default as VisualComparisonDependencies['pixelmatch'];
-    const PNG = (pngModule as unknown as { PNG: {
-      sync: {
-        read(bytes: Uint8Array): { width: number; height: number; data: Uint8Array };
-        write(image: { width: number; height: number; data: Uint8Array }): Uint8Array;
-      };
-    } }).PNG;
+    const pixelmatch = pixelmatchModule.default;
+    const { PNG } = pngModule;
     if (typeof pixelmatch !== 'function' || !PNG?.sync?.read || !PNG?.sync?.write) throw new Error('unsupported module interface');
     return {
       decodePng: (bytes) => PNG.sync.read(bytes),
@@ -97,11 +54,7 @@ export async function loadVisualComparisonDependencies(): Promise<VisualComparis
   }
 }
 
-export function compareVisualImageBuffers(
-  baselineBytes: Uint8Array,
-  currentBytes: Uint8Array,
-  dependencies: VisualComparisonDependencies,
-): VisualImageComparison {
+export function compareVisualImageBuffers(baselineBytes, currentBytes, dependencies) {
   if (!(baselineBytes instanceof Uint8Array) || baselineBytes.length < 1 || baselineBytes.length > MAX_IMAGE_BYTES
     || !(currentBytes instanceof Uint8Array) || currentBytes.length < 1 || currentBytes.length > MAX_IMAGE_BYTES) {
     throw new TypeError('Visual comparison inputs must be bounded non-empty PNG byte buffers.');
@@ -138,7 +91,7 @@ export function compareVisualImageBuffers(
   });
 }
 
-async function boundedRegularFile(pathValue: string, label: string): Promise<Uint8Array> {
+async function boundedRegularFile(pathValue, label) {
   const path = resolve(pathValue);
   const stat = await fs.lstat(path);
   if (!stat.isFile() || stat.isSymbolicLink() || stat.size < 1 || stat.size > MAX_IMAGE_BYTES) {
@@ -148,11 +101,7 @@ async function boundedRegularFile(pathValue: string, label: string): Promise<Uin
   try { return await handle.readFile(); } finally { await handle.close(); }
 }
 
-export async function compareVisualBaselineFiles(input: {
-  baselinePath: string;
-  currentPath: string;
-  dependencies?: VisualComparisonDependencies;
-}): Promise<VisualImageComparison | { comparison: VisualComparisonResult; error: string }> {
+export async function compareVisualBaselineFiles(input) {
   let dependencies;
   try { dependencies = input.dependencies ?? await loadVisualComparisonDependencies(); } catch (error) {
     return {
@@ -174,9 +123,9 @@ export async function compareVisualBaselineFiles(input: {
   }
 }
 
-async function main(): Promise<void> {
+async function main() {
   const args = process.argv.slice(2);
-  const value = (name: string): string | null => {
+  const value = (name) => {
     const index = args.indexOf(name);
     const candidate = index >= 0 ? args[index + 1] : undefined;
     return candidate ?? null;
@@ -185,7 +134,7 @@ async function main(): Promise<void> {
   const currentPath = value('--current');
   const diffPath = value('--diff');
   if (!baselinePath || !currentPath || !diffPath) {
-    throw new Error('Usage: compare-visual-baselines.ts --baseline BASELINE.png --current CURRENT.png --diff DIFF.png');
+    throw new Error('Usage: compare-visual-baselines.mjs --baseline BASELINE.png --current CURRENT.png --diff DIFF.png');
   }
   const result = await compareVisualBaselineFiles({ baselinePath, currentPath });
   if ('diffPng' in result) {

@@ -1,4 +1,4 @@
-import type { VisualComparisonDependencies } from '../compare-visual-baselines.ts';
+import type { VisualComparisonDependencies } from '../compare-visual-baselines.mjs';
 import type { SingleSiteVisualComparisonPublication } from './single-site-visual-comparisons.mjs';
 
 export function publishSingleSiteVisualComparisonsForTest(

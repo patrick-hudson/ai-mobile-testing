@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PNG } from 'pngjs';
 import pixelmatch from 'pixelmatch';
-import { VISUAL_COMPARISON_POLICY } from '../audit/visual-policy.js';
+import { VISUAL_COMPARISON_POLICY } from '../audit/visual-policy.mjs';
 import { visualBaselineCanonicalJson, visualBaselineDigest } from '../shared/visual-baseline-contract.mjs';
 
 const WIDTH = 160;

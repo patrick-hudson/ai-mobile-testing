@@ -50,7 +50,7 @@
     "single-site-purge:self-test": "node scripts/single-site-purge-self-test.mjs",
     "visual-comparator-calibration:self-test": "node scripts/visual-comparator-calibration-self-test.mjs",
     "single-site-visual-comparisons:self-test": "node scripts/single-site-visual-comparisons-self-test.mjs",
-    "visual-baseline:self-test": "node --import tsx scripts/visual-baseline-self-test.mjs",
+    "visual-baseline:self-test": "node scripts/visual-baseline-self-test.mjs",
     "portal-visual-baseline-api:self-test": "node scripts/portal-visual-baseline-api-self-test.mjs",
     "portal": "node scripts/start-portal.mjs",
     "portal:container": "node portal/server.mjs",

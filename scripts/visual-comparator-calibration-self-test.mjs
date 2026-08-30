@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import pixelmatch from 'pixelmatch';
 import { PNG } from 'pngjs';
-import { VISUAL_COMPARISON_POLICY } from '../audit/visual-policy.js';
+import { VISUAL_COMPARISON_POLICY } from '../audit/visual-policy.mjs';
 import { visualBaselineDigest } from '../shared/visual-baseline-contract.mjs';
 import {
   VISUAL_COMPARATOR_CALIBRATION_CORPUS_DIGEST,

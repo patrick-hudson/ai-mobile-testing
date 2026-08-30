@@ -9,8 +9,8 @@ import {
   visualBaselineDigest,
 } from '../../shared/visual-baseline-contract.mjs';
 import { resolveVisualBaseline } from '../../portal/visual-baselines.mjs';
-import { visualComparisonUnavailable } from '../../audit/visual-policy.ts';
-import { compareVisualBaselineFiles } from '../compare-visual-baselines.ts';
+import { visualComparisonUnavailable } from '../../audit/visual-policy.mjs';
+import { compareVisualBaselineFiles } from '../compare-visual-baselines.mjs';
 import {
   verifyVisualComparatorCalibration,
   verifyPublishedVisualComparatorCalibration,

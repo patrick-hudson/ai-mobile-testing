@@ -2,8 +2,8 @@ import { readFile } from 'node:fs/promises';
 import type { Page } from '@playwright/test';
 import { ENVIRONMENTS, projectMetadata, resolveEnvironmentPath } from '../audit/environments.js';
 import { REPRESENTATIVE_VISUAL_ROUTES } from '../audit/routes.js';
-import { visualComparisonUnavailable } from '../audit/visual-policy.js';
-import { compareVisualBaselineFiles } from '../scripts/compare-visual-baselines.js';
+import { visualComparisonUnavailable } from '../audit/visual-policy.mjs';
+import { compareVisualBaselineFiles } from '../scripts/compare-visual-baselines.mjs';
 import {
   expect,
   standaloneStaticEvidence,
