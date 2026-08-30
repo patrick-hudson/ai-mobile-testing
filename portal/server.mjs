@@ -5335,6 +5335,11 @@ async function sendFile(request, response, file, contentSecurityPolicy, {
       ? Number(request.headers['x-portal-e2e-send-file-delay-ms'] ?? 0)
       : 0;
     if (Number.isInteger(injectedDelay) && injectedDelay > 0 && injectedDelay <= 20_000) {
+      const readyFile = process.env.PORTAL_E2E_SEND_FILE_READY_FILE;
+      if (readyFile !== undefined) {
+        if (!isAbsolute(readyFile)) throw new Error('PORTAL_E2E_SEND_FILE_READY_FILE must be absolute.');
+        await fs.writeFile(readyFile, `${Date.now()}\n`, { mode: 0o600 });
+      }
       await new Promise((resolveDelay) => setTimeout(resolveDelay, injectedDelay));
     }
     if (response.destroyed || response.writableEnded) {

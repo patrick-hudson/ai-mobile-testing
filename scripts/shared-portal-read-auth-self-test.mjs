@@ -42,6 +42,7 @@ try {
   const authorityFloorRoot = path.join(root, 'authority-floor');
   const backupRoot = path.join(root, 'backups');
   const restoreRoot = path.join(root, 'restores');
+  const sendFileReadyFile = path.join(root, 'send-file-ready');
   const sharedStoreMarker = '12'.repeat(32);
   const sharedBackupMarker = '34'.repeat(32);
   const sharedStoreMarkerFile = path.join(store, '.trusted-store-marker');
@@ -244,6 +245,7 @@ try {
     PORTAL_SHARED_READ_REAUTH_MS: '60000',
     PORTAL_SINGLE_SITE_AI_REVIEW_SYNC_MS: '500',
     PORTAL_E2E_FAILURE_INJECTION: '1',
+    PORTAL_E2E_SEND_FILE_READY_FILE: sendFileReadyFile,
   };
   for (const name of [
     'PORTAL_RUNNER_UID', 'PORTAL_RUNNER_GID', 'PORTAL_AI_WORKER_UID', 'PORTAL_AI_WORKER_GID',
@@ -452,13 +454,14 @@ try {
     assert.match(mismatchedActive.headers.get('content-security-policy') ?? '', /default-src 'none'/u);
   }
 
+  await rm(sendFileReadyFile, { force: true });
   const racedSharedRequest = fetch(`${origin}${sharedCanaryUrl}`, {
     headers: {
       Cookie: viewerACookie.cookie,
       'x-portal-e2e-send-file-delay-ms': '1000',
     },
   });
-  await new Promise((resolve) => setTimeout(resolve, 500));
+  await waitForFile(sendFileReadyFile);
   await writeFile(
     path.join(store, 'runs', sharedRunId, sharedCanary.relativePath),
     Buffer.alloc(sharedCanary.sizeBytes, 0x79),
@@ -625,6 +628,20 @@ async function waitForConsoleRun(origin, cookie, runId) {
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   assert.fail(`Shared run ${runId} did not reach the console index. ${JSON.stringify(lastBody?.limitations ?? [])}`);
+}
+
+async function waitForFile(file) {
+  const deadline = Date.now() + 8_000;
+  while (Date.now() < deadline) {
+    try {
+      await readFile(file);
+      return;
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.fail(`Timed out waiting for portal test rendezvous file ${file}.`);
 }
 
 async function startPortal({ environment, origin }) {
