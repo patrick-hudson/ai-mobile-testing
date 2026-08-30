@@ -37,12 +37,13 @@ async function routeSharedGallery(page: Page, mode: SharedMode, runId: string, o
         : { schemaVersion: 1, error: { code: 'AUTHENTICATION_REQUIRED', message: 'Authentication is required.' } } });
     }
     const root = `/api/control/v1/runs/${runId}`;
-    if (url.pathname === `${root}/publication`) {
+    if (url.pathname === `${root}/workspace`) {
       if (publicationFailures > 0) {
         publicationFailures -= 1;
         return route.fulfill({ status: 503, json: { error: { code: 'TEMPORARILY_UNAVAILABLE', message: 'The publication reader is restarting.' } } });
       }
       if (options.denyPublication) return route.fulfill({ status: 403, json: { error: { code: 'OBJECT_SCOPE_DENIED', message: 'This principal cannot view that run.' } } });
+      if (options.revisionMismatch) return route.fulfill({ status: 409, json: { error: { code: 'SHARED_CONTROL_REVISION_RACE', message: 'The run changed while loading one coherent revision.' } } });
       const expandedRisks = [...view.riskRegister.risks];
       const baseRisk = view.riskRegister.risks[0];
       if (!baseRisk && (options.riskCount ?? 0) > 0) throw new Error('The shared gallery risk fixture requires a base risk.');
@@ -56,29 +57,38 @@ async function routeSharedGallery(page: Page, mode: SharedMode, runId: string, o
         });
       }
       return route.fulfill({ json: { schemaVersion: 1, data: {
-        runId,
-        runRevision: view.revisions.run,
-        decisionRevision: view.revisions.decision,
-        riskRevision: view.revisions.risk,
-        finalSubjectDigest: view.subjectDigest,
-        decision: view.decision,
-        riskRegister: { ...view.riskRegister, risks: expandedRisks },
+        schemaVersion: 1,
+        snapshotToken: `sha256:${'a'.repeat(64)}`,
+        stateRevision: view.revisions.run,
+        publication: {
+          runId,
+          runRevision: view.revisions.run,
+          decisionRevision: view.revisions.decision,
+          riskRevision: view.revisions.risk,
+          finalSubjectDigest: view.subjectDigest,
+          decision: view.decision,
+          riskRegister: { ...view.riskRegister, risks: expandedRisks },
+        },
+        executions: {
+          runId,
+          runRevision: view.revisions.run,
+          executions: [
+            { id: 'work-active', state: 'leased', feature: 'navigation' },
+            { id: 'work-incomplete', state: 'incomplete', feature: 'search' },
+            { id: 'work-complete', state: 'completed_pass', completedAt: '2026-08-29T14:05:00.000Z' },
+          ],
+          oracleExecutions: [{ id: 'oracle-navigation' }],
+        },
+        logs: {
+          runId,
+          runRevision: view.revisions.run,
+          limit: 200,
+          truncated: false,
+          events: [{ kind: 'operation', state: 'recovering', executionId: 'work-incomplete' }],
+          attemptLogs: [{ executionId: 'work-active', state: 'running', message: 'Bounded redacted log.' }],
+        },
       } } });
     }
-    if (url.pathname === `${root}/executions`) return route.fulfill({ json: { schemaVersion: 1, data: {
-      runId, runRevision: options.revisionMismatch ? view.revisions.run - 1 : view.revisions.run,
-      executions: [
-        { id: 'work-active', state: 'leased', feature: 'navigation' },
-        { id: 'work-incomplete', state: 'incomplete', feature: 'search' },
-        { id: 'work-complete', state: 'completed_pass', completedAt: '2026-08-29T14:05:00.000Z' },
-      ],
-      oracleExecutions: [{ id: 'oracle-navigation' }],
-    } } });
-    if (url.pathname === `${root}/logs`) return route.fulfill({ json: { schemaVersion: 1, data: {
-      runId, runRevision: view.revisions.run, limit: 200, truncated: false,
-      events: [{ kind: 'operation', state: 'recovering', executionId: 'work-incomplete' }],
-      attemptLogs: [{ executionId: 'work-active', state: 'running', message: 'Bounded redacted log.' }],
-    } } });
     const comparativeGallery = `/api/runs/${runId}/gallery`;
     const singleGallery = `/api/single-site/runs/${runId}/gallery`;
     if (url.pathname === comparativeGallery) return route.fulfill({ status: 404, json: { error: { code: 'GALLERY_NOT_FOUND', message: 'No legacy gallery exists.' } } });
