@@ -606,8 +606,10 @@ async function runInventorySealCrashBoundary() {
     const runId = 'proof-boundary-inventory-seal';
     compose(project, ['down', '-v', '--remove-orphans'], { allowFailure: true });
     compose(project, ['run', '--rm', '--no-deps', 'single-site-volume-init']);
-    driver(project, 'seed-inventory-completed', runId);
-    await new Promise((resolve) => setTimeout(resolve, 150));
+    const staged = driver(project, 'seed-inventory-completed', runId);
+    const coordinatorExpiry = Date.parse(staged.coordinatorExpiresAt);
+    assert(Number.isFinite(coordinatorExpiry), 'inventory staging must return the exact coordinator lease expiry');
+    await new Promise((resolve) => setTimeout(resolve, Math.max(0, coordinatorExpiry - Date.now() + 150)));
     const environment = crashEnvironment(boundary);
     compose(project, ['up', '-d', 'shared-coordinator'], { environment });
     const containerId = compose(project, ['ps', '-aq', 'shared-coordinator'], { environment }).stdout.trim();

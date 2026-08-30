@@ -203,7 +203,7 @@ if (action === 'seed') {
     deploymentIdentity,
   });
   await createParentRun(store, { runId, ...launch.createParentRunInput });
-  const coordinator = await acquireStoreCoordinator(store, { ownerId: 'proof-inventory-seeder', leaseMs: 100 });
+  let coordinator = await acquireStoreCoordinator(store, { ownerId: 'proof-inventory-seeder', leaseMs: 5_000 });
   // The proof driver owns the only coordinator fence while staging the
   // completed inventory barrier. Use the normal claim API so the adoption is
   // indistinguishable from a real inventory worker publication.
@@ -237,8 +237,11 @@ if (action === 'seed') {
       contentBase64: inventoryBytes.toString('base64'),
     }],
   });
+  coordinator = await heartbeatCoordinator(store, coordinator, { leaseMs: 5_000 });
   await adoptAttemptEvidence(store, runId, coordinator, inbox);
-  process.stdout.write(`${JSON.stringify({ event: 'shared-resilience-inventory-staged', runId })}\n`);
+  process.stdout.write(`${JSON.stringify({
+    event: 'shared-resilience-inventory-staged', runId, coordinatorExpiresAt: coordinator.expiresAt,
+  })}\n`);
 } else if (action === 'stale-fence-probe') {
   const current = await readStoreCoordinator(store);
   if (current === null || current.epoch < 2) throw new Error('Recovered coordinator did not advance its fence.');
@@ -251,13 +254,15 @@ if (action === 'seed') {
   }
   process.stdout.write(`${JSON.stringify({ event: 'shared-resilience-stale-fence-probed', runId, outcome, currentEpoch: current.epoch })}\n`);
 } else if (action === 'activate-authority') {
-  const coordinator = await acquireStoreCoordinator(store, { ownerId: 'proof-authority-activator', leaseMs: 100 });
+  const coordinator = await acquireStoreCoordinator(store, { ownerId: 'proof-authority-activator', leaseMs: 5_000 });
   const shadow = await readReleaseAuthoritySelector(store);
   const draining = await transitionReleaseAuthority(store, coordinator, {
     expectedSelectorDigest: shadow.digest, phase: 'DRAINING', buildIdentity,
   });
   const active = await transitionReleaseAuthority(store, coordinator, {
     expectedSelectorDigest: draining.digest, phase: 'ACTIVE', activationRevision: 1, buildIdentity,
+    activationCutoverDigest: canonicalDigest({ proof: 'shared-resilience-activation-cutover' }),
+    authorityTransitionDigest: canonicalDigest({ proof: 'shared-resilience-activation-transition' }),
   });
   process.stdout.write(`${JSON.stringify({ event: 'shared-resilience-authority-activated', runId, selector: active })}\n`);
 } else if (action === 'read-failpoint') {
