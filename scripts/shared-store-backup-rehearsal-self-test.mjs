@@ -21,7 +21,10 @@ function seal(body) {
   return { ...body, digest: canonicalDigest(body) };
 }
 
-function storeDocuments() {
+function storeDocuments({ active = false } = {}) {
+  const activationRevision = active ? 41 : null;
+  const activationCutoverDigest = active ? canonicalDigest({ cutover: 'backup-rehearsal-active' }) : null;
+  const authorityTransitionDigest = active ? canonicalDigest({ transition: 'backup-rehearsal-active' }) : null;
   const manifest = seal({
     schemaVersion: 2,
     kind: 'durable-parent-run-store',
@@ -34,8 +37,8 @@ function storeDocuments() {
     currentWriterProtocol: 'single-coordinator-global-performance-v2',
     minimumWriterProtocol: 'single-coordinator-global-performance-v2',
     coordinatorEpoch: 11,
-    activationEpoch: 0,
-    activationRevision: null,
+    activationEpoch: active ? 1 : 0,
+    activationRevision,
     createdAt: '2026-08-29T18:00:00.000Z',
     cutoverRevision: 41,
     backupMarker,
@@ -46,13 +49,15 @@ function storeDocuments() {
     kind: 'release-authority-selector',
     storeMarkerDigest: manifest.storeMarkerDigest,
     storeGeneration: manifest.storeGeneration,
-    phase: 'DRAINING',
-    activationEpoch: 0,
-    activationRevision: null,
-    activatedAt: null,
-    activeWriterProtocol: null,
+    phase: active ? 'ACTIVE' : 'DRAINING',
+    activationEpoch: active ? 1 : 0,
+    activationRevision,
+    activatedAt: active ? '2026-08-29T18:05:00.000Z' : null,
+    activeWriterProtocol: active ? manifest.currentWriterProtocol : null,
     minimumWriterProtocol: manifest.minimumWriterProtocol,
-    activeBuildIdentity: null,
+    activeBuildIdentity: active ? buildIdentity : null,
+    authorityTransitionDigest,
+    activationCutoverDigest,
     backupMarker,
     prequalifiedRollbackBuilds: [buildIdentity],
     revision: 3,
@@ -76,9 +81,9 @@ function expectedStore(manifest) {
   };
 }
 
-async function createFixture(base, name = 'store') {
+async function createFixture(base, name = 'store', documents = storeDocuments()) {
   const sourceRoot = path.join(base, name);
-  const { manifest, selector } = storeDocuments();
+  const { manifest, selector } = documents;
   await mkdir(path.join(sourceRoot, 'runs', 'run-001', 'evidence', 'empty'), { recursive: true });
   await writeFile(path.join(sourceRoot, '.coordinator-mutation-lock'), '');
   await writeFile(path.join(sourceRoot, 'store-manifest.json'), `${canonicalJson(manifest)}\n`);
@@ -154,6 +159,25 @@ try {
     backupMarker,
     limits: options(fixture, destinations).limits,
   })).digest, receipt.digest);
+
+  const activeFixture = await createFixture(root, 'active-store', storeDocuments({ active: true }));
+  const activeDestinations = paths(root, 'active');
+  const activeReceipt = await rehearseSharedStoreBackup(options(activeFixture, activeDestinations, 'active'));
+  assert.equal(activeReceipt.activationEpoch, 1,
+    'post-activation handoff backups must preserve activated authority');
+  assert.equal(activeReceipt.selectorDigest, activeFixture.selector.digest,
+    'the backup receipt must bind the selector carrying cutover and transition identities');
+  const tamperedActiveSelector = structuredClone(activeFixture.selector);
+  tamperedActiveSelector.authorityTransitionDigest = canonicalDigest({ transition: 'tampered' });
+  await writeFile(
+    path.join(activeFixture.sourceRoot, 'release-authority-selector.json'),
+    `${canonicalJson(tamperedActiveSelector)}\n`,
+  );
+  await assert.rejects(
+    rehearseSharedStoreBackup(options(activeFixture, paths(root, 'active-tampered'), 'active-tampered')),
+    (error) => error?.code === 'BACKUP_BINDING_MISMATCH',
+    'tampering with the selector transition identity must invalidate backup qualification',
+  );
 
   const tamperedReceipt = structuredClone(receipt);
   tamperedReceipt.configurationDigest = canonicalDigest({ fixture: 'tampered' });

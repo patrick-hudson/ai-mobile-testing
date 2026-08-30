@@ -28,7 +28,8 @@ const MANIFEST_KEYS = Object.freeze([
 const SELECTOR_KEYS = Object.freeze([
   'schemaVersion', 'kind', 'storeMarkerDigest', 'storeGeneration', 'phase',
   'activationEpoch', 'activationRevision', 'activatedAt', 'activeWriterProtocol',
-  'minimumWriterProtocol', 'activeBuildIdentity', 'backupMarker',
+  'minimumWriterProtocol', 'activeBuildIdentity', 'authorityTransitionDigest',
+  'activationCutoverDigest', 'backupMarker',
   'prequalifiedRollbackBuilds', 'revision', 'previousDigest', 'updatedAt', 'digest',
 ]);
 const EXPECTED_STORE_KEYS = Object.freeze([
@@ -193,9 +194,11 @@ function validateSelector(value, manifest) {
   const active = ['ACTIVE', 'PROMOTION_DISABLED'].includes(value.phase);
   if ((active && (value.activationEpoch !== 1 || value.activationRevision === null
     || value.activatedAt === null || value.activeWriterProtocol !== manifest.currentWriterProtocol
-    || typeof value.activeBuildIdentity !== 'string' || value.activeBuildIdentity.length === 0))
+    || typeof value.activeBuildIdentity !== 'string' || value.activeBuildIdentity.length === 0
+    || !DIGEST.test(value.authorityTransitionDigest) || !DIGEST.test(value.activationCutoverDigest)))
     || (!active && (value.activationEpoch !== 0 || value.activationRevision !== null
-      || value.activatedAt !== null || value.activeWriterProtocol !== null || value.activeBuildIdentity !== null))) {
+      || value.activatedAt !== null || value.activeWriterProtocol !== null || value.activeBuildIdentity !== null
+      || value.authorityTransitionDigest !== null || value.activationCutoverDigest !== null))) {
     fail('BACKUP_BINDING_MISMATCH', 'Release-authority selector activation fields are inconsistent.');
   }
   if (value.activatedAt !== null) canonicalTimestamp(value.activatedAt, 'release-authority selector activatedAt', 'BACKUP_STORE_INVALID');
