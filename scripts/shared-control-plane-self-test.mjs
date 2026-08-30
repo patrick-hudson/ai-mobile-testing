@@ -149,22 +149,31 @@ try {
     AUDIT_SHARED_WORKER_B_CREDENTIAL_FILE: path.join(provisionRoot, 'ordinary-b', 'token'),
     AUDIT_SHARED_PERFORMANCE_CREDENTIAL_FILE: path.join(provisionRoot, 'performance', 'token'),
   };
+  const portalOperatorCredentialFile = path.join(provisionRoot, 'portal-operator', 'token');
   const provisionEnvironment = {
     ...process.env,
     AUDIT_SHARED_CREDENTIAL_ROOT: path.join(provisionRoot, 'authority'),
     AUDIT_SHARED_PROJECT_ID: 'project-1',
+    AUDIT_SHARED_PORTAL_OPERATOR_CREDENTIAL_FILE: portalOperatorCredentialFile,
+    AUDIT_SHARED_PORTAL_OPERATOR_ID: 'operator-local-cutover',
     ...workerCredentialFiles,
   };
   const firstProvision = await runCommand(process.execPath, [
-    new URL('./provision-shared-worker-identities.mjs', import.meta.url).pathname,
+    new URL('./provision-shared-identities.mjs', import.meta.url).pathname,
   ], path.join(root, 'compose-provision-first'), { env: provisionEnvironment });
   assert.equal(firstProvision.code, 0, firstProvision.stderr);
-  assert.deepEqual(JSON.parse(firstProvision.stdout).provisioned.map((entry) => entry.status), ['issued', 'issued', 'issued']);
+  assertProvisioned(firstProvision.stdout, {
+    'compose-worker-ordinary-a': 'issued', 'compose-worker-ordinary-b': 'issued',
+    'compose-worker-performance': 'issued', 'operator-local-cutover': 'issued',
+  });
   const secondProvision = await runCommand(process.execPath, [
-    new URL('./provision-shared-worker-identities.mjs', import.meta.url).pathname,
+    new URL('./provision-shared-identities.mjs', import.meta.url).pathname,
   ], path.join(root, 'compose-provision-second'), { env: provisionEnvironment });
   assert.equal(secondProvision.code, 0, secondProvision.stderr);
-  assert.deepEqual(JSON.parse(secondProvision.stdout).provisioned.map((entry) => entry.status), ['reused', 'reused', 'reused']);
+  assertProvisioned(secondProvision.stdout, {
+    'compose-worker-ordinary-a': 'reused', 'compose-worker-ordinary-b': 'reused',
+    'compose-worker-performance': 'reused', 'operator-local-cutover': 'reused',
+  });
   const provisionedCredentials = await Promise.all(Object.values(workerCredentialFiles).map(async (file) => {
     assert.equal((await stat(file)).mode & 0o077, 0, `${file} must remain private`);
     return (await readFile(file, 'utf8')).trim();
@@ -179,31 +188,52 @@ try {
     { capabilities: ['browser:chromium', 'browser:firefox', 'browser:webkit', 'inventory:http'], resourceClasses: ['ordinary'] },
     { capabilities: ['performance:lighthouse'], resourceClasses: ['performance'] },
   ]);
+  assert.equal((await stat(portalOperatorCredentialFile)).mode & 0o077, 0,
+    'the portal operator credential must remain private');
+  const portalOperator = await provisionedAuthority.authenticateCredential(
+    (await readFile(portalOperatorCredentialFile, 'utf8')).trim(),
+  );
+  assert.deepEqual(portalOperator, {
+    id: 'operator-local-cutover', kind: 'human', roles: ['operator'], projectIds: ['project-1'], runIds: ['*'],
+    authVersion: 1, workerGrant: null,
+  }, 'the local portal operator must retain aggregate run-list scope');
   await provisionedAuthority.setWorkerGrant('compose-worker-ordinary-a', {
     capabilities: ['performance:lighthouse'], resourceClasses: ['performance'],
   });
+  await provisionedAuthority.setScopes('operator-local-cutover', {
+    projectIds: ['project-1'], runIds: ['run-stale-overnight'],
+  });
   const repairedProvision = await runCommand(process.execPath, [
-    new URL('./provision-shared-worker-identities.mjs', import.meta.url).pathname,
+    new URL('./provision-shared-identities.mjs', import.meta.url).pathname,
   ], path.join(root, 'compose-provision-repair'), { env: provisionEnvironment });
   assert.equal(repairedProvision.code, 0, repairedProvision.stderr);
-  assert.deepEqual(JSON.parse(repairedProvision.stdout).provisioned.map((entry) => entry.status), ['updated', 'reused', 'reused']);
+  assertProvisioned(repairedProvision.stdout, {
+    'compose-worker-ordinary-a': 'updated', 'compose-worker-ordinary-b': 'reused',
+    'compose-worker-performance': 'reused', 'operator-local-cutover': 'updated',
+  });
   assert.deepEqual((await provisionedAuthority.authenticateCredential(provisionedCredentials[0])).workerGrant,
     { capabilities: ['browser:chromium', 'browser:firefox', 'browser:webkit', 'inventory:http'], resourceClasses: ['ordinary'] });
+  assert.deepEqual((await provisionedAuthority.authenticateCredential(
+    (await readFile(portalOperatorCredentialFile, 'utf8')).trim(),
+  )).runIds, ['*'], 'provisioning repairs a run-scoped portal operator before the aggregate dashboard starts');
   await rm(workerCredentialFiles.AUDIT_SHARED_WORKER_B_CREDENTIAL_FILE);
   await provisionedAuthority.setWorkerGrant('compose-worker-ordinary-b', {
     capabilities: ['performance:lighthouse'], resourceClasses: ['performance'],
   });
   const recoveredCredentialProvision = await runCommand(process.execPath, [
-    new URL('./provision-shared-worker-identities.mjs', import.meta.url).pathname,
+    new URL('./provision-shared-identities.mjs', import.meta.url).pathname,
   ], path.join(root, 'compose-provision-missing-credential'), { env: provisionEnvironment });
   assert.equal(recoveredCredentialProvision.code, 0, recoveredCredentialProvision.stderr);
-  assert.deepEqual(JSON.parse(recoveredCredentialProvision.stdout).provisioned.map((entry) => entry.status), ['reused', 'issued', 'reused']);
+  assertProvisioned(recoveredCredentialProvision.stdout, {
+    'compose-worker-ordinary-a': 'reused', 'compose-worker-ordinary-b': 'issued',
+    'compose-worker-performance': 'reused', 'operator-local-cutover': 'reused',
+  });
   const recoveredCredential = (await readFile(workerCredentialFiles.AUDIT_SHARED_WORKER_B_CREDENTIAL_FILE, 'utf8')).trim();
   assert.deepEqual((await provisionedAuthority.authenticateCredential(recoveredCredential)).workerGrant,
     { capabilities: ['browser:chromium', 'browser:firefox', 'browser:webkit', 'inventory:http'], resourceClasses: ['ordinary'] },
     'credential recovery also repairs an existing principal grant before rotating the secret');
   const overriddenProvision = await runCommand(process.execPath, [
-    new URL('./provision-shared-worker-identities.mjs', import.meta.url).pathname,
+    new URL('./provision-shared-identities.mjs', import.meta.url).pathname,
   ], path.join(root, 'compose-provision-override'), {
     env: { ...provisionEnvironment, AUDIT_SHARED_ORDINARY_CAPABILITIES: 'inventory:http,browser:chromium' },
   });
@@ -1180,6 +1210,11 @@ try {
   }), (error) => error?.code === 'PROMOTION_CLAIM_EXPIRED');
 } finally {
   await rm(root, { recursive: true, force: true });
+}
+
+function assertProvisioned(stdout, expected) {
+  const entries = JSON.parse(stdout).provisioned;
+  assert.deepEqual(Object.fromEntries(entries.map(({ id, status }) => [id, status])), expected);
 }
 
 async function runCommand(command, args, capturePrefix, options = {}) {

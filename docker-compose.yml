@@ -203,7 +203,7 @@ services:
     user: pwuser
     healthcheck:
       disable: true
-    command: ["node", "scripts/provision-shared-worker-identities.mjs"]
+    command: ["node", "scripts/provision-shared-identities.mjs"]
     restart: "no"
     depends_on:
       single-site-volume-init:
@@ -215,6 +215,8 @@ services:
       AUDIT_SHARED_WORKER_A_CREDENTIAL_FILE: /var/lib/ai-mobile-testing/shared/secrets/ordinary-a/token
       AUDIT_SHARED_WORKER_B_CREDENTIAL_FILE: /var/lib/ai-mobile-testing/shared/secrets/ordinary-b/token
       AUDIT_SHARED_PERFORMANCE_CREDENTIAL_FILE: /var/lib/ai-mobile-testing/shared/secrets/performance/token
+      AUDIT_SHARED_PORTAL_OPERATOR_ID: ${AUDIT_SHARED_PORTAL_OPERATOR_ID:-operator-local-cutover}
+      AUDIT_SHARED_PORTAL_OPERATOR_CREDENTIAL_FILE: /var/lib/ai-mobile-testing/shared/credentials/local-cutover-operator.credential
     volumes:
       - shared-control-identities:/var/lib/ai-mobile-testing/shared/credentials
       - shared-worker-ordinary-a-secret:/var/lib/ai-mobile-testing/shared/secrets/ordinary-a
