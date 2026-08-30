@@ -836,7 +836,7 @@ export async function readStorePerformanceScheduler(store) {
   return clone(await readPerformanceSchedulerUnlocked(store));
 }
 
-async function validateCoordinator(store, coordinator) {
+async function validateCoordinator(store, coordinator, runId = null) {
   await refreshManifestUnlocked(store);
   const current = await readGlobalCoordinator(store);
   const selector = await readAuthoritySelectorUnlocked(store);
@@ -852,6 +852,7 @@ async function validateCoordinator(store, coordinator) {
   if (Date.parse(current.expiresAt) <= store.clock()) {
     fail('STALE_COORDINATOR', 'Coordinator lease expired.');
   }
+  if (runId !== null) await requireHandoffRunPermit(store, selector, runId);
   return current;
 }
 
@@ -1091,7 +1092,7 @@ async function mutate(store, runId, { coordinator = null, kind = 'mutation', typ
   return withDirectoryLock(store.storage, globalLockPath(store), () => (
     withDirectoryLock(store.storage, lockPath(store, runId), async () => {
       const state = await recoverUnlocked(store, runId);
-      if (coordinator) await validateCoordinator(store, coordinator);
+      if (coordinator) await validateCoordinator(store, coordinator, runId);
       return appendMutationUnlocked(store, state, kind, type, apply, { actor, data });
     })
   ));
@@ -1393,7 +1394,7 @@ export async function sealParentRunGraph(store, runId, coordinator, input) {
   const finalSubject = parseFinalReleaseSubject(input.finalSubject);
   return withDirectoryLock(store.storage, globalLockPath(store), () => withDirectoryLock(store.storage, lockPath(store, runId), async () => {
     const state = await recoverUnlocked(store, runId);
-    await validateCoordinator(store, coordinator);
+    await validateCoordinator(store, coordinator, runId);
     const subjectCoreDigest = subjectCore?.digest ?? state.subjectCoreDigest;
     if (executionManifest.subjectCoreDigest !== subjectCoreDigest
       || finalSubject.subjectCoreDigest !== subjectCoreDigest
@@ -1452,7 +1453,7 @@ export async function sealParentRunGraph(store, runId, coordinator, input) {
 export async function terminalizeParentRunCompilation(store, runId, coordinator) {
   return withDirectoryLock(store.storage, globalLockPath(store), () => withDirectoryLock(store.storage, lockPath(store, runId), async () => {
     const state = await recoverUnlocked(store, runId);
-    await validateCoordinator(store, coordinator);
+    await validateCoordinator(store, coordinator, runId);
     if (state.compilationState === 'failed') {
       delete state.clockNow;
       return state;
@@ -1523,6 +1524,8 @@ async function acquireWithRunAudit(store, runId, input, takeoverOnly) {
   return withDirectoryLock(store.storage, globalLockPath(store), () => (
     withDirectoryLock(store.storage, lockPath(store, runId), async () => {
       const state = await recoverUnlocked(store, runId);
+      const selector = await readAuthoritySelectorUnlocked(store);
+      await requireHandoffRunPermit(store, selector, runId);
       const coordinator = await acquireStoreCoordinatorUnlocked(store, input, takeoverOnly);
       await appendMutationUnlocked(store, state, 'mutation', takeoverOnly ? 'coordinator-taken-over' : 'coordinator-acquired', (next) => {
         next.coordinator = coordinator;
@@ -2287,7 +2290,7 @@ export async function requeueExpiredWork(store, runId, coordinator) {
   let quarantineRoot;
   const expiredCount = await withDirectoryLock(store.storage, globalLockPath(store), () => withDirectoryLock(store.storage, lockPath(store, runId), async () => {
     const state = await recoverUnlocked(store, runId);
-    await validateCoordinator(store, coordinator);
+    await validateCoordinator(store, coordinator, runId);
     const expiredIds = Object.values(state.workItems)
       .filter((item) => item.state === 'running'
         && (Date.parse(item.lease.expiresAt) <= store.clock() || item.lease.epoch !== coordinator.epoch))
@@ -2839,7 +2842,7 @@ export async function appendAttemptLog(store, runId, lease, entry) {
 export async function adoptAttemptEvidence(store, runId, coordinator, inbox) {
   return withDirectoryLock(store.storage, globalLockPath(store), () => withDirectoryLock(store.storage, lockPath(store, runId), async () => {
   const state = await recoverUnlocked(store, runId);
-  await validateCoordinator(store, coordinator);
+  await validateCoordinator(store, coordinator, runId);
   const file = containedPath(runDirectory(store, runId), inbox.relativePath);
   const document = await readBoundedJson(store.storage, file, { label: 'attempt evidence inbox' });
   const { digest, ...body } = document;
@@ -3367,7 +3370,7 @@ async function verifyOpenedArtifactIntegrity(store, handle, initialStat, descrip
 export async function cancelParentRun(store, runId, coordinator, input) {
   return withDirectoryLock(store.storage, globalLockPath(store), () => withDirectoryLock(store.storage, lockPath(store, runId), async () => {
     const state = await recoverUnlocked(store, runId);
-    await validateCoordinator(store, coordinator);
+    await validateCoordinator(store, coordinator, runId);
     if (state.status === 'cancelled') {
       delete state.clockNow;
       return state;
@@ -3527,7 +3530,7 @@ function classifyTargetIdentityRecheck(state, input) {
 export async function applyRekickOperation(store, runId, coordinator, operationId, input = {}) {
   return withDirectoryLock(store.storage, globalLockPath(store), () => withDirectoryLock(store.storage, lockPath(store, runId), async () => {
     const state = await recoverUnlocked(store, runId);
-    await validateCoordinator(store, coordinator);
+    await validateCoordinator(store, coordinator, runId);
     const operation = Object.values(state.operations).find((candidate) => candidate.operationId === operationId);
     if (!operation) fail('OPERATION_NOT_FOUND', `Operation ${operationId} was not found.`);
     if (operation.kind !== 'rekick') fail('OPERATION_KIND_INVALID', 'Only a rekick operation can use the atomic rekick transition.');
@@ -3561,7 +3564,7 @@ export async function applyRekickOperation(store, runId, coordinator, operationI
 export async function applyDiagnosticRerunOperation(store, runId, coordinator, operationId, input = {}) {
   return withDirectoryLock(store.storage, globalLockPath(store), () => withDirectoryLock(store.storage, lockPath(store, runId), async () => {
     const state = await recoverUnlocked(store, runId);
-    await validateCoordinator(store, coordinator);
+    await validateCoordinator(store, coordinator, runId);
     const operation = Object.values(state.operations).find((candidate) => candidate.operationId === operationId);
     if (!operation) fail('OPERATION_NOT_FOUND', `Operation ${operationId} was not found.`);
     if (operation.kind !== 'diagnostic-rerun') {
@@ -3628,7 +3631,7 @@ export async function applyDiagnosticRerunOperation(store, runId, coordinator, o
 export async function completeOperation(store, runId, coordinator, operationId, outcome) {
   return withDirectoryLock(store.storage, globalLockPath(store), () => withDirectoryLock(store.storage, lockPath(store, runId), async () => {
     const state = await recoverUnlocked(store, runId);
-    await validateCoordinator(store, coordinator);
+    await validateCoordinator(store, coordinator, runId);
     const operation = Object.values(state.operations).find((candidate) => candidate.operationId === operationId);
     if (!operation) fail('OPERATION_NOT_FOUND', `Operation ${operationId} was not found.`);
     if (operation.state === 'completed') {
@@ -3676,7 +3679,7 @@ export async function appendMutationAuditEvent(store, runId, coordinator, input)
 export async function tombstoneParentRunAuthority(store, runId, coordinator, input) {
   return withDirectoryLock(store.storage, globalLockPath(store), () => withDirectoryLock(store.storage, lockPath(store, runId), async () => {
     const state = await recoverUnlocked(store, runId);
-    await validateCoordinator(store, coordinator);
+    await validateCoordinator(store, coordinator, runId);
     if (state.authorityTombstone !== null) return clone(state.authorityTombstone);
     if (!input?.actor || typeof input.actor.id !== 'string' || !input.actor.id
       || !['human', 'service'].includes(input.actor.kind)) fail('STORE_SCHEMA_INVALID', 'Authority tombstone requires an immutable human or service actor.');
@@ -3861,7 +3864,7 @@ export async function publishCurrentEnvelope(store, runId, coordinator, envelope
   if (envelope.runId !== runId) fail('STORE_SCHEMA_INVALID', 'Publication envelope belongs to a different run.');
   return withDirectoryLock(store.storage, globalLockPath(store), () => withDirectoryLock(store.storage, lockPath(store, runId), async () => {
     const state = await recoverUnlocked(store, runId);
-    await validateCoordinator(store, coordinator);
+    await validateCoordinator(store, coordinator, runId);
     const { selector, binding } = await requirePublicationAuthority(store, runId);
     if (state.compilationState === 'failed') {
       if (!state.compilationFailure || !Object.hasOwn(envelope, 'subjectCoreDigest')

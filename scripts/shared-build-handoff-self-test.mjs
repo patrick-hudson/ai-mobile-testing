@@ -11,6 +11,7 @@ import {
   acceptOperation,
   acquireStoreCoordinator,
   adoptAttemptEvidence,
+  cancelParentRun,
   claimWorkItem,
   createParentRun,
   openParentRunStore,
@@ -207,6 +208,9 @@ try {
   await expectCode('AUTHORITY_HANDOFF_CANARY_REQUIRED', () => acceptOperation(target, 'source-era-run', {
     idempotencyKey: 'source-era-rekick-0001', kind: 'rekick', actor: { id: 'operator:test', kind: 'human' },
     body: { reason: 'must stay fenced' },
+  }));
+  await expectCode('AUTHORITY_HANDOFF_CANARY_REQUIRED', () => cancelParentRun(target, 'source-era-run', targetCoordinator, {
+    reason: 'must stay fenced', actor: { id: 'operator:test', kind: 'human' },
   }));
   await expectCode('AUTHORITY_HANDOFF_CANARY_REQUIRED', () => requestStorePerformanceDrain(target, targetCoordinator, {
     workerId: 'source-era-performance-worker', capabilities: ['performance:lighthouse'],
