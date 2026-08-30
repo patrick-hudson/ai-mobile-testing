@@ -1,4 +1,4 @@
-import { canonicalDigest } from './canonical-contract.mjs';
+import { canonicalDigest, isRecord } from './canonical-contract.mjs';
 
 export const SHARED_DOCKER_RESILIENCE_ENV = 'AUDIT_SHARED_RESILIENCE_PROOF';
 export const SHARED_DOCKER_RESILIENCE_SPEC = 'tests/fixtures/shared-docker-resilience.spec.ts';
@@ -18,6 +18,13 @@ export const SHARED_DOCKER_RESILIENCE_CASES = Object.freeze(Array.from({ length:
   });
 }));
 export const SHARED_DOCKER_RESILIENCE_WORK_ITEM_COUNT = SHARED_DOCKER_RESILIENCE_CASES.length;
+
+export function pinSharedDockerResilienceInitialGeneration(environment, overrides = {}) {
+  if (!isRecord(environment) || !isRecord(overrides)) {
+    throw new TypeError('Shared Docker resilience environment and overrides must be objects.');
+  }
+  return Object.freeze({ ...environment, ...overrides, AUDIT_SHARED_STORE_GENERATION: '1' });
+}
 
 export const SHARED_DOCKER_RESILIENCE_WORKLOAD = Object.freeze({
   schemaVersion: 1,

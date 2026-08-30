@@ -6,6 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
 import {
+  pinSharedDockerResilienceInitialGeneration,
   SHARED_DOCKER_RESILIENCE_ENV,
   SHARED_DOCKER_RESILIENCE_WORK_ITEM_COUNT,
 } from '../shared/shared-docker-resilience-contract.mjs';
@@ -41,8 +42,7 @@ const authoritativeNanoCpus = 1_000_000_000;
 const authoritativeMemoryBytes = 2_147_483_648;
 const performanceNanoCpus = 2_000_000_000;
 const performanceMemoryBytes = 4_294_967_296;
-const commonEnvironment = {
-  ...process.env,
+const commonEnvironment = pinSharedDockerResilienceInitialGeneration(process.env, {
   COMPOSE_ANSI: 'never',
   [SHARED_DOCKER_RESILIENCE_ENV]: '1',
   AUDIT_SHARED_ORDINARY_CAPABILITIES: 'browser:chromium',
@@ -52,7 +52,7 @@ const commonEnvironment = {
   AUDIT_SHARED_PROOF_WORK_ITEMS: String(workItemCount),
   AUDIT_SHARED_ORDINARY_CPUS: ordinaryWorkerCpuLimit,
   AUDIT_SHARED_ORDINARY_MEMORY: ordinaryWorkerMemoryLimit,
-};
+});
 const observedEvents = new Map();
 const eventFollowers = new Map();
 

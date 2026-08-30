@@ -2,11 +2,29 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { validateSharedDockerResilienceProof } from './assert-shared-docker-resilience-proof.mjs';
 import { canonicalDigest } from '../shared/canonical-contract.mjs';
-import { SHARED_DOCKER_RESILIENCE_WORKLOAD_DIGEST } from '../shared/shared-docker-resilience-contract.mjs';
+import {
+  pinSharedDockerResilienceInitialGeneration,
+  SHARED_DOCKER_RESILIENCE_WORKLOAD_DIGEST,
+} from '../shared/shared-docker-resilience-contract.mjs';
 import { SHARED_RESILIENCE_CRASH_BOUNDARIES } from './lib/shared-resilience-failpoint.mjs';
 
 const digest = (character) => `sha256:${character.repeat(64)}`;
+const isolatedEnvironment = pinSharedDockerResilienceInitialGeneration({
+  AUDIT_SHARED_STORE_GENERATION: '47',
+  PRESERVED_HOST_SETTING: 'retained',
+}, {
+  AUDIT_SHARED_STORE_GENERATION: '99',
+});
+assert.equal(isolatedEnvironment.AUDIT_SHARED_STORE_GENERATION, '1',
+  'the proof harness base must pin generation one after host and base overrides');
+assert.equal(isolatedEnvironment.PRESERVED_HOST_SETTING, 'retained');
 const proofSource = await readFile(new URL('./shared-docker-resilience-self-test.mjs', import.meta.url), 'utf8');
+assert.match(proofSource,
+  /const commonEnvironment = pinSharedDockerResilienceInitialGeneration\(process\.env, \{/u,
+  'the Docker proof harness must construct its base environment through the generation pin');
+assert.match(proofSource,
+  /environment: \{\s*\.\.\.commonEnvironment,[\s\S]*?\.\.\.\(options\?\.environment \?\? \{\}\),\s*\}/u,
+  'scenario-specific environments must overlay the pinned base for activated generations');
 assert.match(proofSource, /function duplicateTerminalEvidenceCount\(workItems\)/u);
 assert.doesNotMatch(proofSource, /attempts\.length - 1/u,
   'operational recovery attempts are retained evidence, not duplicate terminal product evidence');
