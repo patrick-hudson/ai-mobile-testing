@@ -719,6 +719,7 @@ test.describe('run-workspace', () => {
       });
       await page.goto(`/run.html?mode=${mode}&run=${runId}&view=overview`);
       await page.locator(`[data-run-action="${actionId}"]`).click();
+      await expect(page.locator('#run-action-dialog')).toBeVisible();
       const frozen = await page.evaluate(() => (window as any).__runWorkspaceDiagnostics.action);
       expect(frozen).toMatchObject({
         bindingFrozen: true,
