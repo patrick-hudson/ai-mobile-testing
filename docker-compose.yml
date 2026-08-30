@@ -45,6 +45,7 @@ services:
 
   portal:
     <<: *audit-base
+    restart: unless-stopped
     depends_on:
       single-site-volume-init:
         condition: service_completed_successfully

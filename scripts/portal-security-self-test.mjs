@@ -118,6 +118,8 @@ async function assertComposeJobHealthPolicy() {
   };
   assert.doesNotMatch(serviceBlock('portal'), /healthcheck:\s*\n\s+disable:\s*true/,
     'The long-running portal must retain the image health probe.');
+  assert.match(serviceBlock('portal'), /restart:\s*unless-stopped/u,
+    'The long-running portal must restart after a process or container crash.');
   for (const service of [
     'portal-e2e',
     'audit-smoke',
