@@ -1,10 +1,15 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import { validateSharedDockerResilienceProof } from './assert-shared-docker-resilience-proof.mjs';
 import { canonicalDigest } from '../shared/canonical-contract.mjs';
 import { SHARED_DOCKER_RESILIENCE_WORKLOAD_DIGEST } from '../shared/shared-docker-resilience-contract.mjs';
 import { SHARED_RESILIENCE_CRASH_BOUNDARIES } from './lib/shared-resilience-failpoint.mjs';
 
 const digest = (character) => `sha256:${character.repeat(64)}`;
+const proofSource = await readFile(new URL('./shared-docker-resilience-self-test.mjs', import.meta.url), 'utf8');
+assert.match(proofSource, /function duplicateTerminalEvidenceCount\(workItems\)/u);
+assert.doesNotMatch(proofSource, /attempts\.length - 1/u,
+  'operational recovery attempts are retained evidence, not duplicate terminal product evidence');
 const sample = (container) => ({
   container, cpuPercent: 50, memoryPercent: 10, memoryUsage: '200MiB / 2GiB', pids: 30,
   nanoCpus: 1_000_000_000, memoryBytes: 2_147_483_648,

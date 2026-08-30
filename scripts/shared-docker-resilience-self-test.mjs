@@ -431,6 +431,12 @@ function assertTerminalAttemptLineage(item) {
     `work item ${item.id} may retry only pre-terminal operational failures: ${JSON.stringify(item.attempts)}`);
 }
 
+function duplicateTerminalEvidenceCount(workItems) {
+  return workItems.reduce((total, item) => total + Math.max(0, item.attempts.filter(({ outcome }) => (
+    outcome === 'completed_pass' || outcome === 'completed_product_failure'
+  )).length - 1), 0);
+}
+
 function assertCompletedSemantics(inspected) {
   for (const item of inspected.workItems) assertTerminalAttemptLineage(item);
   const productFailure = inspected.workItems.find(({ id }) => id === 'proof-008');
@@ -613,8 +619,8 @@ async function runCoordinatorCrashBoundary(boundary, referenceInvariant) {
     const inspected = await inspectAfterDown(project, runId, environment);
     assert.deepEqual(inspected.invariant, referenceInvariant,
       `${boundary} recovery changed canonical state or evidence membership`);
-    const duplicateEvidenceCount = inspected.workItems.reduce((total, item) => total + Math.max(0, item.attempts.length - 1), 0);
-    assert.equal(duplicateEvidenceCount, 0, `${boundary} created duplicate attempt evidence`);
+    const duplicateEvidenceCount = duplicateTerminalEvidenceCount(inspected.workItems);
+    assert.equal(duplicateEvidenceCount, 0, `${boundary} created duplicate terminal product evidence`);
     return sealCrashReceipt({
       boundary,
       service: 'shared-coordinator',
@@ -664,7 +670,7 @@ async function runInventorySealCrashBoundary() {
     const afterRestart = driver(project, 'inspect', runId, { environment });
     assert.equal(canonicalDigest(afterRestart.invariant), stateDigest,
       'inventory sealed graph changed after bounded recovery');
-    const duplicateEvidenceCount = afterRestart.workItems.reduce((total, item) => total + Math.max(0, item.attempts.length - 1), 0);
+    const duplicateEvidenceCount = duplicateTerminalEvidenceCount(afterRestart.workItems);
     return sealCrashReceipt({
       boundary,
       service: 'shared-coordinator',
