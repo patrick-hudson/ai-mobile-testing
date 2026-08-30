@@ -4,7 +4,10 @@ import * as fs from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { collectSharedWorkerAttempt } from './lib/shared-worker-evidence.mjs';
-import { maintainSharedWorkerLease } from './lib/shared-worker-heartbeat.mjs';
+import {
+  maintainSharedWorkerLease,
+  sharedWorkHeartbeatInterval,
+} from './lib/shared-worker-heartbeat.mjs';
 import { createSharedWorkCommand } from './lib/shared-work-dispatcher.mjs';
 import { SHARED_DOCKER_RESILIENCE_ENV } from '../shared/shared-docker-resilience-contract.mjs';
 
@@ -183,11 +186,7 @@ while (!stopping) {
   });
   if (!commandLog.response.ok) throw new Error(`Coordinator rejected command log: ${commandLog.value.error ?? commandLog.response.status}`);
   const leaseDurationMs = Date.parse(claimed.value.expiresAt) - Date.parse(claimed.value.claimedAt);
-  const heartbeatIntervalMs = Math.max(100, Math.floor(leaseDurationMs / 3));
-  if (!Number.isSafeInteger(leaseDurationMs) || leaseDurationMs < 300 || leaseDurationMs > 3_600_000
-    || heartbeatIntervalMs >= leaseDurationMs) {
-    throw new Error('Coordinator returned a work lease that is too short for safe heartbeat maintenance.');
-  }
+  const heartbeatIntervalMs = sharedWorkHeartbeatInterval(leaseDurationMs);
   let maintained;
   try {
     maintained = await maintainSharedWorkerLease({

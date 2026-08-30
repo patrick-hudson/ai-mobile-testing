@@ -4,6 +4,8 @@ export class SharedWorkLeaseFencedError extends Error {
   code: 'SHARED_WORK_LEASE_FENCED';
 }
 
+export function sharedWorkHeartbeatInterval(leaseDurationMs: number): number;
+
 export function maintainSharedWorkerLease<T>(options: {
   lease: WorkLease;
   intervalMs: number;

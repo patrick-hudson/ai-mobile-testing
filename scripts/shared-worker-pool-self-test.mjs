@@ -10,7 +10,10 @@ import {
   classifyExecutionFailure,
   runSharedWorkerPool,
 } from './lib/shared-worker-pool.mjs';
-import { maintainSharedWorkerLease } from './lib/shared-worker-heartbeat.mjs';
+import {
+  maintainSharedWorkerLease,
+  sharedWorkHeartbeatInterval,
+} from './lib/shared-worker-heartbeat.mjs';
 import {
   collectSharedWorkerAttempt,
   collectSharedWorkerEvidence,
@@ -845,6 +848,12 @@ try {
   assert.match(compose, /shared-worker-ordinary-b:/);
   assert.match(compose, /shared-resilience-driver:/);
   assert.match(compose, /shared-worker-performance:/);
+  assert.match(compose, /AUDIT_SHARED_LEASE_MS:\s*\$\{AUDIT_SHARED_LEASE_MS:-60000\}/,
+    'the deployed lease must retain enough recovery margin for loaded evidence and Lighthouse workers');
+  assert.equal(sharedWorkHeartbeatInterval(60_000), 10_000,
+    'production workers heartbeat well before the loaded lease boundary');
+  assert.equal(sharedWorkHeartbeatInterval(12_000), 4_000,
+    'short proof leases preserve the one-third heartbeat cadence');
   const workerABlock = compose.match(/shared-worker-ordinary-a:[\s\S]*?(?=\n  [a-z][a-z0-9-]+:|\nvolumes:)/)?.[0] ?? '';
   const workerBBlock = compose.match(/shared-worker-ordinary-b:[\s\S]*?(?=\n  [a-z][a-z0-9-]+:|\nvolumes:)/)?.[0] ?? '';
   for (const workerBlock of [workerABlock, workerBBlock]) {

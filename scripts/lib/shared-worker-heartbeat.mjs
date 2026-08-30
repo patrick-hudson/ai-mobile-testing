@@ -6,6 +6,13 @@ export class SharedWorkLeaseFencedError extends Error {
   }
 }
 
+export function sharedWorkHeartbeatInterval(leaseDurationMs) {
+  if (!Number.isSafeInteger(leaseDurationMs) || leaseDurationMs < 300 || leaseDurationMs > 3_600_000) {
+    throw new TypeError('Shared work lease duration must be an integer from 300 through 3600000.');
+  }
+  return Math.max(100, Math.min(10_000, Math.floor(leaseDurationMs / 3)));
+}
+
 function abortableDelay(milliseconds, signal) {
   return new Promise((resolve, reject) => {
     if (signal.aborted) {
