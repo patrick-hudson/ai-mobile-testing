@@ -229,6 +229,19 @@ async function waitFor(project, label, predicate, timeoutMs = 180_000) {
   throw new Error(`Timed out waiting for ${label}. Recent events: ${JSON.stringify(events.slice(-20))}`);
 }
 
+async function waitForDurableTerminalWork(project, runId, environment, label, timeoutMs = 300_000) {
+  const deadline = Date.now() + timeoutMs;
+  let inspected = null;
+  while (Date.now() < deadline) {
+    inspected = driver(project, 'inspect', runId, { environment });
+    if (inspected.terminal === true && inspected.workItems.length === workItemCount) return inspected;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw new Error(`Timed out waiting for ${label}. Durable work states: ${JSON.stringify(
+    inspected?.workItems.map(({ id, state, attempts }) => ({ id, state, attempts: attempts.length })) ?? [],
+  )}`);
+}
+
 const publishedIds = (events) => new Set(events.filter(({ event }) => event === 'work-item-published').map(({ workItemId }) => workItemId));
 function claimedButUnpublished(events) {
   const published = publishedIds(events);
@@ -572,7 +585,7 @@ async function runCoordinatorCrashBoundary(boundary, referenceInvariant) {
     const before = restartCount(containerId);
     startWorkers(project, 1, environment);
     const restarted = await waitForRestart(containerId, before, `${boundary} coordinator`);
-    await waitFor(project, `all work after ${boundary}`, (events) => publishedIds(events).size === workItemCount);
+    await waitForDurableTerminalWork(project, runId, environment, `durable terminal work after ${boundary}`);
     const stale = driver(project, 'stale-fence-probe', runId, { environment });
     assert.equal(stale.outcome, 'rejected');
     const sentinel = driver(project, 'read-failpoint', runId, { environment, extraEnvironment: {
