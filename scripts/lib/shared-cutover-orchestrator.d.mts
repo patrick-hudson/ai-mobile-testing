@@ -224,6 +224,34 @@ export function prepareSharedAuthorityBuildHandoff(options: {
   hooks?: { afterAdmissionClosed?(gate: CutoverAdmissionGateDocument): void | Promise<void> };
 }): Promise<any>;
 
+export function prequalifySharedAuthorityBuild(options: {
+  store: ParentRunStore;
+  coordinator: CoordinatorFence;
+  legacyAuthorityFence: LegacyAuthorityFence;
+  authorityFloor: SharedAuthorityFloor;
+  reportDirectory: string;
+  prequalificationId: string;
+  targetBuildIdentity: string;
+  compatibilityProof: {
+    schemaVersion: 1;
+    kind: 'shared-build-compatibility-proof';
+    targetBuildIdentity: string;
+    runnerRevision: string;
+    imageDigest: string;
+    validationDigest: string;
+    generatedAt: string;
+    digest: string;
+  };
+  operatorReview: { reviewed: true; actorId: string; reviewedAt: string };
+  clock?: () => number;
+  hooks?: {
+    afterIntentPersisted?(intent: any): void | Promise<void>;
+    afterManifestCommitted?(manifest: any): void | Promise<void>;
+    afterSelectorCommitted?(selector: any): void | Promise<void>;
+    afterAuthorityFloorAdvanced?(floor: any): void | Promise<void>;
+  };
+}): Promise<any>;
+
 export function beginSharedAuthorityBuildHandoff(options: {
   store: ParentRunStore;
   coordinator: CoordinatorFence;

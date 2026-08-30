@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 import { constants as fsConstants, promises as fs } from 'node:fs';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { canonicalDigest } from '../shared/canonical-contract.mjs';
+import { deriveRunnerRevision } from '../shared/runner-revision.mjs';
 import {
   probeTargetPreflightSet,
   targetPreflightInputsForRunContract,
@@ -14,6 +15,7 @@ import {
   acquireStoreCoordinator,
   openParentRunStore,
   readReleaseAuthoritySelector,
+  releaseStoreCoordinator,
 } from './lib/parent-run-store.mjs';
 import {
   activateSharedAuthorityCutover,
@@ -26,6 +28,7 @@ import {
   openCutoverAdmissionGate,
   prepareSharedAuthorityCutover,
   prepareSharedAuthorityBuildHandoff,
+  prequalifySharedAuthorityBuild,
   recordSharedBuildHandoffCanary,
   recordSharedCutoverCanary,
   reopenSharedAdmissionAfterCanaries,
@@ -43,15 +46,29 @@ import { openSharedLaunchOperationStore } from './lib/shared-launch-operation-st
 import { readTrustedStoreMarker } from './lib/shared-store-runtime.mjs';
 import { rehearseSharedStoreBackup } from './lib/shared-store-backup-rehearsal.mjs';
 import { openSharedAuthorityFloor } from './lib/shared-authority-floor.mjs';
+import { createSharedBuildCompatibilityProof } from './create-shared-build-compatibility-proof.mjs';
+
+const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 const ACTIONS = new Set([
   'rehearse-backup', 'prepare', 'activate', 'launch-single-site-canary', 'launch-comparative-canary',
   'record-single-site-canary', 'record-comparative-canary', 'reopen',
   'rollback', 'disable-promotion', 'enable-promotion',
-  'prepare-handoff', 'begin-handoff',
+  'prequalify-handoff-target', 'prepare-handoff', 'begin-handoff',
   'launch-handoff-single-site-canary', 'launch-handoff-comparative-canary',
   'record-handoff-single-site-canary', 'record-handoff-comparative-canary', 'complete-handoff',
 ]);
+
+const HANDOFF_ACTIONS = new Set([...ACTIONS].filter((action) => action.includes('handoff')));
+const COORDINATOR_ACTIONS = new Set([
+  'prepare', 'activate', 'rollback', 'disable-promotion', 'enable-promotion',
+  'prequalify-handoff-target', 'prepare-handoff', 'begin-handoff', 'complete-handoff',
+]);
+
+export function sharedCutoverActionRequiresCoordinator(action) {
+  if (!ACTIONS.has(action)) throw new TypeError(`Unknown shared cutover action: ${action}`);
+  return COORDINATOR_ACTIONS.has(action);
+}
 
 function usage() {
   return `Usage: run-shared-authority-cutover.mjs <${[...ACTIONS].join('|')}> --config <operator-config.json>`;
@@ -108,7 +125,7 @@ async function openConfiguredStore(config, action, marker) {
   } catch (error) {
     if (error?.code !== 'STORE_GENERATION_MISMATCH'
       || !['activate', 'launch-single-site-canary', 'launch-comparative-canary', 'record-single-site-canary', 'record-comparative-canary', 'reopen', 'disable-promotion', 'enable-promotion',
-        'prepare-handoff', 'begin-handoff', 'launch-handoff-single-site-canary', 'launch-handoff-comparative-canary',
+        'prequalify-handoff-target', 'prepare-handoff', 'begin-handoff', 'launch-handoff-single-site-canary', 'launch-handoff-comparative-canary',
         'record-handoff-single-site-canary', 'record-handoff-comparative-canary', 'complete-handoff'].includes(action)) throw error;
     return openParentRunStore({ ...options, expectedStoreGeneration: originalGeneration + 1 });
   }
@@ -218,15 +235,22 @@ export async function beginSharedAuthorityBuildHandoffFromCli({
   });
 }
 
-export async function runSharedAuthorityCutoverCli(argv, { output = process.stdout } = {}) {
+export async function runSharedAuthorityCutoverCli(argv, {
+  output = process.stdout,
+  createCompatibilityProof = createSharedBuildCompatibilityProof,
+  resolveWorkspaceRevision = () => deriveRunnerRevision(repositoryRoot),
+} = {}) {
   const { action, configFile } = parseArguments(argv);
   const config = requiredObject(await readBoundedJsonFile(configFile, 'Operator config'), 'Operator config');
   if (config.schemaVersion !== 1) throw new TypeError('Operator config must use schemaVersion 1.');
   const marker = await readTrustedStoreMarker(config.store?.storeMarkerFile, 'trusted shared store marker');
   const store = await openConfiguredStore(config, action, marker);
   const expectedStore = expectedStoreFromConfig(config, marker);
-  const backupRehearsal = requiredObject(config.backupRehearsal, 'config.backupRehearsal');
+  const backupRehearsal = config.backupRehearsal
+    ? requiredObject(config.backupRehearsal, 'config.backupRehearsal')
+    : null;
   if (action === 'rehearse-backup') {
+    if (!backupRehearsal) throw new TypeError('config.backupRehearsal must be an object.');
     const backupMarker = await readTrustedStoreMarker(
       backupRehearsal.backupMarkerFile,
       'trusted shared backup marker',
@@ -263,10 +287,13 @@ export async function runSharedAuthorityCutoverCli(argv, { output = process.stdo
     if (selector.phase !== 'SHADOW' || selector.activationEpoch !== 0) throw error;
     admissionGate = await initializeCutoverAdmissionGate({ root: admissionRoot });
   }
-  const coordinator = await acquireStoreCoordinator(store, {
-    ownerId: config.coordinatorOwnerId,
-    leaseMs: config.coordinatorLeaseMs ?? 30_000,
-  });
+  const coordinator = sharedCutoverActionRequiresCoordinator(action)
+    ? await acquireStoreCoordinator(store, {
+        ownerId: config.coordinatorOwnerId,
+        leaseMs: config.coordinatorLeaseMs ?? 30_000,
+      })
+    : null;
+  try {
   const legacyFenceRoot = path.join(store.root, 'legacy-authority');
   if (config.legacyAuthorityFenceRoot
     && path.resolve(config.legacyAuthorityFenceRoot) !== path.resolve(legacyFenceRoot)) {
@@ -281,35 +308,66 @@ export async function runSharedAuthorityCutoverCli(argv, { output = process.stdo
     if (selector.phase !== 'SHADOW' || selector.activationEpoch !== 0) throw error;
     legacyAuthorityFence = await initializeLegacyAuthorityFence({ root: legacyFenceRoot });
   }
-  const operatorReview = requiredObject(config.operatorReview, 'config.operatorReview');
+  const operatorReview = config.operatorReview
+    ? requiredObject(config.operatorReview, 'config.operatorReview')
+    : null;
   const floorAction = action.includes('handoff') || action === 'activate'
     || action === 'disable-promotion' || action === 'enable-promotion';
   const authorityFloor = floorAction ? await openSharedAuthorityFloor({
     root: config.authorityFloorRoot,
-    protectedRoots: [store.root, backupRehearsal.backupRoot, backupRehearsal.restoreRoot],
+    protectedRoots: [store.root, backupRehearsal?.backupRoot, backupRehearsal?.restoreRoot].filter(Boolean),
     verifyStorage: config.authorityFloorVerifyStorage !== false,
   }) : null;
-  const commonInput = {
-    cutoverId: config.cutoverId,
-    activationRevision: config.activationRevision,
-    buildIdentity: config.store.buildIdentity,
-    rollbackBuildIdentity: config.rollbackBuildIdentity,
-    expectedStore,
-    shadowReport: config.shadowReportFile
-      ? await readBoundedJsonFile(config.shadowReportFile, 'Shadow validation report', 16 * 1_048_576)
-      : null,
-    operatorReview,
-    backupRehearsalReceipt: await readBoundedJsonFile(
-      backupRehearsal.receiptFile,
-      'Backup rehearsal receipt',
-    ),
-    backupRoot: backupRehearsal.backupRoot,
-    restoreRoot: backupRehearsal.restoreRoot,
-  };
+  let commonInput = null;
+  if (action === 'prepare' || action === 'activate') {
+    if (!backupRehearsal) throw new TypeError('config.backupRehearsal must be an object.');
+    commonInput = {
+      cutoverId: config.cutoverId,
+      activationRevision: config.activationRevision,
+      buildIdentity: config.store.buildIdentity,
+      rollbackBuildIdentity: config.rollbackBuildIdentity,
+      expectedStore,
+      shadowReport: config.shadowReportFile
+        ? await readBoundedJsonFile(config.shadowReportFile, 'Shadow validation report', 16 * 1_048_576)
+        : null,
+      operatorReview: requiredObject(operatorReview, 'config.operatorReview'),
+      backupRehearsalReceipt: await readBoundedJsonFile(
+        backupRehearsal.receiptFile,
+        'Backup rehearsal receipt',
+      ),
+      backupRoot: backupRehearsal.backupRoot,
+      restoreRoot: backupRehearsal.restoreRoot,
+    };
+  }
 
   let result;
-  const handoff = config.handoff ? requiredObject(config.handoff, 'config.handoff') : null;
-  if (action === 'prepare-handoff') {
+  const handoff = HANDOFF_ACTIONS.has(action)
+    ? requiredObject(config.handoff, 'config.handoff')
+    : null;
+  if (action === 'prequalify-handoff-target') {
+    const resilienceProof = handoff.resilienceProofFile
+      ? await readBoundedJsonFile(
+          handoff.resilienceProofFile,
+          'Authoritative shared Docker resilience proof',
+          32 * 1_048_576,
+        )
+      : null;
+    const compatibilityProof = resilienceProof === null ? null : createCompatibilityProof({
+      resilienceProof,
+      targetBuildIdentity: handoff.targetBuildIdentity,
+      expectedWorkspaceRevision: await resolveWorkspaceRevision(),
+    });
+    result = await prequalifySharedAuthorityBuild({
+      store, coordinator, legacyAuthorityFence, authorityFloor,
+      reportDirectory: config.reportDirectory,
+      prequalificationId: handoff.prequalificationId,
+      targetBuildIdentity: handoff.targetBuildIdentity,
+      compatibilityProof,
+      operatorReview: handoff.operatorReview
+        ? requiredObject(handoff.operatorReview, 'config.handoff.operatorReview')
+        : null,
+    });
+  } else if (action === 'prepare-handoff') {
     result = await prepareSharedAuthorityBuildHandoff({
       store, coordinator, admissionGate, legacyAuthorityFence, authorityFloor,
       reportDirectory: config.reportDirectory,
@@ -424,7 +482,8 @@ export async function runSharedAuthorityCutoverCli(argv, { output = process.stdo
   } else if (action === 'rollback') {
     result = await rollbackSharedAuthorityBeforeActivation({
       store, coordinator, admissionGate, legacyAuthorityFence, reportDirectory: config.reportDirectory,
-      cutoverId: config.cutoverId, buildIdentity: config.store.buildIdentity, operatorReview,
+      cutoverId: config.cutoverId, buildIdentity: config.store.buildIdentity,
+      operatorReview: requiredObject(operatorReview, 'config.operatorReview'),
     });
   } else {
     const enable = action === 'enable-promotion';
@@ -446,6 +505,9 @@ export async function runSharedAuthorityCutoverCli(argv, { output = process.stdo
     });
   }
   output.write(`${JSON.stringify(result, null, 2)}\n`);
+  } finally {
+    if (coordinator !== null) await releaseStoreCoordinator(store, coordinator);
+  }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

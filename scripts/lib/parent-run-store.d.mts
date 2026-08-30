@@ -43,6 +43,9 @@ export function takeOverCoordinator(store: ParentRunStore, runId: string, input:
 export function acquireStoreCoordinator(store: ParentRunStore, input: { ownerId: string; leaseMs: number }): Promise<CoordinatorFence>;
 export function takeOverStoreCoordinator(store: ParentRunStore, input: { ownerId: string; leaseMs: number }): Promise<CoordinatorFence>;
 export function readStoreCoordinator(store: ParentRunStore): Promise<(CoordinatorFence & { digest: string }) | null>;
+export function releaseStoreCoordinator(store: ParentRunStore, coordinator: CoordinatorFence): Promise<{
+  buildIdentity: string; ownerId: string; epoch: number; releasedAt: string;
+}>;
 export function readReleaseAuthoritySelector(store: ParentRunStore): Promise<any>;
 export function readReleaseAuthorityContext(store: ParentRunStore, options?: { requireActive?: boolean }): Promise<any>;
 export function transitionReleaseAuthority(store: ParentRunStore, coordinator: CoordinatorFence, input: {
@@ -53,6 +56,15 @@ export function transitionReleaseAuthority(store: ParentRunStore, coordinator: C
 export function transitionReleaseAuthorityWithPublicationFence(store: ParentRunStore, coordinator: CoordinatorFence, input: {
   expectedSelectorDigest: string; phase: 'ACTIVE'; buildIdentity: string; activationRevision: number;
   expectedPublications: Array<{ runId: string; envelopeDigest: string }>;
+}): Promise<any>;
+export function prequalifyReleaseAuthorityBuild(store: ParentRunStore, coordinator: CoordinatorFence, input: {
+  expectedSelectorDigest: string; expectedManifestDigest: string; expectedManifest?: unknown; targetBuildIdentity: string;
+  expectedTargetSelectorRevision: number; authorityTransitionDigest: string;
+  hooks?: {
+    afterIntent?(selector: any): void | Promise<void>;
+    afterManifest?(selector: any): void | Promise<void>;
+    afterSelector?(selector: any): void | Promise<void>;
+  };
 }): Promise<any>;
 export function beginReleaseAuthorityBuildHandoff(store: ParentRunStore, coordinator: CoordinatorFence, input: {
   expectedSelectorDigest: string; handoffId: string; targetBuildIdentity: string;

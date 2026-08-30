@@ -158,7 +158,15 @@ services:
     profiles: [shared-runner]
     user: pwuser
     healthcheck:
-      disable: true
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:4180/healthz').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 5s
     command: ["node", "scripts/run-shared-coordinator.mjs"]
     restart: unless-stopped
     stop_grace_period: 30s

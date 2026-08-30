@@ -491,6 +491,15 @@ function authorityActivationIntentPath(store) {
   return containedPath(store.root, 'release-authority-activation-intent.json');
 }
 
+function authorityBuildPrequalificationIntentPath(store) {
+  return containedPath(store.root, 'release-authority-build-prequalification-intent.json');
+}
+
+function authorityBuildPrequalificationHistoryPath(store, targetBuildIdentity) {
+  const key = createHash('sha256').update(targetBuildIdentity).digest('hex');
+  return containedPath(store.root, 'release-authority-build-prequalification-intents', `${key}.json`);
+}
+
 function selectorBody(value) {
   const body = {
     schemaVersion: 1,
@@ -522,6 +531,156 @@ function selectorBody(value) {
 function sealAuthoritySelector(value) {
   const body = selectorBody(value);
   return { ...body, digest: canonicalDigest(body) };
+}
+
+function validateAuthorityBuildPrequalificationIntent(store, value) {
+  const { digest, ...body } = value ?? {};
+  if (value?.schemaVersion !== 1 || value.kind !== 'release-authority-build-prequalification-intent'
+    || typeof value.targetBuildIdentity !== 'string' || !value.targetBuildIdentity
+    || !DIGEST_PATTERN.test(value.authorityTransitionDigest ?? '')
+    || !Number.isSafeInteger(value.expectedTargetSelectorRevision)
+    || value.expectedTargetSelectorRevision < 2
+    || value.fromManifest?.digest !== value.fromManifestDigest
+    || value.manifest?.digest !== value.toManifestDigest
+    || value.fromSelector?.digest !== value.fromSelectorDigest
+    || value.selector?.digest !== value.toSelectorDigest
+    || digest !== canonicalDigest(body)) {
+    fail('AUTHORITY_PREQUALIFICATION_INTENT_INVALID', 'Build-prequalification intent is corrupt or unsupported.');
+  }
+
+  const currentManifest = store.manifest;
+  try {
+    validateManifest(value.fromManifest, {
+      supportedSchemaVersion: PARENT_RUN_STORE_SCHEMA_VERSION,
+      writerProtocol: currentManifest.currentWriterProtocol,
+    });
+    store.manifest = value.fromManifest;
+    validateAuthoritySelector(store, structuredClone(value.fromSelector));
+    validateManifest(value.manifest, {
+      supportedSchemaVersion: PARENT_RUN_STORE_SCHEMA_VERSION,
+      writerProtocol: currentManifest.currentWriterProtocol,
+    });
+    store.manifest = value.manifest;
+    validateAuthoritySelector(store, structuredClone(value.selector));
+  } catch (error) {
+    if (error instanceof ParentRunStoreError) {
+      fail('AUTHORITY_PREQUALIFICATION_INTENT_INVALID', 'Build-prequalification intent contains corrupt durable state.');
+    }
+    throw error;
+  } finally {
+    store.manifest = currentManifest;
+  }
+
+  const expectedBuilds = [...value.fromManifest.prequalifiedRollbackBuilds, value.targetBuildIdentity].sort();
+  const expectedManifest = {
+    ...manifestBody(value.fromManifest),
+    prequalifiedRollbackBuilds: expectedBuilds,
+  };
+  const expectedSelector = sealAuthoritySelector({
+    ...value.fromSelector,
+    prequalifiedRollbackBuilds: expectedBuilds,
+    authorityTransitionDigest: value.authorityTransitionDigest,
+    revision: value.expectedTargetSelectorRevision,
+    previousDigest: value.fromSelector.digest,
+    updatedAt: value.selector.updatedAt,
+  });
+  if (value.fromSelector.phase !== 'ACTIVE' || value.fromSelector.activationEpoch !== 1
+    || value.fromSelector.pendingBuildIdentity !== null
+    || value.targetBuildIdentity === value.fromSelector.activeBuildIdentity
+    || value.fromManifest.prequalifiedRollbackBuilds.includes(value.targetBuildIdentity)
+    || new Set(expectedBuilds).size !== expectedBuilds.length
+    || value.expectedTargetSelectorRevision !== value.fromSelector.revision + 1
+    || canonicalJson(value.fromSelector.prequalifiedRollbackBuilds)
+      !== canonicalJson(value.fromManifest.prequalifiedRollbackBuilds)
+    || canonicalJson(value.manifest) !== canonicalJson({
+      ...expectedManifest, digest: canonicalDigest(expectedManifest),
+    })
+    || canonicalJson(value.selector) !== canonicalJson(expectedSelector)) {
+    fail('AUTHORITY_PREQUALIFICATION_INTENT_INVALID', 'Build-prequalification intent does not describe one append-only transition.');
+  }
+  return value;
+}
+
+async function persistAuthorityBuildPrequalificationIntent(store, intent) {
+  const directory = containedPath(store.root, 'release-authority-build-prequalification-intents');
+  const file = authorityBuildPrequalificationHistoryPath(store, intent.targetBuildIdentity);
+  await ensureDirectory(store.storage.fs, directory);
+  const assertExistingMatches = async () => {
+    const existing = validateAuthorityBuildPrequalificationIntent(store, await readBoundedJson(
+      store.storage,
+      file,
+      { label: 'release-authority build-prequalification history', maximumBytes: 256 * 1_024 },
+    ));
+    if (canonicalJson(existing) !== canonicalJson(intent)) {
+      fail('AUTHORITY_PREQUALIFICATION_INTENT_INVALID', 'Build-prequalification history conflicts with the durable intent.');
+    }
+  };
+  if (await pathExists(store.storage.fs, file)) {
+    await assertExistingMatches();
+    return;
+  }
+  try {
+    await atomicWriteJson(store.storage, file, intent, { exclusive: true });
+  } catch (error) {
+    if (error?.code !== 'ATOMIC_ALREADY_EXISTS') throw error;
+    await assertExistingMatches();
+  }
+}
+
+async function recoverAuthorityBuildPrequalificationIntentUnlocked(store) {
+  const intentPath = authorityBuildPrequalificationIntentPath(store);
+  if (!await pathExists(store.storage.fs, intentPath)) return false;
+  let rawIntent;
+  try {
+    rawIntent = await readBoundedJson(store.storage, intentPath, {
+      label: 'release-authority build-prequalification intent', maximumBytes: 256 * 1_024,
+    });
+  } catch (error) {
+    if (error?.code === 'ATOMIC_NOT_FOUND') return false;
+    throw error;
+  }
+  const intent = validateAuthorityBuildPrequalificationIntent(store, rawIntent);
+  let selector;
+  try {
+    selector = await readBoundedJson(store.storage, authoritySelectorPath(store), {
+      label: 'release-authority selector',
+    });
+  } catch (error) {
+    if (error?.code === 'ATOMIC_NOT_FOUND') {
+      fail('AUTHORITY_PREQUALIFICATION_INTENT_INVALID', 'Build-prequalification recovery found no selector.');
+    }
+    throw error;
+  }
+
+  const manifestDigest = store.manifest.digest;
+  const selectorDigest = selector?.digest;
+  if (manifestDigest === intent.fromManifestDigest && selectorDigest === intent.fromSelectorDigest) {
+    await atomicWriteJson(store.storage, containedPath(store.root, 'store-manifest.json'), intent.manifest);
+    store.manifest = intent.manifest;
+    await atomicWriteJson(store.storage, authoritySelectorPath(store), intent.selector);
+  } else if (manifestDigest === intent.toManifestDigest && selectorDigest === intent.fromSelectorDigest) {
+    await atomicWriteJson(store.storage, authoritySelectorPath(store), intent.selector);
+  } else if (manifestDigest !== intent.toManifestDigest || selectorDigest !== intent.toSelectorDigest) {
+    fail('AUTHORITY_PREQUALIFICATION_INTENT_INVALID', 'Build-prequalification recovery found conflicting durable state.');
+  }
+  store.manifest = intent.manifest;
+  await persistAuthorityBuildPrequalificationIntent(store, intent);
+  await store.storage.fs.rm(intentPath, { force: true });
+  return true;
+}
+
+function manifestCarriesPrequalificationTransition(current, intended) {
+  if (!Number.isSafeInteger(current?.coordinatorEpoch)
+    || current.coordinatorEpoch < intended.coordinatorEpoch) return false;
+  return canonicalJson({ ...manifestBody(current), coordinatorEpoch: intended.coordinatorEpoch })
+    === canonicalJson(manifestBody(intended));
+}
+
+function manifestIsCoordinatorSuccessor(current, expected) {
+  if (!Number.isSafeInteger(current?.coordinatorEpoch)
+    || current.coordinatorEpoch < expected.coordinatorEpoch) return false;
+  return canonicalJson({ ...manifestBody(current), coordinatorEpoch: expected.coordinatorEpoch })
+    === canonicalJson(manifestBody(expected));
 }
 
 async function migrateLegacyShadowAuthoritySelector(store) {
@@ -603,6 +762,7 @@ function validateAuthoritySelector(store, value) {
 
 async function readAuthoritySelectorUnlocked(store) {
   await refreshManifestUnlocked(store);
+  await recoverAuthorityBuildPrequalificationIntentUnlocked(store);
   let selector;
   try {
     selector = await readBoundedJson(store.storage, authoritySelectorPath(store), { label: 'release-authority selector' });
@@ -1849,6 +2009,120 @@ export function transitionReleaseAuthorityWithPublicationFence(store, coordinato
   });
 }
 
+export function prequalifyReleaseAuthorityBuild(store, coordinator, input = {}) {
+  return withDirectoryLock(store.storage, globalLockPath(store), async () => {
+    await validateCoordinator(store, coordinator);
+    const current = await readAuthoritySelectorUnlocked(store);
+    const targetBuildIdentity = input.targetBuildIdentity;
+    if (current.phase !== 'ACTIVE' || current.activationEpoch !== 1
+      || current.pendingBuildIdentity !== null
+      || store.buildIdentity !== current.activeBuildIdentity
+      || coordinator.buildIdentity !== current.activeBuildIdentity) {
+      fail('AUTHORITY_PREQUALIFICATION_INVALID', 'Build prequalification requires the active source opener and coordinator lease with no pending handoff.');
+    }
+    if (typeof targetBuildIdentity !== 'string' || !targetBuildIdentity
+      || targetBuildIdentity === current.activeBuildIdentity) {
+      fail('AUTHORITY_PREQUALIFICATION_TARGET_INVALID', 'Build prequalification requires a distinct non-empty target build identity.');
+    }
+    if (!DIGEST_PATTERN.test(input.expectedSelectorDigest ?? '')
+      || !DIGEST_PATTERN.test(input.expectedManifestDigest ?? '')
+      || !DIGEST_PATTERN.test(input.authorityTransitionDigest ?? '')
+      || !Number.isSafeInteger(input.expectedTargetSelectorRevision)) {
+      fail('AUTHORITY_PREQUALIFICATION_INVALID', 'Build prequalification requires exact manifest, selector, revision, and transition digests.');
+    }
+    let expectedManifest = null;
+    if (input.expectedManifest !== undefined && input.expectedManifest !== null) {
+      expectedManifest = validateManifest(structuredClone(input.expectedManifest), {
+        supportedSchemaVersion: PARENT_RUN_STORE_SCHEMA_VERSION,
+        writerProtocol: store.manifest.currentWriterProtocol,
+      });
+      if (expectedManifest.digest !== input.expectedManifestDigest) {
+        fail('STORE_MANIFEST_CONFLICT', 'Expected build-prequalification manifest does not match its digest.');
+      }
+    }
+
+    if (current.prequalifiedRollbackBuilds.includes(targetBuildIdentity)) {
+      let intent = null;
+      try {
+        intent = validateAuthorityBuildPrequalificationIntent(store, await readBoundedJson(
+          store.storage,
+          authorityBuildPrequalificationHistoryPath(store, targetBuildIdentity),
+          { label: 'release-authority build-prequalification history', maximumBytes: 256 * 1_024 },
+        ));
+      } catch (error) {
+        if (error?.code !== 'ATOMIC_NOT_FOUND') throw error;
+      }
+      const exactReplay = intent !== null
+        && intent.fromSelectorDigest === input.expectedSelectorDigest
+        && intent.expectedTargetSelectorRevision === input.expectedTargetSelectorRevision
+        && intent.authorityTransitionDigest === input.authorityTransitionDigest
+        && intent.toSelectorDigest === current.digest
+        && (intent.fromManifestDigest === input.expectedManifestDigest
+          || (expectedManifest !== null
+            && manifestIsCoordinatorSuccessor(intent.fromManifest, expectedManifest)))
+        && manifestCarriesPrequalificationTransition(store.manifest, intent.manifest);
+      if (exactReplay) return clone(current);
+      fail('AUTHORITY_PREQUALIFICATION_TARGET_CONFLICT', 'Target build is already prequalified by a different durable transition.');
+    }
+    if (current.digest !== input.expectedSelectorDigest) {
+      fail('AUTHORITY_SELECTOR_CONFLICT', 'Release-authority selector changed before build prequalification.');
+    }
+    if (store.manifest.digest !== input.expectedManifestDigest
+      && (expectedManifest === null || !manifestIsCoordinatorSuccessor(store.manifest, expectedManifest))) {
+      fail('STORE_MANIFEST_CONFLICT', 'Parent-run store manifest changed before build prequalification.');
+    }
+    if (input.expectedTargetSelectorRevision !== current.revision + 1) {
+      fail('AUTHORITY_PREQUALIFICATION_REVISION_INVALID', 'Build prequalification requires the exact next selector revision.');
+    }
+
+    const prequalifiedRollbackBuilds = [...current.prequalifiedRollbackBuilds, targetBuildIdentity].sort();
+    const nextManifestBody = {
+      ...manifestBody(store.manifest),
+      prequalifiedRollbackBuilds,
+    };
+    const nextManifest = {
+      ...nextManifestBody,
+      digest: canonicalDigest(nextManifestBody),
+    };
+    const nextSelector = sealAuthoritySelector({
+      ...current,
+      prequalifiedRollbackBuilds,
+      authorityTransitionDigest: input.authorityTransitionDigest,
+      revision: input.expectedTargetSelectorRevision,
+      previousDigest: current.digest,
+      updatedAt: nextTimestamp(store, current.updatedAt),
+    });
+    const intentBody = {
+      schemaVersion: 1,
+      kind: 'release-authority-build-prequalification-intent',
+      targetBuildIdentity,
+      authorityTransitionDigest: input.authorityTransitionDigest,
+      expectedTargetSelectorRevision: input.expectedTargetSelectorRevision,
+      fromManifestDigest: store.manifest.digest,
+      toManifestDigest: nextManifest.digest,
+      fromSelectorDigest: current.digest,
+      toSelectorDigest: nextSelector.digest,
+      fromManifest: store.manifest,
+      manifest: nextManifest,
+      fromSelector: current,
+      selector: nextSelector,
+      createdAt: timestamp(store),
+    };
+    const intent = { ...intentBody, digest: canonicalDigest(intentBody) };
+    validateAuthorityBuildPrequalificationIntent(store, structuredClone(intent));
+    await atomicWriteJson(store.storage, authorityBuildPrequalificationIntentPath(store), intent, { exclusive: true });
+    await input.hooks?.afterIntent?.(clone(nextSelector));
+    await atomicWriteJson(store.storage, containedPath(store.root, 'store-manifest.json'), nextManifest);
+    store.manifest = nextManifest;
+    await input.hooks?.afterManifest?.(clone(nextSelector));
+    await atomicWriteJson(store.storage, authoritySelectorPath(store), nextSelector);
+    await input.hooks?.afterSelector?.(clone(nextSelector));
+    await persistAuthorityBuildPrequalificationIntent(store, intent);
+    await store.storage.fs.rm(authorityBuildPrequalificationIntentPath(store), { force: true });
+    return clone(nextSelector);
+  });
+}
+
 export function beginReleaseAuthorityBuildHandoff(store, coordinator, input = {}) {
   return withDirectoryLock(store.storage, globalLockPath(store), async () => {
     await validateCoordinator(store, coordinator);
@@ -2026,6 +2300,21 @@ export async function heartbeatCoordinator(store, coordinator, { leaseMs }) {
       acquiredAt: renewed.acquiredAt, expiresAt: renewed.expiresAt,
     });
   });
+}
+
+export function releaseStoreCoordinator(store, coordinator) {
+  return withDirectoryLock(store.storage, globalLockPath(store), () => (
+    withDirectoryLock(store.storage, coordinatorLeaseLockPath(store), async () => {
+      await validateCoordinator(store, coordinator);
+      await store.storage.fs.rm(globalCoordinatorPath(store), { force: true });
+      return Object.freeze({
+        buildIdentity: coordinator.buildIdentity,
+        ownerId: coordinator.ownerId,
+        epoch: coordinator.epoch,
+        releasedAt: timestamp(store),
+      });
+    })
+  ));
 }
 
 function validatedWorkerScheduling(input) {

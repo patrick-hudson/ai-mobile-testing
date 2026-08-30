@@ -31,6 +31,7 @@ import {
   beginReleaseAuthorityBuildHandoff,
   completeReleaseAuthorityBuildHandoffWithPublicationFence,
   listParentRunIds,
+  prequalifyReleaseAuthorityBuild,
   readCurrentEnvelope,
   readParentRun,
   readStorePerformanceScheduler,
@@ -1985,6 +1986,161 @@ function parseHandoffCheckpoint(value, intent) {
 
 function handoffPath(storage, handoffId, suffix) {
   return reportStoragePath(storage, safeId(handoffId, 'handoffId'), `.handoff${suffix}`);
+}
+
+function buildCompatibilityProof(value, targetBuildIdentity) {
+  parseSealed(value, 'Build compatibility proof');
+  exactKeys(value, [
+    'schemaVersion', 'kind', 'targetBuildIdentity', 'runnerRevision', 'imageDigest',
+    'validationDigest', 'generatedAt', 'digest',
+  ], 'Build compatibility proof');
+  if (value.schemaVersion !== 1 || value.kind !== 'shared-build-compatibility-proof'
+    || value.targetBuildIdentity !== targetBuildIdentity
+    || value.targetBuildIdentity !== `build:${value.imageDigest}`) {
+    fail('AUTHORITY_BUILD_QUALIFICATION_INVALID', 'Build compatibility proof does not identify the requested target.');
+  }
+  for (const key of ['runnerRevision', 'imageDigest', 'validationDigest']) {
+    assertDigest(value[key], `Build compatibility proof ${key}`);
+  }
+  canonicalTimestamp(value.generatedAt, 'Build compatibility proof generatedAt');
+  return clone(value);
+}
+
+function buildPrequalificationPath(storage, prequalificationId, suffix) {
+  return reportStoragePath(storage, safeId(prequalificationId, 'prequalificationId'), `.build-prequalification${suffix}`);
+}
+
+export async function prequalifySharedAuthorityBuild({
+  store, coordinator, legacyAuthorityFence, authorityFloor, reportDirectory,
+  prequalificationId, targetBuildIdentity, compatibilityProof: rawCompatibilityProof,
+  operatorReview: rawOperatorReview, clock = store?.clock ?? (() => Date.now()), hooks = {},
+} = {}) {
+  const storage = await openReportStorage(reportDirectory);
+  safeId(prequalificationId, 'prequalificationId');
+  nonEmptyString(targetBuildIdentity, 'targetBuildIdentity');
+  return withCutoverLock(storage, prequalificationId, async () => {
+    const intentPath = buildPrequalificationPath(storage, prequalificationId, '.intent.json');
+    const receiptPath = buildPrequalificationPath(storage, prequalificationId, '.json');
+    let intent;
+    if (await pathExists(storage.fs, intentPath)) {
+      intent = parseSealed(await readBoundedJson(storage, intentPath, {
+        label: 'build prequalification intent', maximumBytes: 256 * 1_024,
+      }), 'Build prequalification intent');
+      const compatibilityProof = buildCompatibilityProof(intent.compatibilityProof, targetBuildIdentity);
+      const operatorReview = parseOperatorReview(intent.operatorReview);
+      if (intent.compatibilityProofDigest !== compatibilityProof.digest) {
+        fail('CUTOVER_CHECKPOINT_CONFLICT', 'Durable build prequalification proof binding is invalid.');
+      }
+      if (intent.kind !== 'release-authority-build-prequalification-intent'
+        || intent.prequalificationId !== prequalificationId
+        || intent.targetBuildIdentity !== targetBuildIdentity
+        || (rawCompatibilityProof !== null && rawCompatibilityProof !== undefined
+          && canonicalJson(buildCompatibilityProof(rawCompatibilityProof, targetBuildIdentity)) !== canonicalJson(compatibilityProof))
+        || (rawOperatorReview !== null && rawOperatorReview !== undefined
+          && canonicalJson(parseOperatorReview(rawOperatorReview)) !== canonicalJson(operatorReview))) {
+        fail('CUTOVER_CHECKPOINT_CONFLICT', 'Build prequalification intent is immutable.');
+      }
+    } else {
+      const operatorReview = parseOperatorReview(rawOperatorReview);
+      const compatibilityProof = buildCompatibilityProof(rawCompatibilityProof, targetBuildIdentity);
+      const [selector, floor, legacy] = await Promise.all([
+        readReleaseAuthoritySelector(store), authorityFloor?.read(), legacyAuthorityFence?.read(),
+      ]);
+      if (!authorityFloor || !floor || selector.phase !== 'ACTIVE' || selector.activationEpoch !== 1
+        || selector.activeBuildIdentity !== store.buildIdentity || selector.pendingBuildIdentity !== null
+        || targetBuildIdentity === selector.activeBuildIdentity
+        || floor.storeMarkerDigest !== selector.storeMarkerDigest
+        || floor.minimumStoreGeneration !== selector.storeGeneration
+        || floor.minimumSelectorRevision !== selector.revision
+        || floor.activeBuildIdentity !== selector.activeBuildIdentity
+        || floor.authorityTransitionDigest !== selector.authorityTransitionDigest
+        || floor.activationEpoch !== 1 || floor.legacyPermanentlyRetired !== true
+        || floor.activationRevision !== selector.activationRevision
+        || floor.activationCutoverDigest !== selector.activationCutoverDigest) {
+        fail('AUTHORITY_FLOOR_STATE_INVALID', 'Build prequalification requires exact active selector and authority-floor lineage.');
+      }
+      if (!legacy || legacy.state !== 'ACTIVATED' || legacy.activationEpoch !== 1) {
+        fail('CUTOVER_LEGACY_FENCE_CONFLICT', 'Build prequalification requires permanently retired legacy authority.');
+      }
+      intent = seal({
+        schemaVersion: 1,
+        kind: 'release-authority-build-prequalification-intent',
+        prequalificationId,
+        sourceBuildIdentity: selector.activeBuildIdentity,
+        targetBuildIdentity,
+        sourceManifest: clone(store.manifest),
+        sourceManifestDigest: store.manifest.digest,
+        sourceSelectorDigest: selector.digest,
+        targetSelectorRevision: selector.revision + 1,
+        authorityFloorBeforeDigest: floor.digest,
+        activationCutoverDigest: selector.activationCutoverDigest,
+        activationRevision: selector.activationRevision,
+        compatibilityProof,
+        compatibilityProofDigest: compatibilityProof.digest,
+        operatorReview,
+        requestedAt: timestamp(clock),
+      });
+      await atomicWriteJson(storage, intentPath, intent, { exclusive: true });
+      await hooks.afterIntentPersisted?.(clone(intent));
+    }
+    let selector = await prequalifyReleaseAuthorityBuild(store, coordinator, {
+      expectedSelectorDigest: intent.sourceSelectorDigest,
+      expectedManifestDigest: intent.sourceManifestDigest,
+      expectedManifest: intent.sourceManifest,
+      targetBuildIdentity: intent.targetBuildIdentity,
+      expectedTargetSelectorRevision: intent.targetSelectorRevision,
+      authorityTransitionDigest: intent.digest,
+      hooks: {
+        afterManifest: hooks.afterManifestCommitted,
+        afterSelector: hooks.afterSelectorCommitted,
+      },
+    });
+    let floorAfter = await authorityFloor.read();
+    if (floorAfter.digest === intent.authorityFloorBeforeDigest) {
+      floorAfter = await authorityFloor.compareAndAdvance(intent.authorityFloorBeforeDigest, {
+        minimumStoreGeneration: selector.storeGeneration,
+        minimumSelectorRevision: selector.revision,
+        activeBuildIdentity: intent.sourceBuildIdentity,
+        authorityTransitionDigest: intent.digest,
+        activationEpoch: 1,
+        legacyPermanentlyRetired: true,
+        activationRevision: intent.activationRevision,
+        activationCutoverDigest: intent.activationCutoverDigest,
+      });
+      await hooks.afterAuthorityFloorAdvanced?.(clone(floorAfter));
+    } else if (floorAfter.minimumStoreGeneration !== selector.storeGeneration
+      || floorAfter.minimumSelectorRevision !== selector.revision
+      || floorAfter.activeBuildIdentity !== intent.sourceBuildIdentity
+      || floorAfter.authorityTransitionDigest !== intent.digest
+      || floorAfter.activationEpoch !== 1 || floorAfter.legacyPermanentlyRetired !== true
+      || floorAfter.activationRevision !== intent.activationRevision
+      || floorAfter.activationCutoverDigest !== intent.activationCutoverDigest) {
+      fail('AUTHORITY_FLOOR_STATE_INVALID', 'Authority floor is neither before nor exactly after this build prequalification.');
+    }
+    const receipt = seal({
+      schemaVersion: 1,
+      kind: 'release-authority-build-prequalification-receipt',
+      prequalificationId,
+      intentDigest: intent.digest,
+      compatibilityProofDigest: intent.compatibilityProofDigest,
+      selector,
+      authorityFloorAfter: floorAfter,
+      completedAt: timestamp(clock),
+    });
+    if (await pathExists(storage.fs, receiptPath)) {
+      const existing = parseSealed(await readBoundedJson(storage, receiptPath, {
+        label: 'build prequalification receipt', maximumBytes: 512 * 1_024,
+      }), 'Build prequalification receipt');
+      if (existing.intentDigest !== receipt.intentDigest
+        || existing.selector?.digest !== receipt.selector.digest
+        || existing.authorityFloorAfter?.digest !== receipt.authorityFloorAfter.digest) {
+        fail('CUTOVER_CHECKPOINT_CONFLICT', 'Build prequalification receipt conflicts with durable authority state.');
+      }
+      return clone(existing);
+    }
+    await atomicWriteJson(storage, receiptPath, receipt, { exclusive: true });
+    return clone(receipt);
+  });
 }
 
 async function readHandoffDocuments(storage, handoffId) {

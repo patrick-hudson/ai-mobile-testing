@@ -293,10 +293,23 @@ server.listen(port, '0.0.0.0', () => process.stdout.write(`${JSON.stringify({
   event: 'shared-coordinator-listening', port, state: supervisor.status().state, epoch: supervisor.status().epoch,
 })}\n`));
 
-for (const signal of ['SIGINT', 'SIGTERM']) {
-  process.once(signal, () => {
-    clearInterval(maintenanceTimer);
-    clearInterval(coordinatorHeartbeat);
-    server.close(() => process.exit());
-  });
+let shuttingDown = false;
+async function shutDown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  clearInterval(maintenanceTimer);
+  clearInterval(coordinatorHeartbeat);
+  await new Promise((resolve) => server.close(resolve));
+  await maintenance;
+  try {
+    await supervisor.relinquishCoordinator();
+    process.stdout.write(`${JSON.stringify({ event: 'shared-coordinator-stopped', signal, leaseReleased: true })}\n`);
+    process.exit();
+  } catch (error) {
+    process.stderr.write(`${JSON.stringify({
+      event: 'shared-coordinator-stop-failed', signal, code: error?.code, message: error?.message,
+    })}\n`);
+    process.exitCode = 1;
+  }
 }
+for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => { void shutDown(signal); });

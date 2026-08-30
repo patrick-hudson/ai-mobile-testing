@@ -28,6 +28,7 @@ import {
   publishAttemptEvidence,
   readParentRun,
   readReleaseAuthoritySelector,
+  readStoreCoordinator,
   transitionReleaseAuthority,
 } from './lib/parent-run-store.mjs';
 import {
@@ -39,6 +40,7 @@ import {
   initializeCutoverAdmissionGate,
   prepareSharedAuthorityCutover,
   prepareSharedAuthorityBuildHandoff,
+  prequalifySharedAuthorityBuild,
   recordSharedCutoverCanary,
   reopenSharedAdmissionAfterCanaries,
   rollbackSharedAuthorityBeforeActivation,
@@ -47,11 +49,12 @@ import {
 } from './lib/shared-cutover-orchestrator.mjs';
 import { openSharedLaunchOperationStore } from './lib/shared-launch-operation-store.mjs';
 import { rehearseSharedStoreBackup } from './lib/shared-store-backup-rehearsal.mjs';
-import { initializeLegacyAuthorityFence } from './lib/legacy-authority-fence.mjs';
-import { initializeSharedAuthorityFloor } from './lib/shared-authority-floor.mjs';
+import { initializeLegacyAuthorityFence, openLegacyAuthorityFence } from './lib/legacy-authority-fence.mjs';
+import { initializeSharedAuthorityFloor, openSharedAuthorityFloor } from './lib/shared-authority-floor.mjs';
 import {
   beginSharedAuthorityBuildHandoffFromCli,
   runSharedAuthorityCutoverCli,
+  sharedCutoverActionRequiresCoordinator,
 } from './run-shared-authority-cutover.mjs';
 
 const marker = 'cd'.repeat(32);
@@ -295,6 +298,120 @@ async function fixture(name) {
   };
 }
 
+async function activatedFixture(name) {
+  const context = await fixture(name);
+  const shadow = await readReleaseAuthoritySelector(context.store);
+  const draining = await transitionReleaseAuthority(context.store, context.coordinator, {
+    expectedSelectorDigest: shadow.digest,
+    phase: 'DRAINING',
+    buildIdentity: build,
+  });
+  const active = await transitionReleaseAuthority(context.store, context.coordinator, {
+    expectedSelectorDigest: draining.digest,
+    phase: 'ACTIVE',
+    activationRevision: 73,
+    buildIdentity: build,
+    activationCutoverDigest: digest('c'),
+    authorityTransitionDigest: digest('d'),
+  });
+  let legacy = await context.legacyAuthorityFence.read();
+  legacy = await context.legacyAuthorityFence.close(legacy.digest, `${name}-cutover`);
+  legacy = await context.legacyAuthorityFence.freeze(legacy.digest, `${name}-cutover`);
+  await context.legacyAuthorityFence.activate(legacy.digest, `${name}-cutover`, 1);
+  const floor = await context.authorityFloor.read();
+  await context.authorityFloor.compareAndAdvance(floor.digest, {
+    minimumStoreGeneration: active.storeGeneration,
+    minimumSelectorRevision: active.revision,
+    activeBuildIdentity: active.activeBuildIdentity,
+    authorityTransitionDigest: active.authorityTransitionDigest,
+    activationEpoch: 1,
+    legacyPermanentlyRetired: true,
+    activationRevision: active.activationRevision,
+    activationCutoverDigest: active.activationCutoverDigest,
+  });
+  return { ...context, active };
+}
+
+async function activatedCliFixture(name) {
+  const directory = path.join(root, name);
+  const store = await openParentRunStore({
+    root: path.join(directory, 'store'),
+    deploymentIdentity,
+    volumeIdentity,
+    storeMarker: marker,
+    storeGeneration: 4,
+    schemaFloor: PARENT_RUN_STORE_SCHEMA_VERSION,
+    writerProtocol: PARENT_RUN_WRITER_PROTOCOL,
+    minimumWriterProtocol: PARENT_RUN_WRITER_PROTOCOL,
+    buildIdentity: build,
+    backupMarker: backup,
+    prequalifiedRollbackBuilds: [build, rollbackBuild],
+    verifyStorage: false,
+    clock,
+  });
+  const admissionGate = await initializeCutoverAdmissionGate({
+    root: path.join(store.root, 'cutover-admission'), verifyStorage: false, clock,
+  });
+  const legacyAuthorityFence = await initializeLegacyAuthorityFence({
+    root: path.join(store.root, 'legacy-authority'), verifyStorage: false, clock,
+  });
+  await openSharedLaunchOperationStore({ root: path.join(store.root, 'launch-operations'), clock });
+  const coordinator = await acquireStoreCoordinator(store, {
+    ownerId: `coordinator-${name}`, leaseMs: 60_000,
+  });
+  const shadow = await readReleaseAuthoritySelector(store);
+  const draining = await transitionReleaseAuthority(store, coordinator, {
+    expectedSelectorDigest: shadow.digest,
+    phase: 'DRAINING',
+    buildIdentity: build,
+  });
+  const active = await transitionReleaseAuthority(store, coordinator, {
+    expectedSelectorDigest: draining.digest,
+    phase: 'ACTIVE',
+    activationRevision: 73,
+    buildIdentity: build,
+    activationCutoverDigest: digest('c'),
+    authorityTransitionDigest: digest('d'),
+  });
+  let legacy = await legacyAuthorityFence.read();
+  legacy = await legacyAuthorityFence.close(legacy.digest, `${name}-cutover`);
+  legacy = await legacyAuthorityFence.freeze(legacy.digest, `${name}-cutover`);
+  await legacyAuthorityFence.activate(legacy.digest, `${name}-cutover`, 1);
+  const authorityFloor = await initializeSharedAuthorityFloor({
+    root: path.join(directory, 'authority-floor'),
+    protectedRoots: [store.root],
+    verifyStorage: false,
+    clock,
+    initial: {
+      storeMarkerDigest: active.storeMarkerDigest,
+      minimumStoreGeneration: active.storeGeneration,
+      minimumSelectorRevision: active.revision,
+      activeBuildIdentity: active.activeBuildIdentity,
+      authorityTransitionDigest: active.authorityTransitionDigest,
+      activationEpoch: active.activationEpoch,
+      legacyPermanentlyRetired: true,
+      activationRevision: active.activationRevision,
+      activationCutoverDigest: active.activationCutoverDigest,
+    },
+  });
+  return { directory, store, admissionGate, legacyAuthorityFence, authorityFloor, active };
+}
+
+function compatibilityProof(targetBuildIdentity, validationDigest = digest('a')) {
+  const imageDigest = targetBuildIdentity.slice('build:'.length);
+  assert.match(imageDigest, /^sha256:[a-f0-9]{64}$/u);
+  const body = {
+    schemaVersion: 1,
+    kind: 'shared-build-compatibility-proof',
+    targetBuildIdentity,
+    runnerRevision: digest('8'),
+    imageDigest,
+    validationDigest,
+    generatedAt: new Date(now).toISOString(),
+  };
+  return { ...body, digest: canonicalDigest(body) };
+}
+
 async function request(cutoverId, { directory, store }, suffix = 'initial', requestedRollbackBuild = rollbackBuild) {
   const input = {
     cutoverId,
@@ -332,9 +449,187 @@ async function expectCode(code, operation) {
 }
 
 try {
+  assert.equal(sharedCutoverActionRequiresCoordinator('prequalify-handoff-target'), true);
+  assert.equal(sharedCutoverActionRequiresCoordinator('prepare-handoff'), true);
+  assert.equal(sharedCutoverActionRequiresCoordinator('launch-handoff-single-site-canary'), false,
+    'remote canary launch must not contend with the live shared coordinator lease');
+  assert.equal(sharedCutoverActionRequiresCoordinator('record-handoff-comparative-canary'), false,
+    'canary observation must not acquire an unrelated writer lease');
+  await assert.rejects(async () => sharedCutoverActionRequiresCoordinator('unknown-action'),
+    /Unknown shared cutover action/u);
   await expectCode('LAUNCH_OPERATION_STORE_UNAVAILABLE', () => openSharedLaunchOperationStore({
     root: path.join(root, 'missing-launch-operations'), requireExisting: true, clock,
   }));
+  {
+    const targetBuildIdentity = `build:${digest('9')}`;
+    const context = await activatedFixture('prequalify-build');
+    const reportDirectory = path.join(context.directory, 'reports');
+    const proof = compatibilityProof(targetBuildIdentity);
+    const request = {
+      store: context.store,
+      coordinator: context.coordinator,
+      legacyAuthorityFence: context.legacyAuthorityFence,
+      authorityFloor: context.authorityFloor,
+      reportDirectory,
+      prequalificationId: 'prequalify-build-0001',
+      targetBuildIdentity,
+      compatibilityProof: proof,
+      operatorReview: review(),
+      clock,
+    };
+    const receipt = await prequalifySharedAuthorityBuild(request);
+    assert.equal(receipt.kind, 'release-authority-build-prequalification-receipt');
+    assert.equal(receipt.compatibilityProofDigest, proof.digest);
+    assert.deepEqual(receipt.selector.prequalifiedRollbackBuilds,
+      [build, rollbackBuild, targetBuildIdentity].sort());
+    assert.deepEqual(context.store.manifest.prequalifiedRollbackBuilds,
+      receipt.selector.prequalifiedRollbackBuilds);
+    assert.equal(receipt.authorityFloorAfter.minimumSelectorRevision, receipt.selector.revision);
+    assert.equal(receipt.authorityFloorAfter.authorityTransitionDigest, receipt.intentDigest);
+    assert.equal((await context.authorityFloor.read()).digest, receipt.authorityFloorAfter.digest);
+    assert.equal((await prequalifySharedAuthorityBuild(request)).digest, receipt.digest,
+      'an exact replay returns the immutable receipt');
+    await expectCode('CUTOVER_CHECKPOINT_CONFLICT', () => prequalifySharedAuthorityBuild({
+      ...request,
+      compatibilityProof: compatibilityProof(targetBuildIdentity, digest('b')),
+    }));
+  }
+  for (const [sequence, hook] of [
+    'afterIntentPersisted', 'afterManifestCommitted', 'afterSelectorCommitted', 'afterAuthorityFloorAdvanced',
+  ].entries()) {
+    const targetBuildIdentity = `build:${digest(String(sequence + 5))}`;
+    const context = await activatedFixture(`prequalify-build-crash-${hook}`);
+    const reportDirectory = path.join(context.directory, 'reports');
+    const request = {
+      store: context.store,
+      coordinator: context.coordinator,
+      legacyAuthorityFence: context.legacyAuthorityFence,
+      authorityFloor: context.authorityFloor,
+      reportDirectory,
+      prequalificationId: `prequalify-build-crash-${sequence + 1}`,
+      targetBuildIdentity,
+      compatibilityProof: compatibilityProof(targetBuildIdentity),
+      operatorReview: review(),
+      clock,
+    };
+    await assert.rejects(prequalifySharedAuthorityBuild({
+      ...request,
+      hooks: { [hook]: () => { throw new Error(`synthetic crash at ${hook}`); } },
+    }), new RegExp(`synthetic crash at ${hook}`, 'u'));
+
+    now += 60_001;
+    const reopenedStore = await openParentRunStore({
+      root: context.store.root,
+      deploymentIdentity,
+      volumeIdentity,
+      storeMarker: marker,
+      storeGeneration: context.store.manifest.storeGeneration,
+      expectedStoreGeneration: context.store.manifest.storeGeneration,
+      buildIdentity: build,
+      writerProtocol: PARENT_RUN_WRITER_PROTOCOL,
+      verifyStorage: false,
+      clock,
+    });
+    const reopenedCoordinator = await acquireStoreCoordinator(reopenedStore, {
+      ownerId: `coordinator-replay-${sequence + 1}`,
+      leaseMs: 60_000,
+    });
+    const reopenedLegacyFence = await openLegacyAuthorityFence({
+      root: path.join(context.directory, 'legacy-authority'), verifyStorage: false, clock,
+    });
+    const reopenedAuthorityFloor = await openSharedAuthorityFloor({
+      root: path.join(context.directory, 'authority-floor'),
+      protectedRoots: [reopenedStore.root],
+      verifyStorage: false,
+      clock,
+    });
+    const recovered = await prequalifySharedAuthorityBuild({
+      ...request,
+      store: reopenedStore,
+      coordinator: reopenedCoordinator,
+      legacyAuthorityFence: reopenedLegacyFence,
+      authorityFloor: reopenedAuthorityFloor,
+      compatibilityProof: null,
+      operatorReview: null,
+    });
+    const selectorAfterRecovery = await readReleaseAuthoritySelector(reopenedStore);
+    assert(selectorAfterRecovery.prequalifiedRollbackBuilds.includes(targetBuildIdentity));
+    assert.equal(recovered.selector.digest, selectorAfterRecovery.digest);
+    assert.equal(recovered.authorityFloorAfter.authorityTransitionDigest, recovered.intentDigest);
+    assert.equal((await reopenedAuthorityFloor.read()).digest, recovered.authorityFloorAfter.digest);
+    assert.equal((await prequalifySharedAuthorityBuild({
+      ...request,
+      store: reopenedStore,
+      coordinator: reopenedCoordinator,
+      legacyAuthorityFence: reopenedLegacyFence,
+      authorityFloor: reopenedAuthorityFloor,
+    })).digest, recovered.digest, `exact ${hook} replay must return the immutable receipt`);
+  }
+  {
+    const targetBuildIdentity = `build:${digest('6')}`;
+    const context = await activatedCliFixture('prequalify-build-cli');
+    const trustDirectory = path.join(context.directory, 'trust');
+    const reportDirectory = path.join(context.directory, 'reports');
+    await mkdir(trustDirectory, { recursive: true });
+    const storeMarkerFile = path.join(trustDirectory, 'store-marker');
+    const proofFile = path.join(trustDirectory, 'resilience-proof.json');
+    const configFile = path.join(context.directory, 'prequalification-operator-config.json');
+    const proof = compatibilityProof(targetBuildIdentity);
+    await Promise.all([
+      writeFile(storeMarkerFile, `${marker}\n`),
+      writeFile(proofFile, `${JSON.stringify({ fixture: 'validated-resilience-proof' })}\n`),
+    ]);
+    await writeFile(configFile, `${JSON.stringify({
+      schemaVersion: 1,
+      coordinatorOwnerId: 'coordinator-prequalification-cli',
+      coordinatorLeaseMs: 30_000,
+      reportDirectory,
+      authorityFloorRoot: context.authorityFloor.root,
+      authorityFloorVerifyStorage: false,
+      store: {
+        root: context.store.root,
+        deploymentIdentity,
+        volumeIdentity,
+        storeMarkerFile,
+        storeGeneration: context.store.manifest.storeGeneration,
+        schemaFloor: PARENT_RUN_STORE_SCHEMA_VERSION,
+        supportedSchemaVersion: PARENT_RUN_STORE_SCHEMA_VERSION,
+        writerProtocol: PARENT_RUN_WRITER_PROTOCOL,
+        minimumWriterProtocol: PARENT_RUN_WRITER_PROTOCOL,
+        buildIdentity: build,
+        prequalifiedRollbackBuilds: context.store.manifest.prequalifiedRollbackBuilds,
+        backupMarker: backup,
+        verifyStorage: false,
+      },
+      handoff: {
+        prequalificationId: 'prequalify-build-cli-0001',
+        targetBuildIdentity,
+        resilienceProofFile: proofFile,
+        operatorReview: review(),
+      },
+    })}\n`);
+    let stdout = '';
+    await runSharedAuthorityCutoverCli(
+      ['prequalify-handoff-target', '--config', configFile],
+      {
+        output: { write: (chunk) => { stdout += chunk; } },
+        createCompatibilityProof: ({ resilienceProof, targetBuildIdentity: requestedTarget }) => {
+          assert.deepEqual(resilienceProof, { fixture: 'validated-resilience-proof' });
+          assert.equal(requestedTarget, targetBuildIdentity);
+          return proof;
+        },
+        resolveWorkspaceRevision: async () => `workspace:${digest('e')}`,
+      },
+    );
+    const receipt = JSON.parse(stdout);
+    assert.equal(receipt.kind, 'release-authority-build-prequalification-receipt');
+    assert.equal(receipt.compatibilityProofDigest, proof.digest);
+    assert(receipt.selector.prequalifiedRollbackBuilds.includes(targetBuildIdentity));
+    assert.equal(receipt.authorityFloorAfter.minimumSelectorRevision, receipt.selector.revision);
+    assert.equal(receipt.authorityFloorAfter.authorityTransitionDigest, receipt.intentDigest);
+    assert.equal(await readStoreCoordinator(context.store), null,
+      'the one-shot cutover CLI must release its coordinator lease before returning');
+  }
   {
     const {
       directory, store, admissionGate, coordinator, launchOperationStore, legacyAuthorityFence,

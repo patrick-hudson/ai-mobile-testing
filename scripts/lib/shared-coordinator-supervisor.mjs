@@ -6,6 +6,7 @@ import {
   listParentRunIds,
   readAdoptedAttemptArtifactJson,
   reconcileStorePerformanceScheduler,
+  releaseStoreCoordinator,
   recoverParentRun,
   requeueExpiredWork,
   requestStorePerformanceDrain,
@@ -302,6 +303,20 @@ export function createSharedCoordinatorSupervisor({
     return requireCoordinator({ forceRenewal: true });
   }
 
+  function relinquishCoordinator() {
+    const action = async () => {
+      if (coordinator === null) return null;
+      const released = await releaseStoreCoordinator(store, coordinator);
+      coordinator = null;
+      latest = Object.freeze({ ...latest, state: 'waiting-for-lease', epoch: null });
+      onEvent({ event: 'coordinator-released', epoch: released.epoch });
+      return released;
+    };
+    const next = coordinatorAccess.then(action, action);
+    coordinatorAccess = next.catch(() => undefined);
+    return next;
+  }
+
   function withSchedulingAccess(action) {
     const next = schedulingAccess.then(action, action);
     schedulingAccess = next.catch(() => undefined);
@@ -364,6 +379,7 @@ export function createSharedCoordinatorSupervisor({
   return Object.freeze({
     maintain,
     renewCoordinator,
+    relinquishCoordinator,
     claim,
     requestPerformanceDrain,
     status: () => latest,

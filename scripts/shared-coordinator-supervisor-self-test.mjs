@@ -7,6 +7,7 @@ import { createSharedCoordinatorSupervisor } from './lib/shared-coordinator-supe
 import { createSharedControlService } from './lib/shared-control-service.mjs';
 import {
   adoptAttemptEvidence, createParentRun, openParentRunStore, publishAttemptEvidence, readParentRun,
+  readStoreCoordinator,
 } from './lib/parent-run-store.mjs';
 import { compileSharedLaunchPlan } from '../shared/launch-plan-compiler.mjs';
 import { withDirectoryLock } from './lib/atomic-filesystem.mjs';
@@ -157,6 +158,22 @@ try {
     'final-attempt lease expiry must terminalize inventory compilation');
   assert.match(terminalAttempt.canonicalResultDigest, /^sha256:[a-f0-9]{64}$/u);
   assert.equal(expiredInventory.compilationFailure.terminalResultDigest, terminalAttempt.canonicalResultDigest);
+  const released = await supervisor.relinquishCoordinator();
+  assert.equal(released.epoch, 1);
+  assert.equal(await readStoreCoordinator(store), null,
+    'graceful coordinator shutdown must release its lease immediately');
+  const replacement = createSharedCoordinatorSupervisor({
+    store,
+    controlService: createSharedControlService({ store, projectId: 'project-1' }),
+    projectId: 'project-1',
+    ownerId: 'coordinator-supervisor-replacement',
+    coordinatorLeaseMs: 60_000,
+    workLeaseMs: 1_000,
+    pluginRegistry,
+    targetRegistry,
+  });
+  assert.equal((await replacement.maintain()).epoch, 2,
+    'a replacement coordinator must acquire immediately after graceful release');
 } finally {
   await rm(root, { recursive: true, force: true });
 }
