@@ -16,8 +16,11 @@ if (options.action === 'create') {
   });
 } else if (options.action === 'rotate') result = await authority.rotateCredential(required(options, 'id'));
 else if (options.action === 'roles') result = { principal: await authority.setRoles(required(options, 'id'), list(required(options, 'roles'))) };
+else if (options.action === 'scopes') result = { principal: await authority.setScopes(required(options, 'id'), {
+  projectIds: list(required(options, 'projects')), runIds: list(required(options, 'runs')),
+}) };
 else if (options.action === 'revoke') result = { principal: await authority.revokePrincipal(required(options, 'id')), revoked: true };
-else throw new Error('--action must be create, rotate, roles, or revoke.');
+else throw new Error('--action must be create, rotate, roles, scopes, or revoke.');
 if (result.credential) await credentialOutput.write(result.credential);
 await writeStream(process.stdout, `${JSON.stringify({ ...result, credential: undefined, credentialPath: credentialOutput?.path ?? undefined })}\n`);
 if (credentialOutput) await writeStream(process.stderr, `Credential written once to ${credentialOutput.path}; the secret was not emitted on stdout.\n`);

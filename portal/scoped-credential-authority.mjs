@@ -95,6 +95,12 @@ export async function openScopedCredentialAuthority({ root, clock = () => Date.n
     setRoles: (id, roles) => serialize(authority, () => mutatePrincipal(authority, id, (record) => ({
       ...record, roles: unique(roles, 'roles', KIND_ROLES[record.kind]), authVersion: record.authVersion + 1,
     }))),
+    setScopes: (id, { projectIds, runIds } = {}) => serialize(authority, () => mutatePrincipal(authority, id, (record) => ({
+      ...record,
+      projectIds: validateScope(projectIds, 'projectIds'),
+      runIds: validateScope(runIds, 'runIds'),
+      authVersion: record.authVersion + 1,
+    }))),
     setWorkerGrant: (id, grant) => serialize(authority, () => mutatePrincipal(authority, id, (record) => ({
       ...record, workerGrant: workerGrant(grant, record.kind), authVersion: record.authVersion + 1,
     }))),

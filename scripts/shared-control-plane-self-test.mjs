@@ -121,6 +121,13 @@ try {
   assert.equal(principalCliDocument.principal.id, 'cli-worker');
   assert.match(await readFile(credentialOutput, 'utf8'), /^amt\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{32,}\n$/u);
   assert.equal((await stat(credentialOutput)).mode & 0o077, 0, 'principal credential output must be mode 0600');
+  const principalScopeCli = await runCommand(process.execPath, [
+    new URL('./manage-control-principal.mjs', import.meta.url).pathname,
+    '--root', path.join(root, 'principal-cli-authority'), '--action', 'scopes', '--id', 'cli-worker',
+    '--projects', 'project-1', '--runs', 'run-1,run-2',
+  ], path.join(root, 'principal-scope-cli-capture'));
+  assert.equal(principalScopeCli.code, 0, principalScopeCli.stderr);
+  assert.deepEqual(JSON.parse(principalScopeCli.stdout).principal.runIds, ['run-1', 'run-2']);
   const releaseUsage = await runCommand(process.execPath, [
     new URL('./assert-release-decision.mjs', import.meta.url).pathname, '--unsupported', 'value',
   ], path.join(root, 'release-usage'));
@@ -383,6 +390,12 @@ try {
   const roleSession = await authority.createBrowserSession(sessionPrincipal, { idleMs: 1_000, absoluteMs: 3_000 });
   await authority.setRoles('session-human', ['viewer']);
   await assert.rejects(() => authority.authenticateBrowserSession(roleSession.token),
+    (error) => error?.code === 'SESSION_REVOKED');
+  const scopePrincipal = await authority.authenticateCredential(sessionPrincipalIssued.credential);
+  const scopeSession = await authority.createBrowserSession(scopePrincipal, { idleMs: 1_000, absoluteMs: 3_000 });
+  const scoped = await authority.setScopes('session-human', { projectIds: ['project-1'], runIds: ['*'] });
+  assert.deepEqual(scoped.runIds, ['*']);
+  await assert.rejects(() => authority.authenticateBrowserSession(scopeSession.token),
     (error) => error?.code === 'SESSION_REVOKED');
   const updatedSessionPrincipal = await authority.authenticateCredential(sessionPrincipalIssued.credential);
   const absolute = await authority.createBrowserSession(updatedSessionPrincipal, { idleMs: 1_000, absoluteMs: 1_500 });

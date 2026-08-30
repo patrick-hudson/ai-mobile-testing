@@ -160,8 +160,8 @@ try {
     assert.match(block, /shared-authority-floor:\/var\/lib\/ai-mobile-testing\/shared\/authority-floor:ro/u, `${service} gets only read access to the external floor`);
     assert.match(block, /AUDIT_SHARED_AUTHORITY_FLOOR_ROOT: \/var\/lib\/ai-mobile-testing\/shared\/authority-floor/u);
   }
-  assert.match(serviceBlock('portal'), /PORTAL_ALLOWED_HOSTS: \$\{PORTAL_ALLOWED_HOSTS:-\}/u,
-    'additional portal hosts must remain an explicit deployment input with no permissive default');
+  assert.match(serviceBlock('portal'), /PORTAL_ALLOWED_HOSTS: \$\{PORTAL_ALLOWED_HOSTS:-portal\}/u,
+    'the bounded Compose service hostname must be available to shared control clients by default');
   const coordinator = serviceBlock('shared-coordinator');
   assert.match(coordinator, /shared-authority-floor:\/var\/lib\/ai-mobile-testing\/shared\/authority-floor(?!:ro)/u,
     'the singleton coordinator owns future monotonic authority-floor transitions');

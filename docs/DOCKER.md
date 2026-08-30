@@ -452,7 +452,7 @@ These optional variables affect the portal container:
 | `AUDIT_QUEUE_POLL_MS` | `1000` | Idle polling interval for the Single-site worker and finalizer pools; allowed range 100–60000 ms. |
 | `AUDIT_PREVIEW_TLS_BYPASS_ALLOWLIST` | unset | Exact comma-separated Preview origins allowed to request Single-site `preview-bypass`; the result is non-authoritative. Production and comparative runs remain strict. |
 | `PORTAL_SHARDED_ARTIFACT_ROOT` | `/work/artifacts/sharded` | Discovery/evidence root for terminal-launched releases; active execution stays read-only, terminal evidence may be purged with confirmation. |
-| `PORTAL_ALLOWED_HOSTS` | unset | Optional comma-separated extra local hostnames accepted by the request Host guard; loopback names are always allowed. |
+| `PORTAL_ALLOWED_HOSTS` | `portal` | Comma-separated extra local hostnames accepted by the request Host guard. The default permits the bounded Compose service name used by shared control clients; loopback names are always allowed. |
 | `PORTAL_EXTERNAL_RUN_SYNC_MS` | `1000` | External-run log and lifecycle refresh interval; allowed range 250–30000 ms. |
 | `PORTAL_EXTERNAL_TERMINAL_REFRESH_MS` | `30000` | Recheck interval for terminal external lifecycle evidence; allowed range 1000–600000 ms. |
 | `PORTAL_EXTERNAL_REFRESH_BYTES` | `2097152` | Global bytes available to one asynchronous external-run refresh; allowed range 512 KiB–64 MiB. |
