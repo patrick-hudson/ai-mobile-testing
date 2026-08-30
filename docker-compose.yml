@@ -37,6 +37,8 @@ services:
       - shared-parent-runs:/var/lib/ai-mobile-testing/shared/canonical
       - shared-authority-floor:/var/lib/ai-mobile-testing/shared/authority-floor
       - shared-store-trust:/var/lib/ai-mobile-testing/shared/trust
+      - shared-store-backups:/var/lib/ai-mobile-testing/shared/backups
+      - shared-store-restores:/var/lib/ai-mobile-testing/shared/restores
       - shared-worker-exchange:/var/lib/ai-mobile-testing/shared/exchange
       - shared-control-identities:/var/lib/ai-mobile-testing/shared/credentials
       - shared-worker-ordinary-a-secret:/var/lib/ai-mobile-testing/shared/secrets/ordinary-a
@@ -190,6 +192,8 @@ services:
       - shared-parent-runs:/var/lib/ai-mobile-testing/shared/canonical
       - shared-authority-floor:/var/lib/ai-mobile-testing/shared/authority-floor
       - shared-store-trust:/var/lib/ai-mobile-testing/shared/trust:ro
+      - shared-store-backups:/var/lib/ai-mobile-testing/shared/backups
+      - shared-store-restores:/var/lib/ai-mobile-testing/shared/restores
       - shared-worker-exchange:/var/lib/ai-mobile-testing/shared/exchange
       - shared-control-identities:/var/lib/ai-mobile-testing/shared/credentials
 
@@ -535,6 +539,8 @@ volumes:
   shared-parent-runs:
   shared-authority-floor:
   shared-store-trust:
+  shared-store-backups:
+  shared-store-restores:
   shared-worker-exchange:
   shared-control-identities:
   shared-worker-ordinary-a-secret:

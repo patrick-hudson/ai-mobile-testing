@@ -155,6 +155,10 @@ try {
   }
   assert.match(serviceBlock('single-site-volume-init'), /shared-authority-floor:\/var\/lib\/ai-mobile-testing\/shared\/authority-floor(?!:ro)/u);
   assert.match(serviceBlock('single-site-volume-init'), /AUDIT_SHARED_AUTHORITY_FLOOR_ROOT: \/var\/lib\/ai-mobile-testing\/shared\/authority-floor/u);
+  assert.match(serviceBlock('single-site-volume-init'), /shared-store-backups:\/var\/lib\/ai-mobile-testing\/shared\/backups/u,
+    'trusted init owns the durable backup volume used by cutover rehearsal');
+  assert.match(serviceBlock('single-site-volume-init'), /shared-store-restores:\/var\/lib\/ai-mobile-testing\/shared\/restores/u,
+    'trusted init owns the durable restore rehearsal volume');
   for (const service of ['portal', 'single-site-finalizer', 'audit-release', 'audit-release-merge']) {
     const block = serviceBlock(service);
     assert.match(block, /shared-authority-floor:\/var\/lib\/ai-mobile-testing\/shared\/authority-floor:ro/u, `${service} gets only read access to the external floor`);
@@ -165,6 +169,10 @@ try {
   const coordinator = serviceBlock('shared-coordinator');
   assert.match(coordinator, /shared-authority-floor:\/var\/lib\/ai-mobile-testing\/shared\/authority-floor(?!:ro)/u,
     'the singleton coordinator owns future monotonic authority-floor transitions');
+  assert.match(coordinator, /shared-store-backups:\/var\/lib\/ai-mobile-testing\/shared\/backups/u,
+    'cutover reports and backup receipts must survive coordinator replacement');
+  assert.match(coordinator, /shared-store-restores:\/var\/lib\/ai-mobile-testing\/shared\/restores/u,
+    'restore rehearsals must use durable storage rather than a container layer');
   const proof = serviceBlock('shared-resilience-driver');
   assert.match(proof, /shared-authority-floor:\/var\/lib\/ai-mobile-testing\/shared\/authority-floor(?!:ro)/u,
     'the proof-only authority activator advances the isolated external floor while holding its durable coordinator fence');
@@ -174,6 +182,8 @@ try {
     'only the isolated mutation-boundary proof opts the Docker service hostname into portal requests');
   assert.match(initScript, /node scripts\/init-shared-authority-floor\.mjs/u);
   assert.match(compose, /\n  shared-authority-floor:\s*$/mu);
+  assert.match(compose, /\n  shared-store-backups:\s*$/mu);
+  assert.match(compose, /\n  shared-store-restores:\s*$/mu);
   assert.doesNotMatch(serviceBlock('shared-worker-ordinary-a'), /shared-authority-floor/u);
   assert.doesNotMatch(serviceBlock('shared-worker-ordinary-b'), /shared-authority-floor/u);
 } finally {
