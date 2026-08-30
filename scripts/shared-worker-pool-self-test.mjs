@@ -867,8 +867,10 @@ try {
   const proofDriverBlock = compose.match(/shared-resilience-driver:[\s\S]*?(?=\n  [a-z][a-z0-9-]+:|\nvolumes:)/)?.[0] ?? '';
   assert.match(proofDriverBlock, /profiles: \[shared-proof\]/);
   assert.match(proofDriverBlock, /shared-parent-runs:/);
+  assert.match(proofDriverBlock, /shared-authority-floor:\/var\/lib\/ai-mobile-testing\/shared\/authority-floor(?!:ro)/,
+    'the proof-only authority activator must advance its isolated external floor');
   assert.doesNotMatch(proofDriverBlock, /shared-control-identities|shared-worker-exchange|docker\.sock|PORTAL_SECRET|TOKEN_FILE/,
-    'the proof driver may read the isolated canonical volume but must not receive control credentials, exchange storage, or host control');
+    'the proof driver may mutate only isolated authority stores and must not receive control credentials, exchange storage, or host control');
   const proofControlClientBlock = compose.match(/shared-resilience-control-client:[\s\S]*?(?=\n  [a-z][a-z0-9-]+:|\nvolumes:)/)?.[0] ?? '';
   assert.match(proofControlClientBlock, /shared-control-identities:/,
     'the isolated control client must receive only the scoped credential authority needed to emulate an operator');

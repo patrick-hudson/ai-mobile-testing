@@ -236,7 +236,7 @@ services:
       AUDIT_SHARED_STORE_GENERATION: ${AUDIT_SHARED_STORE_GENERATION:-1}
     volumes:
       - shared-parent-runs:/var/lib/ai-mobile-testing/shared/canonical
-      - shared-authority-floor:/var/lib/ai-mobile-testing/shared/authority-floor:ro
+      - shared-authority-floor:/var/lib/ai-mobile-testing/shared/authority-floor
       - shared-store-trust:/var/lib/ai-mobile-testing/shared/trust:ro
 
   shared-resilience-control-client:

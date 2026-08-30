@@ -163,7 +163,8 @@ try {
   assert.match(coordinator, /shared-authority-floor:\/var\/lib\/ai-mobile-testing\/shared\/authority-floor(?!:ro)/u,
     'the singleton coordinator owns future monotonic authority-floor transitions');
   const proof = serviceBlock('shared-resilience-driver');
-  assert.match(proof, /shared-authority-floor:\/var\/lib\/ai-mobile-testing\/shared\/authority-floor:ro/u);
+  assert.match(proof, /shared-authority-floor:\/var\/lib\/ai-mobile-testing\/shared\/authority-floor(?!:ro)/u,
+    'the proof-only authority activator advances the isolated external floor while holding its durable coordinator fence');
   assert.match(initScript, /node scripts\/init-shared-authority-floor\.mjs/u);
   assert.match(compose, /\n  shared-authority-floor:\s*$/mu);
   assert.doesNotMatch(serviceBlock('shared-worker-ordinary-a'), /shared-authority-floor/u);
