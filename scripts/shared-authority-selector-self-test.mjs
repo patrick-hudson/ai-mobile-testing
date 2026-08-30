@@ -188,6 +188,15 @@ try {
     principal: delivery, publication: published, authorityContext: activeContext,
     expected, requestId: 'selector-claim-0001', ttlMs: 60_000,
   });
+  assert.deepEqual(claim.authorityBinding, {
+    storeMarkerDigest: activeContext.binding.storeMarkerDigest,
+    storeGeneration: activeContext.binding.storeGeneration,
+    activationEpoch: activeContext.binding.activationEpoch,
+    writerProtocol: activeContext.binding.writerProtocol,
+    selectorDigest: activeContext.selector.digest,
+    selectorRevision: activeContext.selector.revision,
+    activeBuildIdentity: activeContext.selector.activeBuildIdentity,
+  });
   const staleBindingBody = { ...activeContext.binding, storeGeneration: activeContext.binding.storeGeneration + 1 };
   delete staleBindingBody.digest;
   const staleContext = {
@@ -218,6 +227,29 @@ try {
     expectedSubjectDigest: published.finalSubjectDigest,
     withCurrentPublication: (callback) => withCurrentEnvelopeFence(store, 'run-selector', callback),
   }));
+  const reenabledWithoutHeadChange = await transitionReleaseAuthorityWithPublicationFence(store, takeover, {
+    expectedSelectorDigest: disabled.digest,
+    phase: 'ACTIVE',
+    activationRevision: disabled.activationRevision,
+    buildIdentity: build,
+    expectedPublications: [{ runId: 'run-selector', envelopeDigest: published.digest }],
+  });
+  assert.equal(reenabledWithoutHeadChange.activationEpoch, active.activationEpoch);
+  assert.equal(reenabledWithoutHeadChange.storeGeneration, active.storeGeneration);
+  assert.equal(reenabledWithoutHeadChange.writerProtocol, active.writerProtocol);
+  assert.notEqual(reenabledWithoutHeadChange.digest, active.digest);
+  assert.notEqual(reenabledWithoutHeadChange.revision, active.revision);
+  await expectCode('PROMOTION_CLAIM_STALE', () => consumePromotionClaim(claimStore, claim.token, {
+    principal: delivery,
+    requestId: 'selector-consume-after-reenable-0003',
+    expectedSubjectDigest: published.finalSubjectDigest,
+    withCurrentPublication: (callback) => withCurrentEnvelopeFence(store, 'run-selector', callback),
+  }));
+  disabled = await transitionReleaseAuthority(store, takeover, {
+    expectedSelectorDigest: reenabledWithoutHeadChange.digest,
+    phase: 'PROMOTION_DISABLED',
+    buildIdentity: build,
+  });
   const disabledHealthEnvelope = appendPublicationEnvelope(published, {
     schemaVersion: 1,
     runId: 'run-selector',

@@ -6,6 +6,7 @@ import { assertPrincipalAuthorized, CONTROL_ACTIONS, ControlPlaneError } from '.
 import { atomicWriteFile, atomicWriteJson } from './atomic-filesystem.mjs';
 
 const DIGEST = /^sha256:[a-f0-9]{64}$/;
+export const PROMOTION_CLAIM_SCHEMA_VERSION = 2;
 function fail(code, message, statusCode = 409) { throw new ControlPlaneError(code, message, statusCode); }
 function match(value, expected) {
   const left = Buffer.from(String(value)); const right = Buffer.from(String(expected));
@@ -36,7 +37,10 @@ export async function openPromotionClaimStore({ root, clock = () => Date.now() }
 
 function parseStoredClaim(value, expectedId) {
   const { digest, ...body } = value ?? {};
-  if (value?.schemaVersion !== 1 || value.kind !== 'promotion-claim' || value.id !== expectedId
+  if (value?.schemaVersion !== PROMOTION_CLAIM_SCHEMA_VERSION || value.kind !== 'promotion-claim' || value.id !== expectedId
+    || !DIGEST.test(value.selectorDigest)
+    || !Number.isSafeInteger(value.selectorRevision) || value.selectorRevision < 1
+    || typeof value.activeBuildIdentity !== 'string' || !value.activeBuildIdentity
     || digest !== canonicalDigest(body)) fail('PROMOTION_CLAIM_CORRUPT', 'Promotion claim record is corrupt.', 500);
   return value;
 }
@@ -69,16 +73,28 @@ function consumptionResult(receipt) {
 function validateAuthorityContext(value) {
   const selector = value?.selector;
   const binding = value?.binding;
-  const { digest, ...body } = binding ?? {};
+  const { digest: selectorDigest, ...selectorBody } = selector ?? {};
+  const { digest: bindingDigest, ...bindingBody } = binding ?? {};
   if (selector?.phase !== 'ACTIVE' || selector.activationEpoch !== 1
+    || !DIGEST.test(selectorDigest) || selectorDigest !== canonicalDigest(selectorBody)
+    || !Number.isSafeInteger(selector.revision) || selector.revision < 1
+    || typeof selector.activeBuildIdentity !== 'string' || !selector.activeBuildIdentity
     || !DIGEST.test(binding?.storeMarkerDigest)
     || !Number.isSafeInteger(binding?.storeGeneration) || binding.storeGeneration < 1
     || binding.activationEpoch !== selector.activationEpoch
     || typeof binding.writerProtocol !== 'string' || !binding.writerProtocol
-    || digest !== canonicalDigest(body)) {
+    || bindingDigest !== canonicalDigest(bindingBody)) {
     fail('PROMOTION_AUTHORITY_INACTIVE', 'Promotion requires the current ACTIVE durable store binding.');
   }
-  return binding;
+  return Object.freeze({
+    storeMarkerDigest: binding.storeMarkerDigest,
+    storeGeneration: binding.storeGeneration,
+    activationEpoch: binding.activationEpoch,
+    writerProtocol: binding.writerProtocol,
+    selectorDigest,
+    selectorRevision: selector.revision,
+    activeBuildIdentity: selector.activeBuildIdentity,
+  });
 }
 
 function claimResult(claim, secret) {
@@ -91,13 +107,17 @@ function claimResult(claim, secret) {
       storeGeneration: claim.storeGeneration,
       activationEpoch: claim.activationEpoch,
       writerProtocol: claim.writerProtocol,
+      selectorDigest: claim.selectorDigest,
+      selectorRevision: claim.selectorRevision,
+      activeBuildIdentity: claim.activeBuildIdentity,
     },
   });
 }
 
 function assertIdempotentClaim(existing, intended, ttlMs) {
   for (const field of ['requestId', 'principalId', 'projectId', 'runId', 'subjectDigest', 'authority', 'executionSetDigest', 'runRevision', 'decisionRevision',
-    'storeMarkerDigest', 'storeGeneration', 'activationEpoch', 'writerProtocol']) {
+    'storeMarkerDigest', 'storeGeneration', 'activationEpoch', 'writerProtocol',
+    'selectorDigest', 'selectorRevision', 'activeBuildIdentity']) {
     if (existing[field] !== intended[field]) fail('IDEMPOTENCY_CONFLICT', 'Promotion assertion request id was reused with different content.');
   }
   if (Date.parse(existing.expiresAt) - Date.parse(existing.issuedAt) !== ttlMs) {
@@ -140,6 +160,8 @@ export async function issuePromotionClaim(store, { principal, publication, autho
     runRevision: expected?.runRevision, decisionRevision: expected?.decisionRevision,
     storeMarkerDigest: authorityBinding.storeMarkerDigest, storeGeneration: authorityBinding.storeGeneration,
     activationEpoch: authorityBinding.activationEpoch, writerProtocol: authorityBinding.writerProtocol,
+    selectorDigest: authorityBinding.selectorDigest, selectorRevision: authorityBinding.selectorRevision,
+    activeBuildIdentity: authorityBinding.activeBuildIdentity,
   };
   const claimPath = path.join(store.root, `${id}.json`);
   const existing = await fs.readFile(claimPath, 'utf8').then(JSON.parse).catch((error) => error?.code === 'ENOENT' ? null : Promise.reject(error));
@@ -150,7 +172,7 @@ export async function issuePromotionClaim(store, { principal, publication, autho
   }
   validateHead(publication, principal, expected);
   const body = {
-    schemaVersion: 1, kind: 'promotion-claim', id, requestId: effectiveRequestId, principalId: principal.id, projectId: expected.projectId,
+    schemaVersion: PROMOTION_CLAIM_SCHEMA_VERSION, kind: 'promotion-claim', id, requestId: effectiveRequestId, principalId: principal.id, projectId: expected.projectId,
     runId: publication.runId, subjectDigest: publication.finalSubjectDigest,
     authority: publication.decision.grantedAuthority,
     executionSetDigest: publication.decision.executionManifestDigest,
@@ -158,6 +180,8 @@ export async function issuePromotionClaim(store, { principal, publication, autho
     decisionRevision: publication.decisionRevision, issuedAt: new Date(store.clock()).toISOString(),
     storeMarkerDigest: authorityBinding.storeMarkerDigest, storeGeneration: authorityBinding.storeGeneration,
     activationEpoch: authorityBinding.activationEpoch, writerProtocol: authorityBinding.writerProtocol,
+    selectorDigest: authorityBinding.selectorDigest, selectorRevision: authorityBinding.selectorRevision,
+    activeBuildIdentity: authorityBinding.activeBuildIdentity,
     expiresAt: new Date(store.clock() + ttlMs).toISOString(), tokenHash, consumedAt: null,
     digest: null,
   };
@@ -216,7 +240,10 @@ export async function consumePromotionClaim(store, token, {
         || authorityBinding.storeMarkerDigest !== claim.storeMarkerDigest
         || authorityBinding.storeGeneration !== claim.storeGeneration
         || authorityBinding.activationEpoch !== claim.activationEpoch
-        || authorityBinding.writerProtocol !== claim.writerProtocol) {
+        || authorityBinding.writerProtocol !== claim.writerProtocol
+        || authorityBinding.selectorDigest !== claim.selectorDigest
+        || authorityBinding.selectorRevision !== claim.selectorRevision
+        || authorityBinding.activeBuildIdentity !== claim.activeBuildIdentity) {
         fail('PROMOTION_CLAIM_STALE', 'Release head changed after assertion; delivery is refused.');
       }
       const receipt = {

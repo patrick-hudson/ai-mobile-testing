@@ -42,13 +42,22 @@ import { CONTROL_EXIT_CODES, controlExitCode } from '../shared/control-client-co
 import { canonicalDigest } from '../shared/canonical-contract.mjs';
 
 const claimAuthorityContext = () => {
+  const selectorBody = {
+    phase: 'ACTIVE',
+    activationEpoch: 1,
+    revision: 17,
+    activeBuildIdentity: 'build:shared-control-plane-test',
+  };
   const body = {
     storeMarkerDigest: canonicalDigest({ storeMarker: 'control-plane-test' }),
     storeGeneration: 1,
     activationEpoch: 1,
     writerProtocol: 'single-coordinator-global-performance-v2',
   };
-  return { selector: { phase: 'ACTIVE', activationEpoch: 1 }, binding: { ...body, digest: canonicalDigest(body) } };
+  return {
+    selector: { ...selectorBody, digest: canonicalDigest(selectorBody) },
+    binding: { ...body, digest: canonicalDigest(body) },
+  };
 };
 const issuePromotionClaim = (store, input) => issuePromotionClaimRaw(store, {
   authorityContext: claimAuthorityContext(),
@@ -1000,6 +1009,16 @@ try {
     ttlMs: 60_000,
     requestId: 'promotion-assertion-0001',
   });
+  const issuedAuthority = claimAuthorityContext();
+  assert.deepEqual(issued.authorityBinding, {
+    storeMarkerDigest: issuedAuthority.binding.storeMarkerDigest,
+    storeGeneration: issuedAuthority.binding.storeGeneration,
+    activationEpoch: issuedAuthority.binding.activationEpoch,
+    writerProtocol: issuedAuthority.binding.writerProtocol,
+    selectorDigest: issuedAuthority.selector.digest,
+    selectorRevision: issuedAuthority.selector.revision,
+    activeBuildIdentity: issuedAuthority.selector.activeBuildIdentity,
+  }, 'claim responses must expose the complete authority selector fence');
   const duplicateIssue = await issuePromotionClaim(claimStore, {
     principal: delivery, publication: head, expected: expectedHead, ttlMs: 60_000,
     requestId: 'promotion-assertion-0001',
