@@ -584,8 +584,11 @@ try {
   await new Promise((resolve) => setTimeout(resolve, 300));
   assert.equal(claimCount, 1, 'the worker must not claim another item before the rejected lease expires');
 } finally {
-  worker.kill('SIGTERM');
-  await new Promise((resolve) => worker.once('close', resolve));
+  if (worker.exitCode === null && worker.signalCode === null) {
+    const closed = new Promise((resolve) => worker.once('close', resolve));
+    worker.kill('SIGTERM');
+    await closed;
+  }
   await new Promise((resolve) => server.close(resolve));
   await rm(processRoot, { recursive: true, force: true });
 }

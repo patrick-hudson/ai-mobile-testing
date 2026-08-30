@@ -89,6 +89,20 @@ const uploadArtifact = async (lease, intentDigest, artifact, ordinal, signal) =>
   return { value, status: response.status };
 };
 const wait = () => new Promise((resolve) => setTimeout(resolve, pollMs));
+const retryableHeartbeatFailure = (error) => {
+  const code = error?.code ?? error?.cause?.code;
+  return error?.name === 'TimeoutError'
+    || ['COORDINATOR_UNAVAILABLE', 'ECONNREFUSED', 'ECONNRESET', 'EPIPE', 'UND_ERR_CONNECT_TIMEOUT'].includes(code);
+};
+const heartbeatTimeoutMs = (lease, terminationReserveMs) => {
+  const remainingMs = Date.parse(lease.expiresAt) - Date.now();
+  if (!Number.isFinite(remainingMs) || remainingMs <= terminationReserveMs) {
+    const error = new Error('The locally known shared work lease no longer has heartbeat recovery headroom.');
+    error.code = 'SHARED_WORK_LEASE_LOCAL_EXPIRY';
+    throw error;
+  }
+  return Math.min(30_000, remainingMs - terminationReserveMs);
+};
 const execute = async ({ lease, signal: abortSignal }) => {
   const evidenceRoot = await fs.mkdtemp(path.join(tmpdir(), 'audit-shared-evidence-'));
   try {
@@ -101,14 +115,20 @@ const execute = async ({ lease, signal: abortSignal }) => {
         env: command.environment,
       });
       let escalation;
-      const terminate = () => {
-        try { process.kill(-child.pid, 'SIGTERM'); } catch (error) { if (error?.code !== 'ESRCH') reject(error); }
+      const terminate = (reason) => {
+        const immediate = reason?.immediate === true;
+        try { process.kill(-child.pid, immediate ? 'SIGKILL' : 'SIGTERM'); } catch (error) { if (error?.code !== 'ESRCH') reject(error); }
+        if (immediate) return;
+        const hardDeadline = Date.parse(reason?.hardDeadlineAt);
+        const escalationMs = Number.isFinite(hardDeadline)
+          ? Math.max(0, Math.min(5_000, hardDeadline - Date.now()))
+          : 5_000;
         escalation = setTimeout(() => {
           try { process.kill(-child.pid, 'SIGKILL'); } catch (error) { if (error?.code !== 'ESRCH') process.stderr.write(`${error.message}\n`); }
-        }, 5_000);
+        }, escalationMs);
         escalation.unref();
       };
-      const aborted = () => terminate();
+      const aborted = () => terminate(abortSignal.reason);
       abortSignal.addEventListener('abort', aborted, { once: true });
       child.once('error', reject);
       child.once('close', (code, signal) => {
@@ -187,13 +207,15 @@ while (!stopping) {
   if (!commandLog.response.ok) throw new Error(`Coordinator rejected command log: ${commandLog.value.error ?? commandLog.response.status}`);
   const leaseDurationMs = Date.parse(claimed.value.expiresAt) - Date.parse(claimed.value.claimedAt);
   const heartbeatIntervalMs = sharedWorkHeartbeatInterval(leaseDurationMs);
+  const executorTerminationReserveMs = Math.min(5_000, Math.max(100, Math.floor(leaseDurationMs / 3)));
   let maintained;
   try {
     maintained = await maintainSharedWorkerLease({
       lease: claimed.value,
       intervalMs: heartbeatIntervalMs,
       heartbeat: async (lease, signal) => {
-        const renewed = await post('/v1/heartbeat', { lease }, signal);
+        const renewed = await post('/v1/heartbeat', { lease }, signal,
+          heartbeatTimeoutMs(lease, executorTerminationReserveMs));
         if (!renewed.response.ok) {
           const error = new Error(`Coordinator rejected work heartbeat: ${renewed.value.error ?? renewed.response.status}`);
           error.code = renewed.value.code ?? 'SHARED_WORK_HEARTBEAT_REJECTED';
@@ -201,6 +223,9 @@ while (!stopping) {
         }
         return renewed.value;
       },
+      retryHeartbeat: retryableHeartbeatFailure,
+      maxHeartbeatRetries: 1,
+      expirySafetyMs: executorTerminationReserveMs,
       execute,
     });
   } catch (error) {

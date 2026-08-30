@@ -745,6 +745,7 @@ try {
   const maintained = await maintainSharedWorkerLease({
     lease: longLease,
     intervalMs: 25,
+    now: () => now,
     waitForHeartbeat: async (_intervalMs, signal) => {
       heartbeatTurn += 1;
       if (heartbeatTurn <= 3) return;
@@ -809,16 +810,24 @@ try {
   );
 
   let executorAborted = false;
+  let rejectedHeartbeatCalls = 0;
+  let rejectedExecutorReason = null;
   const heartbeatRejected = Object.assign(new Error('coordinator rejected stale lease'), { code: 'STALE_WORK_LEASE' });
   await assert.rejects(
     maintainSharedWorkerLease({
       lease: takeover,
       intervalMs: 25,
+      now: () => now,
       waitForHeartbeat: async () => {},
-      heartbeat: async () => { throw heartbeatRejected; },
+      retryHeartbeat: (error) => error?.name === 'TimeoutError',
+      heartbeat: async () => {
+        rejectedHeartbeatCalls += 1;
+        throw heartbeatRejected;
+      },
       execute: async ({ signal }) => new Promise((resolve, reject) => {
         signal.addEventListener('abort', () => {
           executorAborted = true;
+          rejectedExecutorReason = signal.reason;
           reject(signal.reason);
         }, { once: true });
       }),
@@ -827,6 +836,120 @@ try {
     'heartbeat rejection must fence the worker and abort its executor',
   );
   assert.equal(executorAborted, true);
+  assert.equal(rejectedHeartbeatCalls, 1, 'an explicit stale-lease rejection must never retry');
+  assert.equal(rejectedExecutorReason?.immediate, true,
+    'an explicit authority fence must request immediate executor termination');
+
+  let changedIdentityCalls = 0;
+  await assert.rejects(
+    maintainSharedWorkerLease({
+      lease: { ...takeover, expiresAt: new Date(now + 1_000).toISOString() },
+      intervalMs: 25,
+      now: () => now,
+      waitForHeartbeat: async () => {},
+      retryHeartbeat: () => true,
+      heartbeat: async (lease) => {
+        changedIdentityCalls += 1;
+        return { ...lease, token: 'different-fencing-token' };
+      },
+      execute: async ({ signal }) => new Promise((resolve, reject) => {
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      }),
+    }),
+    (error) => error?.code === 'SHARED_WORK_LEASE_FENCED'
+      && error?.cause?.code === 'SHARED_WORK_LEASE_IDENTITY_CHANGED',
+    'a response with changed fencing identity must abort without consulting transient retry policy',
+  );
+  assert.equal(changedIdentityCalls, 1);
+
+  let transientHeartbeatCalls = 0;
+  let transientRetryWaits = 0;
+  let transientCadenceWaits = 0;
+  let finishTransientExecution;
+  const transientExecution = new Promise((resolve) => { finishTransientExecution = resolve; });
+  const transientLease = { ...takeover, expiresAt: new Date(now + 1_000).toISOString() };
+  const transientMaintained = await maintainSharedWorkerLease({
+    lease: transientLease,
+    intervalMs: 25,
+    retryDelayMs: 10,
+    now: () => now,
+    waitForHeartbeat: async (delay, signal) => {
+      if (signal.aborted) throw signal.reason;
+      if (delay === 10) transientRetryWaits += 1;
+      if (delay === 25) {
+        transientCadenceWaits += 1;
+        if (transientCadenceWaits > 1) {
+          await new Promise((resolve) => signal.addEventListener('abort', resolve, { once: true }));
+        }
+      }
+    },
+    retryHeartbeat: (error) => error?.name === 'TimeoutError',
+    heartbeat: async (lease) => {
+      transientHeartbeatCalls += 1;
+      if (transientHeartbeatCalls === 1) throw new DOMException('ambiguous heartbeat timeout', 'TimeoutError');
+      const renewed = { ...lease, expiresAt: new Date(now + 2_000).toISOString() };
+      finishTransientExecution('transient-recovered');
+      return renewed;
+    },
+    execute: async () => transientExecution,
+  });
+  assert.equal(transientMaintained.value, 'transient-recovered');
+  assert.equal(transientHeartbeatCalls, 2,
+    'an ambiguous transient heartbeat failure must retry without restarting the work executor');
+  assert.equal(transientRetryWaits, 1);
+  assert.equal(transientMaintained.lease.expiresAt, new Date(now + 2_000).toISOString());
+
+  let exhaustedExecutorAborted = false;
+  let exhaustedHeartbeatCalls = 0;
+  const exhaustedLease = { ...takeover, expiresAt: new Date(now + 30).toISOString() };
+  await assert.rejects(
+    maintainSharedWorkerLease({
+      lease: exhaustedLease,
+      intervalMs: 5,
+      retryDelayMs: 10,
+      now: () => now,
+      waitForHeartbeat: async (delay) => { now += delay; },
+      retryHeartbeat: (error) => error?.name === 'TimeoutError',
+      heartbeat: async () => {
+        exhaustedHeartbeatCalls += 1;
+        throw new DOMException('coordinator remains unavailable', 'TimeoutError');
+      },
+      execute: async ({ signal }) => new Promise((resolve, reject) => {
+        signal.addEventListener('abort', () => {
+          exhaustedExecutorAborted = true;
+          reject(signal.reason);
+        }, { once: true });
+      }),
+    }),
+    (error) => error?.code === 'SHARED_WORK_LEASE_FENCED' && error?.cause?.name === 'TimeoutError',
+    'transient heartbeat retries must stop before the last locally known lease expires',
+  );
+  assert.equal(exhaustedExecutorAborted, true);
+  assert.equal(exhaustedHeartbeatCalls, 2);
+
+  let watchdogAbortReason = null;
+  const watchdogStartedAt = Date.now();
+  await assert.rejects(
+    maintainSharedWorkerLease({
+      lease: { ...takeover, expiresAt: new Date(watchdogStartedAt + 80).toISOString() },
+      intervalMs: 1,
+      expirySafetyMs: 30,
+      heartbeat: async () => new Promise(() => {}),
+      execute: async ({ signal }) => new Promise((resolve, reject) => {
+        signal.addEventListener('abort', () => {
+          watchdogAbortReason = signal.reason;
+          reject(signal.reason);
+        }, { once: true });
+      }),
+    }),
+    (error) => error?.code === 'SHARED_WORK_LEASE_FENCED'
+      && error?.cause?.code === 'SHARED_WORK_LEASE_EXPIRING',
+    'the independent watchdog must fence a hung heartbeat before the last acknowledged lease expires',
+  );
+  assert.equal(watchdogAbortReason?.code, 'SHARED_WORK_LEASE_EXPIRING');
+  assert.equal(watchdogAbortReason?.hardDeadlineAt, new Date(watchdogStartedAt + 80).toISOString());
+  assert(Date.now() < watchdogStartedAt + 80,
+    'the watchdog must reserve termination time before the hard lease deadline');
 
   const oneWorker = await runTopology('one', 1);
   const multipleWorkers = await runTopology('many', 2);
