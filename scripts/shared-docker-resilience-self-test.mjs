@@ -479,8 +479,11 @@ async function runSteady(label, workerCount, sequence) {
         'both workers in the many-worker topology must publish canonical work');
     }
     const inspected = await inspectAfterDown(project, runId);
-    assert(inspected.workItems.every(({ attempts }) => attempts.length === 1),
-      'steady topology trials must publish every work item exactly once');
+    const retried = inspected.workItems.filter(({ attempts }) => attempts.length !== 1);
+    assert.equal(retried.length, 0,
+      `steady topology trials must publish every work item exactly once: ${JSON.stringify(
+        retried.map(({ id, state, attempts }) => ({ id, state, attempts })),
+      )}`);
     return { label, workerCount, sequence, wallTimeMs, utilization, seed, inspected };
   });
 }
