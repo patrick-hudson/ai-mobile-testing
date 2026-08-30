@@ -1541,7 +1541,7 @@ test('characterization: mutation security and production certificate guards fail
   expect(await blockedDevelopmentTls.text()).toContain('cannot restrict it to one exact origin');
 });
 
-test('characterization: bounded live output and manual evidence preserve credential non-disclosure', async ({ page, request, playwright }) => {
+test('characterization: retired comparative publication fails closed without leaking credentials or unsafe uploads', async ({ page, request, playwright }) => {
   await page.goto('/runs.html');
   const portalBaseUrl = process.env.PORTAL_E2E_BASE_URL;
   if (!portalBaseUrl) throw new Error('PORTAL_E2E_BASE_URL is required for portal acceptance tests.');
@@ -1568,21 +1568,22 @@ test('characterization: bounded live output and manual evidence preserve credent
   await expect(page.locator('#run-log-list')).toContainText(/AUDIT_(HTTP|STEP|TEST)/, { timeout: 120_000 });
 
   const finished = await waitForTerminal(request, started.id);
-  expect(finished.pipeline).toMatchObject({ completed: true, status: 'completed' });
-  expect(finished.release.decision).toBe('NOT_READY');
-  expect(finished.status).toBe('not-ready');
-  expect(finished.stages.aiReview).toMatchObject({ status: 'completed' });
-  expect(finished.reviewReasons.join(' ')).toMatch(/selected scope|cannot certify|targeted|manual|not ready|incomplete/i);
+  expect(finished.pipeline).toMatchObject({ completed: false, status: 'failed' });
+  expect(finished.release.decision).not.toBe('READY');
+  expect(['failed', 'evidence-failed']).toContain(finished.status);
+  expect(finished.stages.aiReview).toMatchObject({ status: 'failed' });
+  expect(finished.stages.reportRebuild).toMatchObject({ status: 'failed' });
   const finalLogResponse = await request.get(`/api/runs/${encodeURIComponent(started.id)}/logs?maxBytes=1048576`);
   expect(finalLogResponse.ok()).toBeTruthy();
   const finalLog = (await finalLogResponse.json()).log as string;
   expect(finalLog).toContain('Execution identity: aiworker');
   expect(finalLog).toContain('Execution identity: reportworker');
-  expect(finalLog).toContain('Privately staged checklist published atomically.');
+  expect(finalLog).toContain('Comparative archive publication requires AUDIT_SHARED_STORE_ROOT');
+  expect(finalLog).toContain('Comparative report rebuild requires AUDIT_SHARED_STORE_ROOT');
   expect(finalLog).not.toContain(syntheticKey);
   const aiReview = await request.get(`/artifacts/${encodeURIComponent(started.id)}/ai-review/review.json`);
   const aiReviewBody = await aiReview.text();
-  expect(aiReview.status(), aiReviewBody).toBe(200);
+  expect(aiReview.status(), aiReviewBody).toBe(404);
   expect(aiReviewBody).not.toContain(syntheticKey);
   const deletedCredential = await request.delete('/api/settings/anthropic-key', { data: {} });
   expect(deletedCredential.status(), await deletedCredential.text()).toBe(200);
@@ -1610,13 +1611,13 @@ test('characterization: bounded live output and manual evidence preserve credent
   const secondPage = await (await request.get(`/api/runs/${encodeURIComponent(started.id)}/artifacts?offset=${artifactPage.nextOffset}&limit=150`)).json();
   expect(secondPage.files.length).toBeGreaterThan(0);
   expect(secondPage.offset).toBe(artifactPage.nextOffset);
-  expect(artifacts.some(({ kind }) => kind === 'checklist')).toBeTruthy();
+  expect(artifacts.some(({ kind }) => kind === 'checklist')).toBeFalsy();
   const boundedArtifactPage = await (await request.get(`/api/runs/${encodeURIComponent(started.id)}/artifacts?offset=0&limit=500`)).json();
   const boundedArtifactPaths = boundedArtifactPage.files.map(({ path }: { path: string }) => path);
   expect(boundedArtifactPaths.some((path: string) => path.includes('.playwright-artifacts-'))).toBeFalsy();
   expect(boundedArtifactPaths.some((path: string) => path.endsWith('.DS_Store'))).toBeFalsy();
   expect(boundedArtifactPaths.some((path: string) => path.endsWith('unvalidated-helper-video.webm'))).toBeFalsy();
-  const video = artifacts.find(({ kind }) => kind === 'video');
+  const video = boundedArtifactPage.files.find(({ kind }: { kind: string }) => kind === 'video');
   expect(video, 'Release-profile portal acceptance must produce a playable video').toBeTruthy();
   const range = await request.get(video!.url, { headers: { Range: 'bytes=0-1023' } });
   expect(range.status()).toBe(206);
@@ -1636,40 +1637,18 @@ test('characterization: bounded live output and manual evidence preserve credent
   expect((await request.get(`/artifacts/${started.id}/disappearing-artifact.txt`)).status()).toBe(404);
 
   await page.goto(`/run.html?mode=comparative&run=${encodeURIComponent(started.id)}&view=evidence`);
-  await expect(page.locator('#run-execution-state')).toContainText(/review|required|not ready/i);
+  await expect(page.locator('#run-execution-state')).toContainText(/failed/i);
   await expect(page.locator('[data-run-destination="report"]')).toHaveAttribute('href', `/report.html?run=${started.id}`);
   await expect(page.locator('[data-run-destination="gallery"]')).toHaveAttribute('href', `/gallery.html?mode=comparative&run=${started.id}&from=runs`);
   expect(new URL(page.url()).searchParams.get('view')).toBe('evidence');
-  await expect(page.locator('.run-artifact-list')).toContainText(/checklist\/manifest\.json/);
+  await expect(page.locator('.run-artifact-list')).toContainText(/results\.json|video\.webm/);
   await expect(page.locator('[data-artifact-more]')).toBeVisible();
   const firstArtifactCount = await page.locator('.run-artifact-list li').count();
   await page.locator('[data-artifact-more]').click();
   await expect.poll(() => page.locator('.run-artifact-list li').count()).toBeGreaterThan(firstArtifactCount);
 
-  const reportRequests: string[] = [];
-  page.on('request', (request) => reportRequests.push(request.url()));
-  await page.goto(`/report.html?run=${encodeURIComponent(started.id)}`);
-  await expect(page.locator('#visual-gallery-link')).toHaveAttribute('href', `/gallery.html?run=${started.id}&from=report`);
-  await expect(page.locator('#decision-title')).toContainText(/not ready/i);
-  await expect(page.locator('#metric-grid')).toContainText('Structured executions');
-  await expect(page.locator('#audit-result-count')).toContainText(/matching checks/i);
-  expect(reportRequests.some((url) => url.endsWith('/checklist/manifest.json'))).toBeFalsy();
-  expect(reportRequests.some((url) => url.includes('/logs'))).toBeFalsy();
-  await page.locator('#filter-query').fill('SEARCH-001');
-  await expect(page.locator('#audit-result-count')).toContainText('1–1 of 1 matching checks');
-  const searchAudit = page.locator('.report-audit-card').filter({ hasText: 'SEARCH-001' });
-  await searchAudit.locator('.audit-summary-button').click();
-  const expandedAudit = page.locator('.audit-detail:not([hidden])');
-  await expect(expandedAudit).toContainText(/expected behavior/i);
-  await expect(expandedAudit).toContainText(/evidence policy/i);
-  await expandedAudit.locator('.execution-card summary').first().click();
-  const expandedExecution = expandedAudit.locator('.execution-card[open] .execution-body');
-  await expect(expandedExecution).toContainText(/HTTP responses/i);
-  await expect(expandedExecution.locator('video')).toHaveAttribute('preload', 'metadata');
-  await expect(expandedExecution).toContainText(/interaction video/i);
-  await page.locator('#load-log').click();
-  await expect(page.locator('#report-log')).toContainText(/Command started:/);
-  expect(reportRequests.filter((url) => url.includes('/logs?maxBytes=65536')).length).toBe(1);
+  const report = await request.get(`/api/runs/${encodeURIComponent(started.id)}/report`);
+  expect([404, 409]).toContain(report.status());
 
   const validPng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64');
   const unauthorizedUpload = await playwright.request.newContext({
@@ -1720,16 +1699,6 @@ test('characterization: bounded live output and manual evidence preserve credent
   expect(retainedUploads).toHaveLength(2);
   expect(retainedUploads.some((name) => name.includes('fake-') || name.endsWith('.uploading'))).toBeFalsy();
 
-  const attestation = {
-    auditId: 'DEVICE-001', outcome: 'blocked', reviewer: 'Portal E2E', device: 'Synthetic concurrency fixture',
-    notes: 'Concurrent attestation fixture verifies that one checklist rebuild owns the run mutation lock.',
-    uploadIds: [], confirmed: true,
-  };
-  const attestations = await Promise.all([
-    request.post(`/api/runs/${started.id}/manual-evidence`, { data: attestation }),
-    parallelRequest.post(`/api/runs/${started.id}/manual-evidence`, { data: attestation }),
-  ]);
-  expect(attestations.map((response) => response.status()).sort()).toEqual([201, 409]);
   await parallelRequest.dispose();
 });
 
