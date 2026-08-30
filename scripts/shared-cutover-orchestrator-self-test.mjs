@@ -595,6 +595,21 @@ try {
       assert.equal(operation.runId, runId);
       evidenceByRun.set(runId, evidence);
     }
+    let cutoverCanaryCancelAccepted = false;
+    await policy.withMutationAdmission(
+      'cancel',
+      'cutover-canary-cancel-0001',
+      { runId: singleCanaryRunId },
+      async () => { cutoverCanaryCancelAccepted = true; },
+    );
+    assert.equal(cutoverCanaryCancelAccepted, true,
+      'closed admission must permit cancellation of the exact consumed cutover canary so bounded recovery can proceed');
+    await expectCode('CUTOVER_ADMISSION_CLOSED', () => policy.withMutationAdmission(
+      'cancel',
+      'cutover-non-canary-cancel-0001',
+      { runId: 'run-not-the-current-canary' },
+      async () => undefined,
+    ));
     await expectCode('CUTOVER_CANARY_REPLACEMENT_BLOCKED', () => authorizeSharedCutoverCanaryLaunch({
       store,
       admissionGate,

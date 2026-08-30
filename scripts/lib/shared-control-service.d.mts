@@ -23,7 +23,7 @@ export declare function createSharedControlService(options: {
   store: ParentRunStore;
   projectId?: string;
   admissionPolicy?: {
-    withMutationAdmission<T>(kind: string, requestId: string, operation: () => Promise<T>): Promise<T>;
+    withMutationAdmission<T>(kind: string, requestId: string, context: { runId: string }, operation: () => Promise<T>): Promise<T>;
   } | null;
   reprobeTargetIdentity?: ((input: { runId: string; subjectCore: any; finalSubject: any }) => Promise<any>) | null;
   afterOracleSeal?: (input: { runId: string; oracleResultsDigest: string }) => Promise<void> | void;

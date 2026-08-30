@@ -238,7 +238,7 @@ export function createSharedControlService({
         });
       };
       return admissionPolicy
-        ? admissionPolicy.withMutationAdmission(kind, requestId, accept)
+        ? admissionPolicy.withMutationAdmission(kind, requestId, { runId }, accept)
         : accept();
     },
     async readOperation(principal, runId, { kind, requestId }) {

@@ -104,6 +104,7 @@ export function createCutoverAdmissionPolicy(options: {
   withLaunchAdmission<T>(requestId: string, intent: unknown, operation: () => Promise<T>): Promise<T>;
   withPromotionAdmission<T>(requestId: string, operation: () => Promise<T>): Promise<T>;
   withMutationAdmission<T>(kind: string, requestId: string, operation: () => Promise<T>): Promise<T>;
+  withMutationAdmission<T>(kind: string, requestId: string, context: { runId: string }, operation: () => Promise<T>): Promise<T>;
 };
 
 export function authorizeSharedCutoverCanaryLaunch(options: {

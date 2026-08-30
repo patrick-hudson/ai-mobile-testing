@@ -669,9 +669,41 @@ export function createCutoverAdmissionPolicy({ admissionGate, store = null } = {
     withPromotionAdmission(_requestId, operation) {
       return admissionGate.withOpen(operation);
     },
-    withMutationAdmission(kind, _requestId, operation) {
+    withMutationAdmission(kind, _requestId, contextOrOperation, maybeOperation) {
+      const operation = maybeOperation ?? contextOrOperation;
+      const context = maybeOperation ? contextOrOperation : null;
+      if (typeof operation !== 'function') fail('CUTOVER_INPUT_INVALID', 'Admission operation is required.');
       if (!RELEASE_CHANGING_MUTATIONS.has(kind)) return operation();
-      return admissionGate.withOpen(operation);
+      if (kind !== 'cancel' || !store || !isRecord(context)) return admissionGate.withOpen(operation);
+      return admissionGate.withState(async (gate) => {
+        if (gate.state === 'OPEN') return operation(gate);
+        const reject = () => fail(
+          'CUTOVER_ADMISSION_CLOSED',
+          `Release admission is closed by ${gate.cutoverId}; only its exact active canary may be cancelled for recovery.`,
+          { cutoverId: gate.cutoverId, gateDigest: gate.digest },
+          503,
+        );
+        if (!SAFE_ID.test(context.runId ?? '') || !SAFE_ID.test(gate.cutoverId ?? '')) return reject();
+        const selector = await readReleaseAuthoritySelector(store);
+        try {
+          assertActivatedCutover(selector, gate, gate.cutoverId);
+        } catch {
+          return reject();
+        }
+        const permits = await Promise.all(CUTOVER_CANARY_MODES.map(
+          (mode) => readCanaryLaunchPermit(admissionGate, gate.cutoverId, mode),
+        ));
+        const permit = permits.find((candidate) => candidate?.state === 'CONSUMED'
+          && candidate.runId === context.runId);
+        const binding = cutoverStoreBinding(store);
+        if (!permit || permit.state !== 'CONSUMED' || permit.runId !== context.runId
+          || permit.authoritySelectorDigest !== selector.digest || permit.admissionGateDigest !== gate.digest
+          || permit.activeBuildIdentity !== selector.activeBuildIdentity
+          || permit.activeBuildIdentity !== store.buildIdentity || permit.storeBindingDigest !== binding.digest) {
+          return reject();
+        }
+        return operation(gate);
+      });
     },
   });
 }
