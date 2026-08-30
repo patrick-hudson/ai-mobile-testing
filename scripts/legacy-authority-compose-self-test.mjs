@@ -13,7 +13,7 @@ function serviceBlock(name) {
   return compose.match(new RegExp(`\\n  ${name}:[\\s\\S]*?(?=\\n  [a-z][a-z0-9-]+:|\\nvolumes:)`, 'u'))?.[0] ?? '';
 }
 
-for (const name of ['portal', 'single-site-finalizer', 'audit-release', 'audit-release-merge']) {
+for (const name of ['portal', 'single-site-finalizer', 'audit-release', 'audit-release-merge', 'shared-resilience-driver']) {
   const block = serviceBlock(name);
   assert.ok(block, `${name} service must exist`);
   assert.match(block, new RegExp(`AUDIT_LEGACY_AUTHORITY_FENCE_ROOT: ${fenceRoot}`, 'u'),
