@@ -520,6 +520,35 @@ function sealAuthoritySelector(value) {
   return { ...body, digest: canonicalDigest(body) };
 }
 
+async function migrateLegacyShadowAuthoritySelector(store) {
+  const file = authoritySelectorPath(store);
+  const value = await readBoundedJson(store.storage, file, { label: 'release-authority selector' });
+  const missingTransitionDigest = !Object.hasOwn(value, 'authorityTransitionDigest');
+  const missingCutoverDigest = !Object.hasOwn(value, 'activationCutoverDigest');
+  if (!missingTransitionDigest && !missingCutoverDigest) return false;
+  if (!missingTransitionDigest || !missingCutoverDigest
+    || value.phase !== 'SHADOW' || value.activationEpoch !== 0
+    || value.activationRevision !== null || value.activatedAt !== null
+    || value.activeWriterProtocol !== null || value.activeBuildIdentity !== null) return false;
+
+  const legacyBody = selectorBody(value);
+  delete legacyBody.authorityTransitionDigest;
+  delete legacyBody.activationCutoverDigest;
+  if (canonicalDigest(legacyBody) !== value.digest) return false;
+
+  const upgraded = sealAuthoritySelector({
+    ...value,
+    authorityTransitionDigest: null,
+    activationCutoverDigest: null,
+    revision: value.revision + 1,
+    previousDigest: value.digest,
+    updatedAt: timestamp(store),
+  });
+  validateAuthoritySelector(store, structuredClone(upgraded));
+  await atomicWriteJson(store.storage, file, upgraded);
+  return true;
+}
+
 function validateAuthoritySelector(store, value) {
   const body = selectorBody(value ?? {});
   if (value?.schemaVersion !== 1 || value.kind !== 'release-authority-selector'
@@ -1285,6 +1314,8 @@ export async function openParentRunStore({
         revision: 1, previousDigest: null, updatedAt: timestamp(store),
       });
       await atomicWriteJson(storage, selectorPath, initial, { exclusive: true });
+    } else {
+      await migrateLegacyShadowAuthoritySelector(store);
     }
     const openedSelector = await readAuthoritySelectorUnlocked(store);
     if (['ACTIVE', 'PROMOTION_DISABLED'].includes(openedSelector.phase) && storeMarker === null) {

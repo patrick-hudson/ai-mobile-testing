@@ -71,6 +71,58 @@ function envelope() {
   });
 }
 
+async function verifyLegacyShadowSelectorMigration() {
+  const migrationRoot = await mkdtemp(path.join(tmpdir(), 'shared-authority-selector-migration-'));
+  try {
+    await openParentRunStore({
+      root: migrationRoot,
+      deploymentIdentity: 'compose-project:selector-migration-test',
+      volumeIdentity: 'named-volume:selector-migration-test',
+      storeMarker: marker,
+      storeGeneration: 1,
+      schemaFloor: PARENT_RUN_STORE_SCHEMA_VERSION,
+      writerProtocol: PARENT_RUN_WRITER_PROTOCOL,
+      minimumWriterProtocol: PARENT_RUN_WRITER_PROTOCOL,
+      buildIdentity: build,
+      backupMarker: backup,
+      prequalifiedRollbackBuilds: [build],
+      verifyStorage: false,
+      clock,
+    });
+    const selectorPath = path.join(migrationRoot, 'release-authority-selector.json');
+    const legacy = JSON.parse(await readFile(selectorPath, 'utf8'));
+    delete legacy.authorityTransitionDigest;
+    delete legacy.activationCutoverDigest;
+    const { digest: _currentDigest, ...legacyBody } = legacy;
+    legacy.digest = canonicalDigest(legacyBody);
+    await writeFile(selectorPath, `${JSON.stringify(legacy)}\n`);
+
+    const reopened = await openParentRunStore({
+      root: migrationRoot,
+      deploymentIdentity: 'compose-project:selector-migration-test',
+      volumeIdentity: 'named-volume:selector-migration-test',
+      storeMarker: marker,
+      storeGeneration: 1,
+      writerProtocol: PARENT_RUN_WRITER_PROTOCOL,
+      buildIdentity: build,
+      backupMarker: backup,
+      prequalifiedRollbackBuilds: [build],
+      verifyStorage: false,
+      clock,
+    });
+    const migrated = await readReleaseAuthoritySelector(reopened);
+    assert.equal(migrated.phase, 'SHADOW');
+    assert.equal(migrated.authorityTransitionDigest, null);
+    assert.equal(migrated.activationCutoverDigest, null);
+    assert.equal(migrated.previousDigest, legacy.digest);
+    assert.equal(migrated.revision, legacy.revision + 1);
+  } finally {
+    await rm(migrationRoot, { recursive: true, force: true });
+  }
+}
+
+await verifyLegacyShadowSelectorMigration();
+
 try {
   const store = await openParentRunStore({
     root,
