@@ -62,10 +62,15 @@ const valid = {
       { label: 'many', sequence: index + 1, workerCount: 2,
         samples: [sample(`proof-many-${index}-shared-worker-ordinary-a-1`), sample(`proof-many-${index}-shared-worker-ordinary-b-1`)] },
     ]).flat(),
+    recoveryLineages: Array.from({ length: 3 }, (_, index) => [
+      { label: 'one', sequence: index + 1, workerCount: 1, workItems: [] },
+      { label: 'many', sequence: index + 1, workerCount: 2, workItems: [] },
+    ]).flat(),
   },
   invariants: {
     digest: digest('b'), transitionDigest: digest('b'), workerKillDigest: digest('b'), coordinatorKillDigest: digest('b'),
     workerKillRecoveredWorkItem: 'proof-002', coordinatorKillRecoveredWorkItem: 'proof-002', productFailureAttempts: 1,
+    productFailureOperationalRecoveries: 0,
     performanceIsolation: {
       workItemId: 'proof-003', workerId: 'compose-worker-performance', workerService: 'shared-worker-performance',
       capability: 'performance:lighthouse', resourceClass: 'performance', runningOrdinaryAtExclusiveBoundary: 0,
@@ -102,6 +107,12 @@ const rejected = [
   (report) => { report.measurements.oneWorkerMs[0] = 600; },
   (report) => { report.measurements.utilization[0].sequence = 2; },
   (report) => { report.measurements.utilization[0].workerCount = 2; },
+  (report) => { report.measurements.recoveryLineages.pop(); },
+  (report) => { report.measurements.recoveryLineages[0].workItems = [{ id: 'proof-008', attempts: [
+    { attempt: 1, outcome: 'completed_product_failure', reason: 'assertion', artifactCount: 1 },
+    { attempt: 2, outcome: 'completed_pass', reason: null, artifactCount: 1 },
+  ] }]; },
+  (report) => { report.invariants.productFailureOperationalRecoveries = 1; },
   (report) => { report.resources.manyWorkerPrincipals = ['ordinary-a']; },
   (report) => { report.resources.performanceWorkerCpuLimit = '1.0'; },
   (report) => { report.resources.performanceWorkerPrincipal = 'ordinary-a'; },

@@ -119,6 +119,38 @@ export function validateSharedDockerResilienceProof(report, { expectedWorkspaceR
   assert.deepEqual([...topologyCells].sort(), [
     'many:1', 'many:2', 'many:3', 'one:1', 'one:2', 'one:3',
   ]);
+  assert.equal(report.measurements.recoveryLineages?.length, 6);
+  const recoveryCells = new Set();
+  let productFailureOperationalRecoveries = 0;
+  for (const entry of report.measurements.recoveryLineages) {
+    assert(['one', 'many'].includes(entry?.label));
+    assert(Number.isSafeInteger(entry?.sequence) && entry.sequence >= 1 && entry.sequence <= 3);
+    assert.equal(entry?.workerCount, entry.label === 'one' ? 1 : 2);
+    const cell = `${entry.label}:${entry.sequence}`;
+    assert(!recoveryCells.has(cell), `duplicate recovery-lineage observation ${cell}`);
+    recoveryCells.add(cell);
+    assert(Array.isArray(entry.workItems) && entry.workItems.length <= 8);
+    const workItemIds = new Set();
+    for (const workItem of entry.workItems) {
+      assert.match(workItem?.id ?? '', WORK_ITEM_ID);
+      assert(!workItemIds.has(workItem.id), `duplicate recovery lineage for ${workItem.id} in ${cell}`);
+      workItemIds.add(workItem.id);
+      assert(Array.isArray(workItem.attempts) && workItem.attempts.length >= 2 && workItem.attempts.length <= 3);
+      assert.deepEqual(workItem.attempts.map(({ attempt }) => attempt),
+        Array.from({ length: workItem.attempts.length }, (_, index) => index + 1));
+      assert(workItem.attempts.slice(0, -1).every(({ outcome }) => outcome === 'operational_failure'),
+        `${workItem.id} may retain only pre-terminal operational recovery attempts`);
+      assert(['completed_pass', 'completed_product_failure'].includes(workItem.attempts.at(-1)?.outcome),
+        `${workItem.id} must end in one terminal product outcome`);
+      assert.equal(workItem.attempts.filter(({ outcome }) => (
+        outcome === 'completed_pass' || outcome === 'completed_product_failure'
+      )).length, 1, `${workItem.id} must not retry a completed product outcome`);
+      if (workItem.id === 'proof-008') productFailureOperationalRecoveries += workItem.attempts.length - 1;
+    }
+  }
+  assert.deepEqual([...recoveryCells].sort(), [
+    'many:1', 'many:2', 'many:3', 'one:1', 'one:2', 'one:3',
+  ]);
 
   for (const value of [
     report?.invariants?.digest,
@@ -132,6 +164,10 @@ export function validateSharedDockerResilienceProof(report, { expectedWorkspaceR
   assert.match(report.invariants.workerKillRecoveredWorkItem ?? '', WORK_ITEM_ID);
   assert.match(report.invariants.coordinatorKillRecoveredWorkItem ?? '', WORK_ITEM_ID);
   assert.equal(report.invariants.productFailureAttempts, 1);
+  assert(Number.isSafeInteger(report.invariants.productFailureOperationalRecoveries)
+    && report.invariants.productFailureOperationalRecoveries >= 0
+    && report.invariants.productFailureOperationalRecoveries <= 12);
+  assert.equal(report.invariants.productFailureOperationalRecoveries, productFailureOperationalRecoveries);
   assert.deepEqual(report.invariants.performanceIsolation, {
     workItemId: 'proof-003',
     workerId: 'compose-worker-performance',

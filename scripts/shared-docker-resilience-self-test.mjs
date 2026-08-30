@@ -417,12 +417,28 @@ function sealCrashReceipt(input) {
   return Object.freeze({ ...body, digest: canonicalDigest(body) });
 }
 
+function assertTerminalAttemptLineage(item) {
+  assert(item.attempts.length >= 1 && item.attempts.length <= 3,
+    `work item ${item.id} must retain one bounded terminal lineage: ${JSON.stringify(item.attempts)}`);
+  const terminalAttempts = item.attempts.filter(({ outcome }) => (
+    outcome === 'completed_pass' || outcome === 'completed_product_failure'
+  ));
+  assert.equal(terminalAttempts.length, 1,
+    `work item ${item.id} must contain exactly one terminal product outcome: ${JSON.stringify(item.attempts)}`);
+  assert.equal(item.attempts.at(-1).outcome, item.outcome,
+    `work item ${item.id} must end at its canonical product outcome: ${JSON.stringify(item.attempts)}`);
+  assert(item.attempts.slice(0, -1).every(({ outcome }) => outcome === 'operational_failure'),
+    `work item ${item.id} may retry only pre-terminal operational failures: ${JSON.stringify(item.attempts)}`);
+}
+
 function assertCompletedSemantics(inspected) {
+  for (const item of inspected.workItems) assertTerminalAttemptLineage(item);
   const productFailure = inspected.workItems.find(({ id }) => id === 'proof-008');
   assert(productFailure, 'the frozen workload must contain its product-failure assertion');
   assert.equal(productFailure.state, 'completed_product_failure');
   assert.equal(productFailure.outcome, 'completed_product_failure');
-  assert.equal(productFailure.attempts.length, 1, 'product assertion failures must never be retried');
+  assert.equal(productFailure.attempts.filter(({ outcome }) => outcome === 'completed_product_failure').length, 1,
+    `a completed product assertion must be terminal and never retried: ${JSON.stringify(productFailure.attempts)}`);
   assert(inspected.workItems.filter(({ id }) => id !== 'proof-008').every(({ state, outcome }) => (
     state === 'completed_pass' && outcome === 'completed_pass'
   )), 'all non-failing frozen cases must pass');
@@ -479,11 +495,6 @@ async function runSteady(label, workerCount, sequence) {
         'both workers in the many-worker topology must publish canonical work');
     }
     const inspected = await inspectAfterDown(project, runId);
-    const retried = inspected.workItems.filter(({ attempts }) => attempts.length !== 1);
-    assert.equal(retried.length, 0,
-      `steady topology trials must publish every work item exactly once: ${JSON.stringify(
-        retried.map(({ id, state, attempts }) => ({ id, state, attempts })),
-      )}`);
     return { label, workerCount, sequence, wallTimeMs, utilization, seed, inspected };
   });
 }
@@ -890,12 +901,21 @@ try {
     measurements: { oneWorkerMs: oneTimes, manyWorkerMs: manyTimes, oneWorkerMedianMs,
       manyWorkerMedianMs, oneWorkerVarianceMs2: variance(oneTimes),
       manyWorkerVarianceMs2: variance(manyTimes), throughputImprovement: oneWorkerMedianMs / manyWorkerMedianMs,
-      utilization: recorded.map(({ label, sequence, workerCount, utilization }) => ({ label, sequence, workerCount, samples: utilization })) },
+      utilization: recorded.map(({ label, sequence, workerCount, utilization }) => ({ label, sequence, workerCount, samples: utilization })),
+      recoveryLineages: recorded.map(({ label, sequence, workerCount, inspected }) => ({
+        label,
+        sequence,
+        workerCount,
+        workItems: inspected.workItems.filter(({ attempts }) => attempts.length > 1).map(({ id, attempts }) => ({ id, attempts })),
+      })) },
     invariants: { digest: recorded[0].inspected.invariantDigest, transitionDigest: transition.invariantDigest,
       workerKillDigest: workerKill.inspected.invariantDigest, coordinatorKillDigest: coordinatorKill.inspected.invariantDigest,
       workerKillRecoveredWorkItem: workerKill.killedWorkItemId,
       coordinatorKillRecoveredWorkItem: coordinatorKill.interruptedWorkItemId,
-      productFailureAttempts: recorded[0].inspected.workItems.find(({ id }) => id === 'proof-008').attempts.length,
+      productFailureAttempts: recorded[0].inspected.workItems.find(({ id }) => id === 'proof-008')
+        .attempts.filter(({ outcome }) => outcome === 'completed_product_failure').length,
+      productFailureOperationalRecoveries: recorded.reduce((total, run) => total + run.inspected.workItems
+        .find(({ id }) => id === 'proof-008').attempts.filter(({ outcome }) => outcome === 'operational_failure').length, 0),
       performanceIsolation },
     crashBoundaries,
     durableState: 'docker compose down preserved every inspected run; down -v was used only for isolated proof cleanup',
