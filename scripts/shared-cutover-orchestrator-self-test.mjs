@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -40,14 +40,17 @@ import {
   reopenSharedAdmissionAfterCanaries,
   rollbackSharedAuthorityBeforeActivation,
   setSharedPromotionAvailability,
+  sharedCutoverConfigurationDigest,
 } from './lib/shared-cutover-orchestrator.mjs';
 import { openSharedLaunchOperationStore } from './lib/shared-launch-operation-store.mjs';
+import { rehearseSharedStoreBackup } from './lib/shared-store-backup-rehearsal.mjs';
 import { initializeLegacyAuthorityFence } from './lib/legacy-authority-fence.mjs';
+import { runSharedAuthorityCutoverCli } from './run-shared-authority-cutover.mjs';
 
 const marker = 'cd'.repeat(32);
 const build = 'build:cutover-current';
 const rollbackBuild = 'build:cutover-rollback';
-const backup = 'backup:cutover-rehearsed';
+const backup = 'ef'.repeat(32);
 const deploymentIdentity = 'compose-project:cutover-test';
 const volumeIdentity = 'named-volume:cutover-test';
 const root = await mkdtemp(path.join(tmpdir(), 'shared-cutover-orchestrator-'));
@@ -127,16 +130,6 @@ function canaryIntent(mode) {
   };
 }
 
-function cutoverConfigurationDigest(input) {
-  return canonicalDigest({
-    cutoverId: input.cutoverId,
-    activationRevision: input.activationRevision,
-    buildIdentity: input.buildIdentity,
-    rollbackBuildIdentity: input.rollbackBuildIdentity,
-    expectedStore: input.expectedStore,
-  });
-}
-
 function cutoverReview(input) {
   return {
     ...review(),
@@ -144,7 +137,8 @@ function cutoverReview(input) {
     shadowMatrixDigest: input.shadowReport.matrixDigest,
     buildIdentity: input.buildIdentity,
     expectedStoreDigest: canonicalDigest(input.expectedStore),
-    configurationDigest: cutoverConfigurationDigest(input),
+    configurationDigest: sharedCutoverConfigurationDigest(input),
+    backupRehearsalReceiptDigest: input.backupRehearsalReceipt.digest,
   };
 }
 
@@ -231,6 +225,11 @@ function observation(cutoverId, gate, coordinator) {
   return { ...body, digest: canonicalDigest(body) };
 }
 
+function resealReceipt(receipt) {
+  const { digest: ignored, ...body } = receipt;
+  return { ...body, digest: canonicalDigest(body) };
+}
+
 async function fixture(name) {
   const directory = path.join(root, name);
   const store = await openParentRunStore({
@@ -272,15 +271,34 @@ async function fixture(name) {
   };
 }
 
-function request(cutoverId) {
+async function request(cutoverId, { directory, store }, suffix = 'initial', requestedRollbackBuild = rollbackBuild) {
   const input = {
     cutoverId,
     activationRevision: 73,
     buildIdentity: build,
-    rollbackBuildIdentity: rollbackBuild,
+    rollbackBuildIdentity: requestedRollbackBuild,
     expectedStore: expectedStore(),
     shadowReport: shadowReport(),
   };
+  const backupRoot = path.join(directory, 'backup-rehearsals', `${cutoverId}-${suffix}-backup`);
+  const restoreRoot = path.join(directory, 'backup-rehearsals', `${cutoverId}-${suffix}-restore`);
+  const receiptPath = path.join(directory, 'backup-rehearsals', `${cutoverId}-${suffix}-receipt.json`);
+  await mkdir(path.dirname(backupRoot), { recursive: true });
+  input.backupRehearsalReceipt = await rehearseSharedStoreBackup({
+    rehearsalId: `${cutoverId}-${suffix}`,
+    sourceRoot: store.root,
+    backupRoot,
+    restoreRoot,
+    receiptPath,
+    storeMarker: marker,
+    backupMarker: backup,
+    buildIdentity: build,
+    configurationDigest: sharedCutoverConfigurationDigest(input),
+    expectedStore: input.expectedStore,
+    clock,
+  });
+  input.backupRoot = backupRoot;
+  input.restoreRoot = restoreRoot;
   input.operatorReview = cutoverReview(input);
   return input;
 }
@@ -294,11 +312,69 @@ try {
     root: path.join(root, 'missing-launch-operations'), requireExisting: true, clock,
   }));
   {
+    const { directory, store } = await fixture('backup-cli-action');
+    const trustDirectory = path.join(directory, 'trust');
+    const backupDirectory = path.join(directory, 'cli-backup-rehearsal');
+    await Promise.all([
+      mkdir(trustDirectory, { recursive: true }),
+      mkdir(backupDirectory, { recursive: true }),
+    ]);
+    const storeMarkerFile = path.join(trustDirectory, 'store-marker');
+    const backupMarkerFile = path.join(trustDirectory, 'backup-marker');
+    await Promise.all([
+      writeFile(storeMarkerFile, `${marker}\n`),
+      writeFile(backupMarkerFile, `${backup}\n`),
+    ]);
+    const configFile = path.join(directory, 'backup-operator-config.json');
+    const receiptFile = path.join(backupDirectory, 'receipt.json');
+    const backupRoot = path.join(backupDirectory, 'backup');
+    const restoreRoot = path.join(backupDirectory, 'restore');
+    await writeFile(configFile, `${JSON.stringify({
+      schemaVersion: 1,
+      cutoverId: 'cutover-backup-cli-action',
+      activationRevision: 73,
+      rollbackBuildIdentity: rollbackBuild,
+      store: {
+        root: store.root,
+        deploymentIdentity,
+        volumeIdentity,
+        storeMarkerFile,
+        storeGeneration: 4,
+        schemaFloor: PARENT_RUN_STORE_SCHEMA_VERSION,
+        supportedSchemaVersion: PARENT_RUN_STORE_SCHEMA_VERSION,
+        writerProtocol: PARENT_RUN_WRITER_PROTOCOL,
+        minimumWriterProtocol: PARENT_RUN_WRITER_PROTOCOL,
+        buildIdentity: build,
+        prequalifiedRollbackBuilds: [build, rollbackBuild],
+        backupMarker: backup,
+        verifyStorage: false,
+      },
+      backupRehearsal: {
+        rehearsalId: 'cutover-backup-cli-action-rehearsal',
+        backupMarkerFile,
+        backupRoot,
+        restoreRoot,
+        receiptFile,
+      },
+    })}\n`);
+    let stdout = '';
+    await runSharedAuthorityCutoverCli(
+      ['rehearse-backup', '--config', configFile],
+      { output: { write: (chunk) => { stdout += chunk; } } },
+    );
+    const receipt = JSON.parse(stdout);
+    assert.equal(receipt.kind, 'shared-store-backup-rehearsal-receipt');
+    assert.equal(receipt.digest, JSON.parse(await readFile(receiptFile, 'utf8')).digest);
+    assert.equal(receipt.sourceSnapshot.digest, receipt.restoreSnapshot.digest);
+  }
+  {
     const {
       directory, store, admissionGate, coordinator, launchOperationStore,
       legacyAuthorityFence, legacyComparativeRoot, legacySingleSiteQueueRoot,
     } = await fixture('happy');
-    const input = request('cutover-happy');
+    const input = await request('cutover-happy', { directory, store });
+    now += 100;
+    input.operatorReview.reviewedAt = new Date(now).toISOString();
     const prepared = await prepareSharedAuthorityCutover({
       store, coordinator, admissionGate, legacyAuthorityFence,
       reportDirectory: path.join(directory, 'reports'), input,
@@ -334,6 +410,14 @@ try {
     assert.equal(report.preconditions.activeLegacyAuthoritativeRuns, 0);
     assert.equal(report.preconditions.releaseChangingMutations, 0);
     assert.equal(report.preconditions.singletonCanonicalWriter, true);
+    assert.equal(report.preconditions.backupRehearsed, true);
+    assert.equal(report.preconditions.backupRehearsalReceiptDigest, input.backupRehearsalReceipt.digest);
+    assert.equal(report.backupRehearsal.receiptDigest, input.backupRehearsalReceipt.digest);
+    assert.equal(report.backupRehearsal.sourceSnapshotDigest, report.backupRehearsal.backupSnapshotDigest);
+    assert.equal(report.backupRehearsal.sourceSnapshotDigest, report.backupRehearsal.restoreSnapshotDigest);
+    assert.equal(report.backupRehearsal.restoreMatchesSource, true);
+    assert.equal(report.backupRehearsal.retainedCopiesPresent, true);
+    assert.equal(report.backupRehearsal.retainedCopiesVerifiedAt, report.completedAt);
     assert.equal(report.operatorReview.reviewed, true);
     assert.equal(report.digest, canonicalDigest(Object.fromEntries(Object.entries(report).filter(([key]) => key !== 'digest'))));
     assert.equal(JSON.parse(await readFile(path.join(directory, 'reports', 'cutover-happy.json'), 'utf8')).digest, report.digest);
@@ -561,7 +645,7 @@ try {
       directory, store, admissionGate, coordinator, launchOperationStore,
       legacyComparativeRoot, legacySingleSiteQueueRoot,
     } = await fixture('production-observer-operation');
-    const input = request('cutover-production-observer-operation');
+    const input = await request('cutover-production-observer-operation', { directory, store });
     await createParentRun(store, {
       runId: 'run-cutover-operation', subjectCoreDigest: `sha256:${'e'.repeat(64)}`,
       workItems: [{ id: 'work-cutover-operation', maxAttempts: 1, capability: 'browser:chromium', targetId: 'candidate' }],
@@ -587,7 +671,7 @@ try {
       directory, store, admissionGate, coordinator, launchOperationStore,
       legacyComparativeRoot, legacySingleSiteQueueRoot,
     } = await fixture('claim-fenced-after-observation');
-    const input = request('cutover-claim-fenced-after-observation');
+    const input = await request('cutover-claim-fenced-after-observation', { directory, store });
     await createParentRun(store, {
       runId: 'run-cutover-queued', subjectCoreDigest: digest('8'),
       workItems: [{ id: 'work-cutover-queued', maxAttempts: 1, capability: 'browser:chromium', targetId: 'candidate' }],
@@ -612,7 +696,7 @@ try {
       directory, store, admissionGate, coordinator, launchOperationStore,
       legacyComparativeRoot, legacySingleSiteQueueRoot,
     } = await fixture('production-observer-applied-operation');
-    const input = request('cutover-production-observer-applied-operation');
+    const input = await request('cutover-production-observer-applied-operation', { directory, store });
     const runId = 'run-cutover-applied-operation';
     const workItemId = 'work-cutover-applied-operation';
     await createParentRun(store, sealedRunInput(runId, workItemId));
@@ -653,7 +737,7 @@ try {
       directory, store, admissionGate, coordinator, launchOperationStore,
       legacyComparativeRoot, legacySingleSiteQueueRoot,
     } = await fixture('production-observer-running-diagnostic');
-    const input = request('cutover-production-observer-running-diagnostic');
+    const input = await request('cutover-production-observer-running-diagnostic', { directory, store });
     const runId = 'run-cutover-running-diagnostic';
     const workItemId = 'work-cutover-running-diagnostic';
     const runInput = sealedRunInput(runId, workItemId);
@@ -705,7 +789,7 @@ try {
       directory, store, admissionGate, coordinator, launchOperationStore,
       legacyComparativeRoot, legacySingleSiteQueueRoot,
     } = await fixture('production-observer-active-legacy');
-    const input = request('cutover-production-observer-active-legacy');
+    const input = await request('cutover-production-observer-active-legacy', { directory, store });
     await prepareSharedAuthorityCutover({
       store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
     });
@@ -728,7 +812,7 @@ try {
       directory, store, admissionGate, coordinator, launchOperationStore,
       legacyComparativeRoot, legacySingleSiteQueueRoot,
     } = await fixture('production-observer-partial-legacy');
-    const input = request('cutover-production-observer-partial-legacy');
+    const input = await request('cutover-production-observer-partial-legacy', { directory, store });
     await prepareSharedAuthorityCutover({
       store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
     });
@@ -743,7 +827,7 @@ try {
 
   {
     const { directory, store, admissionGate, coordinator } = await fixture('rollback');
-    const input = request('cutover-rollback');
+    const input = await request('cutover-rollback', { directory, store });
     const prepared = await prepareSharedAuthorityCutover({
       store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
     });
@@ -760,7 +844,7 @@ try {
 
   {
     const { directory, store, admissionGate, coordinator } = await fixture('crash');
-    const input = request('cutover-crash');
+    const input = await request('cutover-crash', { directory, store });
     await assert.rejects(prepareSharedAuthorityCutover({
       store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
       hooks: { afterAdmissionClosed: () => { throw new Error('synthetic crash after admission close'); } },
@@ -791,7 +875,7 @@ try {
     ['split-writer', (value) => value.canonicalWriterOwnerIds.push('coordinator-other'), 'CUTOVER_WRITER_NOT_SINGLETON'],
   ]) {
     const { directory, store, admissionGate, coordinator } = await fixture(`reject-${name}`);
-    const input = request(`cutover-reject-${name}`);
+    const input = await request(`cutover-reject-${name}`, { directory, store });
     const prepared = await prepareSharedAuthorityCutover({
       store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
     });
@@ -808,7 +892,7 @@ try {
 
   {
     const { directory, store, admissionGate, coordinator } = await fixture('reject-drift');
-    const input = request('cutover-reject-drift');
+    const input = await request('cutover-reject-drift', { directory, store });
     const changed = structuredClone(buildPreRegisteredShadowMatrix());
     changed.cases.find(({ caseId }) => caseId === 'AE1').shared.outcomeCode = 'NOT_READY_TEST_FAILURE';
     input.shadowReport = runShadowValidation({ ...changed, generatedAt: new Date(now).toISOString() });
@@ -829,7 +913,7 @@ try {
     }, 'CUTOVER_SHADOW_MATRIX_MISMATCH'],
   ]) {
     const { directory, store, admissionGate, coordinator } = await fixture(`reject-shadow-${name}`);
-    const input = request(`cutover-reject-shadow-${name}`);
+    const input = await request(`cutover-reject-shadow-${name}`, { directory, store });
     const matrix = structuredClone(buildPreRegisteredShadowMatrix());
     mutate(matrix);
     input.shadowReport = runShadowValidation({ ...matrix, generatedAt: new Date(now).toISOString() });
@@ -842,9 +926,10 @@ try {
 
   for (const field of [
     'shadowValidationDigest', 'shadowMatrixDigest', 'buildIdentity', 'expectedStoreDigest', 'configurationDigest',
+    'backupRehearsalReceiptDigest',
   ]) {
     const { directory, store, admissionGate, coordinator } = await fixture(`reject-review-${field}`);
-    const input = request(`cutover-reject-review-${field}`);
+    const input = await request(`cutover-reject-review-${field}`, { directory, store });
     input.operatorReview[field] = field === 'buildIdentity' ? 'build:other' : digest('9');
     await expectCode('CUTOVER_SHADOW_REVIEW_MISMATCH', () => prepareSharedAuthorityCutover({
       store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
@@ -854,7 +939,7 @@ try {
 
   {
     const { directory, store, admissionGate, coordinator } = await fixture('reject-review-predates-shadow');
-    const input = request('cutover-reject-review-predates-shadow');
+    const input = await request('cutover-reject-review-predates-shadow', { directory, store });
     input.operatorReview.reviewedAt = new Date(now - 1).toISOString();
     await expectCode('CUTOVER_SHADOW_REVIEW_MISMATCH', () => prepareSharedAuthorityCutover({
       store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
@@ -864,7 +949,7 @@ try {
 
   {
     const { directory, store, admissionGate, coordinator } = await fixture('reject-activation-shadow-rebinding');
-    const input = request('cutover-reject-activation-shadow-rebinding');
+    const input = await request('cutover-reject-activation-shadow-rebinding', { directory, store });
     const prepared = await prepareSharedAuthorityCutover({
       store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
     });
@@ -893,16 +978,93 @@ try {
   }
 
   {
+    const { directory, store, admissionGate, coordinator } = await fixture('reject-backup-receipt-shapes');
+    const input = await request('cutover-reject-backup-receipt-shapes', { directory, store });
+    const markerOnly = structuredClone(input);
+    markerOnly.backupRehearsalReceipt = { backupMarker: backup };
+    await expectCode('CUTOVER_BACKUP_RECEIPT_INVALID', () => prepareSharedAuthorityCutover({
+      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input: markerOnly,
+    }));
+    const missing = structuredClone(input);
+    missing.backupRehearsalReceipt = undefined;
+    await expectCode('CUTOVER_BACKUP_RECEIPT_INVALID', () => prepareSharedAuthorityCutover({
+      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input: missing,
+    }));
+    const tampered = structuredClone(input);
+    tampered.backupRehearsalReceipt.completedAt = new Date(now + 1_000).toISOString();
+    await expectCode('CUTOVER_BACKUP_RECEIPT_INVALID', () => prepareSharedAuthorityCutover({
+      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input: tampered,
+    }));
+  }
+
+  for (const [name, mutate] of [
+    ['generation', (receipt) => { receipt.storeGeneration += 1; }],
+    ['build', (receipt) => { receipt.buildIdentity = 'build:stale-backup-rehearsal'; }],
+    ['configuration', (receipt) => { receipt.configurationDigest = digest('9'); }],
+    ['selector', (receipt) => { receipt.selectorDigest = digest('9'); }],
+  ]) {
+    const { directory, store, admissionGate, coordinator } = await fixture(`reject-backup-${name}`);
+    const input = await request(`cutover-reject-backup-${name}`, { directory, store });
+    const changed = structuredClone(input.backupRehearsalReceipt);
+    mutate(changed);
+    input.backupRehearsalReceipt = resealReceipt(changed);
+    input.operatorReview.backupRehearsalReceiptDigest = input.backupRehearsalReceipt.digest;
+    await expectCode('CUTOVER_BACKUP_RECEIPT_MISMATCH', () => prepareSharedAuthorityCutover({
+      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
+    }));
+  }
+
+  {
+    const { directory, store, admissionGate, coordinator } = await fixture('reject-incomplete-backup-restore');
+    const input = await request('cutover-reject-incomplete-backup-restore', { directory, store });
+    await unlink(path.join(input.restoreRoot, 'store-manifest.json'));
+    await expectCode('CUTOVER_BACKUP_RESTORE_INVALID', () => prepareSharedAuthorityCutover({
+      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
+    }));
+  }
+
+  {
+    const { directory, store, admissionGate, coordinator } = await fixture('reject-stale-backup-receipt');
+    const input = await request('cutover-reject-stale-backup-receipt', { directory, store });
+    now += 60 * 60_000 + 1;
+    await expectCode('CUTOVER_BACKUP_RECEIPT_MISMATCH', () => prepareSharedAuthorityCutover({
+      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
+    }));
+  }
+
+  {
     const { directory, store, admissionGate, coordinator } = await fixture('reject-mismatch');
-    const input = request('cutover-reject-mismatch');
+    const input = await request('cutover-reject-mismatch', { directory, store });
     input.expectedStore.storeMarkerDigest = canonicalDigest({ storeMarker: 'ef'.repeat(32) });
     input.operatorReview = cutoverReview(input);
-    await expectCode('CUTOVER_STORE_MISMATCH', () => prepareSharedAuthorityCutover({
+    await expectCode('CUTOVER_BACKUP_RECEIPT_MISMATCH', () => prepareSharedAuthorityCutover({
       store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
     }));
     input.expectedStore = expectedStore();
     input.rollbackBuildIdentity = 'build:not-prequalified';
     input.operatorReview = cutoverReview(input);
+    await expectCode('CUTOVER_BACKUP_RECEIPT_MISMATCH', () => prepareSharedAuthorityCutover({
+      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
+    }));
+  }
+
+  {
+    const { directory, store, admissionGate, coordinator } = await fixture('reject-live-store-mismatch');
+    const input = await request('cutover-reject-live-store-mismatch', { directory, store });
+    store.buildIdentity = 'build:unexpected-live-store-opener';
+    await expectCode('CUTOVER_STORE_MISMATCH', () => prepareSharedAuthorityCutover({
+      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
+    }));
+  }
+
+  {
+    const { directory, store, admissionGate, coordinator } = await fixture('reject-live-rollback-build');
+    const input = await request(
+      'cutover-reject-live-rollback-build',
+      { directory, store },
+      'initial',
+      'build:not-prequalified',
+    );
     await expectCode('CUTOVER_ROLLBACK_BUILD_UNQUALIFIED', () => prepareSharedAuthorityCutover({
       store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
     }));
@@ -910,7 +1072,7 @@ try {
 
   {
     const { directory, store, admissionGate, coordinator } = await fixture('reject-stale');
-    const input = request('cutover-reject-stale');
+    const input = await request('cutover-reject-stale', { directory, store });
     const prepared = await prepareSharedAuthorityCutover({
       store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
     });

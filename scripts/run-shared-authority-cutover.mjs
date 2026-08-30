@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { constants as fsConstants, promises as fs } from 'node:fs';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import { canonicalDigest } from '../shared/canonical-contract.mjs';
 import {
@@ -25,6 +26,7 @@ import {
   reopenSharedAdmissionAfterCanaries,
   rollbackSharedAuthorityBeforeActivation,
   setSharedPromotionAvailability,
+  sharedCutoverConfigurationDigest,
 } from './lib/shared-cutover-orchestrator.mjs';
 import { createSharedReleaseHttpClient } from './lib/shared-release-ci.mjs';
 import { readCredentialFile } from './lib/credential-file.mjs';
@@ -34,15 +36,16 @@ import {
 } from './lib/legacy-authority-fence.mjs';
 import { openSharedLaunchOperationStore } from './lib/shared-launch-operation-store.mjs';
 import { readTrustedStoreMarker } from './lib/shared-store-runtime.mjs';
+import { rehearseSharedStoreBackup } from './lib/shared-store-backup-rehearsal.mjs';
 
 const ACTIONS = new Set([
-  'prepare', 'activate', 'launch-single-site-canary', 'launch-comparative-canary',
+  'rehearse-backup', 'prepare', 'activate', 'launch-single-site-canary', 'launch-comparative-canary',
   'record-single-site-canary', 'record-comparative-canary', 'reopen',
   'rollback', 'disable-promotion', 'enable-promotion',
 ]);
 
 function usage() {
-  return 'Usage: run-shared-authority-cutover.mjs <prepare|activate|launch-single-site-canary|launch-comparative-canary|record-single-site-canary|record-comparative-canary|reopen|rollback|disable-promotion|enable-promotion> --config <operator-config.json>';
+  return 'Usage: run-shared-authority-cutover.mjs <rehearse-backup|prepare|activate|launch-single-site-canary|launch-comparative-canary|record-single-site-canary|record-comparative-canary|reopen|rollback|disable-promotion|enable-promotion> --config <operator-config.json>';
 }
 
 function parseArguments(argv) {
@@ -133,12 +136,62 @@ async function canaryReprobeByMode(config, collection = 'canaries') {
   };
 }
 
-async function main() {
-  const { action, configFile } = parseArguments(process.argv.slice(2));
+function expectedStoreFromConfig(config, marker) {
+  return {
+    deploymentIdentity: config.store.deploymentIdentity,
+    volumeIdentity: config.store.volumeIdentity,
+    storeMarkerDigest: canonicalDigest({ storeMarker: marker }),
+    storeGeneration: Number(config.store.storeGeneration),
+    schemaVersion: config.store.supportedSchemaVersion ?? PARENT_RUN_STORE_SCHEMA_VERSION,
+    schemaFloor: config.store.schemaFloor ?? PARENT_RUN_STORE_SCHEMA_VERSION,
+    currentWriterProtocol: config.store.writerProtocol ?? PARENT_RUN_WRITER_PROTOCOL,
+    minimumWriterProtocol: config.store.minimumWriterProtocol ?? PARENT_RUN_WRITER_PROTOCOL,
+    backupMarker: config.store.backupMarker,
+  };
+}
+
+function cutoverIdentityFromConfig(config, expectedStore) {
+  return {
+    cutoverId: config.cutoverId,
+    activationRevision: config.activationRevision,
+    buildIdentity: config.store.buildIdentity,
+    rollbackBuildIdentity: config.rollbackBuildIdentity,
+    expectedStore,
+  };
+}
+
+export async function runSharedAuthorityCutoverCli(argv, { output = process.stdout } = {}) {
+  const { action, configFile } = parseArguments(argv);
   const config = requiredObject(await readBoundedJsonFile(configFile, 'Operator config'), 'Operator config');
   if (config.schemaVersion !== 1) throw new TypeError('Operator config must use schemaVersion 1.');
   const marker = await readTrustedStoreMarker(config.store?.storeMarkerFile, 'trusted shared store marker');
   const store = await openConfiguredStore(config, action, marker);
+  const expectedStore = expectedStoreFromConfig(config, marker);
+  const backupRehearsal = requiredObject(config.backupRehearsal, 'config.backupRehearsal');
+  if (action === 'rehearse-backup') {
+    const backupMarker = await readTrustedStoreMarker(
+      backupRehearsal.backupMarkerFile,
+      'trusted shared backup marker',
+    );
+    if (backupMarker !== expectedStore.backupMarker) {
+      throw new TypeError('Trusted backup marker does not match config.store.backupMarker.');
+    }
+    const receipt = await rehearseSharedStoreBackup({
+      rehearsalId: backupRehearsal.rehearsalId ?? `${config.cutoverId}-backup`,
+      sourceRoot: store.root,
+      backupRoot: backupRehearsal.backupRoot,
+      restoreRoot: backupRehearsal.restoreRoot,
+      receiptPath: backupRehearsal.receiptFile,
+      storeMarker: marker,
+      backupMarker,
+      buildIdentity: config.store.buildIdentity,
+      configurationDigest: sharedCutoverConfigurationDigest(cutoverIdentityFromConfig(config, expectedStore)),
+      expectedStore,
+      limits: backupRehearsal.limits,
+    });
+    output.write(`${JSON.stringify(receipt, null, 2)}\n`);
+    return;
+  }
   const admissionRoot = path.join(store.root, 'cutover-admission');
   if (config.admissionRoot && path.resolve(config.admissionRoot) !== path.resolve(admissionRoot)) {
     throw new TypeError('config.admissionRoot must identify the canonical store cutover-admission directory.');
@@ -176,21 +229,17 @@ async function main() {
     activationRevision: config.activationRevision,
     buildIdentity: config.store.buildIdentity,
     rollbackBuildIdentity: config.rollbackBuildIdentity,
-    expectedStore: {
-      deploymentIdentity: config.store.deploymentIdentity,
-      volumeIdentity: config.store.volumeIdentity,
-      storeMarkerDigest: canonicalDigest({ storeMarker: marker }),
-      storeGeneration: Number(config.store.storeGeneration),
-      schemaVersion: config.store.supportedSchemaVersion ?? PARENT_RUN_STORE_SCHEMA_VERSION,
-      schemaFloor: config.store.schemaFloor ?? PARENT_RUN_STORE_SCHEMA_VERSION,
-      currentWriterProtocol: config.store.writerProtocol ?? PARENT_RUN_WRITER_PROTOCOL,
-      minimumWriterProtocol: config.store.minimumWriterProtocol ?? PARENT_RUN_WRITER_PROTOCOL,
-      backupMarker: config.store.backupMarker,
-    },
+    expectedStore,
     shadowReport: config.shadowReportFile
       ? await readBoundedJsonFile(config.shadowReportFile, 'Shadow validation report', 16 * 1_048_576)
       : null,
     operatorReview,
+    backupRehearsalReceipt: await readBoundedJsonFile(
+      backupRehearsal.receiptFile,
+      'Backup rehearsal receipt',
+    ),
+    backupRoot: backupRehearsal.backupRoot,
+    restoreRoot: backupRehearsal.restoreRoot,
   };
 
   let result;
@@ -280,10 +329,12 @@ async function main() {
       probeTargetIdentity: enable ? await canaryReprobeByMode(config, 'promotionHealth') : undefined,
     });
   }
-  process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+  output.write(`${JSON.stringify(result, null, 2)}\n`);
 }
 
-main().catch((error) => {
-  process.stderr.write(`[shared-cutover] ${error?.code ? `${error.code}: ` : ''}${error instanceof Error ? error.message : String(error)}\n`);
-  process.exitCode = 1;
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  runSharedAuthorityCutoverCli(process.argv.slice(2)).catch((error) => {
+    process.stderr.write(`[shared-cutover] ${error?.code ? `${error.code}: ` : ''}${error instanceof Error ? error.message : String(error)}\n`);
+    process.exitCode = 1;
+  });
+}

@@ -38,9 +38,14 @@ import {
 } from './parent-run-store.mjs';
 import { listRecoverableSharedLaunchOperations } from './shared-launch-operation-store.mjs';
 import { inspectLegacyAuthorityDrainSources } from './legacy-authority-drain-source.mjs';
+import {
+  parseSharedStoreBackupRehearsalReceipt,
+  verifySharedStoreBackupRehearsal,
+} from './shared-store-backup-rehearsal.mjs';
 
 const SAFE_ID = /^[A-Za-z0-9._-]{1,128}$/u;
 const MAX_OBSERVATION_AGE_MS = 5 * 60_000;
+const MAX_BACKUP_REHEARSAL_AGE_MS = 60 * 60_000;
 const SHADOW_CASE_IDS = Object.freeze([
   ...SHADOW_ACCEPTANCE_CASE_IDS,
   ...SHADOW_CORRUPTION_CASE_IDS,
@@ -737,7 +742,7 @@ function validateOperatorReviewFields(value) {
   canonicalTimestamp(value.reviewedAt, 'operatorReview.reviewedAt');
 }
 
-function cutoverConfigurationDigest(input) {
+export function sharedCutoverConfigurationDigest(input) {
   return canonicalDigest({
     cutoverId: input.cutoverId,
     activationRevision: input.activationRevision,
@@ -750,7 +755,7 @@ function cutoverConfigurationDigest(input) {
 function parseCutoverOperatorReview(value, input) {
   exactKeys(value, [
     'reviewed', 'actorId', 'reviewedAt', 'shadowValidationDigest', 'shadowMatrixDigest',
-    'buildIdentity', 'expectedStoreDigest', 'configurationDigest',
+    'buildIdentity', 'expectedStoreDigest', 'configurationDigest', 'backupRehearsalReceiptDigest',
   ], 'operatorReview');
   validateOperatorReviewFields(value);
   assertDigest(value.shadowValidationDigest, 'operatorReview.shadowValidationDigest');
@@ -758,12 +763,14 @@ function parseCutoverOperatorReview(value, input) {
   nonEmptyString(value.buildIdentity, 'operatorReview.buildIdentity');
   assertDigest(value.expectedStoreDigest, 'operatorReview.expectedStoreDigest');
   assertDigest(value.configurationDigest, 'operatorReview.configurationDigest');
+  assertDigest(value.backupRehearsalReceiptDigest, 'operatorReview.backupRehearsalReceiptDigest');
   const expectedBindings = {
     shadowValidationDigest: input.shadowReport.digest,
     shadowMatrixDigest: input.shadowReport.matrixDigest,
     buildIdentity: input.buildIdentity,
     expectedStoreDigest: canonicalDigest(input.expectedStore),
-    configurationDigest: cutoverConfigurationDigest(input),
+    configurationDigest: sharedCutoverConfigurationDigest(input),
+    backupRehearsalReceiptDigest: input.backupRehearsalReceipt.digest,
   };
   const mismatches = Object.entries(expectedBindings)
     .filter(([key, expected]) => value[key] !== expected)
@@ -783,7 +790,8 @@ function parseCutoverOperatorReview(value, input) {
 function parseCutoverInput(input) {
   exactKeys(input, [
     'cutoverId', 'activationRevision', 'buildIdentity', 'rollbackBuildIdentity',
-    'expectedStore', 'shadowReport', 'operatorReview',
+    'expectedStore', 'shadowReport', 'operatorReview', 'backupRehearsalReceipt',
+    'backupRoot', 'restoreRoot',
   ], 'cutover input');
   const cutoverId = safeId(input.cutoverId, 'cutoverId');
   if (!Number.isSafeInteger(input.activationRevision) || input.activationRevision < 1) {
@@ -818,8 +826,72 @@ function parseCutoverInput(input) {
     expectedStore,
     shadowReport,
   };
+  for (const key of ['backupRoot', 'restoreRoot']) {
+    nonEmptyString(input[key], key);
+    if (!path.isAbsolute(input[key])) fail('CUTOVER_INPUT_INVALID', `${key} must be an absolute isolated path.`);
+    normalized[key] = path.resolve(input[key]);
+  }
+  try {
+    normalized.backupRehearsalReceipt = parseSharedStoreBackupRehearsalReceipt(
+      input.backupRehearsalReceipt,
+      {
+        expectedStore: normalized.expectedStore,
+        buildIdentity: normalized.buildIdentity,
+        configurationDigest: sharedCutoverConfigurationDigest(normalized),
+        backupMarker: normalized.expectedStore.backupMarker,
+        notBefore: normalized.shadowReport.generatedAt,
+      },
+    );
+  } catch (error) {
+    const mismatch = error?.code === 'BACKUP_BINDING_MISMATCH';
+    fail(
+      mismatch ? 'CUTOVER_BACKUP_RECEIPT_MISMATCH' : 'CUTOVER_BACKUP_RECEIPT_INVALID',
+      mismatch
+        ? 'Backup rehearsal receipt is stale or does not match this cutover.'
+        : 'Cutover requires a valid sealed backup rehearsal receipt.',
+      { cause: error?.code ?? error?.message },
+    );
+  }
   normalized.operatorReview = parseCutoverOperatorReview(input.operatorReview, normalized);
   return { ...normalized, digest: canonicalDigest(normalized) };
+}
+
+function assertBackupSelectorLineage(receipt, selector, checkpoint = null) {
+  let expectedReceiptSelector = checkpoint?.selectorBefore?.digest;
+  if (selector.phase === 'SHADOW') expectedReceiptSelector = selector.digest;
+  if (selector.phase === 'DRAINING') expectedReceiptSelector = selector.previousDigest;
+  if (receipt.selectorDigest !== expectedReceiptSelector) {
+    fail(
+      'CUTOVER_BACKUP_RECEIPT_MISMATCH',
+      'Backup rehearsal receipt is not descended from this cutover preactivation selector.',
+    );
+  }
+}
+
+async function verifyCutoverBackup({ input, selector, checkpoint = null, clock, enforceFreshness = false }) {
+  assertBackupSelectorLineage(input.backupRehearsalReceipt, selector, checkpoint);
+  try {
+    return await verifySharedStoreBackupRehearsal({
+      receipt: input.backupRehearsalReceipt,
+      backupRoot: input.backupRoot,
+      restoreRoot: input.restoreRoot,
+      expectedStore: input.expectedStore,
+      buildIdentity: input.buildIdentity,
+      configurationDigest: sharedCutoverConfigurationDigest(input),
+      backupMarker: input.expectedStore.backupMarker,
+      notBefore: input.shadowReport.generatedAt,
+      ...(enforceFreshness ? { maximumAgeMs: MAX_BACKUP_REHEARSAL_AGE_MS, now: clock() } : {}),
+    });
+  } catch (error) {
+    const mismatch = error?.code === 'BACKUP_BINDING_MISMATCH';
+    fail(
+      mismatch ? 'CUTOVER_BACKUP_RECEIPT_MISMATCH' : 'CUTOVER_BACKUP_RESTORE_INVALID',
+      mismatch
+        ? 'Backup rehearsal receipt is stale or does not match this cutover.'
+        : 'Retained backup and restore content no longer proves a complete rehearsal.',
+      { cause: error?.code ?? error?.message },
+    );
+  }
 }
 
 function validateStore(store, input, { activated = false } = {}) {
@@ -988,7 +1060,15 @@ export async function prepareSharedAuthorityCutover({
     if (gate.state === 'CLOSED' && gate.cutoverId !== input.cutoverId) {
       fail('CUTOVER_ADMISSION_OWNED', `Admission is closed by ${gate.cutoverId}.`);
     }
-    let checkpoint = await initializeCheckpoint(storage, input, selector, gate, clock);
+    let checkpoint = await readCheckpoint(storage, input);
+    await verifyCutoverBackup({
+      input,
+      selector,
+      checkpoint,
+      clock,
+      enforceFreshness: checkpoint === null && selector.phase === 'SHADOW' && gate.state === 'OPEN',
+    });
+    checkpoint ??= await initializeCheckpoint(storage, input, selector, gate, clock);
     if (legacyAuthorityFence) {
       const legacyFence = await legacyAuthorityFence.read();
       if (legacyFence.state === 'OPEN') {
@@ -1032,6 +1112,7 @@ export async function prepareSharedAuthorityCutover({
 }
 
 function reportBody({ input, checkpoint, selectorAfter, admissionGate, observation, store, completedAt }) {
+  const backupReceipt = input.backupRehearsalReceipt;
   return {
     schemaVersion: 1,
     kind: 'release-authority-cutover-report',
@@ -1049,6 +1130,25 @@ function reportBody({ input, checkpoint, selectorAfter, admissionGate, observati
     storeBefore: input.expectedStore,
     storeAfter: clone(store.manifest),
     rollbackBuildIdentity: input.rollbackBuildIdentity,
+    backupRehearsal: {
+      receiptDigest: backupReceipt.digest,
+      completedAt: backupReceipt.completedAt,
+      retainedCopiesVerifiedAt: completedAt,
+      manifestDigest: backupReceipt.manifestDigest,
+      selectorDigest: backupReceipt.selectorDigest,
+      expectedStoreDigest: backupReceipt.expectedStoreDigest,
+      sourceSnapshotDigest: backupReceipt.sourceSnapshot.digest,
+      backupSnapshotDigest: backupReceipt.backupSnapshot.digest,
+      restoreSnapshotDigest: backupReceipt.restoreSnapshot.digest,
+      entryCount: backupReceipt.sourceSnapshot.entryCount,
+      totalBytes: backupReceipt.sourceSnapshot.totalBytes,
+      sourceQuiesced: backupReceipt.verification.sourceQuiesced,
+      backupMatchesSource: backupReceipt.verification.backupMatchesSource,
+      restoreMatchesSource: backupReceipt.verification.restoreMatchesSource,
+      unsupportedEntriesRejected: backupReceipt.verification.unsupportedEntriesRejected,
+      isolatedPaths: backupReceipt.verification.isolatedPaths,
+      retainedCopiesPresent: true,
+    },
     preconditions: {
       activeLegacyAuthoritativeRuns: observation.activeLegacyAuthoritativeRunIds.length,
       releaseChangingMutations: observation.releaseChangingMutationIds.length,
@@ -1057,7 +1157,10 @@ function reportBody({ input, checkpoint, selectorAfter, admissionGate, observati
       singletonCanonicalWriter: observation.canonicalWriterOwnerIds.length === 1,
       unexplainedAuthorityDrift: input.shadowReport.summary.unexplainedDrift,
       shadowValidationStatus: input.shadowReport.validationStatus,
-      backupRehearsed: input.expectedStore.backupMarker !== null,
+      backupRehearsed: backupReceipt.verification.sourceQuiesced === true
+        && backupReceipt.verification.backupMatchesSource === true
+        && backupReceipt.verification.restoreMatchesSource === true,
+      backupRehearsalReceiptDigest: backupReceipt.digest,
       rollbackBuildPrequalified: true,
     },
     operatorReview: input.operatorReview,
@@ -1099,6 +1202,7 @@ export async function activateSharedAuthorityCutover({
     }
     let checkpoint = await readCheckpoint(storage, input);
     if (!checkpoint) fail('CUTOVER_CHECKPOINT_MISSING', 'Prepare must complete before activation.');
+    await verifyCutoverBackup({ input, selector, checkpoint, clock });
     let observed = checkpoint.drainObservation;
     if (selector.phase !== 'ACTIVE') {
       observed = parseDrainObservation(drainObservation, { input, gate, coordinator, clock });

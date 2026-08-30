@@ -1,5 +1,6 @@
 import type { CoordinatorFence, ParentRunStore } from './parent-run-store.mjs';
 import type { LegacyAuthorityFence } from './legacy-authority-fence.mjs';
+import type { SharedStoreBackupRehearsalReceipt } from './shared-store-backup-rehearsal.mjs';
 
 export class SharedCutoverError extends Error {
   code: string;
@@ -43,6 +44,9 @@ export interface SharedCutoverInput {
     backupMarker: string;
   };
   shadowReport: unknown;
+  backupRehearsalReceipt: SharedStoreBackupRehearsalReceipt;
+  backupRoot: string;
+  restoreRoot: string;
   operatorReview: {
     reviewed: true;
     actorId: string;
@@ -52,8 +56,13 @@ export interface SharedCutoverInput {
     buildIdentity: string;
     expectedStoreDigest: string;
     configurationDigest: string;
+    backupRehearsalReceiptDigest: string;
   };
 }
+
+export function sharedCutoverConfigurationDigest(input: Pick<SharedCutoverInput,
+  'cutoverId' | 'activationRevision' | 'buildIdentity' | 'rollbackBuildIdentity' | 'expectedStore'
+>): string;
 
 export interface CutoverDrainObservation {
   schemaVersion: 1;
