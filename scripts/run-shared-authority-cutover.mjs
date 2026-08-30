@@ -17,11 +17,16 @@ import {
 } from './lib/parent-run-store.mjs';
 import {
   activateSharedAuthorityCutover,
+  authorizeSharedBuildHandoffCanaryLaunch,
   authorizeSharedCutoverCanaryLaunch,
+  beginSharedAuthorityBuildHandoff,
+  completeSharedAuthorityBuildHandoff,
   captureSharedAuthorityDrainObservation,
   initializeCutoverAdmissionGate,
   openCutoverAdmissionGate,
   prepareSharedAuthorityCutover,
+  prepareSharedAuthorityBuildHandoff,
+  recordSharedBuildHandoffCanary,
   recordSharedCutoverCanary,
   reopenSharedAdmissionAfterCanaries,
   rollbackSharedAuthorityBeforeActivation,
@@ -37,15 +42,19 @@ import {
 import { openSharedLaunchOperationStore } from './lib/shared-launch-operation-store.mjs';
 import { readTrustedStoreMarker } from './lib/shared-store-runtime.mjs';
 import { rehearseSharedStoreBackup } from './lib/shared-store-backup-rehearsal.mjs';
+import { openSharedAuthorityFloor } from './lib/shared-authority-floor.mjs';
 
 const ACTIONS = new Set([
   'rehearse-backup', 'prepare', 'activate', 'launch-single-site-canary', 'launch-comparative-canary',
   'record-single-site-canary', 'record-comparative-canary', 'reopen',
   'rollback', 'disable-promotion', 'enable-promotion',
+  'prepare-handoff', 'begin-handoff',
+  'launch-handoff-single-site-canary', 'launch-handoff-comparative-canary',
+  'record-handoff-single-site-canary', 'record-handoff-comparative-canary', 'complete-handoff',
 ]);
 
 function usage() {
-  return 'Usage: run-shared-authority-cutover.mjs <rehearse-backup|prepare|activate|launch-single-site-canary|launch-comparative-canary|record-single-site-canary|record-comparative-canary|reopen|rollback|disable-promotion|enable-promotion> --config <operator-config.json>';
+  return `Usage: run-shared-authority-cutover.mjs <${[...ACTIONS].join('|')}> --config <operator-config.json>`;
 }
 
 function parseArguments(argv) {
@@ -98,7 +107,9 @@ async function openConfiguredStore(config, action, marker) {
     return await openParentRunStore(options);
   } catch (error) {
     if (error?.code !== 'STORE_GENERATION_MISMATCH'
-      || !['activate', 'launch-single-site-canary', 'launch-comparative-canary', 'record-single-site-canary', 'record-comparative-canary', 'reopen', 'disable-promotion', 'enable-promotion'].includes(action)) throw error;
+      || !['activate', 'launch-single-site-canary', 'launch-comparative-canary', 'record-single-site-canary', 'record-comparative-canary', 'reopen', 'disable-promotion', 'enable-promotion',
+        'prepare-handoff', 'begin-handoff', 'launch-handoff-single-site-canary', 'launch-handoff-comparative-canary',
+        'record-handoff-single-site-canary', 'record-handoff-comparative-canary', 'complete-handoff'].includes(action)) throw error;
     return openParentRunStore({ ...options, expectedStoreGeneration: originalGeneration + 1 });
   }
 }
@@ -224,6 +235,12 @@ export async function runSharedAuthorityCutoverCli(argv, { output = process.stdo
     legacyAuthorityFence = await initializeLegacyAuthorityFence({ root: legacyFenceRoot });
   }
   const operatorReview = requiredObject(config.operatorReview, 'config.operatorReview');
+  const handoffAction = action.includes('handoff');
+  const authorityFloor = handoffAction ? await openSharedAuthorityFloor({
+    root: config.authorityFloorRoot,
+    protectedRoots: [store.root, backupRehearsal.backupRoot, backupRehearsal.restoreRoot],
+    verifyStorage: config.authorityFloorVerifyStorage !== false,
+  }) : null;
   const commonInput = {
     cutoverId: config.cutoverId,
     activationRevision: config.activationRevision,
@@ -243,7 +260,63 @@ export async function runSharedAuthorityCutoverCli(argv, { output = process.stdo
   };
 
   let result;
-  if (action === 'prepare') {
+  const handoff = config.handoff ? requiredObject(config.handoff, 'config.handoff') : null;
+  if (action === 'prepare-handoff') {
+    result = await prepareSharedAuthorityBuildHandoff({
+      store, coordinator, admissionGate, legacyAuthorityFence, authorityFloor,
+      reportDirectory: config.reportDirectory,
+      handoffId: handoff.handoffId,
+      targetBuildIdentity: handoff.targetBuildIdentity,
+      operatorReview: requiredObject(handoff.operatorReview, 'config.handoff.operatorReview'),
+    });
+  } else if (action === 'begin-handoff') {
+    const legacySources = requiredObject(config.legacySources, 'config.legacySources');
+    const launchOperationStore = await openSharedLaunchOperationStore({
+      root: path.join(store.root, 'launch-operations'), requireExisting: true,
+    });
+    const drainObservation = await captureSharedAuthorityDrainObservation({
+      store, coordinator, admissionGate, legacyAuthorityFence, launchOperationStore,
+      cutoverId: handoff.handoffId,
+      legacyComparativeRoot: legacySources.comparativeRoot,
+      legacySingleSiteQueueRoot: legacySources.singleSiteQueueRoot,
+    });
+    result = await beginSharedAuthorityBuildHandoff({
+      store, coordinator, admissionGate, legacyAuthorityFence,
+      reportDirectory: config.reportDirectory,
+      handoffId: handoff.handoffId,
+      drainObservation,
+    });
+  } else if (action === 'launch-handoff-single-site-canary' || action === 'launch-handoff-comparative-canary') {
+    const mode = action.includes('single-site') ? 'single-site' : 'comparative';
+    const { canary, intent } = await readCanaryIntent(config, mode, 'handoffCanaries');
+    const control = requiredObject(config.control, 'config.control');
+    const permit = await authorizeSharedBuildHandoffCanaryLaunch({
+      store, admissionGate, reportDirectory: config.reportDirectory,
+      handoffId: handoff.handoffId, mode, runId: canary.runId,
+      requestId: canary.requestId, actor: canary.actor,
+      intent, supersedeReason: canary.supersedeReason ?? null,
+    });
+    const client = createSharedReleaseHttpClient({
+      baseUrl: control.server,
+      token: await readCredentialFile(control.credentialFile, { label: 'Handoff control credential' }),
+    });
+    result = { permit, operation: await client.launch({ requestId: canary.requestId, intent }) };
+  } else if (action === 'record-handoff-single-site-canary' || action === 'record-handoff-comparative-canary') {
+    const mode = action.includes('single-site') ? 'single-site' : 'comparative';
+    const { canary, intent } = await readCanaryIntent(config, mode, 'handoffCanaries');
+    result = await recordSharedBuildHandoffCanary({
+      store, admissionGate, reportDirectory: config.reportDirectory,
+      handoffId: handoff.handoffId, mode, runId: canary.runId,
+      probeTargetIdentity: () => reprobeCanaryIntent(intent),
+    });
+  } else if (action === 'complete-handoff') {
+    result = await completeSharedAuthorityBuildHandoff({
+      store, coordinator, admissionGate, legacyAuthorityFence, authorityFloor,
+      reportDirectory: config.reportDirectory,
+      handoffId: handoff.handoffId,
+      probeTargetIdentity: await canaryReprobeByMode(config, 'handoffCanaries'),
+    });
+  } else if (action === 'prepare') {
     result = await prepareSharedAuthorityCutover({
       store, coordinator, admissionGate, legacyAuthorityFence,
       reportDirectory: config.reportDirectory, input: commonInput,

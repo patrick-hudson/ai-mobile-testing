@@ -141,6 +141,8 @@ try {
     phase: 'ACTIVE',
     activationRevision: 41,
     buildIdentity: build,
+    activationCutoverDigest: digest,
+    authorityTransitionDigest: digest,
     hooks: { afterActivationIntent: () => { throw new Error('synthetic interrupted pre-fence activation'); } },
   }), /synthetic interrupted pre-fence activation/);
   assert.equal((await readReleaseAuthoritySelector(store)).phase, 'DRAINING',
@@ -154,6 +156,8 @@ try {
     phase: 'ACTIVE',
     activationRevision: 41,
     buildIdentity: build,
+    activationCutoverDigest: digest,
+    authorityTransitionDigest: digest,
     hooks: { afterActivationFence: () => { throw new Error('synthetic crash after activation fence'); } },
   }), /synthetic crash after activation fence/);
   const active = await readReleaseAuthoritySelector(store);
@@ -318,22 +322,9 @@ try {
     verifyStorage: false, clock,
   });
   now += 101;
-  const rollbackCoordinator = await takeOverStoreCoordinator(rollbackStore, {
+  await expectCode('STORE_WRITER_NOT_ACTIVE', () => takeOverStoreCoordinator(rollbackStore, {
     ownerId: 'coordinator-compatible-rollback', leaseMs: 100,
-  });
-  const rollbackActive = await transitionReleaseAuthority(rollbackStore, rollbackCoordinator, {
-    expectedSelectorDigest: disabled.digest,
-    phase: 'ACTIVE', activationRevision: 41, buildIdentity: rollbackBuild,
-  });
-  assert.equal(rollbackActive.activeBuildIdentity, rollbackBuild);
-  await expectCode('AUTHORITY_TRANSITION_INVALID', () => transitionReleaseAuthority(
-    rollbackStore, rollbackCoordinator, {
-      expectedSelectorDigest: rollbackActive.digest, phase: 'SHADOW', buildIdentity: rollbackBuild,
-    },
-  ));
-  await transitionReleaseAuthority(rollbackStore, rollbackCoordinator, {
-    expectedSelectorDigest: rollbackActive.digest, phase: 'PROMOTION_DISABLED', buildIdentity: rollbackBuild,
-  });
+  }));
 
   await expectCode('STORE_IDENTITY_MISMATCH', () => openParentRunStore({
     root, deploymentIdentity: 'compose-project:selector-test', volumeIdentity: 'named-volume:wrong',

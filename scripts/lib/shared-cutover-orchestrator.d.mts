@@ -1,6 +1,7 @@
 import type { CoordinatorFence, ParentRunStore } from './parent-run-store.mjs';
 import type { LegacyAuthorityFence } from './legacy-authority-fence.mjs';
 import type { SharedStoreBackupRehearsalReceipt } from './shared-store-backup-rehearsal.mjs';
+import type { SharedAuthorityFloor } from './shared-authority-floor.mjs';
 
 export class SharedCutoverError extends Error {
   code: string;
@@ -206,4 +207,80 @@ export function setSharedPromotionAvailability(options: {
   }) => Promise<unknown> | unknown;
   transitionWithPublicationFence?: (store: ParentRunStore, coordinator: CoordinatorFence, input: unknown) => Promise<unknown>;
   clock?: () => number;
+}): Promise<any>;
+
+export function prepareSharedAuthorityBuildHandoff(options: {
+  store: ParentRunStore;
+  coordinator: CoordinatorFence;
+  admissionGate: CutoverAdmissionGate;
+  legacyAuthorityFence: LegacyAuthorityFence;
+  authorityFloor: SharedAuthorityFloor;
+  reportDirectory: string;
+  handoffId: string;
+  targetBuildIdentity: string;
+  operatorReview: { reviewed: true; actorId: string; reviewedAt: string };
+  clock?: () => number;
+  hooks?: { afterAdmissionClosed?(gate: CutoverAdmissionGateDocument): void | Promise<void> };
+}): Promise<any>;
+
+export function beginSharedAuthorityBuildHandoff(options: {
+  store: ParentRunStore;
+  coordinator: CoordinatorFence;
+  admissionGate: CutoverAdmissionGate;
+  legacyAuthorityFence: LegacyAuthorityFence;
+  reportDirectory: string;
+  handoffId: string;
+  drainObservation: CutoverDrainObservation;
+  clock?: () => number;
+  hooks?: { afterPendingSelector?(selector: any): void | Promise<void> };
+}): Promise<any>;
+
+export function authorizeSharedBuildHandoffCanaryLaunch(options: {
+  store: ParentRunStore;
+  admissionGate: CutoverAdmissionGate;
+  reportDirectory: string;
+  handoffId: string;
+  mode: 'single-site' | 'comparative';
+  runId: string;
+  requestId: string;
+  actor: { id: string; kind: 'human' | 'service' };
+  intent: unknown;
+  supersedeReason?: string | null;
+  probeTargetIdentity?: (intent: unknown) => Promise<unknown> | unknown;
+  clock?: () => number;
+}): Promise<any>;
+
+export function recordSharedBuildHandoffCanary(options: {
+  store: ParentRunStore;
+  admissionGate: CutoverAdmissionGate;
+  reportDirectory: string;
+  handoffId: string;
+  mode: 'single-site' | 'comparative';
+  runId: string;
+  probeTargetIdentity?: (state: unknown) => Promise<unknown> | unknown;
+  readCanaryEvidence?: (store: ParentRunStore, runId: string, options?: {
+    probeTargetIdentity?: (state: unknown) => Promise<unknown> | unknown;
+  }) => Promise<unknown> | unknown;
+  clock?: () => number;
+}): Promise<any>;
+
+export function completeSharedAuthorityBuildHandoff(options: {
+  store: ParentRunStore;
+  coordinator: CoordinatorFence;
+  admissionGate: CutoverAdmissionGate;
+  legacyAuthorityFence: LegacyAuthorityFence;
+  authorityFloor: SharedAuthorityFloor;
+  reportDirectory: string;
+  handoffId: string;
+  probeTargetIdentity: (state: unknown) => Promise<unknown> | unknown;
+  readCanaryEvidence?: (store: ParentRunStore, runId: string, options?: {
+    probeTargetIdentity?: (state: unknown) => Promise<unknown> | unknown;
+  }) => Promise<unknown> | unknown;
+  clock?: () => number;
+  hooks?: {
+    afterCommitIntentPersisted?(intent: any): void | Promise<void>;
+    afterAuthorityFloorAdvanced?(floor: any): void | Promise<void>;
+    afterAuthorityCommitted?(selector: any): void | Promise<void>;
+    afterAdmissionOpened?(gate: CutoverAdmissionGateDocument): void | Promise<void>;
+  };
 }): Promise<any>;

@@ -28,11 +28,15 @@ import {
   withDirectoryLock,
 } from './atomic-filesystem.mjs';
 import {
+  beginReleaseAuthorityBuildHandoff,
+  completeReleaseAuthorityBuildHandoffWithPublicationFence,
   listParentRunIds,
   readCurrentEnvelope,
   readParentRun,
+  readStorePerformanceScheduler,
   readStoreCoordinator,
   readReleaseAuthoritySelector,
+  registerReleaseAuthorityHandoffCanaryRun,
   transitionReleaseAuthority,
   transitionReleaseAuthorityWithPublicationFence,
 } from './parent-run-store.mjs';
@@ -331,6 +335,7 @@ function canaryLaunchPermitBody(value) {
     cutoverConfigurationDigest: value.cutoverConfigurationDigest,
     storeBindingDigest: value.storeBindingDigest,
     targetIdentity: value.targetIdentity,
+    authorizedRunId: value.authorizedRunId,
     supersedesRunId: value.supersedesRunId,
     supersedeReason: value.supersedeReason,
     state: value.state,
@@ -369,6 +374,7 @@ function parseCanaryLaunchPermit(value, { cutoverId = null, mode = null } = {}) 
   })) assertDigest(digest, `Cutover canary permit ${key}`);
   nonEmptyString(value.activeBuildIdentity, 'Cutover canary permit activeBuildIdentity');
   parseTrustedTargetIdentity(value.targetIdentity, 'Cutover canary target identity');
+  if (value.authorizedRunId !== null) safeId(value.authorizedRunId, 'Cutover canary authorizedRunId');
   if (value.revision === 1) {
     if (value.supersedesRunId !== null || value.supersedeReason !== null) {
       fail('CUTOVER_DOCUMENT_INVALID', 'Initial cutover canary permit cannot supersede a run.');
@@ -386,6 +392,9 @@ function parseCanaryLaunchPermit(value, { cutoverId = null, mode = null } = {}) 
     }
   } else {
     safeId(value.runId, 'Cutover canary runId');
+    if (value.authorizedRunId !== null && value.runId !== value.authorizedRunId) {
+      fail('CUTOVER_DOCUMENT_INVALID', 'Consumed canary run does not match its pre-authorized run identity.');
+    }
     if (typeof value.operationId !== 'string' || !/^[a-f0-9]{64}$/u.test(value.operationId)) {
       fail('CUTOVER_DOCUMENT_INVALID', 'Cutover canary operationId is invalid.');
     }
@@ -528,6 +537,7 @@ export async function authorizeSharedCutoverCanaryLaunch({
       cutoverConfigurationDigest: report.operatorReview?.configurationDigest,
       storeBindingDigest: binding.digest,
       targetIdentity: clone(targetIdentity),
+      authorizedRunId: null,
       supersedesRunId: null,
       supersedeReason: null,
       state: 'AUTHORIZED',
@@ -565,7 +575,15 @@ export function createCutoverAdmissionPolicy({ admissionGate, store = null } = {
         if (!CUTOVER_CANARY_MODES.includes(mode)) fail('CUTOVER_CANARY_LAUNCH_MISMATCH', 'Closed admission accepts only a cutover canary.');
         const normalizedIntent = parseCanaryIntent(intent, mode);
         const selector = await readReleaseAuthoritySelector(store);
-        assertActivatedCutover(selector, gate, gate.cutoverId);
+        const buildHandoff = selector.phase === 'PROMOTION_DISABLED'
+          && selector.handoffId === gate.cutoverId && selector.pendingBuildIdentity !== null;
+        if (buildHandoff) {
+          if (store.buildIdentity !== selector.pendingBuildIdentity) {
+            fail('AUTHORITY_HANDOFF_INVALID', 'Only the pending target build may consume handoff canary admission.');
+          }
+        } else {
+          assertActivatedCutover(selector, gate, gate.cutoverId);
+        }
         const permit = await readCanaryLaunchPermit(admissionGate, gate.cutoverId, mode);
         const binding = cutoverStoreBinding(store);
         if (!permit) {
@@ -575,9 +593,19 @@ export function createCutoverAdmissionPolicy({ admissionGate, store = null } = {
         }
         if (permit.requestId !== requestId || permit.intentDigest !== canonicalDigest(normalizedIntent)
           || permit.authoritySelectorDigest !== selector.digest || permit.admissionGateDigest !== gate.digest
-          || permit.activeBuildIdentity !== selector.activeBuildIdentity || permit.activeBuildIdentity !== store.buildIdentity
+          || permit.activeBuildIdentity !== (buildHandoff ? selector.pendingBuildIdentity : selector.activeBuildIdentity)
+          || permit.activeBuildIdentity !== store.buildIdentity
           || permit.storeBindingDigest !== binding.digest) {
           fail('CUTOVER_CANARY_LAUNCH_MISMATCH', 'Closed-admission launch does not match the active cutover canary permit.');
+        }
+        if (buildHandoff) {
+          safeId(permit.authorizedRunId, 'Handoff canary authorizedRunId');
+          await registerReleaseAuthorityHandoffCanaryRun(store, null, {
+            expectedSelectorDigest: selector.digest,
+            handoffId: selector.handoffId,
+            mode,
+            runId: permit.authorizedRunId,
+          });
         }
         const launched = await operation(gate);
         const runnerRevision = launched?.compiledPlan?.createParentRunInput?.runnerRevision;
@@ -585,6 +613,9 @@ export function createCutoverAdmissionPolicy({ admissionGate, store = null } = {
         if (!isRecord(launched) || !SAFE_ID.test(launched.runId ?? '')
           || !/^[a-f0-9]{64}$/u.test(launched.operationId ?? '')) {
           fail('CUTOVER_CANARY_LAUNCH_MISMATCH', 'Canary launch returned an invalid durable operation identity.');
+        }
+        if (buildHandoff && launched.runId !== permit.authorizedRunId) {
+          fail('CUTOVER_CANARY_LAUNCH_MISMATCH', 'Handoff canary launch returned a run other than its pre-authorized identity.');
         }
         if (!isRecord(launched.actor) || canonicalJson(launched.actor) !== canonicalJson(permit.actor)) {
           fail('CUTOVER_CANARY_LAUNCH_MISMATCH', 'Canary launch actor does not match its one-time permit.');
@@ -596,6 +627,14 @@ export function createCutoverAdmissionPolicy({ admissionGate, store = null } = {
             || permit.runRunnerRevision !== runnerRevision
             || permit.runConfigurationRevision !== configurationRevision) {
             fail('CUTOVER_CANARY_LAUNCH_CONFLICT', 'Canary launch replay returned different immutable output.');
+          }
+          if (buildHandoff) {
+            await registerReleaseAuthorityHandoffCanaryRun(store, null, {
+              expectedSelectorDigest: selector.digest,
+              handoffId: selector.handoffId,
+              mode,
+              runId: launched.runId,
+            });
           }
           return launched;
         }
@@ -610,6 +649,14 @@ export function createCutoverAdmissionPolicy({ admissionGate, store = null } = {
         }));
         const storage = await openAtomicStorage({ root: admissionGate.root, verify: false });
         await persistCanaryLaunchPermit(storage, consumed);
+        if (buildHandoff) {
+          await registerReleaseAuthorityHandoffCanaryRun(store, null, {
+            expectedSelectorDigest: selector.digest,
+            handoffId: selector.handoffId,
+            mode,
+            runId: launched.runId,
+          });
+        }
         return launched;
       });
     },
@@ -633,10 +680,11 @@ export async function captureSharedAuthorityDrainObservation({
   if (!store || !admissionGate || !launchOperationStore) {
     fail('CUTOVER_INPUT_INVALID', 'Drain observation requires the canonical store, admission gate, and launch-operation store.');
   }
-  const [gate, selector, durableCoordinator, legacy, launchOperations, runIds] = await Promise.all([
+  const [gate, selector, durableCoordinator, performanceScheduler, legacy, launchOperations, runIds] = await Promise.all([
     admissionGate.read(),
     readReleaseAuthoritySelector(store),
     readStoreCoordinator(store),
+    readStorePerformanceScheduler(store),
     inspectLegacyAuthorityDrainSources({
       comparativeRoot: legacyComparativeRoot,
       singleSiteQueueRoot: legacySingleSiteQueueRoot,
@@ -650,13 +698,18 @@ export async function captureSharedAuthorityDrainObservation({
   }
   if (legacyAuthorityFence) {
     const legacyFence = await legacyAuthorityFence.read();
-    if (legacyFence.state !== 'CLOSED' || legacyFence.cutoverId !== cutoverId
-      || legacyFence.activationEpoch !== 0) {
-      fail('CUTOVER_LEGACY_FENCE_CONFLICT', 'Drain observation requires the closed pre-activation legacy authority fence.');
+    const preactivation = selector.phase === 'DRAINING' && selector.activationEpoch === 0;
+    const postactivation = selector.phase === 'ACTIVE' && selector.activationEpoch === 1;
+    if ((preactivation && (legacyFence.state !== 'CLOSED' || legacyFence.cutoverId !== cutoverId
+      || legacyFence.activationEpoch !== 0))
+      || (postactivation && (legacyFence.state !== 'ACTIVATED' || legacyFence.activationEpoch !== 1))
+      || (!preactivation && !postactivation)) {
+      fail('CUTOVER_LEGACY_FENCE_CONFLICT', 'Drain observation does not match the durable legacy-authority phase.');
     }
   }
-  if (selector.phase !== 'DRAINING' || selector.activationEpoch !== 0) {
-    fail('CUTOVER_PHASE_INVALID', 'Drain observation may be captured only during pre-activation DRAINING.');
+  if (!((selector.phase === 'DRAINING' && selector.activationEpoch === 0)
+    || (selector.phase === 'ACTIVE' && selector.activationEpoch === 1 && selector.pendingBuildIdentity === null))) {
+    fail('CUTOVER_PHASE_INVALID', 'Drain observation requires pre-activation DRAINING or post-activation ACTIVE authority.');
   }
   if (!durableCoordinator || durableCoordinator.ownerId !== coordinator.ownerId
     || durableCoordinator.epoch !== coordinator.epoch || durableCoordinator.token !== coordinator.token
@@ -667,6 +720,9 @@ export async function captureSharedAuthorityDrainObservation({
   const unresolvedOperationIds = [];
   const releaseChangingMutationIds = [];
   const unfencedLegacyLeaseIds = [...legacy.unfencedLegacyLeaseIds];
+  if (performanceScheduler.phase !== 'idle' || performanceScheduler.reservation !== null) {
+    unfencedLegacyLeaseIds.push(`shared-performance-scheduler:${performanceScheduler.digest}`);
+  }
   for (const error of launchOperations.errors) {
     unresolvedOperationIds.push(`launch-corrupt:${error.operationId}:${error.code}`);
   }
@@ -683,12 +739,12 @@ export async function captureSharedAuthorityDrainObservation({
     }
     for (const item of Object.values(state.workItems ?? {})) {
       if (item.state === 'running' && item.lease
-        && item.lease.epoch === coordinator.epoch && Date.parse(item.lease.expiresAt) > clock()) {
+        && Date.parse(item.lease.expiresAt) > clock()) {
         unfencedLegacyLeaseIds.push(`shared-preactivation:${runId}:${item.id}:${item.lease.token}`);
       }
       for (const diagnostic of item.diagnosticExecutions ?? []) {
         if (diagnostic.state !== 'running' || !diagnostic.lease) continue;
-        if (diagnostic.lease.epoch === coordinator.epoch && Date.parse(diagnostic.lease.expiresAt) > clock()) {
+        if (Date.parse(diagnostic.lease.expiresAt) > clock()) {
           unfencedLegacyLeaseIds.push(
             `shared-preactivation:${runId}:${item.id}:diagnostic:${diagnostic.diagnosticExecutionId}:${diagnostic.lease.token}`,
           );
@@ -1227,6 +1283,8 @@ export async function activateSharedAuthorityCutover({
         phase: 'ACTIVE',
         activationRevision: input.activationRevision,
         buildIdentity: input.buildIdentity,
+        activationCutoverDigest: input.digest,
+        authorityTransitionDigest: input.digest,
       });
       await hooks.afterAuthorityActivated?.(clone(selector));
     } else {
@@ -1292,6 +1350,7 @@ async function defaultReadCanaryEvidence(store, runId, { probeTargetIdentity } =
 
 function parseCanaryEvidence(value, {
   mode, runId, selector, store, minimumCreatedAt = null, launchPermit = null,
+  expectedBuildIdentity = selector.activeBuildIdentity,
 }) {
   if (!isRecord(value) || value.mode !== mode || value.decisionCode !== 'RELEASE_READY'
     || value.grantedAuthority !== 'FULL' || value.runId !== runId
@@ -1311,7 +1370,7 @@ function parseCanaryEvidence(value, {
     fail('CUTOVER_CANARY_TARGET_MISMATCH', `${mode} canary target identity changed at trusted re-probe.`);
   }
   const storeBinding = cutoverStoreBinding(store);
-  if (value.activeBuildIdentity !== selector.activeBuildIdentity
+  if (value.activeBuildIdentity !== expectedBuildIdentity
     || value.activeBuildIdentity !== store.buildIdentity) {
     fail('CUTOVER_CANARY_BUILD_MISMATCH', `${mode} canary is not bound to the active cutover build.`);
   }
@@ -1405,6 +1464,20 @@ function assertActivatedCutover(selector, gate, cutoverId) {
   }
 }
 
+function handoffCanaryAuthority(selector, gate, authorityId, store) {
+  const handoff = selector.phase === 'PROMOTION_DISABLED' && selector.activationEpoch === 1
+    && selector.handoffId === authorityId && selector.pendingBuildIdentity !== null;
+  if (!handoff) {
+    assertActivatedCutover(selector, gate, authorityId);
+    return { handoff: false, buildIdentity: selector.activeBuildIdentity, minimumCreatedAt: selector.activatedAt };
+  }
+  if (gate.state !== 'CLOSED' || gate.cutoverId !== authorityId
+    || store.buildIdentity !== selector.pendingBuildIdentity) {
+    fail('AUTHORITY_HANDOFF_INVALID', 'Handoff canary evidence is not owned by the pending target build.');
+  }
+  return { handoff: true, buildIdentity: selector.pendingBuildIdentity, minimumCreatedAt: selector.updatedAt };
+}
+
 export async function recordSharedCutoverCanary({
   store, admissionGate, reportDirectory, cutoverId, mode, runId,
   readCanaryEvidence = defaultReadCanaryEvidence,
@@ -1419,7 +1492,7 @@ export async function recordSharedCutoverCanary({
     const [selector, gate] = await Promise.all([
       readReleaseAuthoritySelector(store), admissionGate.read(),
     ]);
-    assertActivatedCutover(selector, gate, cutoverId);
+    const authority = handoffCanaryAuthority(selector, gate, cutoverId, store);
     const launchPermit = await readCanaryLaunchPermit(admissionGate, cutoverId, mode);
     if (!launchPermit) fail('CUTOVER_CANARY_LAUNCH_MISMATCH', `${mode} canary has no cutover launch permit.`);
     const evidence = parseCanaryEvidence(await readCanaryEvidence(store, runId, { probeTargetIdentity }), {
@@ -1427,8 +1500,9 @@ export async function recordSharedCutoverCanary({
       runId,
       selector,
       store,
-      minimumCreatedAt: selector.activatedAt,
+      minimumCreatedAt: authority.minimumCreatedAt,
       launchPermit,
+      expectedBuildIdentity: authority.buildIdentity,
     });
     const current = await readCanaryHead(storage, cutoverId);
     const prior = current?.receipts[mode];
@@ -1475,6 +1549,53 @@ export async function recordSharedCutoverCanary({
     await atomicWriteJson(storage, reportStoragePath(storage, cutoverId, '.canaries.head.json'), next);
     return clone(next);
   });
+}
+
+export async function recordSharedBuildHandoffCanary(options = {}) {
+  const { reportDirectory, handoffId, clock = options.store?.clock ?? (() => Date.now()) } = options;
+  const storage = await openReportStorage(reportDirectory);
+  try {
+    const head = await recordSharedCutoverCanary({ ...options, cutoverId: handoffId, clock });
+    return withCutoverLock(storage, handoffId, async () => {
+      const { intent, checkpoint } = await readHandoffDocuments(storage, handoffId);
+      const next = await writeHandoffCheckpoint(storage, {
+        ...checkpoint,
+        status: 'PENDING_TARGET_HEALTH',
+        canaryHeadDigest: head.digest,
+        failure: null,
+        updatedAt: timestamp(clock),
+      });
+      return Object.freeze({ head, checkpoint: next, intentDigest: intent.digest });
+    });
+  } catch (error) {
+    await withCutoverLock(storage, handoffId, async () => {
+      const { checkpoint } = await readHandoffDocuments(storage, handoffId);
+      const failure = {
+        code: error?.code ?? 'HANDOFF_CANARY_FAILED',
+        message: error instanceof Error ? error.message : String(error),
+        failedAt: timestamp(clock),
+      };
+      const next = await writeHandoffCheckpoint(storage, {
+        ...checkpoint,
+        status: 'FAILED_HOLD',
+        failure,
+        updatedAt: timestamp(clock),
+      });
+      const report = seal({
+        schemaVersion: 1,
+        kind: 'release-authority-build-handoff-failed-hold',
+        handoffId,
+        status: 'FAILED_HOLD',
+        checkpointDigest: next.digest,
+        selector: await readReleaseAuthoritySelector(options.store),
+        admissionGate: await options.admissionGate.read(),
+        failure,
+      });
+      const file = handoffPath(storage, handoffId, `.failed-${next.digest.slice(7)}.json`);
+      if (!await pathExists(storage.fs, file)) await atomicWriteJson(storage, file, report, { exclusive: true });
+    });
+    throw error;
+  }
 }
 
 export async function reopenSharedAdmissionAfterCanaries({
@@ -1603,6 +1724,595 @@ export async function rollbackSharedAuthorityBeforeActivation({
       operatorReview, completedAt: timestamp(clock),
     }));
     await atomicWriteJson(storage, reportStoragePath(storage, cutoverId, '.rollback.json'), report);
+    return clone(report);
+  });
+}
+
+function handoffIntentBody(value) {
+  return {
+    schemaVersion: 1,
+    kind: 'release-authority-build-handoff-intent',
+    handoffId: value.handoffId,
+    sourceBuildIdentity: value.sourceBuildIdentity,
+    targetBuildIdentity: value.targetBuildIdentity,
+    sourceSelectorDigest: value.sourceSelectorDigest,
+    authorityFloorBeforeDigest: value.authorityFloorBeforeDigest,
+    activationCutoverDigest: value.activationCutoverDigest,
+    activationEpoch: value.activationEpoch,
+    activationRevision: value.activationRevision,
+    operatorReview: value.operatorReview,
+    requestedAt: value.requestedAt,
+  };
+}
+
+function parseHandoffIntent(value, handoffId = null) {
+  parseSealed(value, 'Build handoff intent');
+  exactKeys(value, [...Object.keys(handoffIntentBody(value)), 'digest'], 'Build handoff intent');
+  if (value.schemaVersion !== 1 || value.kind !== 'release-authority-build-handoff-intent'
+    || (handoffId !== null && value.handoffId !== handoffId) || !SAFE_ID.test(value.handoffId)) {
+    fail('CUTOVER_DOCUMENT_INVALID', 'Build handoff intent identity is invalid.');
+  }
+  nonEmptyString(value.sourceBuildIdentity, 'Build handoff sourceBuildIdentity');
+  nonEmptyString(value.targetBuildIdentity, 'Build handoff targetBuildIdentity');
+  if (value.sourceBuildIdentity === value.targetBuildIdentity || value.activationEpoch !== 1
+    || !Number.isSafeInteger(value.activationRevision) || value.activationRevision < 1) {
+    fail('CUTOVER_DOCUMENT_INVALID', 'Build handoff intent authority binding is invalid.');
+  }
+  assertDigest(value.sourceSelectorDigest, 'Build handoff sourceSelectorDigest');
+  assertDigest(value.authorityFloorBeforeDigest, 'Build handoff authorityFloorBeforeDigest');
+  assertDigest(value.activationCutoverDigest, 'Build handoff activationCutoverDigest');
+  parseOperatorReview(value.operatorReview);
+  canonicalTimestamp(value.requestedAt, 'Build handoff requestedAt');
+  return clone(value);
+}
+
+function handoffCheckpointBody(value) {
+  return {
+    schemaVersion: 1,
+    kind: 'release-authority-build-handoff-checkpoint',
+    handoffId: value.handoffId,
+    intentDigest: value.intentDigest,
+    revision: value.revision,
+    previousDigest: value.previousDigest,
+    status: value.status,
+    selectorBefore: value.selectorBefore,
+    selectorCurrent: value.selectorCurrent,
+    admissionBefore: value.admissionBefore,
+    admissionCurrent: value.admissionCurrent,
+    drainObservation: value.drainObservation,
+    canaryHeadDigest: value.canaryHeadDigest,
+    commitIntentDigest: value.commitIntentDigest,
+    authorityFloorAfterDigest: value.authorityFloorAfterDigest,
+    failure: value.failure,
+    updatedAt: value.updatedAt,
+  };
+}
+
+function parseHandoffCheckpoint(value, intent) {
+  parseSealed(value, 'Build handoff checkpoint');
+  exactKeys(value, [...Object.keys(handoffCheckpointBody(value)), 'digest'], 'Build handoff checkpoint');
+  if (value.schemaVersion !== 1 || value.kind !== 'release-authority-build-handoff-checkpoint'
+    || value.handoffId !== intent.handoffId || value.intentDigest !== intent.digest
+    || !Number.isSafeInteger(value.revision) || value.revision < 1
+    || ((value.revision === 1) !== (value.previousDigest === null))
+    || !['ADMISSION_CLOSED', 'DRAIN_VERIFIED', 'PENDING_TARGET_HEALTH', 'FAILED_HOLD', 'COMPLETED'].includes(value.status)) {
+    fail('CUTOVER_CHECKPOINT_CONFLICT', 'Build handoff checkpoint does not match its intent.');
+  }
+  if (value.previousDigest !== null) assertDigest(value.previousDigest, 'Build handoff checkpoint previousDigest');
+  if (value.commitIntentDigest !== null) assertDigest(value.commitIntentDigest, 'Build handoff checkpoint commitIntentDigest');
+  if (value.authorityFloorAfterDigest !== null) assertDigest(value.authorityFloorAfterDigest, 'Build handoff checkpoint authorityFloorAfterDigest');
+  return clone(value);
+}
+
+function handoffPath(storage, handoffId, suffix) {
+  return reportStoragePath(storage, safeId(handoffId, 'handoffId'), `.handoff${suffix}`);
+}
+
+async function readHandoffDocuments(storage, handoffId) {
+  const intent = parseHandoffIntent(await readBoundedJson(storage, handoffPath(storage, handoffId, '.intent.json'), {
+    label: 'build handoff intent', maximumBytes: 256 * 1_024,
+  }), handoffId);
+  const checkpoint = parseHandoffCheckpoint(await readBoundedJson(storage, handoffPath(storage, handoffId, '.state.json'), {
+    label: 'build handoff checkpoint', maximumBytes: 2 * 1_048_576,
+  }), intent);
+  return { intent, checkpoint };
+}
+
+async function writeHandoffCheckpoint(storage, value) {
+  const previousDigest = value.digest ?? null;
+  if (previousDigest !== null) {
+    const previousFile = handoffPath(storage, value.handoffId, `.checkpoints/${previousDigest.slice('sha256:'.length)}.json`);
+    if (!await pathExists(storage.fs, previousFile)) {
+      fail('CUTOVER_CHECKPOINT_CONFLICT', 'Build handoff checkpoint history is incomplete.');
+    }
+  }
+  const checkpoint = seal(handoffCheckpointBody({
+    ...value,
+    revision: previousDigest === null ? 1 : value.revision + 1,
+    previousDigest,
+  }));
+  const historyDirectory = handoffPath(storage, value.handoffId, '.checkpoints');
+  await storage.fs.mkdir(historyDirectory, { recursive: true, mode: 0o700 });
+  const immutable = containedPath(historyDirectory, `${checkpoint.digest.slice('sha256:'.length)}.json`);
+  if (!await pathExists(storage.fs, immutable)) await atomicWriteJson(storage, immutable, checkpoint, { exclusive: true });
+  await atomicWriteJson(storage, handoffPath(storage, value.handoffId, '.state.json'), checkpoint);
+  return clone(checkpoint);
+}
+
+export async function prepareSharedAuthorityBuildHandoff({
+  store, coordinator, admissionGate, legacyAuthorityFence, authorityFloor, reportDirectory,
+  handoffId, targetBuildIdentity, operatorReview: rawOperatorReview,
+  clock = store?.clock ?? (() => Date.now()),
+  hooks = {},
+} = {}) {
+  ensureCoordinator(coordinator);
+  safeId(handoffId, 'handoffId');
+  nonEmptyString(targetBuildIdentity, 'targetBuildIdentity');
+  const operatorReview = parseOperatorReview(rawOperatorReview);
+  const storage = await openReportStorage(reportDirectory);
+  return withCutoverLock(storage, handoffId, async () => {
+    const selector = await readReleaseAuthoritySelector(store);
+    if (selector.phase !== 'ACTIVE' || selector.activationEpoch !== 1
+      || selector.activeBuildIdentity !== store.buildIdentity || selector.pendingBuildIdentity !== null
+      || targetBuildIdentity === selector.activeBuildIdentity
+      || !selector.prequalifiedRollbackBuilds.includes(targetBuildIdentity)) {
+      fail('AUTHORITY_HANDOFF_INVALID', 'Build handoff preparation requires ACTIVE source authority and a distinct prequalified target.');
+    }
+    if (!authorityFloor || typeof authorityFloor.read !== 'function') {
+      fail('AUTHORITY_FLOOR_REQUIRED', 'Build handoff requires the external authority floor.');
+    }
+    const floorBefore = await authorityFloor.read();
+    if (floorBefore.storeMarkerDigest !== selector.storeMarkerDigest
+      || floorBefore.minimumStoreGeneration !== selector.storeGeneration
+      || floorBefore.minimumSelectorRevision !== selector.revision
+      || floorBefore.activeBuildIdentity !== selector.activeBuildIdentity
+      || floorBefore.authorityTransitionDigest !== selector.authorityTransitionDigest
+      || floorBefore.activationCutoverDigest !== selector.activationCutoverDigest
+      || floorBefore.activationEpoch !== 1 || floorBefore.legacyPermanentlyRetired !== true
+      || floorBefore.activationRevision !== selector.activationRevision) {
+      fail('AUTHORITY_FLOOR_STATE_INVALID', 'Build handoff source selector does not exactly match the external authority floor.');
+    }
+    const legacy = await legacyAuthorityFence?.read();
+    if (!legacy || legacy.state !== 'ACTIVATED' || legacy.activationEpoch !== 1) {
+      fail('CUTOVER_LEGACY_FENCE_CONFLICT', 'Post-activation handoff requires the permanently activated legacy fence.');
+    }
+    const gateBefore = await admissionGate.read();
+    if (gateBefore.state === 'CLOSED' && gateBefore.cutoverId !== handoffId) {
+      fail('CUTOVER_ADMISSION_OWNED', `Admission is already closed by ${gateBefore.cutoverId}.`);
+    }
+    const intent = seal(handoffIntentBody({
+      handoffId,
+      sourceBuildIdentity: selector.activeBuildIdentity,
+      targetBuildIdentity,
+      sourceSelectorDigest: selector.digest,
+      authorityFloorBeforeDigest: floorBefore.digest,
+      activationCutoverDigest: selector.activationCutoverDigest,
+      activationEpoch: selector.activationEpoch,
+      activationRevision: selector.activationRevision,
+      operatorReview,
+      requestedAt: timestamp(clock),
+    }));
+    const intentFile = handoffPath(storage, handoffId, '.intent.json');
+    if (await pathExists(storage.fs, intentFile)) {
+      const existing = parseHandoffIntent(await readBoundedJson(storage, intentFile, {
+        label: 'build handoff intent', maximumBytes: 256 * 1_024,
+      }), handoffId);
+      if (existing.digest !== intent.digest) fail('CUTOVER_CHECKPOINT_CONFLICT', 'Build handoff intent is immutable.');
+      return (await readHandoffDocuments(storage, handoffId)).checkpoint;
+    }
+    await atomicWriteJson(storage, intentFile, intent, { exclusive: true });
+    const gateAfter = gateBefore.state === 'OPEN' ? await admissionGate.close(gateBefore.digest, handoffId) : gateBefore;
+    const checkpoint = await writeHandoffCheckpoint(storage, {
+      handoffId,
+      intentDigest: intent.digest,
+      status: 'ADMISSION_CLOSED',
+      selectorBefore: selector,
+      selectorCurrent: selector,
+      admissionBefore: gateBefore,
+      admissionCurrent: gateAfter,
+      drainObservation: null,
+      canaryHeadDigest: null,
+      commitIntentDigest: null,
+      authorityFloorAfterDigest: null,
+      failure: null,
+      updatedAt: timestamp(clock),
+    });
+    await hooks.afterAdmissionClosed?.(clone(gateAfter));
+    return checkpoint;
+  });
+}
+
+export async function beginSharedAuthorityBuildHandoff({
+  store, coordinator, admissionGate, legacyAuthorityFence, reportDirectory, handoffId, drainObservation,
+  clock = store?.clock ?? (() => Date.now()), hooks = {},
+} = {}) {
+  ensureCoordinator(coordinator);
+  const storage = await openReportStorage(reportDirectory);
+  return withCutoverLock(storage, handoffId, async () => {
+    const { intent, checkpoint: storedCheckpoint } = await readHandoffDocuments(storage, handoffId);
+    let checkpoint = storedCheckpoint;
+    const gate = await admissionGate.read();
+    if (gate.state !== 'CLOSED' || gate.cutoverId !== handoffId) {
+      fail('CUTOVER_ADMISSION_OPEN', 'Build handoff requires admission closed by this handoff.');
+    }
+    const legacy = await legacyAuthorityFence?.read();
+    if (!legacy || legacy.state !== 'ACTIVATED' || legacy.activationEpoch !== 1) {
+      fail('CUTOVER_LEGACY_FENCE_CONFLICT', 'Legacy authority must remain permanently activated during build handoff.');
+    }
+    let selector = await readReleaseAuthoritySelector(store);
+    if (checkpoint.status === 'ADMISSION_CLOSED') {
+      const observed = parseDrainObservation(drainObservation, {
+        input: { cutoverId: handoffId }, gate, coordinator, clock,
+      });
+      checkpoint = await writeHandoffCheckpoint(storage, {
+        ...checkpoint, status: 'DRAIN_VERIFIED', drainObservation: observed,
+        admissionCurrent: gate, updatedAt: timestamp(clock),
+      });
+    }
+    if (selector.phase === 'ACTIVE') {
+      if (selector.digest !== intent.sourceSelectorDigest || selector.activeBuildIdentity !== intent.sourceBuildIdentity) {
+        fail('AUTHORITY_HANDOFF_INVALID', 'Active source selector changed after handoff preparation.');
+      }
+      selector = await beginReleaseAuthorityBuildHandoff(store, coordinator, {
+        expectedSelectorDigest: selector.digest,
+        handoffId,
+        targetBuildIdentity: intent.targetBuildIdentity,
+      });
+      await hooks.afterPendingSelector?.(clone(selector));
+    } else if (selector.phase !== 'PROMOTION_DISABLED' || selector.handoffId !== handoffId
+      || selector.pendingBuildIdentity !== intent.targetBuildIdentity) {
+      fail('AUTHORITY_HANDOFF_INVALID', 'Durable selector does not match this resumable build handoff.');
+    }
+    checkpoint = await writeHandoffCheckpoint(storage, {
+      ...checkpoint,
+      status: 'PENDING_TARGET_HEALTH',
+      selectorCurrent: selector,
+      admissionCurrent: gate,
+      failure: null,
+      updatedAt: timestamp(clock),
+    });
+    const pendingReport = seal({
+      schemaVersion: 1,
+      kind: 'release-authority-build-handoff-pending-report',
+      handoffId,
+      status: 'PROMOTION_DISABLED_PENDING_TARGET_HEALTH',
+      intentDigest: intent.digest,
+      checkpointDigest: checkpoint.digest,
+      selectorBefore: checkpoint.selectorBefore,
+      selectorPending: selector,
+      admissionGate: gate,
+      drainObservation: checkpoint.drainObservation,
+      legacyAuthorityFenceDigest: legacy.digest,
+      preparedAt: timestamp(clock),
+    });
+    await atomicWriteJson(storage, handoffPath(storage, handoffId, '.pending.json'), pendingReport);
+    return clone(pendingReport);
+  });
+}
+
+export async function authorizeSharedBuildHandoffCanaryLaunch({
+  store, admissionGate, reportDirectory, handoffId, mode, runId, requestId, actor: rawActor, intent: rawIntent,
+  supersedeReason = null,
+  probeTargetIdentity = defaultProbeCanaryTargetIdentity,
+  clock = store?.clock ?? (() => Date.now()),
+} = {}) {
+  safeId(handoffId, 'handoffId');
+  safeId(runId, 'runId');
+  if (!CUTOVER_CANARY_MODES.includes(mode)) fail('CUTOVER_INPUT_INVALID', 'Handoff canary mode is invalid.');
+  requestIdentity(requestId);
+  const actor = parseCanaryActor(rawActor);
+  const intent = parseCanaryIntent(rawIntent, mode);
+  const targetIdentity = parseTrustedTargetIdentity(await probeTargetIdentity(intent), 'Trusted handoff target identity');
+  const reportStorage = await openReportStorage(reportDirectory);
+  const pendingReport = parseSealed(await readBoundedJson(
+    reportStorage,
+    handoffPath(reportStorage, handoffId, '.pending.json'),
+    { label: 'build handoff pending report', maximumBytes: 2 * 1_048_576 },
+  ), 'Build handoff pending report');
+  const { intent: handoffIntent } = await readHandoffDocuments(reportStorage, handoffId);
+  const storage = await openAtomicStorage({ root: admissionGate.root, verify: false });
+  return admissionGate.withState(async (gate) => {
+    const selector = await readReleaseAuthoritySelector(store);
+    if (gate.state !== 'CLOSED' || gate.cutoverId !== handoffId
+      || selector.phase !== 'PROMOTION_DISABLED' || selector.handoffId !== handoffId
+      || selector.pendingBuildIdentity !== handoffIntent.targetBuildIdentity
+      || store.buildIdentity !== handoffIntent.targetBuildIdentity
+      || pendingReport.selectorPending?.digest !== selector.digest) {
+      fail('AUTHORITY_HANDOFF_INVALID', 'Handoff canary authorization is not bound to the pending target build.');
+    }
+    const binding = cutoverStoreBinding(store);
+    const file = canaryLaunchPermitPath(storage.root, handoffId, mode);
+    if (await pathExists(storage.fs, file)) {
+      const existing = parseCanaryLaunchPermit(await readBoundedJson(storage, file, {
+        label: 'handoff canary launch permit', maximumBytes: 256 * 1_024,
+      }), { cutoverId: handoffId, mode });
+      if (existing.requestId === requestId && existing.intentDigest === canonicalDigest(intent)
+        && canonicalJson(existing.actor) === canonicalJson(actor)
+        && existing.authorizedRunId === runId
+        && canonicalJson(existing.targetIdentity) === canonicalJson(targetIdentity)) return existing;
+      if (existing.state !== 'CONSUMED' || existing.revision >= MAX_CUTOVER_CANARY_PERMITS_PER_MODE) {
+        fail('CUTOVER_CANARY_LAUNCH_CONFLICT', `The ${mode} handoff canary recovery bound is exhausted or another permit is active.`);
+      }
+      nonEmptyString(supersedeReason, 'Handoff canary supersedeReason');
+      await assertCanaryPermitReplaceable(store, existing);
+      const replacement = seal(canaryLaunchPermitBody({
+        ...existing,
+        revision: existing.revision + 1,
+        previousPermitDigest: existing.digest,
+        requestId,
+        actor,
+        intentDigest: canonicalDigest(intent),
+        targetIdentity,
+        authorizedRunId: runId,
+        supersedesRunId: existing.runId,
+        supersedeReason,
+        state: 'AUTHORIZED',
+        runId: null,
+        operationId: null,
+        runRunnerRevision: null,
+        runConfigurationRevision: null,
+        authorizedAt: timestamp(clock),
+        consumedAt: null,
+      }));
+      await persistCanaryLaunchPermit(storage, replacement);
+      return clone(replacement);
+    }
+    const permit = seal(canaryLaunchPermitBody({
+      cutoverId: handoffId,
+      mode,
+      revision: 1,
+      previousPermitDigest: null,
+      requestId,
+      actor,
+      intentDigest: canonicalDigest(intent),
+      authoritySelectorDigest: selector.digest,
+      admissionGateDigest: gate.digest,
+      cutoverReportDigest: pendingReport.digest,
+      activeBuildIdentity: handoffIntent.targetBuildIdentity,
+      cutoverConfigurationDigest: handoffIntent.digest,
+      storeBindingDigest: binding.digest,
+      targetIdentity,
+      authorizedRunId: runId,
+      supersedesRunId: null,
+      supersedeReason: null,
+      state: 'AUTHORIZED',
+      runId: null,
+      operationId: null,
+      runRunnerRevision: null,
+      runConfigurationRevision: null,
+      authorizedAt: timestamp(clock),
+      consumedAt: null,
+    }));
+    await persistCanaryLaunchPermit(storage, permit);
+    return clone(permit);
+  });
+}
+
+export async function completeSharedAuthorityBuildHandoff({
+  store, coordinator, admissionGate, legacyAuthorityFence, authorityFloor, reportDirectory, handoffId,
+  readCanaryEvidence = defaultReadCanaryEvidence,
+  probeTargetIdentity,
+  clock = store?.clock ?? (() => Date.now()),
+  hooks = {},
+} = {}) {
+  ensureCoordinator(coordinator);
+  safeId(handoffId, 'handoffId');
+  if (typeof probeTargetIdentity !== 'function') {
+    fail('CUTOVER_CANARY_REPROBE_REQUIRED', 'Build handoff completion requires a trusted current target re-probe.');
+  }
+  if (!authorityFloor || typeof authorityFloor.read !== 'function'
+    || typeof authorityFloor.compareAndAdvance !== 'function') {
+    fail('AUTHORITY_FLOOR_REQUIRED', 'Build handoff completion requires the external authority floor.');
+  }
+  const storage = await openReportStorage(reportDirectory);
+  return withCutoverLock(storage, handoffId, async () => {
+    const finalPath = handoffPath(storage, handoffId, '.json');
+    if (await pathExists(storage.fs, finalPath)) {
+      const report = parseSealed(await readBoundedJson(storage, finalPath, {
+        label: 'build handoff report', maximumBytes: 4 * 1_048_576,
+      }), 'Build handoff report');
+      const [selector, floor] = await Promise.all([readReleaseAuthoritySelector(store), authorityFloor.read()]);
+      if (selector.digest !== report.selectorAfter?.digest || floor.digest !== report.authorityFloorAfter?.digest
+        || selector.authorityTransitionDigest !== report.commitIntentDigest
+        || floor.authorityTransitionDigest !== selector.authorityTransitionDigest) {
+        fail('AUTHORITY_FLOOR_STATE_INVALID', 'Completed handoff report no longer matches selector and external floor authority.');
+      }
+      const gate = await admissionGate.read();
+      if (gate.state === 'CLOSED' && gate.cutoverId === handoffId) await admissionGate.open(gate.digest, handoffId);
+      return clone(report);
+    }
+    const { intent, checkpoint: originalCheckpoint } = await readHandoffDocuments(storage, handoffId);
+    let checkpoint = originalCheckpoint;
+    const legacy = await legacyAuthorityFence?.read();
+    if (!legacy || legacy.state !== 'ACTIVATED' || legacy.activationEpoch !== 1) {
+      fail('CUTOVER_LEGACY_FENCE_CONFLICT', 'Legacy authority must remain permanently activated through build handoff.');
+    }
+    let gate = await admissionGate.read();
+    if (!((gate.state === 'CLOSED' && gate.cutoverId === handoffId) || gate.state === 'OPEN')) {
+      fail('CUTOVER_ADMISSION_OWNED', 'Build handoff completion lost admission ownership.');
+    }
+    const canaries = await readCanaryHead(storage, handoffId);
+    if (!canaries || CUTOVER_CANARY_MODES.some((mode) => canaries.receipts[mode] === null)) {
+      fail('CUTOVER_CANARIES_INCOMPLETE', 'Build handoff requires current Single-site and Comparative target canaries.');
+    }
+    let selector = await readReleaseAuthoritySelector(store);
+    if (!(selector.phase === 'ACTIVE' && selector.activeBuildIdentity === intent.targetBuildIdentity)
+      && (selector.phase !== 'PROMOTION_DISABLED' || selector.handoffId !== handoffId
+      || selector.pendingBuildIdentity !== intent.targetBuildIdentity || store.buildIdentity !== intent.targetBuildIdentity)) {
+      fail('AUTHORITY_HANDOFF_INVALID', 'Selector is neither pending nor a recoverable committed target handoff.');
+    }
+    const expectedPublications = [];
+    try {
+      for (const mode of CUTOVER_CANARY_MODES) {
+        const receipt = canaries.receipts[mode];
+        const launchPermit = await readCanaryLaunchPermit(admissionGate, handoffId, mode);
+        if (!launchPermit || launchPermit.digest !== receipt.launchPermitDigest) {
+          fail('CUTOVER_CANARY_LAUNCH_MISMATCH', `${mode} handoff permit changed after recording.`);
+        }
+        const current = parseCanaryEvidence(await readCanaryEvidence(store, receipt.runId, { probeTargetIdentity }), {
+          mode,
+          runId: receipt.runId,
+          selector,
+          store,
+          minimumCreatedAt: checkpoint.selectorCurrent.updatedAt,
+          launchPermit,
+          expectedBuildIdentity: intent.targetBuildIdentity,
+        });
+        if (current.finalSubjectDigest !== receipt.finalSubjectDigest
+          || current.publicationDigest !== receipt.publicationDigest
+          || current.decisionRevision !== receipt.decisionRevision) {
+          fail('CUTOVER_CANARY_STALE', `${mode} handoff canary changed after recording.`);
+        }
+        expectedPublications.push({ mode, runId: receipt.runId, envelopeDigest: receipt.publicationDigest });
+      }
+    } catch (error) {
+      const failure = {
+        code: error?.code ?? 'HANDOFF_HEALTH_REPROBE_FAILED',
+        message: error instanceof Error ? error.message : String(error),
+        failedAt: timestamp(clock),
+      };
+      checkpoint = await writeHandoffCheckpoint(storage, {
+        ...checkpoint, status: 'FAILED_HOLD', failure, updatedAt: timestamp(clock),
+      });
+      const failed = seal({
+        schemaVersion: 1,
+        kind: 'release-authority-build-handoff-failed-hold',
+        handoffId,
+        status: 'FAILED_HOLD',
+        intentDigest: intent.digest,
+        checkpointDigest: checkpoint.digest,
+        selector,
+        admissionGate: gate,
+        canaryHeadDigest: canaries.digest,
+        failure,
+      });
+      const failedPath = handoffPath(storage, handoffId, `.failed-${checkpoint.digest.slice('sha256:'.length)}.json`);
+      if (!await pathExists(storage.fs, failedPath)) await atomicWriteJson(storage, failedPath, failed, { exclusive: true });
+      throw error;
+    }
+    const targetSelectorRevision = checkpoint.selectorCurrent.revision + 1;
+    const proposedCommitIntent = seal({
+      schemaVersion: 1,
+      kind: 'release-authority-build-handoff-commit-intent',
+      handoffId,
+      intentDigest: intent.digest,
+      checkpointDigest: checkpoint.digest,
+      selectorBeforeDigest: checkpoint.selectorCurrent.digest,
+      targetSelectorRevision,
+      targetBuildIdentity: intent.targetBuildIdentity,
+      authorityFloorBeforeDigest: intent.authorityFloorBeforeDigest,
+      activationCutoverDigest: intent.activationCutoverDigest,
+      canaryHeadDigest: canaries.digest,
+      admissionGateDigest: checkpoint.admissionCurrent.digest,
+      expectedPublications,
+      createdAt: timestamp(clock),
+    });
+    const commitPath = handoffPath(storage, handoffId, '.commit-intent.json');
+    let commitIntent = proposedCommitIntent;
+    if (await pathExists(storage.fs, commitPath)) {
+      const existing = parseSealed(await readBoundedJson(storage, commitPath, {
+        label: 'build handoff commit intent', maximumBytes: 512 * 1_024,
+      }), 'Build handoff commit intent');
+      if (existing.kind !== proposedCommitIntent.kind || existing.handoffId !== handoffId
+        || existing.intentDigest !== proposedCommitIntent.intentDigest
+        || existing.selectorBeforeDigest !== proposedCommitIntent.selectorBeforeDigest
+        || existing.targetSelectorRevision !== proposedCommitIntent.targetSelectorRevision
+        || existing.targetBuildIdentity !== proposedCommitIntent.targetBuildIdentity
+        || existing.authorityFloorBeforeDigest !== proposedCommitIntent.authorityFloorBeforeDigest
+        || existing.activationCutoverDigest !== proposedCommitIntent.activationCutoverDigest
+        || existing.canaryHeadDigest !== proposedCommitIntent.canaryHeadDigest
+        || existing.admissionGateDigest !== proposedCommitIntent.admissionGateDigest
+        || canonicalJson(existing.expectedPublications) !== canonicalJson(proposedCommitIntent.expectedPublications)) {
+        fail('CUTOVER_CHECKPOINT_CONFLICT', 'Build handoff commit intent is immutable.');
+      }
+      commitIntent = existing;
+    } else {
+      await atomicWriteJson(storage, commitPath, commitIntent, { exclusive: true });
+    }
+    await hooks.afterCommitIntentPersisted?.(clone(commitIntent));
+    let floorAfter = await authorityFloor.read();
+    if (floorAfter.digest === commitIntent.authorityFloorBeforeDigest) {
+      floorAfter = await authorityFloor.compareAndAdvance(commitIntent.authorityFloorBeforeDigest, {
+        minimumStoreGeneration: selector.storeGeneration,
+        minimumSelectorRevision: commitIntent.targetSelectorRevision,
+        activeBuildIdentity: intent.targetBuildIdentity,
+        authorityTransitionDigest: commitIntent.digest,
+        activationEpoch: 1,
+        legacyPermanentlyRetired: true,
+        activationRevision: selector.activationRevision,
+        activationCutoverDigest: commitIntent.activationCutoverDigest,
+      });
+    } else if (floorAfter.minimumStoreGeneration !== selector.storeGeneration
+      || floorAfter.minimumSelectorRevision !== commitIntent.targetSelectorRevision
+      || floorAfter.activeBuildIdentity !== intent.targetBuildIdentity
+      || floorAfter.authorityTransitionDigest !== commitIntent.digest
+      || floorAfter.activationEpoch !== 1 || floorAfter.legacyPermanentlyRetired !== true
+      || floorAfter.activationRevision !== selector.activationRevision
+      || floorAfter.activationCutoverDigest !== commitIntent.activationCutoverDigest) {
+      fail('AUTHORITY_FLOOR_STATE_INVALID', 'External authority floor is neither before nor exactly after this handoff commit.');
+    }
+    await hooks.afterAuthorityFloorAdvanced?.(clone(floorAfter));
+    selector = await readReleaseAuthoritySelector(store);
+    const recoveringCommitted = selector.phase === 'ACTIVE'
+      && selector.activeBuildIdentity === intent.targetBuildIdentity
+      && selector.revision === commitIntent.targetSelectorRevision
+      && selector.previousDigest === commitIntent.selectorBeforeDigest
+      && selector.authorityTransitionDigest === commitIntent.digest;
+    if (!recoveringCommitted) {
+      if (selector.phase !== 'PROMOTION_DISABLED' || selector.digest !== commitIntent.selectorBeforeDigest) {
+        fail('AUTHORITY_HANDOFF_INVALID', 'Floor advanced, but selector is not the exact pending or committed handoff state.');
+      }
+      selector = await completeReleaseAuthorityBuildHandoffWithPublicationFence(store, coordinator, {
+        expectedSelectorDigest: commitIntent.selectorBeforeDigest,
+        handoffId,
+        targetBuildIdentity: intent.targetBuildIdentity,
+        expectedTargetSelectorRevision: commitIntent.targetSelectorRevision,
+        authorityTransitionDigest: commitIntent.digest,
+        expectedPublications,
+      });
+      await hooks.afterAuthorityCommitted?.(clone(selector));
+    }
+    if (gate.state === 'CLOSED') gate = await admissionGate.open(gate.digest, handoffId);
+    await hooks.afterAdmissionOpened?.(clone(gate));
+    checkpoint = await writeHandoffCheckpoint(storage, {
+      ...checkpoint,
+      status: 'COMPLETED',
+      selectorCurrent: selector,
+      admissionCurrent: gate,
+      canaryHeadDigest: canaries.digest,
+      commitIntentDigest: commitIntent.digest,
+      authorityFloorAfterDigest: floorAfter.digest,
+      failure: null,
+      updatedAt: timestamp(clock),
+    });
+    const report = seal({
+      schemaVersion: 1,
+      kind: 'release-authority-build-handoff-report',
+      handoffId,
+      status: 'ACTIVE_TARGET_ADMISSION_OPEN',
+      intent,
+      commitIntentDigest: commitIntent.digest,
+      authorityFloorBeforeDigest: commitIntent.authorityFloorBeforeDigest,
+      authorityFloorAfter: floorAfter,
+      checkpointDigest: checkpoint.digest,
+      selectorBefore: checkpoint.selectorBefore,
+      selectorAfter: selector,
+      admissionBefore: checkpoint.admissionBefore,
+      admissionAfter: gate,
+      drainObservation: checkpoint.drainObservation,
+      canaryHead: canaries,
+      legacyAuthorityFence: legacy,
+      completedAt: timestamp(clock),
+    });
+    try {
+      await atomicWriteJson(storage, finalPath, report, { exclusive: true });
+    } catch (error) {
+      if (error?.code !== 'ATOMIC_ALREADY_EXISTS') throw error;
+      const existing = parseSealed(await readBoundedJson(storage, finalPath, {
+        label: 'build handoff report', maximumBytes: 4 * 1_048_576,
+      }), 'Build handoff report');
+      return clone(existing);
+    }
     return clone(report);
   });
 }

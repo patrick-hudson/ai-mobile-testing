@@ -10,7 +10,7 @@ export const MAX_ATTEMPT_EVIDENCE_BYTES: number;
 export const MAX_DISCOVERED_PARENT_RUNS: 2048;
 export const ARTIFACT_READ_LEASE_MS: number;
 export interface ParentRunStore { root: string; clock(): number; manifest: any; buildIdentity: string }
-export interface CoordinatorFence { ownerId: string; epoch: number; token: string; acquiredAt: string; expiresAt: string }
+export interface CoordinatorFence { buildIdentity: string; ownerId: string; epoch: number; token: string; acquiredAt: string; expiresAt: string }
 export interface ReleaseAuthorityBinding { storeMarkerDigest: string; storeGeneration: number; activationEpoch: 0 | 1; writerProtocol: string; digest: string }
 export interface ReleaseAuthorityContext { selector: any; binding: ReleaseAuthorityBinding }
 export interface WorkLease { runId: string; workItemId: string; workerId: string; attempt: number; epoch: number; token: string; claimedAt: string; expiresAt: string; subjectCoreDigest: string; runnerRevision: string; capability: string; resourceClass: 'ordinary' | 'performance'; targetId: string; specAffinity: string | null; executionDescriptor: WorkExecutionDescriptor | null; executionDescriptorDigest: string | null; diagnosticExecutionId?: string }
@@ -40,12 +40,24 @@ export function readReleaseAuthoritySelector(store: ParentRunStore): Promise<any
 export function readReleaseAuthorityContext(store: ParentRunStore, options?: { requireActive?: boolean }): Promise<any>;
 export function transitionReleaseAuthority(store: ParentRunStore, coordinator: CoordinatorFence, input: {
   expectedSelectorDigest: string; phase: 'SHADOW' | 'DRAINING' | 'ACTIVE' | 'PROMOTION_DISABLED';
-  buildIdentity: string; activationRevision?: number;
+  buildIdentity: string; activationRevision?: number; activationCutoverDigest?: string; authorityTransitionDigest?: string;
   hooks?: { beforeCommit?(selector: any): void | Promise<void>; afterActivationIntent?(selector: any): void | Promise<void>; afterActivationFence?(selector: any): void | Promise<void>; afterCommit?(selector: any): void | Promise<void> };
 }): Promise<any>;
 export function transitionReleaseAuthorityWithPublicationFence(store: ParentRunStore, coordinator: CoordinatorFence, input: {
   expectedSelectorDigest: string; phase: 'ACTIVE'; buildIdentity: string; activationRevision: number;
   expectedPublications: Array<{ runId: string; envelopeDigest: string }>;
+}): Promise<any>;
+export function beginReleaseAuthorityBuildHandoff(store: ParentRunStore, coordinator: CoordinatorFence, input: {
+  expectedSelectorDigest: string; handoffId: string; targetBuildIdentity: string;
+}): Promise<any>;
+export function registerReleaseAuthorityHandoffCanaryRun(store: ParentRunStore, coordinator: CoordinatorFence | null, input: {
+  expectedSelectorDigest: string; handoffId: string; mode: 'single-site' | 'comparative'; runId: string;
+}): Promise<any>;
+export function completeReleaseAuthorityBuildHandoffWithPublicationFence(store: ParentRunStore, coordinator: CoordinatorFence, input: {
+  expectedSelectorDigest: string; handoffId: string; targetBuildIdentity: string;
+  expectedTargetSelectorRevision: number; authorityTransitionDigest: string;
+  expectedPublications: Array<{ mode: 'single-site' | 'comparative'; runId: string; envelopeDigest: string }>;
+  hooks?: { beforeCommit?(selector: any): void | Promise<void>; afterCommit?(selector: any): void | Promise<void> };
 }): Promise<any>;
 export function heartbeatCoordinator(store: ParentRunStore, coordinator: CoordinatorFence, input: { leaseMs: number }): Promise<CoordinatorFence>;
 export function requestPerformanceDrain(store: ParentRunStore, runId: string, coordinator: CoordinatorFence, input: { workerId: string; leaseMs?: number }): Promise<StorePerformanceReservation>;

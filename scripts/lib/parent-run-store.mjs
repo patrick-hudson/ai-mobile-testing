@@ -441,6 +441,19 @@ async function writeManifest(store, body) {
   return manifest;
 }
 
+async function refreshManifestUnlocked(store) {
+  const manifest = validateManifest(await readBoundedJson(
+    store.storage,
+    containedPath(store.root, 'store-manifest.json'),
+    { label: 'store manifest' },
+  ), {
+    supportedSchemaVersion: PARENT_RUN_STORE_SCHEMA_VERSION,
+    writerProtocol: store.manifest.currentWriterProtocol,
+  });
+  store.manifest = manifest;
+  return manifest;
+}
+
 function runDirectory(store, runId) {
   return containedPath(store.root, 'runs', safeId(runId, 'runId'));
 }
@@ -474,7 +487,7 @@ function authorityActivationIntentPath(store) {
 }
 
 function selectorBody(value) {
-  return {
+  const body = {
     schemaVersion: 1,
     kind: 'release-authority-selector',
     storeMarkerDigest: value.storeMarkerDigest,
@@ -486,12 +499,19 @@ function selectorBody(value) {
     activeWriterProtocol: value.activeWriterProtocol,
     minimumWriterProtocol: value.minimumWriterProtocol,
     activeBuildIdentity: value.activeBuildIdentity,
+    authorityTransitionDigest: value.authorityTransitionDigest,
+    activationCutoverDigest: value.activationCutoverDigest,
     backupMarker: value.backupMarker,
     prequalifiedRollbackBuilds: value.prequalifiedRollbackBuilds,
     revision: value.revision,
     previousDigest: value.previousDigest,
     updatedAt: value.updatedAt,
   };
+  if (Object.hasOwn(value, 'pendingBuildIdentity')) {
+    body.pendingBuildIdentity = value.pendingBuildIdentity;
+    body.handoffId = value.handoffId;
+  }
+  return body;
 }
 
 function sealAuthoritySelector(value) {
@@ -512,6 +532,8 @@ function validateAuthoritySelector(store, value) {
     || (value.activeWriterProtocol !== null && typeof value.activeWriterProtocol !== 'string')
     || value.minimumWriterProtocol !== store.manifest.minimumWriterProtocol
     || (value.activeBuildIdentity !== null && typeof value.activeBuildIdentity !== 'string')
+    || (value.authorityTransitionDigest !== null && !DIGEST_PATTERN.test(value.authorityTransitionDigest))
+    || (value.activationCutoverDigest !== null && !DIGEST_PATTERN.test(value.activationCutoverDigest))
     || value.backupMarker !== store.manifest.backupMarker
     || canonicalJson(value.prequalifiedRollbackBuilds) !== canonicalJson(store.manifest.prequalifiedRollbackBuilds)
     || !Number.isSafeInteger(value.revision) || value.revision < 1
@@ -520,18 +542,33 @@ function validateAuthoritySelector(store, value) {
     || canonicalDigest(body) !== value.digest) {
     fail('AUTHORITY_SELECTOR_INVALID', 'Release-authority selector is invalid, stale, or corrupt.');
   }
+  value.pendingBuildIdentity ??= null;
+  value.handoffId ??= null;
   const activated = ['ACTIVE', 'PROMOTION_DISABLED'].includes(value.phase);
   if ((activated && (value.activationEpoch !== 1 || value.activationRevision === null
-    || value.activatedAt === null || value.activeWriterProtocol !== store.manifest.currentWriterProtocol
-    || value.activeBuildIdentity === null))
+      || value.activatedAt === null || value.activeWriterProtocol !== store.manifest.currentWriterProtocol
+      || value.activeBuildIdentity === null || value.authorityTransitionDigest === null
+      || value.activationCutoverDigest === null))
     || (!activated && (value.activationEpoch !== 0 || value.activationRevision !== null
-      || value.activatedAt !== null || value.activeWriterProtocol !== null || value.activeBuildIdentity !== null))) {
+      || value.activatedAt !== null || value.activeWriterProtocol !== null || value.activeBuildIdentity !== null
+      || value.authorityTransitionDigest !== null || value.activationCutoverDigest !== null))) {
     fail('AUTHORITY_SELECTOR_INVALID', 'Release-authority selector activation fields disagree with its phase.');
+  }
+  if ((value.pendingBuildIdentity === null) !== (value.handoffId === null)
+    || (value.pendingBuildIdentity !== null && (value.phase !== 'PROMOTION_DISABLED'
+      || value.pendingBuildIdentity === value.activeBuildIdentity
+      || !value.prequalifiedRollbackBuilds.includes(value.pendingBuildIdentity)
+      || !SAFE_ID.test(value.handoffId)))) {
+    fail('AUTHORITY_SELECTOR_INVALID', 'Release-authority handoff fields are contradictory.');
+  }
+  if (value.phase === 'ACTIVE' && (value.pendingBuildIdentity !== null || value.handoffId !== null)) {
+    fail('AUTHORITY_SELECTOR_INVALID', 'Active release authority cannot retain a pending build handoff.');
   }
   return value;
 }
 
 async function readAuthoritySelectorUnlocked(store) {
+  await refreshManifestUnlocked(store);
   let selector;
   try {
     selector = await readBoundedJson(store.storage, authoritySelectorPath(store), { label: 'release-authority selector' });
@@ -579,14 +616,61 @@ function authorityBinding(store, selector) {
   return Object.freeze({ ...body, digest: canonicalDigest(body) });
 }
 
-async function requirePublicationAuthority(store) {
+function handoffCanaryPermitPath(store, handoffId, mode) {
+  return containedPath(store.root, 'authority-handoff-permits', `${safeId(handoffId, 'handoffId')}-${mode}.json`);
+}
+
+function sealHandoffCanaryPermit(value) {
+  const body = {
+    schemaVersion: 1,
+    kind: 'release-authority-handoff-canary-permit',
+    handoffId: value.handoffId,
+    mode: value.mode,
+    runId: value.runId,
+    targetBuildIdentity: value.targetBuildIdentity,
+    selectorDigest: value.selectorDigest,
+    coordinatorEpoch: value.coordinatorEpoch,
+    registeredAt: value.registeredAt,
+  };
+  return { ...body, digest: canonicalDigest(body) };
+}
+
+function validateHandoffCanaryPermit(value, selector, mode = null) {
+  const { digest, ...body } = value ?? {};
+  if (value?.schemaVersion !== 1 || value.kind !== 'release-authority-handoff-canary-permit'
+    || value.handoffId !== selector.handoffId || value.targetBuildIdentity !== selector.pendingBuildIdentity
+    || value.selectorDigest !== selector.digest || !['single-site', 'comparative'].includes(value.mode)
+    || (mode !== null && value.mode !== mode) || !SAFE_ID.test(value.runId)
+    || !Number.isSafeInteger(value.coordinatorEpoch) || value.coordinatorEpoch < 1
+    || !Number.isFinite(Date.parse(value.registeredAt)) || digest !== canonicalDigest(body)) {
+    fail('AUTHORITY_HANDOFF_PERMIT_INVALID', 'Release-authority handoff canary permit is invalid or stale.');
+  }
+  return value;
+}
+
+async function requirePublicationAuthority(store, runId) {
   const selector = await readAuthoritySelectorUnlocked(store);
   if (!['ACTIVE', 'PROMOTION_DISABLED'].includes(selector.phase)) {
     fail('RELEASE_AUTHORITY_INACTIVE', `Direct release publication requires activated shared authority; current phase is ${selector.phase}.`);
   }
-  if (!selector.prequalifiedRollbackBuilds.includes(store.buildIdentity)
+  const expectedBuildIdentity = selector.pendingBuildIdentity ?? selector.activeBuildIdentity;
+  if (store.buildIdentity !== expectedBuildIdentity
     || selector.activeWriterProtocol !== store.manifest.currentWriterProtocol) {
     fail('STORE_WRITER_INCOMPATIBLE', 'The active selector does not authorize this build and writer protocol.');
+  }
+  if (selector.phase === 'PROMOTION_DISABLED' && selector.pendingBuildIdentity !== null) {
+    let permitted = false;
+    for (const mode of ['single-site', 'comparative']) {
+      const file = handoffCanaryPermitPath(store, selector.handoffId, mode);
+      if (!await pathExists(store.storage.fs, file)) continue;
+      const permit = validateHandoffCanaryPermit(await readBoundedJson(store.storage, file, {
+        label: 'release-authority handoff canary permit', maximumBytes: 64 * 1_024,
+      }), selector, mode);
+      if (permit.runId === runId) permitted = true;
+    }
+    if (!permitted) {
+      fail('AUTHORITY_HANDOFF_CANARY_REQUIRED', 'Pending build may publish only a permitted handoff health canary.');
+    }
   }
   return { selector, binding: authorityBinding(store, selector) };
 }
@@ -632,16 +716,19 @@ async function readGlobalCoordinator(store) {
     if (error?.code === 'ATOMIC_NOT_FOUND') return null;
     fail('STORE_CORRUPT', 'Global coordinator lease is unreadable.', { cause: error?.code ?? error?.message });
   }
-  exactKeys(value, ['schemaVersion', 'kind', 'ownerId', 'epoch', 'token', 'acquiredAt', 'expiresAt', 'digest'], 'global coordinator lease');
+  const buildBound = Object.hasOwn(value ?? {}, 'buildIdentity');
+  exactKeys(value, ['schemaVersion', 'kind', ...(buildBound ? ['buildIdentity'] : []), 'ownerId', 'epoch', 'token', 'acquiredAt', 'expiresAt', 'digest'], 'global coordinator lease');
   const { digest, ...body } = value;
   if (value.schemaVersion !== 1 || value.kind !== 'global-coordinator-lease'
     || !SAFE_ID.test(value.ownerId) || !SAFE_ID.test(value.token)
+    || (buildBound && (typeof value.buildIdentity !== 'string' || !value.buildIdentity))
     || !Number.isSafeInteger(value.epoch) || value.epoch < 1
     || value.epoch > store.manifest.coordinatorEpoch
     || canonicalTimestamp(value.acquiredAt, 'coordinator acquiredAt') >= canonicalTimestamp(value.expiresAt, 'coordinator expiresAt')
     || digest !== canonicalDigest(body)) {
     fail('STORE_CORRUPT', 'Global coordinator lease is invalid or corrupt.');
   }
+  value.buildIdentity ??= null;
   return value;
 }
 
@@ -654,6 +741,7 @@ function sealCoordinatorLease(value) {
   const body = {
     schemaVersion: 1,
     kind: 'global-coordinator-lease',
+    buildIdentity: value.buildIdentity,
     ownerId: value.ownerId,
     epoch: value.epoch,
     token: value.token,
@@ -747,11 +835,16 @@ export async function readStorePerformanceScheduler(store) {
 }
 
 async function validateCoordinator(store, coordinator) {
+  await refreshManifestUnlocked(store);
   const current = await readGlobalCoordinator(store);
+  const selector = await readAuthoritySelectorUnlocked(store);
+  const permittedBuild = selector.pendingBuildIdentity ?? selector.activeBuildIdentity ?? store.buildIdentity;
   if (!coordinator || current === null
     || coordinator.epoch !== current.epoch
     || coordinator.token !== current.token
-    || coordinator.ownerId !== current.ownerId) {
+    || coordinator.ownerId !== current.ownerId
+    || current.buildIdentity !== store.buildIdentity
+    || store.buildIdentity !== permittedBuild) {
     fail('STALE_COORDINATOR', 'Coordinator epoch or fencing token is stale.');
   }
   if (Date.parse(current.expiresAt) <= store.clock()) {
@@ -1098,7 +1191,8 @@ export async function openParentRunStore({
         storeGeneration: store.manifest.storeGeneration,
         phase: 'SHADOW', activationEpoch: 0, activationRevision: null, activatedAt: null,
         activeWriterProtocol: null, minimumWriterProtocol: store.manifest.minimumWriterProtocol,
-        activeBuildIdentity: null, backupMarker: store.manifest.backupMarker,
+        activeBuildIdentity: null, authorityTransitionDigest: null, activationCutoverDigest: null,
+        backupMarker: store.manifest.backupMarker,
         prequalifiedRollbackBuilds: store.manifest.prequalifiedRollbackBuilds,
         revision: 1, previousDigest: null, updatedAt: timestamp(store),
       });
@@ -1179,6 +1273,24 @@ export async function createParentRun(store, input) {
     fail('SEALED_MANIFEST_MISSING', 'A sealed parent run requires execution-manifest and final-subject digests.');
   }
   return withDirectoryLock(store.storage, containedPath(store.root, '.create-lock'), async () => {
+    const selector = await readAuthoritySelectorUnlocked(store);
+    if (selector.phase === 'PROMOTION_DISABLED' && selector.pendingBuildIdentity !== null) {
+      if (store.buildIdentity !== selector.pendingBuildIdentity) {
+        fail('STORE_WRITER_NOT_ACTIVE', 'Only the pending target build may create a handoff health canary.');
+      }
+      let permitted = false;
+      for (const mode of ['single-site', 'comparative']) {
+        const file = handoffCanaryPermitPath(store, selector.handoffId, mode);
+        if (!await pathExists(store.storage.fs, file)) continue;
+        const permit = validateHandoffCanaryPermit(await readBoundedJson(store.storage, file, {
+          label: 'release-authority handoff canary permit', maximumBytes: 64 * 1_024,
+        }), selector, mode);
+        if (permit.runId === runId) permitted = true;
+      }
+      if (!permitted) {
+        fail('AUTHORITY_HANDOFF_CANARY_REQUIRED', 'Pending build may create only a pre-authorized handoff health canary.');
+      }
+    }
     const directory = runDirectory(store, runId);
     if (await pathExists(store.storage.fs, directory)) fail('RUN_ALREADY_EXISTS', `Parent run ${runId} already exists.`);
     const temporaryDirectory = containedPath(store.root, 'runs', `.${runId}.initializing.${store.storage.nonce()}`);
@@ -1385,14 +1497,23 @@ export async function terminalizeParentRunCompilation(store, runId, coordinator)
 }
 
 async function acquireStoreCoordinatorUnlocked(store, input, takeoverOnly) {
+  await refreshManifestUnlocked(store);
   safeId(input?.ownerId, 'coordinator ownerId');
   if (!Number.isSafeInteger(input.leaseMs) || input.leaseMs < 100) fail('STORE_SCHEMA_INVALID', 'Coordinator leaseMs is invalid.');
   const previous = await readGlobalCoordinator(store);
+  const selector = await readAuthoritySelectorUnlocked(store);
+  const permittedBuild = selector.pendingBuildIdentity ?? selector.activeBuildIdentity ?? store.buildIdentity;
+  if (store.buildIdentity !== permittedBuild) {
+    fail('STORE_WRITER_NOT_ACTIVE', `Build ${store.buildIdentity} is not the active or pending canonical writer.`);
+  }
   const active = previous && Date.parse(previous.expiresAt) > store.clock();
-  if (active) fail('COORDINATOR_LEASE_HELD', `Coordinator epoch ${previous.epoch} is still active.`);
+  if (active && previous.buildIdentity === permittedBuild) {
+    fail('COORDINATOR_LEASE_HELD', `Coordinator epoch ${previous.epoch} is still active.`);
+  }
   if (takeoverOnly && previous === null) fail('COORDINATOR_TAKEOVER_INVALID', 'No prior coordinator exists to take over.');
   const epoch = Math.max(previous?.epoch ?? 0, store.manifest.coordinatorEpoch) + 1;
   const coordinator = {
+    buildIdentity: store.buildIdentity,
     ownerId: input.ownerId,
     epoch,
     token: store.storage.nonce(),
@@ -1459,6 +1580,12 @@ async function transitionReleaseAuthorityUnlocked(store, coordinator, input = {}
     if (input.buildIdentity !== store.buildIdentity) {
       fail('STORE_WRITER_INCOMPATIBLE', 'Authority transition build identity does not match the opener.');
     }
+    if (current.pendingBuildIdentity !== null) {
+      fail(
+        input.phase === 'ACTIVE' ? 'AUTHORITY_HANDOFF_HEALTH_REQUIRED' : 'AUTHORITY_HANDOFF_REQUIRED',
+        'A pending build handoff can change authority only through its dedicated health-fenced workflow.',
+      );
+    }
     if (input.phase === current.phase) {
       if (input.phase === 'ACTIVE'
         && (input.activationRevision !== current.activationRevision
@@ -1484,6 +1611,13 @@ async function transitionReleaseAuthorityUnlocked(store, coordinator, input = {}
       || !Number.isSafeInteger(requestedActivationRevision) || requestedActivationRevision < 1)) {
       fail('AUTHORITY_ACTIVATION_NOT_QUALIFIED', 'Activation requires a backup marker, activation revision, and prequalified shared-compatible build.');
     }
+    if (activating && wasActivated && input.buildIdentity !== current.activeBuildIdentity) {
+      fail('AUTHORITY_HANDOFF_REQUIRED', 'Changing the active build requires a durable health-fenced build handoff.');
+    }
+    if (firstActivation && (!DIGEST_PATTERN.test(input.activationCutoverDigest ?? '')
+      || !DIGEST_PATTERN.test(input.authorityTransitionDigest ?? ''))) {
+      fail('AUTHORITY_ACTIVATION_NOT_QUALIFIED', 'First activation requires durable cutover and authority-transition digests.');
+    }
     const nextStoreGeneration = firstActivation ? store.manifest.storeGeneration + 1 : store.manifest.storeGeneration;
     const next = sealAuthoritySelector({
       ...current,
@@ -1494,6 +1628,10 @@ async function transitionReleaseAuthorityUnlocked(store, coordinator, input = {}
       activatedAt: activating ? (current.activatedAt ?? timestamp(store)) : wasActivated ? current.activatedAt : null,
       activeWriterProtocol: activating || wasActivated ? store.manifest.currentWriterProtocol : null,
       activeBuildIdentity: activating ? input.buildIdentity : wasActivated ? current.activeBuildIdentity : null,
+      authorityTransitionDigest: firstActivation ? input.authorityTransitionDigest : current.authorityTransitionDigest,
+      activationCutoverDigest: firstActivation ? input.activationCutoverDigest : current.activationCutoverDigest,
+      pendingBuildIdentity: null,
+      handoffId: null,
       revision: current.revision + 1,
       previousDigest: current.digest,
       updatedAt: nextTimestamp(store, current.updatedAt),
@@ -1581,6 +1719,134 @@ export function transitionReleaseAuthorityWithPublicationFence(store, coordinato
     const transitionInput = { ...input };
     delete transitionInput.expectedPublications;
     return transitionReleaseAuthorityUnlocked(store, coordinator, transitionInput);
+  });
+}
+
+export function beginReleaseAuthorityBuildHandoff(store, coordinator, input = {}) {
+  return withDirectoryLock(store.storage, globalLockPath(store), async () => {
+    await validateCoordinator(store, coordinator);
+    const current = await readAuthoritySelectorUnlocked(store);
+    if (current.digest !== input.expectedSelectorDigest) {
+      fail('AUTHORITY_SELECTOR_CONFLICT', 'Release-authority selector changed before build handoff.');
+    }
+    safeId(input.handoffId, 'handoffId');
+    if (current.phase !== 'ACTIVE' || current.activationEpoch !== 1 || current.pendingBuildIdentity !== null
+      || store.buildIdentity !== current.activeBuildIdentity) {
+      fail('AUTHORITY_HANDOFF_INVALID', 'Build handoff must begin from the active source build.');
+    }
+    if (typeof input.targetBuildIdentity !== 'string' || !input.targetBuildIdentity
+      || input.targetBuildIdentity === current.activeBuildIdentity
+      || !current.prequalifiedRollbackBuilds.includes(input.targetBuildIdentity)) {
+      fail('AUTHORITY_HANDOFF_TARGET_UNQUALIFIED', 'Build handoff target must be a distinct prequalified build.');
+    }
+    const next = sealAuthoritySelector({
+      ...current,
+      phase: 'PROMOTION_DISABLED',
+      pendingBuildIdentity: input.targetBuildIdentity,
+      handoffId: input.handoffId,
+      revision: current.revision + 1,
+      previousDigest: current.digest,
+      updatedAt: nextTimestamp(store, current.updatedAt),
+    });
+    await atomicWriteJson(store.storage, authoritySelectorPath(store), next);
+    return clone(next);
+  });
+}
+
+export function registerReleaseAuthorityHandoffCanaryRun(store, coordinator, input = {}) {
+  return withDirectoryLock(store.storage, globalLockPath(store), async () => {
+    if (coordinator !== null) await validateCoordinator(store, coordinator);
+    const selector = await readAuthoritySelectorUnlocked(store);
+    if (selector.digest !== input.expectedSelectorDigest || selector.phase !== 'PROMOTION_DISABLED'
+      || selector.handoffId !== input.handoffId || selector.pendingBuildIdentity !== store.buildIdentity) {
+      fail('AUTHORITY_HANDOFF_INVALID', 'Canary registration does not match the pending target build handoff.');
+    }
+    if (!['single-site', 'comparative'].includes(input.mode)) {
+      fail('AUTHORITY_HANDOFF_PERMIT_INVALID', 'Handoff canary mode is invalid.');
+    }
+    safeId(input.runId, 'handoff canary runId');
+    const directory = containedPath(store.root, 'authority-handoff-permits');
+    await ensureDirectory(store.storage.fs, directory);
+    const file = handoffCanaryPermitPath(store, input.handoffId, input.mode);
+    const permit = sealHandoffCanaryPermit({
+      handoffId: input.handoffId,
+      mode: input.mode,
+      runId: input.runId,
+      targetBuildIdentity: store.buildIdentity,
+      selectorDigest: selector.digest,
+      coordinatorEpoch: coordinator?.epoch ?? store.manifest.coordinatorEpoch,
+      registeredAt: timestamp(store),
+    });
+    try {
+      await atomicWriteJson(store.storage, file, permit, { exclusive: true });
+    } catch (error) {
+      if (error?.code !== 'ATOMIC_ALREADY_EXISTS') throw error;
+      const existing = validateHandoffCanaryPermit(await readBoundedJson(store.storage, file, {
+        label: 'release-authority handoff canary permit', maximumBytes: 64 * 1_024,
+      }), selector, input.mode);
+      if (existing.runId !== input.runId) {
+        fail('AUTHORITY_HANDOFF_PERMIT_CONFLICT', `A different ${input.mode} handoff canary is already registered.`);
+      }
+      return clone(existing);
+    }
+    return clone(permit);
+  });
+}
+
+export function completeReleaseAuthorityBuildHandoffWithPublicationFence(store, coordinator, input = {}) {
+  return withDirectoryLock(store.storage, globalLockPath(store), async () => {
+    await validateCoordinator(store, coordinator);
+    const selector = await readAuthoritySelectorUnlocked(store);
+    if (selector.digest !== input.expectedSelectorDigest || selector.phase !== 'PROMOTION_DISABLED'
+      || selector.handoffId !== input.handoffId || selector.pendingBuildIdentity !== input.targetBuildIdentity
+      || store.buildIdentity !== input.targetBuildIdentity) {
+      fail('AUTHORITY_HANDOFF_INVALID', 'Build handoff completion does not match the pending target selector.');
+    }
+    if (!Array.isArray(input.expectedPublications) || input.expectedPublications.length !== 2
+      || new Set(input.expectedPublications.map(({ mode }) => mode)).size !== 2
+      || input.expectedPublications.some(({ mode }) => !['single-site', 'comparative'].includes(mode))) {
+      fail('AUTHORITY_HANDOFF_HEALTH_REQUIRED', 'Build handoff requires exact Single-site and Comparative health publications.');
+    }
+    for (const expected of input.expectedPublications) {
+      const permit = validateHandoffCanaryPermit(await readBoundedJson(
+        store.storage,
+        handoffCanaryPermitPath(store, input.handoffId, expected.mode),
+        { label: 'release-authority handoff canary permit', maximumBytes: 64 * 1_024 },
+      ), selector, expected.mode);
+      if (permit.runId !== expected.runId || !DIGEST_PATTERN.test(expected.envelopeDigest ?? '')) {
+        fail('AUTHORITY_HANDOFF_HEALTH_REQUIRED', `${expected.mode} handoff health publication is not permitted.`);
+      }
+      const state = await recoverUnlocked(store, expected.runId);
+      if (state.currentPublicationDigest !== expected.envelopeDigest || state.currentPublicationAuthorityBinding === null) {
+        fail('AUTHORITY_HANDOFF_HEALTH_STALE', `${expected.mode} handoff health publication changed.`);
+      }
+      validatePublicationAuthorityBinding(store, selector, state.currentPublicationAuthorityBinding);
+      const publication = (await readPublicationChain(store, expected.runId, expected.envelopeDigest)).at(-1);
+      if (publication.digest !== expected.envelopeDigest || publication.decision?.ready !== true
+        || publication.decision?.code !== 'RELEASE_READY' || publication.decision?.grantedAuthority !== 'FULL'
+        || publication.decision?.mode !== expected.mode) {
+        fail('AUTHORITY_HANDOFF_HEALTH_NOT_READY', `${expected.mode} handoff health publication is not FULL release ready.`);
+      }
+    }
+    const next = sealAuthoritySelector({
+      ...selector,
+      phase: 'ACTIVE',
+      activeBuildIdentity: input.targetBuildIdentity,
+      authorityTransitionDigest: input.authorityTransitionDigest,
+      pendingBuildIdentity: null,
+      handoffId: null,
+      revision: selector.revision + 1,
+      previousDigest: selector.digest,
+      updatedAt: nextTimestamp(store, selector.updatedAt),
+    });
+    if (!DIGEST_PATTERN.test(input.authorityTransitionDigest ?? '')
+      || input.expectedTargetSelectorRevision !== selector.revision + 1) {
+      fail('AUTHORITY_HANDOFF_COMMIT_INVALID', 'Build handoff completion requires its exact durable transition digest and selector revision.');
+    }
+    await input.hooks?.beforeCommit?.(clone(next));
+    await atomicWriteJson(store.storage, authoritySelectorPath(store), next);
+    await input.hooks?.afterCommit?.(clone(next));
+    return clone(next);
   });
 }
 
@@ -1804,6 +2070,19 @@ export async function claimStoreWorkItem(store, coordinator, input) {
     const authority = await readAuthoritySelectorUnlocked(store);
     if (authority.phase === 'DRAINING') {
       fail('CUTOVER_WORK_CLAIMS_FENCED', 'Work claims are fenced while shared release authority is draining for cutover.');
+    }
+    if (authority.pendingBuildIdentity !== null) {
+      const permittedRuns = new Set();
+      for (const mode of ['single-site', 'comparative']) {
+        const file = handoffCanaryPermitPath(store, authority.handoffId, mode);
+        if (!await pathExists(store.storage.fs, file)) continue;
+        permittedRuns.add(validateHandoffCanaryPermit(await readBoundedJson(store.storage, file, {
+          label: 'release-authority handoff canary permit', maximumBytes: 64 * 1_024,
+        }), authority, mode).runId);
+      }
+      if (runIds.some((runId) => !permittedRuns.has(runId))) {
+        fail('AUTHORITY_HANDOFF_CANARY_REQUIRED', 'Pending target workers may claim only permitted handoff health runs.');
+      }
     }
     const states = await schedulingStatesUnlocked(store);
     const scheduler = await reconcilePerformanceSchedulerUnlocked(store, coordinator, states);
@@ -3598,7 +3877,7 @@ export async function publishCurrentEnvelope(store, runId, coordinator, envelope
   return withDirectoryLock(store.storage, globalLockPath(store), () => withDirectoryLock(store.storage, lockPath(store, runId), async () => {
     const state = await recoverUnlocked(store, runId);
     await validateCoordinator(store, coordinator);
-    const { selector, binding } = await requirePublicationAuthority(store);
+    const { selector, binding } = await requirePublicationAuthority(store, runId);
     if (state.compilationState === 'failed') {
       if (!state.compilationFailure || !Object.hasOwn(envelope, 'subjectCoreDigest')
         || envelope.subjectCoreDigest !== state.subjectCoreDigest || envelope.finalSubjectDigest !== null

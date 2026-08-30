@@ -449,6 +449,8 @@ try {
     phase: 'ACTIVE',
     activationRevision: 1,
     buildIdentity: reopenedStore.buildIdentity,
+    activationCutoverDigest: `sha256:${'a'.repeat(64)}`,
+    authorityTransitionDigest: `sha256:${'a'.repeat(64)}`,
   });
   const applied = await reopenedControl.applyAcceptedOperations(coordinator, 'run-1');
   assert.equal(applied[0].outcome.status, 'succeeded');

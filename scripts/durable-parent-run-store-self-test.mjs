@@ -381,6 +381,8 @@ await transitionReleaseAuthority(store, coordinatorB, {
   phase: 'ACTIVE',
   activationRevision: 1,
   buildIdentity: store.buildIdentity,
+  activationCutoverDigest: DIGEST,
+  authorityTransitionDigest: DIGEST,
 });
 await expectCode('STALE_WORK_LEASE', () => adoptWorkHeartbeat(
   store, 'run-stale-worker-epoch', coordinatorB, staleEpochHeartbeat,
