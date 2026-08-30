@@ -217,6 +217,7 @@ try {
     expectedSelectorDigest: active.digest,
     phase: 'PROMOTION_DISABLED',
     buildIdentity: build,
+    authorityTransitionDigest: canonicalDigest({ transition: 'disable-1' }),
   });
   assert.equal(disabled.phase, 'PROMOTION_DISABLED');
   assert.equal(disabled.activationEpoch, 1);
@@ -236,6 +237,7 @@ try {
     phase: 'ACTIVE',
     activationRevision: disabled.activationRevision,
     buildIdentity: build,
+    authorityTransitionDigest: canonicalDigest({ transition: 'reenable-1' }),
     expectedPublications: [{ runId: 'run-selector', envelopeDigest: published.digest }],
   });
   assert.equal(reenabledWithoutHeadChange.activationEpoch, active.activationEpoch);
@@ -253,6 +255,7 @@ try {
     expectedSelectorDigest: reenabledWithoutHeadChange.digest,
     phase: 'PROMOTION_DISABLED',
     buildIdentity: build,
+    authorityTransitionDigest: canonicalDigest({ transition: 'disable-2' }),
   });
   const disabledHealthEnvelope = appendPublicationEnvelope(published, {
     schemaVersion: 1,
@@ -276,6 +279,7 @@ try {
       phase: 'ACTIVE',
       activationRevision: disabled.activationRevision,
       buildIdentity: build,
+      authorityTransitionDigest: canonicalDigest({ transition: 'stale-reenable' }),
       expectedPublications: [{ runId: 'run-selector', envelopeDigest: canonicalDigest({ stale: true }) }],
     },
   ));
@@ -284,11 +288,13 @@ try {
     phase: 'ACTIVE',
     activationRevision: disabled.activationRevision,
     buildIdentity: build,
+    authorityTransitionDigest: canonicalDigest({ transition: 'reenable-2' }),
     expectedPublications: [{ runId: 'run-selector', envelopeDigest: publishedWhilePromotionDisabled.digest }],
   });
   assert.equal(repaired.phase, 'ACTIVE');
   disabled = await transitionReleaseAuthority(store, takeover, {
     expectedSelectorDigest: repaired.digest, phase: 'PROMOTION_DISABLED', buildIdentity: build,
+    authorityTransitionDigest: canonicalDigest({ transition: 'disable-3' }),
   });
   await expectCode('AUTHORITY_TRANSITION_INVALID', () => transitionReleaseAuthority(store, takeover, {
     expectedSelectorDigest: disabled.digest,

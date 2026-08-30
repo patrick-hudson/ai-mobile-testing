@@ -605,6 +605,8 @@ export function createCutoverAdmissionPolicy({ admissionGate, store = null } = {
             handoffId: selector.handoffId,
             mode,
             runId: permit.authorizedRunId,
+            supersedesRunId: permit.supersedesRunId,
+            supersedeAuthorizationDigest: permit.supersedesRunId === null ? null : permit.digest,
           });
         }
         const launched = await operation(gate);
@@ -634,6 +636,8 @@ export function createCutoverAdmissionPolicy({ admissionGate, store = null } = {
               handoffId: selector.handoffId,
               mode,
               runId: launched.runId,
+              supersedesRunId: permit.supersedesRunId,
+              supersedeAuthorizationDigest: permit.supersedesRunId === null ? null : permit.digest,
             });
           }
           return launched;
@@ -655,6 +659,8 @@ export function createCutoverAdmissionPolicy({ admissionGate, store = null } = {
             handoffId: selector.handoffId,
             mode,
             runId: launched.runId,
+            supersedesRunId: permit.supersedesRunId,
+            supersedeAuthorizationDigest: permit.supersedesRunId === null ? null : permit.digest,
           });
         }
         return launched;
@@ -1000,6 +1006,8 @@ function checkpointBody(value) {
     admissionBefore: value.admissionBefore,
     admissionCurrent: value.admissionCurrent,
     drainObservation: value.drainObservation,
+    authorityFloorBeforeDigest: value.authorityFloorBeforeDigest,
+    authorityFloorAfterDigest: value.authorityFloorAfterDigest,
     updatedAt: value.updatedAt,
   };
 }
@@ -1040,6 +1048,8 @@ async function initializeCheckpoint(storage, input, selector, gate, clock) {
     admissionBefore: gate,
     admissionCurrent: gate,
     drainObservation: null,
+    authorityFloorBeforeDigest: null,
+    authorityFloorAfterDigest: null,
     updatedAt: timestamp(clock),
   });
 }
@@ -1167,7 +1177,10 @@ export async function prepareSharedAuthorityCutover({
   });
 }
 
-function reportBody({ input, checkpoint, selectorAfter, admissionGate, observation, store, completedAt }) {
+function reportBody({
+  input, checkpoint, selectorAfter, admissionGate, observation, store,
+  authorityFloorBeforeDigest, authorityFloorAfter, completedAt,
+}) {
   const backupReceipt = input.backupRehearsalReceipt;
   return {
     schemaVersion: 1,
@@ -1185,6 +1198,8 @@ function reportBody({ input, checkpoint, selectorAfter, admissionGate, observati
     drainObservation: observation,
     storeBefore: input.expectedStore,
     storeAfter: clone(store.manifest),
+    authorityFloorBeforeDigest,
+    authorityFloorAfter,
     rollbackBuildIdentity: input.rollbackBuildIdentity,
     backupRehearsal: {
       receiptDigest: backupReceipt.digest,
@@ -1232,11 +1247,99 @@ function parseFinalReport(value, input) {
   return clone(value);
 }
 
+function authorityFloorMatchesActivatedSelector(floor, selector) {
+  return floor.storeMarkerDigest === selector.storeMarkerDigest
+    && floor.minimumStoreGeneration === selector.storeGeneration
+    && floor.minimumSelectorRevision === selector.revision
+    && floor.activeBuildIdentity === selector.activeBuildIdentity
+    && floor.authorityTransitionDigest === selector.authorityTransitionDigest
+    && floor.activationEpoch === 1
+    && floor.legacyPermanentlyRetired === true
+    && floor.activationRevision === selector.activationRevision
+    && floor.activationCutoverDigest === selector.activationCutoverDigest;
+}
+
+function promotionTransitionIntentPath(storage, cutoverId, selectorRevision, phase) {
+  return reportStoragePath(storage, cutoverId, `.promotion-transition-${selectorRevision}-${phase}.json`);
+}
+
+function promotionTransitionIntentBody(value) {
+  return {
+    schemaVersion: 1,
+    kind: 'release-promotion-transition-intent',
+    cutoverId: value.cutoverId,
+    selectorBeforeDigest: value.selectorBeforeDigest,
+    selectorBeforeRevision: value.selectorBeforeRevision,
+    targetPhase: value.targetPhase,
+    activeBuildIdentity: value.activeBuildIdentity,
+    authorityFloorBeforeDigest: value.authorityFloorBeforeDigest,
+    activationRevision: value.activationRevision,
+    activationCutoverDigest: value.activationCutoverDigest,
+    healthReceiptDigest: value.healthReceiptDigest,
+    createdAt: value.createdAt,
+  };
+}
+
+function parsePromotionTransitionIntent(value, cutoverId, selectorRevision, phase) {
+  parseSealed(value, 'Promotion transition intent');
+  exactKeys(value, [...Object.keys(promotionTransitionIntentBody(value)), 'digest'], 'Promotion transition intent');
+  if (value.schemaVersion !== 1 || value.kind !== 'release-promotion-transition-intent'
+    || value.cutoverId !== cutoverId || value.selectorBeforeRevision !== selectorRevision
+    || value.targetPhase !== phase || !['ACTIVE', 'PROMOTION_DISABLED'].includes(value.targetPhase)) {
+    fail('CUTOVER_CHECKPOINT_CONFLICT', 'Promotion transition intent does not match this request.');
+  }
+  return clone(value);
+}
+
+async function persistPromotionTransitionIntent(storage, proposed) {
+  const file = promotionTransitionIntentPath(
+    storage, proposed.cutoverId, proposed.selectorBeforeRevision, proposed.targetPhase,
+  );
+  if (await pathExists(storage.fs, file)) {
+    const existing = parsePromotionTransitionIntent(await readBoundedJson(storage, file, {
+      label: 'promotion transition intent', maximumBytes: 256 * 1_024,
+    }), proposed.cutoverId, proposed.selectorBeforeRevision, proposed.targetPhase);
+    const expected = promotionTransitionIntentBody({ ...proposed, createdAt: existing.createdAt });
+    if (canonicalJson(promotionTransitionIntentBody(existing)) !== canonicalJson(expected)) {
+      fail('CUTOVER_CHECKPOINT_CONFLICT', 'Promotion transition intent is immutable.');
+    }
+    return existing;
+  }
+  const intent = seal(promotionTransitionIntentBody(proposed));
+  await atomicWriteJson(storage, file, intent, { exclusive: true });
+  return clone(intent);
+}
+
+async function advancePromotionAuthorityFloor(authorityFloor, intent, selector) {
+  let floor = await authorityFloor.read();
+  if (floor.digest === intent.authorityFloorBeforeDigest) {
+    floor = await authorityFloor.compareAndAdvance(intent.authorityFloorBeforeDigest, {
+      storeMarkerDigest: selector.storeMarkerDigest,
+      minimumStoreGeneration: selector.storeGeneration,
+      minimumSelectorRevision: selector.revision,
+      activeBuildIdentity: selector.activeBuildIdentity,
+      authorityTransitionDigest: selector.authorityTransitionDigest,
+      activationEpoch: selector.activationEpoch,
+      legacyPermanentlyRetired: true,
+      activationRevision: selector.activationRevision,
+      activationCutoverDigest: selector.activationCutoverDigest,
+    });
+  } else if (!authorityFloorMatchesActivatedSelector(floor, selector)) {
+    fail('AUTHORITY_FLOOR_STATE_INVALID', 'External authority floor is neither before nor exactly after this promotion transition.');
+  }
+  return floor;
+}
+
 export async function activateSharedAuthorityCutover({
-  store, coordinator, admissionGate, legacyAuthorityFence = null, reportDirectory, input: rawInput, drainObservation,
+  store, coordinator, admissionGate, legacyAuthorityFence = null, authorityFloor,
+  reportDirectory, input: rawInput, drainObservation,
   clock = store?.clock ?? (() => Date.now()), hooks = {},
 } = {}) {
   ensureCoordinator(coordinator);
+  if (!authorityFloor || typeof authorityFloor.read !== 'function'
+    || typeof authorityFloor.compareAndAdvance !== 'function') {
+    fail('AUTHORITY_FLOOR_REQUIRED', 'Shared activation requires the external authority floor.');
+  }
   const input = parseCutoverInput(rawInput);
   const storage = await openReportStorage(reportDirectory);
   return withCutoverLock(storage, input.cutoverId, async () => {
@@ -1245,7 +1348,12 @@ export async function activateSharedAuthorityCutover({
     }
     const reportPath = reportStoragePath(storage, input.cutoverId, '.json');
     if (await pathExists(storage.fs, reportPath)) {
-      return parseFinalReport(await readBoundedJson(storage, reportPath, { label: 'cutover report', maximumBytes: 4 * 1_048_576 }), input);
+      const report = parseFinalReport(await readBoundedJson(storage, reportPath, { label: 'cutover report', maximumBytes: 4 * 1_048_576 }), input);
+      const floor = await authorityFloor.read();
+      if (floor.digest !== report.authorityFloorAfter?.digest) {
+        fail('AUTHORITY_FLOOR_STATE_INVALID', 'Completed activation report no longer matches the external authority floor.');
+      }
+      return report;
     }
     let selector = await readReleaseAuthoritySelector(store);
     if (!['DRAINING', 'ACTIVE'].includes(selector.phase)) {
@@ -1258,6 +1366,23 @@ export async function activateSharedAuthorityCutover({
     }
     let checkpoint = await readCheckpoint(storage, input);
     if (!checkpoint) fail('CUTOVER_CHECKPOINT_MISSING', 'Prepare must complete before activation.');
+    let floor = await authorityFloor.read();
+    if (checkpoint.authorityFloorBeforeDigest === null) {
+      if (floor.activationEpoch !== 0 || floor.legacyPermanentlyRetired !== false
+        || floor.storeMarkerDigest !== selector.storeMarkerDigest
+        || floor.minimumStoreGeneration > selector.storeGeneration
+        || floor.minimumSelectorRevision > selector.revision) {
+        fail('AUTHORITY_FLOOR_STATE_INVALID', 'External authority floor is not a valid preactivation ancestor.');
+      }
+      checkpoint = await writeCheckpoint(storage, {
+        ...checkpoint,
+        authorityFloorBeforeDigest: floor.digest,
+        updatedAt: timestamp(clock),
+      });
+    } else if (floor.digest !== checkpoint.authorityFloorBeforeDigest
+      && !authorityFloorMatchesActivatedSelector(floor, selector)) {
+      fail('AUTHORITY_FLOOR_STATE_INVALID', 'External authority floor changed outside this activation.');
+    }
     await verifyCutoverBackup({ input, selector, checkpoint, clock });
     let observed = checkpoint.drainObservation;
     if (selector.phase !== 'ACTIVE') {
@@ -1304,17 +1429,39 @@ export async function activateSharedAuthorityCutover({
         fail('CUTOVER_LEGACY_FENCE_CONFLICT', 'Legacy authority fence does not match activated shared authority.');
       }
     }
+    floor = await authorityFloor.read();
+    if (floor.digest === checkpoint.authorityFloorBeforeDigest) {
+      floor = await authorityFloor.compareAndAdvance(checkpoint.authorityFloorBeforeDigest, {
+        storeMarkerDigest: selector.storeMarkerDigest,
+        minimumStoreGeneration: selector.storeGeneration,
+        minimumSelectorRevision: selector.revision,
+        activeBuildIdentity: selector.activeBuildIdentity,
+        authorityTransitionDigest: selector.authorityTransitionDigest,
+        activationEpoch: 1,
+        legacyPermanentlyRetired: true,
+        activationRevision: selector.activationRevision,
+        activationCutoverDigest: selector.activationCutoverDigest,
+      });
+      await hooks.afterAuthorityFloorAdvanced?.(clone(floor));
+    } else if (!authorityFloorMatchesActivatedSelector(floor, selector)) {
+      fail('AUTHORITY_FLOOR_STATE_INVALID', 'External authority floor is neither before nor exactly after this activation.');
+    }
     checkpoint = await writeCheckpoint(storage, {
       ...checkpoint,
       status: 'ACTIVE',
       selectorCurrent: selector,
       admissionCurrent: gate,
       drainObservation: observed,
+      authorityFloorBeforeDigest: checkpoint.authorityFloorBeforeDigest,
+      authorityFloorAfterDigest: floor.digest,
       updatedAt: timestamp(clock),
     });
     const report = seal(reportBody({
       input, checkpoint, selectorAfter: selector, admissionGate: gate,
-      observation: observed, store, completedAt: timestamp(clock),
+      observation: observed, store,
+      authorityFloorBeforeDigest: checkpoint.authorityFloorBeforeDigest,
+      authorityFloorAfter: floor,
+      completedAt: timestamp(clock),
     }));
     await atomicWriteJson(storage, reportPath, report, { exclusive: true });
     return clone(report);
@@ -1880,6 +2027,28 @@ export async function prepareSharedAuthorityBuildHandoff({
     if (gateBefore.state === 'CLOSED' && gateBefore.cutoverId !== handoffId) {
       fail('CUTOVER_ADMISSION_OWNED', `Admission is already closed by ${gateBefore.cutoverId}.`);
     }
+    const intentFile = handoffPath(storage, handoffId, '.intent.json');
+    if (await pathExists(storage.fs, intentFile)) {
+      const existing = parseHandoffIntent(await readBoundedJson(storage, intentFile, {
+        label: 'build handoff intent', maximumBytes: 256 * 1_024,
+      }), handoffId);
+      const expected = handoffIntentBody({
+        ...existing,
+        handoffId,
+        sourceBuildIdentity: selector.activeBuildIdentity,
+        targetBuildIdentity,
+        sourceSelectorDigest: selector.digest,
+        authorityFloorBeforeDigest: floorBefore.digest,
+        activationCutoverDigest: selector.activationCutoverDigest,
+        activationEpoch: selector.activationEpoch,
+        activationRevision: selector.activationRevision,
+        operatorReview,
+      });
+      if (canonicalJson(handoffIntentBody(existing)) !== canonicalJson(expected)) {
+        fail('CUTOVER_CHECKPOINT_CONFLICT', 'Build handoff intent is immutable.');
+      }
+      return (await readHandoffDocuments(storage, handoffId)).checkpoint;
+    }
     const intent = seal(handoffIntentBody({
       handoffId,
       sourceBuildIdentity: selector.activeBuildIdentity,
@@ -1892,14 +2061,6 @@ export async function prepareSharedAuthorityBuildHandoff({
       operatorReview,
       requestedAt: timestamp(clock),
     }));
-    const intentFile = handoffPath(storage, handoffId, '.intent.json');
-    if (await pathExists(storage.fs, intentFile)) {
-      const existing = parseHandoffIntent(await readBoundedJson(storage, intentFile, {
-        label: 'build handoff intent', maximumBytes: 256 * 1_024,
-      }), handoffId);
-      if (existing.digest !== intent.digest) fail('CUTOVER_CHECKPOINT_CONFLICT', 'Build handoff intent is immutable.');
-      return (await readHandoffDocuments(storage, handoffId)).checkpoint;
-    }
     await atomicWriteJson(storage, intentFile, intent, { exclusive: true });
     const gateAfter = gateBefore.state === 'OPEN' ? await admissionGate.close(gateBefore.digest, handoffId) : gateBefore;
     const checkpoint = await writeHandoffCheckpoint(storage, {
@@ -2320,6 +2481,7 @@ export async function completeSharedAuthorityBuildHandoff({
 export async function setSharedPromotionAvailability({
   store,
   coordinator,
+  authorityFloor,
   phase,
   buildIdentity,
   reportDirectory = null,
@@ -2329,8 +2491,13 @@ export async function setSharedPromotionAvailability({
   probeTargetIdentity,
   transitionWithPublicationFence = transitionReleaseAuthorityWithPublicationFence,
   clock = store?.clock ?? (() => Date.now()),
+  hooks = {},
 } = {}) {
   ensureCoordinator(coordinator);
+  if (!authorityFloor || typeof authorityFloor.read !== 'function'
+    || typeof authorityFloor.compareAndAdvance !== 'function') {
+    fail('AUTHORITY_FLOOR_REQUIRED', 'Promotion availability changes require the external authority floor.');
+  }
   if (!['ACTIVE', 'PROMOTION_DISABLED'].includes(phase)) {
     fail('CUTOVER_INPUT_INVALID', 'Post-activation authority may only be ACTIVE or PROMOTION_DISABLED.');
   }
@@ -2341,67 +2508,111 @@ export async function setSharedPromotionAvailability({
   if (!selector.prequalifiedRollbackBuilds.includes(buildIdentity) || store.buildIdentity !== buildIdentity) {
     fail('CUTOVER_ROLLBACK_BUILD_UNQUALIFIED', 'Post-activation operation requires the exact opened prequalified build.');
   }
-  if (phase === selector.phase) return clone(selector);
-  if (phase === 'PROMOTION_DISABLED') {
-    return transitionReleaseAuthority(store, coordinator, {
-      expectedSelectorDigest: selector.digest,
-      phase,
-      activationRevision: selector.activationRevision,
-      buildIdentity,
-    });
-  }
-  if (!isRecord(healthCanaries)) {
-    fail('CUTOVER_PROMOTION_HEALTH_REQUIRED', 'Promotion re-enable requires fresh Single-site and Comparative health canaries.');
-  }
-  exactKeys(healthCanaries, CUTOVER_CANARY_MODES, 'promotion health canaries');
   safeId(cutoverId, 'cutoverId');
-  const evidence = {};
-  for (const mode of CUTOVER_CANARY_MODES) {
-    const runId = safeId(healthCanaries[mode], `${mode} health canary runId`);
-    evidence[mode] = parseCanaryEvidence(
-      await readCanaryEvidence(store, runId, { probeTargetIdentity }),
-      { mode, runId, selector, store, minimumCreatedAt: selector.updatedAt },
-    );
-  }
   const storage = await openReportStorage(reportDirectory);
-  const healthBinding = {
-    schemaVersion: 1,
-    kind: 'release-promotion-health-receipt',
+  const floorBefore = await authorityFloor.read();
+  if (phase === selector.phase) {
+    if (authorityFloorMatchesActivatedSelector(floorBefore, selector)) return clone(selector);
+    if (selector.revision < 2 || selector.previousDigest === null) {
+      fail('AUTHORITY_FLOOR_STATE_INVALID', 'Promotion transition recovery has no prior selector lineage.');
+    }
+    const intent = parsePromotionTransitionIntent(await readBoundedJson(
+      storage,
+      promotionTransitionIntentPath(storage, cutoverId, selector.revision - 1, phase),
+      { label: 'promotion transition intent', maximumBytes: 256 * 1_024 },
+    ), cutoverId, selector.revision - 1, phase);
+    if (selector.previousDigest !== intent.selectorBeforeDigest
+      || selector.authorityTransitionDigest !== intent.digest
+      || selector.activeBuildIdentity !== intent.activeBuildIdentity) {
+      fail('AUTHORITY_FLOOR_STATE_INVALID', 'Promotion transition recovery does not match the durable selector successor.');
+    }
+    const recoveredFloor = await advancePromotionAuthorityFloor(authorityFloor, intent, selector);
+    await hooks.afterAuthorityFloorAdvanced?.(clone(recoveredFloor));
+    return clone(selector);
+  }
+  if (!authorityFloorMatchesActivatedSelector(floorBefore, selector)) {
+    fail('AUTHORITY_FLOOR_STATE_INVALID', 'Promotion transition requires selector state exactly bound to the external authority floor.');
+  }
+  let healthReceipt = null;
+  if (!isRecord(healthCanaries)) {
+    if (phase === 'ACTIVE') {
+      fail('CUTOVER_PROMOTION_HEALTH_REQUIRED', 'Promotion re-enable requires fresh Single-site and Comparative health canaries.');
+    }
+  } else if (phase !== 'ACTIVE') {
+    fail('CUTOVER_INPUT_INVALID', 'Promotion disable does not accept health-canary evidence.');
+  }
+  const evidence = {};
+  if (phase === 'ACTIVE') {
+    exactKeys(healthCanaries, CUTOVER_CANARY_MODES, 'promotion health canaries');
+    for (const mode of CUTOVER_CANARY_MODES) {
+      const runId = safeId(healthCanaries[mode], `${mode} health canary runId`);
+      evidence[mode] = parseCanaryEvidence(
+        await readCanaryEvidence(store, runId, { probeTargetIdentity }),
+        { mode, runId, selector, store, minimumCreatedAt: selector.updatedAt },
+      );
+    }
+    const healthBinding = {
+      schemaVersion: 1,
+      kind: 'release-promotion-health-receipt',
+      cutoverId,
+      selectorBeforeDigest: selector.digest,
+      activeBuildIdentity: selector.activeBuildIdentity,
+      storeBindingDigest: cutoverStoreBinding(store).digest,
+      canaries: evidence,
+    };
+    const evidenceTime = Math.max(...CUTOVER_CANARY_MODES.map((mode) => Date.parse(evidence[mode].createdAt)));
+    healthReceipt = seal({ ...healthBinding, recordedAt: new Date(evidenceTime).toISOString() });
+    const healthPath = reportStoragePath(
+      storage,
+      cutoverId,
+      `.promotion-health-${healthReceipt.digest.slice('sha256:'.length)}.json`,
+    );
+    if (!await pathExists(storage.fs, healthPath)) {
+      await atomicWriteJson(storage, healthPath, healthReceipt, { exclusive: true });
+    }
+  }
+  const intent = await persistPromotionTransitionIntent(storage, {
     cutoverId,
     selectorBeforeDigest: selector.digest,
+    selectorBeforeRevision: selector.revision,
+    targetPhase: phase,
     activeBuildIdentity: selector.activeBuildIdentity,
-    storeBindingDigest: cutoverStoreBinding(store).digest,
-    canaries: evidence,
-  };
-  const evidenceTime = Math.max(...CUTOVER_CANARY_MODES.map((mode) => Date.parse(evidence[mode].createdAt)));
-  const healthReceipt = seal({ ...healthBinding, recordedAt: new Date(evidenceTime).toISOString() });
-  const healthPath = reportStoragePath(
-    storage,
-    cutoverId,
-    `.promotion-health-${healthReceipt.digest.slice('sha256:'.length)}.json`,
-  );
-  if (!await pathExists(storage.fs, healthPath)) {
-    await atomicWriteJson(storage, healthPath, healthReceipt, { exclusive: true });
-  }
-  if (typeof transitionWithPublicationFence !== 'function') {
+    authorityFloorBeforeDigest: floorBefore.digest,
+    activationRevision: selector.activationRevision,
+    activationCutoverDigest: selector.activationCutoverDigest,
+    healthReceiptDigest: healthReceipt?.digest ?? null,
+    createdAt: timestamp(clock),
+  });
+  if (phase === 'ACTIVE' && typeof transitionWithPublicationFence !== 'function') {
     fail('CUTOVER_INPUT_INVALID', 'Promotion health publication fence is required.');
   }
-  const activated = await transitionWithPublicationFence(store, coordinator, {
+  const transition = {
     expectedSelectorDigest: selector.digest,
     phase,
     activationRevision: selector.activationRevision,
     buildIdentity,
-    expectedPublications: CUTOVER_CANARY_MODES.map((mode) => ({
+    authorityTransitionDigest: intent.digest,
+  };
+  if (phase === 'ACTIVE') transition.expectedPublications = CUTOVER_CANARY_MODES.map((mode) => ({
       runId: evidence[mode].runId,
       envelopeDigest: evidence[mode].publicationDigest,
-    })),
-  });
+    }));
+  const transitioned = phase === 'ACTIVE'
+    ? await transitionWithPublicationFence(store, coordinator, transition)
+    : await transitionReleaseAuthority(store, coordinator, transition);
+  await hooks.afterSelectorTransition?.(clone(transitioned));
+  const floorAfter = await advancePromotionAuthorityFloor(authorityFloor, intent, transitioned);
+  await hooks.afterAuthorityFloorAdvanced?.(clone(floorAfter));
+  if (phase === 'PROMOTION_DISABLED') return clone(transitioned);
   const reenableReport = seal({
     schemaVersion: 1,
     kind: 'release-promotion-reenable-report',
     cutoverId,
     selectorBefore: selector,
-    selectorAfter: activated,
+    selectorAfter: transitioned,
+    transitionIntentDigest: intent.digest,
+    authorityFloorBeforeDigest: intent.authorityFloorBeforeDigest,
+    authorityFloorAfter: floorAfter,
     healthReceiptDigest: healthReceipt.digest,
     completedAt: timestamp(clock),
   });
@@ -2409,5 +2620,5 @@ export async function setSharedPromotionAvailability({
   if (!await pathExists(storage.fs, reenablePath)) {
     await atomicWriteJson(storage, reenablePath, reenableReport, { exclusive: true });
   }
-  return Object.freeze({ selector: activated, healthReceipt: clone(healthReceipt) });
+  return Object.freeze({ selector: transitioned, healthReceipt: clone(healthReceipt) });
 }

@@ -439,6 +439,44 @@ assert.equal((await loadSharedReleasePublication(root, 'run-main', {
   expectedStoreGeneration: 2,
 })).digest, thirdEnvelope.digest);
 
+let externalAuthorityRejected = false;
+let externalAuthorityChecks = 0;
+const externalAuthorityFloor = {
+  async assertAuthorityState({ manifest, selector, legacyFence }) {
+    externalAuthorityChecks += 1;
+    assert.equal(manifest.storeGeneration, 2);
+    assert.equal(selector.phase, 'ACTIVE');
+    assert.equal(legacyFence.state, 'ACTIVATED');
+    if (externalAuthorityRejected) {
+      throw Object.assign(new Error('synthetic stale restored authority'), { code: 'AUTHORITY_FLOOR_STALE_STORE' });
+    }
+    return { digest: DIGEST };
+  },
+};
+const externalLegacyFence = {
+  async read() { return { state: 'ACTIVATED', activationEpoch: 1 }; },
+};
+const guardedStore = await openParentRunStore({
+  root,
+  storeMarker: STORE_MARKER,
+  expectedStoreGeneration: 2,
+  verifyStorage: false,
+  authorityFloor: externalAuthorityFloor,
+  legacyAuthorityFence: externalLegacyFence,
+});
+assert.equal((await readCurrentEnvelope(guardedStore, 'run-main')).digest, thirdEnvelope.digest);
+assert.ok(externalAuthorityChecks >= 2, 'store open and current-envelope consumption must both consult the external floor');
+externalAuthorityRejected = true;
+await expectCode('AUTHORITY_FLOOR_STALE_STORE', () => readCurrentEnvelope(guardedStore, 'run-main'));
+await expectCode('AUTHORITY_FLOOR_STALE_STORE', () => acquireStoreCoordinator(guardedStore, {
+  ownerId: 'must-not-acquire-after-external-floor-rejection', leaseMs: 1_000,
+}));
+await expectCode('AUTHORITY_FLOOR_STALE_STORE', () => createParentRun(guardedStore, {
+  runId: 'must-not-create-after-external-floor-rejection',
+  subjectCoreDigest: DIGEST,
+  workItems: [{ id: 'must-not-create-work', maxAttempts: 1 }],
+}));
+
 const coordinatorPath = join(root, 'coordinator.json');
 const coordinatorDocument = await readFile(coordinatorPath, 'utf8');
 const forgedCoordinator = JSON.parse(coordinatorDocument);
@@ -446,6 +484,8 @@ forgedCoordinator.token = 'forged-token';
 await writeFile(coordinatorPath, `${JSON.stringify(forgedCoordinator)}\n`);
 await expectCode('STORE_CORRUPT', () => heartbeatCoordinator(store, coordinatorB, { leaseMs: 1_000 }));
 await writeFile(coordinatorPath, coordinatorDocument);
+const renewedCoordinator = await heartbeatCoordinator(store, coordinatorB, { leaseMs: 1_000 });
+assert.equal(renewedCoordinator.buildIdentity, coordinatorB.buildIdentity);
 
 // An OS-backed lock is not stolen from a live paused writer; takeover waits,
 // then the durable epoch advances and fences the prior owner.

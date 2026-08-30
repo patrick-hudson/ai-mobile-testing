@@ -69,6 +69,7 @@ const MAX_BUFFERED_ATTEMPT_EVIDENCE_BYTES = 16 * 1_048_576;
 const ARTIFACT_INTEGRITY_CACHES = new WeakMap();
 export const ARTIFACT_READ_LEASE_MS = 15_000;
 const ARTIFACT_PURGE_DRAIN_MS = 20_000;
+const MAX_HANDOFF_CANARY_PERMIT_REVISIONS = 3;
 
 export class ParentRunStoreError extends Error {
   constructor(code, message, details = undefined) {
@@ -577,7 +578,9 @@ async function readAuthoritySelectorUnlocked(store) {
     throw error;
   }
   try {
-    return validateAuthoritySelector(store, selector);
+    const validated = validateAuthoritySelector(store, selector);
+    await assertExternalAuthorityFloor(store, validated);
+    return validated;
   } catch (error) {
     if (error?.code !== 'AUTHORITY_SELECTOR_INVALID' || store.manifest.activationEpoch !== 1) throw error;
     let intent;
@@ -602,8 +605,19 @@ async function readAuthoritySelectorUnlocked(store) {
     }
     await atomicWriteJson(store.storage, authoritySelectorPath(store), recovered);
     await store.storage.fs.rm(authorityActivationIntentPath(store), { force: true });
+    await assertExternalAuthorityFloor(store, recovered);
     return recovered;
   }
+}
+
+async function assertExternalAuthorityFloor(store, selector) {
+  if (store.authorityFloor === null) return null;
+  const legacyFence = await store.legacyAuthorityFence.read();
+  return store.authorityFloor.assertAuthorityState({
+    manifest: store.manifest,
+    selector,
+    legacyFence,
+  });
 }
 
 function authorityBinding(store, selector) {
@@ -620,6 +634,11 @@ function handoffCanaryPermitPath(store, handoffId, mode) {
   return containedPath(store.root, 'authority-handoff-permits', `${safeId(handoffId, 'handoffId')}-${mode}.json`);
 }
 
+function handoffCanaryPermitHistoryPath(store, permitDigest) {
+  if (!DIGEST_PATTERN.test(permitDigest)) fail('AUTHORITY_HANDOFF_PERMIT_INVALID', 'Handoff canary permit digest is invalid.');
+  return containedPath(store.root, 'authority-handoff-permits', 'history', `${permitDigest.slice('sha256:'.length)}.json`);
+}
+
 function sealHandoffCanaryPermit(value) {
   const body = {
     schemaVersion: 1,
@@ -632,20 +651,70 @@ function sealHandoffCanaryPermit(value) {
     coordinatorEpoch: value.coordinatorEpoch,
     registeredAt: value.registeredAt,
   };
+  if (Object.hasOwn(value, 'revision')) {
+    body.revision = value.revision;
+    body.previousPermitDigest = value.previousPermitDigest;
+    body.supersedesRunId = value.supersedesRunId;
+    body.supersedeAuthorizationDigest = value.supersedeAuthorizationDigest;
+  }
   return { ...body, digest: canonicalDigest(body) };
 }
 
 function validateHandoffCanaryPermit(value, selector, mode = null) {
-  const { digest, ...body } = value ?? {};
+  const modern = Object.hasOwn(value ?? {}, 'revision');
+  const body = sealHandoffCanaryPermit(value ?? {});
+  const keys = Object.keys(body);
+  exactKeys(value, keys, 'release-authority handoff canary permit');
   if (value?.schemaVersion !== 1 || value.kind !== 'release-authority-handoff-canary-permit'
     || value.handoffId !== selector.handoffId || value.targetBuildIdentity !== selector.pendingBuildIdentity
     || value.selectorDigest !== selector.digest || !['single-site', 'comparative'].includes(value.mode)
     || (mode !== null && value.mode !== mode) || !SAFE_ID.test(value.runId)
     || !Number.isSafeInteger(value.coordinatorEpoch) || value.coordinatorEpoch < 1
-    || !Number.isFinite(Date.parse(value.registeredAt)) || digest !== canonicalDigest(body)) {
+    || !Number.isFinite(Date.parse(value.registeredAt)) || value.digest !== body.digest) {
     fail('AUTHORITY_HANDOFF_PERMIT_INVALID', 'Release-authority handoff canary permit is invalid or stale.');
   }
+  if (modern && (!Number.isSafeInteger(value.revision) || value.revision < 1
+    || value.revision > MAX_HANDOFF_CANARY_PERMIT_REVISIONS
+    || ((value.revision === 1) !== (value.previousPermitDigest === null))
+    || (value.revision === 1 && (value.supersedesRunId !== null || value.supersedeAuthorizationDigest !== null))
+    || (value.revision > 1 && (!DIGEST_PATTERN.test(value.previousPermitDigest ?? '')
+      || !SAFE_ID.test(value.supersedesRunId ?? '') || value.supersedesRunId === value.runId
+      || !DIGEST_PATTERN.test(value.supersedeAuthorizationDigest ?? ''))))) {
+    fail('AUTHORITY_HANDOFF_PERMIT_INVALID', 'Release-authority handoff canary permit lineage is invalid.');
+  }
   return value;
+}
+
+async function persistImmutableHandoffCanaryPermit(store, permit) {
+  const history = containedPath(store.root, 'authority-handoff-permits', 'history');
+  await ensureDirectory(store.storage.fs, history);
+  const file = handoffCanaryPermitHistoryPath(store, permit.digest);
+  if (await pathExists(store.storage.fs, file)) {
+    const existing = await readBoundedJson(store.storage, file, {
+      label: 'immutable release-authority handoff canary permit', maximumBytes: 64 * 1_024,
+    });
+    if (canonicalJson(existing) !== canonicalJson(permit)) {
+      fail('AUTHORITY_HANDOFF_PERMIT_INVALID', 'Immutable handoff canary permit digest was reused with different bytes.');
+    }
+    return;
+  }
+  await atomicWriteJson(store.storage, file, permit, { exclusive: true });
+}
+
+async function assertHandoffCanaryPermitReplaceableUnlocked(store, permit) {
+  const state = await recoverUnlocked(store, permit.runId);
+  const workItems = Object.values(state.workItems ?? {});
+  if (workItems.length === 0 || workItems.some((item) => (
+    !['completed_pass', 'completed_product_failure', 'cancelled', 'incomplete'].includes(item.state)
+  ))) {
+    fail('AUTHORITY_HANDOFF_PERMIT_CONFLICT', 'Handoff canary replacement requires a durable terminal prior run.');
+  }
+  if (state.currentPublicationDigest !== null) {
+    const publication = (await readPublicationChain(store, permit.runId, state.currentPublicationDigest)).at(-1);
+    if (publication.decision?.ready === true) {
+      fail('AUTHORITY_HANDOFF_PERMIT_CONFLICT', 'A current ready handoff canary cannot be replaced.');
+    }
+  }
 }
 
 async function requireHandoffRunPermit(store, selector, runId) {
@@ -1093,6 +1162,7 @@ async function mutate(store, runId, { coordinator = null, kind = 'mutation', typ
     withDirectoryLock(store.storage, lockPath(store, runId), async () => {
       const state = await recoverUnlocked(store, runId);
       if (coordinator) await validateCoordinator(store, coordinator, runId);
+      else await readAuthoritySelectorUnlocked(store);
       return appendMutationUnlocked(store, state, kind, type, apply, { actor, data });
     })
   ));
@@ -1118,6 +1188,8 @@ export async function openParentRunStore({
   backupMarker = null,
   cutoverRevision = 0,
   verifyStorage = true,
+  authorityFloor = null,
+  legacyAuthorityFence = null,
 } = {}) {
   if (!root) fail('STORE_SCHEMA_INVALID', 'Parent-run store root is required.');
   if (!LOCAL_VOLUME_DRIVERS.has(volumeDriver)) {
@@ -1140,6 +1212,11 @@ export async function openParentRunStore({
   if (writerProtocol !== minimumWriterProtocol) {
     fail('STORE_WRITER_INCOMPATIBLE', 'The initializing writer protocol must satisfy the durable store minimum.');
   }
+  if ((authorityFloor === null) !== (legacyAuthorityFence === null)
+    || (authorityFloor !== null && (typeof authorityFloor.assertAuthorityState !== 'function'
+      || typeof legacyAuthorityFence.read !== 'function'))) {
+    fail('STORE_SCHEMA_INVALID', 'External authority-floor enforcement requires both authority-floor and legacy-fence handles.');
+  }
   if (typeof buildIdentity !== 'string' || !buildIdentity
     || !Array.isArray(prequalifiedRollbackBuilds) || prequalifiedRollbackBuilds.length < 1
     || prequalifiedRollbackBuilds.some((entry) => typeof entry !== 'string' || !entry)) {
@@ -1149,7 +1226,15 @@ export async function openParentRunStore({
   await storage.fs.mkdir(containedPath(storage.root, 'runs'), { recursive: true, mode: 0o2770 });
   const manifestPath = containedPath(storage.root, 'store-manifest.json');
   const schedulerPath = containedPath(storage.root, 'performance-scheduler.json');
-  const store = { root: storage.root, storage, clock, manifest: null, buildIdentity };
+  const store = {
+    root: storage.root,
+    storage,
+    clock,
+    manifest: null,
+    buildIdentity,
+    authorityFloor,
+    legacyAuthorityFence,
+  };
   ARTIFACT_INTEGRITY_CACHES.set(store, new Map());
   await withDirectoryLock(storage, containedPath(storage.root, '.store-initialization.lock'), async () => {
     const existingStore = await pathExists(storage.fs, manifestPath);
@@ -1612,6 +1697,9 @@ async function transitionReleaseAuthorityUnlocked(store, coordinator, input = {}
       || !DIGEST_PATTERN.test(input.authorityTransitionDigest ?? ''))) {
       fail('AUTHORITY_ACTIVATION_NOT_QUALIFIED', 'First activation requires durable cutover and authority-transition digests.');
     }
+    if (wasActivated && !DIGEST_PATTERN.test(input.authorityTransitionDigest ?? '')) {
+      fail('AUTHORITY_TRANSITION_INVALID', 'Post-activation authority changes require a durable transition identity.');
+    }
     const nextStoreGeneration = firstActivation ? store.manifest.storeGeneration + 1 : store.manifest.storeGeneration;
     const next = sealAuthoritySelector({
       ...current,
@@ -1622,7 +1710,9 @@ async function transitionReleaseAuthorityUnlocked(store, coordinator, input = {}
       activatedAt: activating ? (current.activatedAt ?? timestamp(store)) : wasActivated ? current.activatedAt : null,
       activeWriterProtocol: activating || wasActivated ? store.manifest.currentWriterProtocol : null,
       activeBuildIdentity: activating ? input.buildIdentity : wasActivated ? current.activeBuildIdentity : null,
-      authorityTransitionDigest: firstActivation ? input.authorityTransitionDigest : current.authorityTransitionDigest,
+      authorityTransitionDigest: firstActivation || wasActivated
+        ? input.authorityTransitionDigest
+        : current.authorityTransitionDigest,
       activationCutoverDigest: firstActivation ? input.activationCutoverDigest : current.activationCutoverDigest,
       pendingBuildIdentity: null,
       handoffId: null,
@@ -1763,6 +1853,7 @@ export function registerReleaseAuthorityHandoffCanaryRun(store, coordinator, inp
     await ensureDirectory(store.storage.fs, directory);
     const file = handoffCanaryPermitPath(store, input.handoffId, input.mode);
     const permit = sealHandoffCanaryPermit({
+      schemaVersion: 1,
       handoffId: input.handoffId,
       mode: input.mode,
       runId: input.runId,
@@ -1770,20 +1861,46 @@ export function registerReleaseAuthorityHandoffCanaryRun(store, coordinator, inp
       selectorDigest: selector.digest,
       coordinatorEpoch: coordinator?.epoch ?? store.manifest.coordinatorEpoch,
       registeredAt: timestamp(store),
+      revision: 1,
+      previousPermitDigest: null,
+      supersedesRunId: null,
+      supersedeAuthorizationDigest: null,
     });
-    try {
+    if (!await pathExists(store.storage.fs, file)) {
+      if (input.supersedesRunId !== undefined && input.supersedesRunId !== null
+        || input.supersedeAuthorizationDigest !== undefined && input.supersedeAuthorizationDigest !== null) {
+        fail('AUTHORITY_HANDOFF_PERMIT_CONFLICT', 'Initial handoff canary registration cannot claim supersession.');
+      }
+      await persistImmutableHandoffCanaryPermit(store, permit);
       await atomicWriteJson(store.storage, file, permit, { exclusive: true });
-    } catch (error) {
-      if (error?.code !== 'ATOMIC_ALREADY_EXISTS') throw error;
-      const existing = validateHandoffCanaryPermit(await readBoundedJson(store.storage, file, {
-        label: 'release-authority handoff canary permit', maximumBytes: 64 * 1_024,
-      }), selector, input.mode);
-      if (existing.runId !== input.runId) {
+      return clone(permit);
+    }
+    const existing = validateHandoffCanaryPermit(await readBoundedJson(store.storage, file, {
+      label: 'release-authority handoff canary permit', maximumBytes: 64 * 1_024,
+    }), selector, input.mode);
+    if (existing.runId !== input.runId) {
+      if (input.supersedesRunId !== existing.runId
+        || !DIGEST_PATTERN.test(input.supersedeAuthorizationDigest ?? '')
+        || (existing.revision ?? 1) >= MAX_HANDOFF_CANARY_PERMIT_REVISIONS) {
         fail('AUTHORITY_HANDOFF_PERMIT_CONFLICT', `A different ${input.mode} handoff canary is already registered.`);
       }
-      return clone(existing);
+      return withDirectoryLock(store.storage, lockPath(store, existing.runId), async () => {
+        await assertHandoffCanaryPermitReplaceableUnlocked(store, existing);
+        const replacement = sealHandoffCanaryPermit({
+          ...permit,
+          revision: (existing.revision ?? 1) + 1,
+          previousPermitDigest: existing.digest,
+          supersedesRunId: existing.runId,
+          supersedeAuthorizationDigest: input.supersedeAuthorizationDigest,
+        });
+        await persistImmutableHandoffCanaryPermit(store, existing);
+        await persistImmutableHandoffCanaryPermit(store, replacement);
+        await atomicWriteJson(store.storage, file, replacement);
+        return clone(replacement);
+      });
     }
-    return clone(permit);
+    await persistImmutableHandoffCanaryPermit(store, existing);
+    return clone(existing);
   });
 }
 
@@ -1861,6 +1978,7 @@ export async function heartbeatCoordinator(store, coordinator, { leaseMs }) {
     const renewed = sealCoordinatorLease({ ...current, expiresAt: new Date(store.clock() + leaseMs).toISOString() });
     await atomicWriteJson(store.storage, globalCoordinatorPath(store), renewed);
     return clone({
+      buildIdentity: renewed.buildIdentity,
       ownerId: renewed.ownerId, epoch: renewed.epoch, token: renewed.token,
       acquiredAt: renewed.acquiredAt, expiresAt: renewed.expiresAt,
     });

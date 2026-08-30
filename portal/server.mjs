@@ -43,7 +43,13 @@ import {
   openCutoverAdmissionGate,
 } from '../scripts/lib/shared-cutover-orchestrator.mjs';
 import { openPromotionClaimStore } from '../scripts/lib/promotion-claim-store.mjs';
-import { readTrustedStoreMarker, sharedStoreBuildIdentity, sharedStoreGeneration, sharedStoreRollbackBuilds } from '../scripts/lib/shared-store-runtime.mjs';
+import {
+  openSharedRuntimeAuthorityFloor,
+  readTrustedStoreMarker,
+  sharedStoreBuildIdentity,
+  sharedStoreGeneration,
+  sharedStoreRollbackBuilds,
+} from '../scripts/lib/shared-store-runtime.mjs';
 import {
   openSharedLaunchOperationStore,
 } from '../scripts/lib/shared-launch-operation-store.mjs';
@@ -561,6 +567,7 @@ if (process.env.PORTAL_SHARED_CONTROL === '1') {
   const storeMarker = await readTrustedStoreMarker(process.env.AUDIT_SHARED_STORE_MARKER_FILE);
   const backupMarker = await readTrustedStoreMarker(process.env.AUDIT_SHARED_BACKUP_MARKER_FILE, 'shared backup marker');
   const buildIdentity = sharedStoreBuildIdentity();
+  const authorityFloor = await openSharedRuntimeAuthorityFloor(process.env);
   const controlStore = await openParentRunStore({
     root: process.env.AUDIT_SHARED_STORE_ROOT,
     deploymentIdentity: process.env.AUDIT_SHARED_DEPLOYMENT_IDENTITY,
@@ -571,6 +578,8 @@ if (process.env.PORTAL_SHARED_CONTROL === '1') {
     buildIdentity,
     backupMarker,
     prequalifiedRollbackBuilds: sharedStoreRollbackBuilds(process.env, buildIdentity),
+    authorityFloor,
+    legacyAuthorityFence,
   });
   sharedParentRunStore = controlStore;
   const credentialAuthority = await openScopedCredentialAuthority({

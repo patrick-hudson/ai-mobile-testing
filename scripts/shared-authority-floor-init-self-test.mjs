@@ -60,6 +60,11 @@ try {
 
   const reopened = await initializeSharedAuthorityFloorFromEnvironment(fresh.environment);
   assert.equal(reopened.created, false);
+  await unlink(path.join(fresh.floorRoot, 'authority-floor.json'));
+  const recoveredFirstRevision = await initializeSharedAuthorityFloorFromEnvironment(fresh.environment);
+  assert.equal(recoveredFirstRevision.created, true,
+    'initialization must recover when revision one exists but the head write was interrupted');
+  assert.equal((await floor.read()).revision, 1);
   const staleFloorSelectorFile = path.join(fresh.canonicalRoot, 'release-authority-selector.json');
   await writeFile(staleFloorSelectorFile, `${canonicalJson(seal({
     schemaVersion: 1,

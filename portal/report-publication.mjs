@@ -26,6 +26,8 @@ export async function loadSharedReleasePublication(storeRoot, runId, options = {
     expectedStoreGeneration: options.expectedStoreGeneration,
     writerProtocol: options.writerProtocol,
     buildIdentity: options.buildIdentity,
+    authorityFloor: options.authorityFloor ?? null,
+    legacyAuthorityFence: options.legacyAuthorityFence ?? null,
   });
   return readCurrentEnvelope(store, runId);
 }

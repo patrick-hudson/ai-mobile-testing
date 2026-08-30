@@ -9,7 +9,14 @@ export const MAX_ATTEMPT_ARTIFACT_BYTES: number;
 export const MAX_ATTEMPT_EVIDENCE_BYTES: number;
 export const MAX_DISCOVERED_PARENT_RUNS: 2048;
 export const ARTIFACT_READ_LEASE_MS: number;
-export interface ParentRunStore { root: string; clock(): number; manifest: any; buildIdentity: string }
+export interface ParentRunStore {
+  root: string;
+  clock(): number;
+  manifest: any;
+  buildIdentity: string;
+  authorityFloor: null | { assertAuthorityState(value: any): Promise<any> };
+  legacyAuthorityFence: null | { read(): Promise<any> };
+}
 export interface CoordinatorFence { buildIdentity: string; ownerId: string; epoch: number; token: string; acquiredAt: string; expiresAt: string }
 export interface ReleaseAuthorityBinding { storeMarkerDigest: string; storeGeneration: number; activationEpoch: 0 | 1; writerProtocol: string; digest: string }
 export interface ReleaseAuthorityContext { selector: any; binding: ReleaseAuthorityBinding }
@@ -52,6 +59,7 @@ export function beginReleaseAuthorityBuildHandoff(store: ParentRunStore, coordin
 }): Promise<any>;
 export function registerReleaseAuthorityHandoffCanaryRun(store: ParentRunStore, coordinator: CoordinatorFence | null, input: {
   expectedSelectorDigest: string; handoffId: string; mode: 'single-site' | 'comparative'; runId: string;
+  supersedesRunId?: string | null; supersedeAuthorizationDigest?: string | null;
 }): Promise<any>;
 export function completeReleaseAuthorityBuildHandoffWithPublicationFence(store: ParentRunStore, coordinator: CoordinatorFence, input: {
   expectedSelectorDigest: string; handoffId: string; targetBuildIdentity: string;

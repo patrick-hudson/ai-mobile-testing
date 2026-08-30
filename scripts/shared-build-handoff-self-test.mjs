@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -17,6 +17,7 @@ import {
   openParentRunStore,
   publishCurrentEnvelope,
   publishAttemptEvidence,
+  registerReleaseAuthorityHandoffCanaryRun,
   requestStorePerformanceDrain,
   readCurrentEnvelope,
   readParentRun,
@@ -175,6 +176,13 @@ try {
     reportDirectory, handoffId, targetBuildIdentity: targetBuild, operatorReview, clock,
   });
   assert.equal(prepared.status, 'ADMISSION_CLOSED');
+  now += 1_000;
+  const replayedPreparation = await prepareSharedAuthorityBuildHandoff({
+    store: source, coordinator: sourceCoordinator, admissionGate, legacyAuthorityFence, authorityFloor,
+    reportDirectory, handoffId, targetBuildIdentity: targetBuild, operatorReview, clock,
+  });
+  assert.equal(replayedPreparation.digest, prepared.digest,
+    'handoff preparation must resume the persisted intent after admission closes');
   const drainObservation = await captureSharedAuthorityDrainObservation({
     store: source, coordinator: sourceCoordinator, admissionGate, legacyAuthorityFence,
     launchOperationStore, cutoverId: handoffId,
@@ -227,6 +235,7 @@ try {
   const configurationRevision = canonicalDigest({ configuration: 'handoff-target' });
   const policy = createCutoverAdmissionPolicy({ admissionGate, store: target });
   const evidenceByRun = new Map();
+  let completedSingleSiteRunId = 'handoff-health-single';
   for (const [mode, runId] of [['single-site', 'handoff-health-single'], ['comparative', 'handoff-health-comparative']]) {
     now += 10;
     const intent = {
@@ -245,29 +254,34 @@ try {
     };
     const requestId = `handoff-${mode}-request-0001`;
     const actor = { id: 'operator:handoff-canary', kind: 'human' };
+    const launchRun = (launchRequestId, launchRunId, operationId) => policy.withLaunchAdmission(
+      launchRequestId,
+      intent,
+      async () => {
+        await createParentRun(target, {
+          runId: launchRunId,
+          subjectCoreDigest: digest,
+          finalSubjectDigest: digest,
+          executionManifestDigest: digest,
+          runnerRevision,
+          compilationState: 'sealed',
+          workItems: [{ id: `work-${mode}`, maxAttempts: 1 }],
+        });
+        return {
+          runId: launchRunId,
+          operationId,
+          actor,
+          compiledPlan: { createParentRunInput: { runnerRevision, subjectCore: { revisions: { configuration: configurationRevision } } } },
+        };
+      },
+    );
     const launchPermit = await authorizeSharedBuildHandoffCanaryLaunch({
       store: target, admissionGate, reportDirectory, handoffId, mode, requestId, actor, intent,
       runId,
       probeTargetIdentity: async () => targetIdentity, clock,
     });
     assert.equal(launchPermit.activeBuildIdentity, targetBuild);
-    await policy.withLaunchAdmission(requestId, intent, async () => {
-      await createParentRun(target, {
-        runId,
-        subjectCoreDigest: digest,
-        finalSubjectDigest: digest,
-        executionManifestDigest: digest,
-        runnerRevision,
-        compilationState: 'sealed',
-        workItems: [{ id: `work-${mode}`, maxAttempts: 1 }],
-      });
-      return {
-        runId,
-        operationId: mode === 'single-site' ? '1'.repeat(64) : '2'.repeat(64),
-        actor,
-        compiledPlan: { createParentRunInput: { runnerRevision, subjectCore: { revisions: { configuration: configurationRevision } } } },
-      };
-    });
+    await launchRun(requestId, runId, mode === 'single-site' ? '1'.repeat(64) : '2'.repeat(64));
     const unpermittedRunId = `${runId}-unpermitted`;
     await expectCode('AUTHORITY_HANDOFF_CANARY_REQUIRED', () => createParentRun(target, {
       runId: unpermittedRunId,
@@ -278,36 +292,112 @@ try {
       compilationState: 'sealed',
       workItems: [{ id: `work-unpermitted-${mode}`, maxAttempts: 1 }],
     }));
-    const lease = await claimWorkItem(target, runId, targetCoordinator, {
+    let acceptedRunId = runId;
+    if (mode === 'single-site') {
+      const replacementRunId = `${runId}-replacement`;
+      const replacementRequestId = `handoff-${mode}-request-0002`;
+      const replacementOptions = {
+        store: target,
+        admissionGate,
+        reportDirectory,
+        handoffId,
+        mode,
+        requestId: replacementRequestId,
+        actor,
+        intent,
+        runId: replacementRunId,
+        supersedeReason: 'The first canary reached a durable terminal non-ready result.',
+        probeTargetIdentity: async () => targetIdentity,
+        clock,
+      };
+      await expectCode('CUTOVER_CANARY_REPLACEMENT_BLOCKED', () => (
+        authorizeSharedBuildHandoffCanaryLaunch(replacementOptions)
+      ));
+      await expectCode('AUTHORITY_HANDOFF_PERMIT_CONFLICT', () => (
+        registerReleaseAuthorityHandoffCanaryRun(target, targetCoordinator, {
+          expectedSelectorDigest: pending.digest,
+          handoffId,
+          mode,
+          runId: replacementRunId,
+          supersedesRunId: runId,
+          supersedeAuthorizationDigest: canonicalDigest({ unsafe: 'nonterminal-replacement' }),
+        })
+      ));
+      const failedLease = await claimWorkItem(target, runId, targetCoordinator, {
+        workerId: `worker-${mode}-failed`, workItemId: `work-${mode}`, capabilities: ['browser:any'],
+        resourceClasses: ['ordinary'], leaseMs: 1_000,
+      });
+      const failedInbox = await publishAttemptEvidence(target, runId, failedLease, {
+        outcome: 'cancelled', reason: 'Synthetic terminal non-ready handoff canary.', artifacts: [],
+      });
+      await adoptAttemptEvidence(target, runId, targetCoordinator, failedInbox);
+      assert.equal((await readParentRun(target, runId)).workItems[`work-${mode}`].state, 'cancelled');
+
+      now += 10;
+      const replacementPermit = await authorizeSharedBuildHandoffCanaryLaunch(replacementOptions);
+      assert.equal(replacementPermit.revision, 2);
+      assert.equal(replacementPermit.supersedesRunId, runId);
+      await launchRun(replacementRequestId, replacementRunId, '3'.repeat(64));
+      const storedPermit = JSON.parse(await readFile(
+        path.join(root, 'authority-handoff-permits', `${handoffId}-${mode}.json`),
+        'utf8',
+      ));
+      assert.equal(storedPermit.runId, replacementRunId);
+      assert.equal(storedPermit.revision, 2);
+      assert.equal(storedPermit.supersedesRunId, runId);
+      assert.equal(storedPermit.supersedeAuthorizationDigest, replacementPermit.digest);
+      assert.equal((await readdir(path.join(root, 'authority-handoff-permits', 'history'))).length, 2,
+        'supersession must retain both immutable store permit revisions');
+      acceptedRunId = replacementRunId;
+      completedSingleSiteRunId = replacementRunId;
+    }
+    const lease = await claimWorkItem(target, acceptedRunId, targetCoordinator, {
       workerId: `worker-${mode}`, workItemId: `work-${mode}`, capabilities: ['browser:any'],
       resourceClasses: ['ordinary'], leaseMs: 1_000,
     });
-    const inbox = await publishAttemptEvidence(target, runId, lease, {
+    const inbox = await publishAttemptEvidence(target, acceptedRunId, lease, {
       outcome: 'completed_pass', reason: null, artifacts: [],
     });
-    await adoptAttemptEvidence(target, runId, targetCoordinator, inbox);
-    const state = await readParentRun(target, runId);
+    await adoptAttemptEvidence(target, acceptedRunId, targetCoordinator, inbox);
+    const state = await readParentRun(target, acceptedRunId);
     assert.equal(state.workItems[`work-${mode}`].state, 'completed_pass');
-    const publication = readyEnvelope(runId, mode, state.ledgerSequences.mutation);
-    await publishCurrentEnvelope(target, runId, targetCoordinator, publication);
-    evidenceByRun.set(runId, {
-      runId, mode, createdAt: state.createdAt,
+    const publication = readyEnvelope(acceptedRunId, mode, state.ledgerSequences.mutation);
+    await publishCurrentEnvelope(target, acceptedRunId, targetCoordinator, publication);
+    evidenceByRun.set(acceptedRunId, {
+      runId: acceptedRunId, mode, createdAt: state.createdAt,
       subjectCoreDigest: state.subjectCoreDigest, finalSubjectDigest: state.finalSubjectDigest,
       publicationDigest: publication.digest, decisionCode: 'RELEASE_READY', decisionRevision: 1,
       grantedAuthority: 'FULL', deploymentIdentity: targetIdentity, trustedReprobeIdentity: targetIdentity,
       runnerRevision, configurationRevision, activeBuildIdentity: targetBuild,
     });
     if (mode === 'single-site') {
+      await expectCode('CUTOVER_CANARY_REPLACEMENT_BLOCKED', () => authorizeSharedBuildHandoffCanaryLaunch({
+        store: target, admissionGate, reportDirectory, handoffId, mode,
+        requestId: `handoff-${mode}-request-0003`, actor, intent,
+        runId: `${acceptedRunId}-unsafe-ready-replacement`,
+        supersedeReason: 'Ready publications must never be superseded.',
+        probeTargetIdentity: async () => targetIdentity, clock,
+      }));
+      await expectCode('AUTHORITY_HANDOFF_PERMIT_CONFLICT', () => (
+        registerReleaseAuthorityHandoffCanaryRun(target, targetCoordinator, {
+          expectedSelectorDigest: pending.digest,
+          handoffId,
+          mode,
+          runId: `${acceptedRunId}-unsafe-ready-replacement`,
+          supersedesRunId: acceptedRunId,
+          supersedeAuthorizationDigest: canonicalDigest({ unsafe: 'ready-replacement' }),
+        })
+      ));
       await expectCode('CUTOVER_CANARY_NOT_READY', () => recordSharedBuildHandoffCanary({
-        store: target, admissionGate, reportDirectory, handoffId, mode, runId,
-        readCanaryEvidence: async () => ({ ...evidenceByRun.get(runId), decisionCode: 'NOT_READY_TEST_FAILURE' }),
+        store: target, admissionGate, reportDirectory, handoffId, mode, runId: acceptedRunId,
+        readCanaryEvidence: async () => ({ ...evidenceByRun.get(acceptedRunId), decisionCode: 'NOT_READY_TEST_FAILURE' }),
         probeTargetIdentity: async () => targetIdentity, clock,
       }));
       assert.equal((await admissionGate.read()).state, 'CLOSED');
     }
     await recordSharedBuildHandoffCanary({
-      store: target, admissionGate, reportDirectory, handoffId, mode, runId,
-      readCanaryEvidence: async () => evidenceByRun.get(runId),
+      store: target, admissionGate, reportDirectory, handoffId, mode, runId: acceptedRunId,
+      readCanaryEvidence: async () => evidenceByRun.get(acceptedRunId),
       probeTargetIdentity: async () => targetIdentity, clock,
     });
   }
@@ -318,7 +408,7 @@ try {
   await expectCode('CUTOVER_CANARY_STALE', () => completeSharedAuthorityBuildHandoff({
     store: target, coordinator: targetCoordinator, admissionGate, legacyAuthorityFence, authorityFloor,
     reportDirectory, handoffId,
-    readCanaryEvidence: async (_store, runId) => (runId === 'handoff-health-single'
+    readCanaryEvidence: async (_store, runId) => (runId === completedSingleSiteRunId
       ? { ...evidenceByRun.get(runId), decisionRevision: 2 }
       : evidenceByRun.get(runId)),
     probeTargetIdentity: async () => targetIdentity, clock,

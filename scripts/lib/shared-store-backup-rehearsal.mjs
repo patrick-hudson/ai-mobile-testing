@@ -25,12 +25,15 @@ const MANIFEST_KEYS = Object.freeze([
   'minimumWriterProtocol', 'coordinatorEpoch', 'activationEpoch', 'activationRevision',
   'createdAt', 'cutoverRevision', 'backupMarker', 'prequalifiedRollbackBuilds', 'digest',
 ]);
-const SELECTOR_KEYS = Object.freeze([
+const SELECTOR_BASE_KEYS = Object.freeze([
   'schemaVersion', 'kind', 'storeMarkerDigest', 'storeGeneration', 'phase',
   'activationEpoch', 'activationRevision', 'activatedAt', 'activeWriterProtocol',
   'minimumWriterProtocol', 'activeBuildIdentity', 'authorityTransitionDigest',
   'activationCutoverDigest', 'backupMarker',
   'prequalifiedRollbackBuilds', 'revision', 'previousDigest', 'updatedAt', 'digest',
+]);
+const SELECTOR_HANDOFF_KEYS = Object.freeze([
+  ...SELECTOR_BASE_KEYS.slice(0, -1), 'pendingBuildIdentity', 'handoffId', 'digest',
 ]);
 const EXPECTED_STORE_KEYS = Object.freeze([
   'deploymentIdentity', 'volumeIdentity', 'storeMarkerDigest', 'storeGeneration',
@@ -175,8 +178,20 @@ function selectorBody(value) {
 }
 
 function validateSelector(value, manifest) {
-  exactKeys(value, SELECTOR_KEYS, 'Release-authority selector', 'BACKUP_STORE_INVALID');
+  const hasPendingBuildIdentity = Object.hasOwn(value ?? {}, 'pendingBuildIdentity');
+  const hasHandoffId = Object.hasOwn(value ?? {}, 'handoffId');
+  if (hasPendingBuildIdentity !== hasHandoffId) {
+    fail('BACKUP_STORE_INVALID', 'Release-authority selector has an invalid schema.');
+  }
+  exactKeys(
+    value,
+    hasPendingBuildIdentity ? SELECTOR_HANDOFF_KEYS : SELECTOR_BASE_KEYS,
+    'Release-authority selector',
+    'BACKUP_STORE_INVALID',
+  );
   const body = selectorBody(value);
+  const pendingBuildIdentity = hasPendingBuildIdentity ? value.pendingBuildIdentity : null;
+  const handoffId = hasHandoffId ? value.handoffId : null;
   if (value.schemaVersion !== 1 || value.kind !== 'release-authority-selector'
     || value.storeMarkerDigest !== manifest.storeMarkerDigest
     || value.storeGeneration !== manifest.storeGeneration
@@ -200,6 +215,15 @@ function validateSelector(value, manifest) {
       || value.activatedAt !== null || value.activeWriterProtocol !== null || value.activeBuildIdentity !== null
       || value.authorityTransitionDigest !== null || value.activationCutoverDigest !== null))) {
     fail('BACKUP_BINDING_MISMATCH', 'Release-authority selector activation fields are inconsistent.');
+  }
+  if ((pendingBuildIdentity === null) !== (handoffId === null)
+    || (pendingBuildIdentity !== null && (value.phase !== 'PROMOTION_DISABLED'
+      || typeof pendingBuildIdentity !== 'string' || pendingBuildIdentity.length === 0
+      || pendingBuildIdentity === value.activeBuildIdentity
+      || !value.prequalifiedRollbackBuilds.includes(pendingBuildIdentity)
+      || typeof handoffId !== 'string' || !SAFE_ID.test(handoffId)))
+    || (value.phase === 'ACTIVE' && (pendingBuildIdentity !== null || handoffId !== null))) {
+    fail('BACKUP_BINDING_MISMATCH', 'Release-authority selector handoff fields are inconsistent.');
   }
   if (value.activatedAt !== null) canonicalTimestamp(value.activatedAt, 'release-authority selector activatedAt', 'BACKUP_STORE_INVALID');
   return value;

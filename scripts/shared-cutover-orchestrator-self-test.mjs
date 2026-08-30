@@ -28,14 +28,17 @@ import {
   publishAttemptEvidence,
   readParentRun,
   readReleaseAuthoritySelector,
+  transitionReleaseAuthority,
 } from './lib/parent-run-store.mjs';
 import {
   activateSharedAuthorityCutover,
   authorizeSharedCutoverCanaryLaunch,
+  beginSharedAuthorityBuildHandoff,
   captureSharedAuthorityDrainObservation,
   createCutoverAdmissionPolicy,
   initializeCutoverAdmissionGate,
   prepareSharedAuthorityCutover,
+  prepareSharedAuthorityBuildHandoff,
   recordSharedCutoverCanary,
   reopenSharedAdmissionAfterCanaries,
   rollbackSharedAuthorityBeforeActivation,
@@ -45,7 +48,11 @@ import {
 import { openSharedLaunchOperationStore } from './lib/shared-launch-operation-store.mjs';
 import { rehearseSharedStoreBackup } from './lib/shared-store-backup-rehearsal.mjs';
 import { initializeLegacyAuthorityFence } from './lib/legacy-authority-fence.mjs';
-import { runSharedAuthorityCutoverCli } from './run-shared-authority-cutover.mjs';
+import { initializeSharedAuthorityFloor } from './lib/shared-authority-floor.mjs';
+import {
+  beginSharedAuthorityBuildHandoffFromCli,
+  runSharedAuthorityCutoverCli,
+} from './run-shared-authority-cutover.mjs';
 
 const marker = 'cd'.repeat(32);
 const build = 'build:cutover-current';
@@ -253,6 +260,23 @@ async function fixture(name) {
   const legacyAuthorityFence = await initializeLegacyAuthorityFence({
     root: path.join(directory, 'legacy-authority'), verifyStorage: false, clock,
   });
+  const authorityFloor = await initializeSharedAuthorityFloor({
+    root: path.join(directory, 'authority-floor'),
+    protectedRoots: [store.root],
+    verifyStorage: false,
+    clock,
+    initial: {
+      storeMarkerDigest: store.manifest.storeMarkerDigest,
+      minimumStoreGeneration: store.manifest.storeGeneration,
+      minimumSelectorRevision: 1,
+      activeBuildIdentity: null,
+      authorityTransitionDigest: null,
+      activationEpoch: 0,
+      legacyPermanentlyRetired: false,
+      activationRevision: null,
+      activationCutoverDigest: null,
+    },
+  });
   const legacyComparativeRoot = path.join(directory, 'legacy-comparative');
   const legacySingleSiteQueueRoot = path.join(directory, 'legacy-single-site');
   await Promise.all([
@@ -266,7 +290,7 @@ async function fixture(name) {
     ownerId: `coordinator-${name}`, leaseMs: 60_000,
   });
   return {
-    directory, store, admissionGate, legacyAuthorityFence, coordinator, launchOperationStore,
+    directory, store, admissionGate, legacyAuthorityFence, authorityFloor, coordinator, launchOperationStore,
     legacyComparativeRoot, legacySingleSiteQueueRoot,
   };
 }
@@ -311,6 +335,104 @@ try {
   await expectCode('LAUNCH_OPERATION_STORE_UNAVAILABLE', () => openSharedLaunchOperationStore({
     root: path.join(root, 'missing-launch-operations'), requireExisting: true, clock,
   }));
+  {
+    const {
+      directory, store, admissionGate, coordinator, launchOperationStore, legacyAuthorityFence,
+      legacyComparativeRoot, legacySingleSiteQueueRoot,
+    } = await fixture('begin-handoff-cli-resume');
+    const shadow = await readReleaseAuthoritySelector(store);
+    const draining = await transitionReleaseAuthority(store, coordinator, {
+      expectedSelectorDigest: shadow.digest,
+      phase: 'DRAINING',
+      buildIdentity: build,
+    });
+    const active = await transitionReleaseAuthority(store, coordinator, {
+      expectedSelectorDigest: draining.digest,
+      phase: 'ACTIVE',
+      activationRevision: 73,
+      buildIdentity: build,
+      activationCutoverDigest: digest('c'),
+      authorityTransitionDigest: digest('d'),
+    });
+    let legacy = await legacyAuthorityFence.read();
+    legacy = await legacyAuthorityFence.close(legacy.digest, 'initial-cli-resume-cutover');
+    legacy = await legacyAuthorityFence.freeze(legacy.digest, 'initial-cli-resume-cutover');
+    await legacyAuthorityFence.activate(legacy.digest, 'initial-cli-resume-cutover', 1);
+    const authorityFloor = await initializeSharedAuthorityFloor({
+      root: path.join(directory, 'external-authority-floor'),
+      protectedRoots: [store.root],
+      verifyStorage: false,
+      clock,
+      initial: {
+        storeMarkerDigest: active.storeMarkerDigest,
+        minimumStoreGeneration: active.storeGeneration,
+        minimumSelectorRevision: active.revision,
+        activeBuildIdentity: active.activeBuildIdentity,
+        authorityTransitionDigest: active.authorityTransitionDigest,
+        activationEpoch: 1,
+        legacyPermanentlyRetired: true,
+        activationRevision: active.activationRevision,
+        activationCutoverDigest: active.activationCutoverDigest,
+      },
+    });
+    const handoffId = 'cli-resume-handoff-0001';
+    const reportDirectory = path.join(directory, 'reports');
+    await prepareSharedAuthorityBuildHandoff({
+      store,
+      coordinator,
+      admissionGate,
+      legacyAuthorityFence,
+      authorityFloor,
+      reportDirectory,
+      handoffId,
+      targetBuildIdentity: rollbackBuild,
+      operatorReview: review(),
+      clock,
+    });
+    const drainObservation = await captureSharedAuthorityDrainObservation({
+      store,
+      coordinator,
+      admissionGate,
+      legacyAuthorityFence,
+      launchOperationStore,
+      cutoverId: handoffId,
+      legacyComparativeRoot,
+      legacySingleSiteQueueRoot,
+      clock,
+    });
+    await assert.rejects(beginSharedAuthorityBuildHandoff({
+      store,
+      coordinator,
+      admissionGate,
+      legacyAuthorityFence,
+      reportDirectory,
+      handoffId,
+      drainObservation,
+      clock,
+      hooks: { afterPendingSelector: () => { throw new Error('synthetic crash after pending selector'); } },
+    }), /synthetic crash/u);
+    const pending = await readReleaseAuthoritySelector(store);
+    assert.equal(pending.phase, 'PROMOTION_DISABLED');
+    assert.equal(pending.handoffId, handoffId);
+    assert.equal(pending.pendingBuildIdentity, rollbackBuild);
+
+    const resumed = await beginSharedAuthorityBuildHandoffFromCli({
+      store,
+      coordinator,
+      admissionGate,
+      legacyAuthorityFence,
+      reportDirectory,
+      handoffId,
+      targetBuildIdentity: rollbackBuild,
+      launchOperationRoot: path.join(store.root, 'launch-operations'),
+      legacyComparativeRoot,
+      legacySingleSiteQueueRoot,
+      clock,
+    });
+    assert.equal(resumed.status, 'PROMOTION_DISABLED_PENDING_TARGET_HEALTH');
+    assert.equal(resumed.selectorPending.digest, pending.digest,
+      'the CLI begin-handoff rerun must resume without recapturing an ACTIVE-only drain observation');
+  }
   {
     const { directory, store } = await fixture('backup-cli-action');
     const trustDirectory = path.join(directory, 'trust');
@@ -369,14 +491,14 @@ try {
   }
   {
     const {
-      directory, store, admissionGate, coordinator, launchOperationStore,
+      directory, store, admissionGate, authorityFloor, coordinator, launchOperationStore,
       legacyAuthorityFence, legacyComparativeRoot, legacySingleSiteQueueRoot,
     } = await fixture('happy');
     const input = await request('cutover-happy', { directory, store });
     now += 100;
     input.operatorReview.reviewedAt = new Date(now).toISOString();
     const prepared = await prepareSharedAuthorityCutover({
-      store, coordinator, admissionGate, legacyAuthorityFence,
+      store, coordinator, admissionGate, legacyAuthorityFence, authorityFloor,
       reportDirectory: path.join(directory, 'reports'), input,
     });
     assert.equal(prepared.status, 'DRAINING');
@@ -396,7 +518,7 @@ try {
       'drain observation must not initialize indexes or otherwise mutate the legacy queue',
     );
     const report = await activateSharedAuthorityCutover({
-      store, coordinator, admissionGate, legacyAuthorityFence,
+      store, coordinator, admissionGate, legacyAuthorityFence, authorityFloor,
       reportDirectory: path.join(directory, 'reports'), input,
       drainObservation,
     });
@@ -405,6 +527,11 @@ try {
     assert.equal(report.selectorAfter.activationEpoch, 1);
     assert.equal(report.selectorAfter.activationRevision, 73);
     assert.equal((await legacyAuthorityFence.read()).state, 'ACTIVATED');
+    assert.equal(report.authorityFloorAfter.activationEpoch, 1);
+    assert.equal(report.authorityFloorAfter.minimumStoreGeneration, report.storeAfter.storeGeneration);
+    assert.equal(report.authorityFloorAfter.minimumSelectorRevision, report.selectorAfter.revision);
+    assert.equal(report.authorityFloorAfter.activeBuildIdentity, build);
+    assert.equal((await authorityFloor.read()).digest, report.authorityFloorAfter.digest);
     assert.equal(report.storeAfter.storeGeneration, 5);
     assert.equal(report.preconditions.unexplainedAuthorityDrift, 0);
     assert.equal(report.preconditions.activeLegacyAuthoritativeRuns, 0);
@@ -582,24 +709,37 @@ try {
     assert.equal((await admissionGate.read()).state, 'OPEN');
 
     const repeated = await activateSharedAuthorityCutover({
-      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
+      store, coordinator, admissionGate, authorityFloor, reportDirectory: path.join(directory, 'reports'), input,
       drainObservation: observation(input.cutoverId, prepared.admissionGate, coordinator),
     });
     assert.equal(repeated.digest, report.digest, 'activation replay must return the immutable report');
     assert.equal((await readReleaseAuthoritySelector(store)).revision, report.selectorAfter.revision,
       'activation replay must not advance the selector');
 
+    await assert.rejects(setSharedPromotionAvailability({
+      store, coordinator, authorityFloor, phase: 'PROMOTION_DISABLED', buildIdentity: build,
+      reportDirectory: path.join(directory, 'reports'), cutoverId: input.cutoverId,
+      hooks: { afterSelectorTransition: () => { throw new Error('synthetic crash after promotion selector transition'); } },
+    }), /synthetic crash after promotion selector transition/u);
+    const selectorAfterPromotionCrash = await readReleaseAuthoritySelector(store);
+    assert.equal(selectorAfterPromotionCrash.phase, 'PROMOTION_DISABLED');
+    assert.notEqual((await authorityFloor.read()).authorityTransitionDigest,
+      selectorAfterPromotionCrash.authorityTransitionDigest,
+      'a crash between selector and floor must fail closed until replay');
     const disabled = await setSharedPromotionAvailability({
-      store, coordinator, phase: 'PROMOTION_DISABLED', buildIdentity: build,
+      store, coordinator, authorityFloor, phase: 'PROMOTION_DISABLED', buildIdentity: build,
+      reportDirectory: path.join(directory, 'reports'), cutoverId: input.cutoverId,
     });
     assert.equal(disabled.phase, 'PROMOTION_DISABLED');
     assert.equal(disabled.activationEpoch, 1);
+    assert.equal((await authorityFloor.read()).authorityTransitionDigest, disabled.authorityTransitionDigest,
+      'promotion transition replay must advance the external floor to the exact selector successor');
     await expectCode('AUTHORITY_TRANSITION_INVALID', () => rollbackSharedAuthorityBeforeActivation({
       store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'),
       cutoverId: input.cutoverId, buildIdentity: build, operatorReview: review(),
     }));
     await expectCode('CUTOVER_PROMOTION_HEALTH_REQUIRED', () => setSharedPromotionAvailability({
-      store, coordinator, phase: 'ACTIVE', buildIdentity: build,
+      store, coordinator, authorityFloor, phase: 'ACTIVE', buildIdentity: build,
       reportDirectory: path.join(directory, 'reports'), cutoverId: input.cutoverId,
       readCanaryEvidence, clock,
     }));
@@ -607,20 +747,20 @@ try {
     evidenceByRun.set('health-single-site', canaryEvidence({ mode: 'single-site', runId: 'health-single-site' }));
     evidenceByRun.set('health-comparative', canaryEvidence({ mode: 'comparative', runId: 'health-comparative' }));
     await expectCode('CUTOVER_INPUT_INVALID', () => setSharedPromotionAvailability({
-      store, coordinator, phase: 'ACTIVE', buildIdentity: build,
+      store, coordinator, authorityFloor, phase: 'ACTIVE', buildIdentity: build,
       reportDirectory: path.join(directory, 'reports'), cutoverId: input.cutoverId,
       healthCanaries: { 'single-site': 'health-single-site' }, readCanaryEvidence, clock,
     }));
     evidenceByRun.get('health-comparative').createdAt = new Date(Date.parse(disabled.updatedAt) - 1).toISOString();
     await expectCode('CUTOVER_CANARY_STALE', () => setSharedPromotionAvailability({
-      store, coordinator, phase: 'ACTIVE', buildIdentity: build,
+      store, coordinator, authorityFloor, phase: 'ACTIVE', buildIdentity: build,
       reportDirectory: path.join(directory, 'reports'), cutoverId: input.cutoverId,
       healthCanaries: { 'single-site': 'health-single-site', comparative: 'health-comparative' },
       readCanaryEvidence, clock,
     }));
     evidenceByRun.get('health-comparative').createdAt = new Date(now).toISOString();
     const reenabled = await setSharedPromotionAvailability({
-      store, coordinator, phase: 'ACTIVE', buildIdentity: build,
+      store, coordinator, authorityFloor, phase: 'ACTIVE', buildIdentity: build,
       reportDirectory: path.join(directory, 'reports'), cutoverId: input.cutoverId,
       healthCanaries: { 'single-site': 'health-single-site', comparative: 'health-comparative' },
       readCanaryEvidence, clock,
@@ -642,7 +782,7 @@ try {
 
   {
     const {
-      directory, store, admissionGate, coordinator, launchOperationStore,
+      directory, store, admissionGate, authorityFloor, coordinator, launchOperationStore,
       legacyComparativeRoot, legacySingleSiteQueueRoot,
     } = await fixture('production-observer-operation');
     const input = await request('cutover-production-observer-operation', { directory, store });
@@ -655,7 +795,7 @@ try {
       actor: { id: 'operator-cutover', kind: 'human' }, body: { reason: 'drain proof' },
     });
     await prepareSharedAuthorityCutover({
-      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
+      store, coordinator, admissionGate, authorityFloor, reportDirectory: path.join(directory, 'reports'), input,
     });
     const observed = await captureSharedAuthorityDrainObservation({
       store, coordinator, admissionGate, launchOperationStore, cutoverId: input.cutoverId,
@@ -668,7 +808,7 @@ try {
 
   {
     const {
-      directory, store, admissionGate, coordinator, launchOperationStore,
+      directory, store, admissionGate, authorityFloor, coordinator, launchOperationStore,
       legacyComparativeRoot, legacySingleSiteQueueRoot,
     } = await fixture('claim-fenced-after-observation');
     const input = await request('cutover-claim-fenced-after-observation', { directory, store });
@@ -677,7 +817,7 @@ try {
       workItems: [{ id: 'work-cutover-queued', maxAttempts: 1, capability: 'browser:chromium', targetId: 'candidate' }],
     });
     await prepareSharedAuthorityCutover({
-      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
+      store, coordinator, admissionGate, authorityFloor, reportDirectory: path.join(directory, 'reports'), input,
     });
     const observed = await captureSharedAuthorityDrainObservation({
       store, coordinator, admissionGate, launchOperationStore, cutoverId: input.cutoverId,
@@ -693,7 +833,7 @@ try {
 
   {
     const {
-      directory, store, admissionGate, coordinator, launchOperationStore,
+      directory, store, admissionGate, authorityFloor, coordinator, launchOperationStore,
       legacyComparativeRoot, legacySingleSiteQueueRoot,
     } = await fixture('production-observer-applied-operation');
     const input = await request('cutover-production-observer-applied-operation', { directory, store });
@@ -721,7 +861,7 @@ try {
     });
     assert.equal(applied.state, 'applied');
     await prepareSharedAuthorityCutover({
-      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
+      store, coordinator, admissionGate, authorityFloor, reportDirectory: path.join(directory, 'reports'), input,
     });
     const observed = await captureSharedAuthorityDrainObservation({
       store, coordinator, admissionGate, launchOperationStore, cutoverId: input.cutoverId,
@@ -734,7 +874,7 @@ try {
 
   {
     const {
-      directory, store, admissionGate, coordinator, launchOperationStore,
+      directory, store, admissionGate, authorityFloor, coordinator, launchOperationStore,
       legacyComparativeRoot, legacySingleSiteQueueRoot,
     } = await fixture('production-observer-running-diagnostic');
     const input = await request('cutover-production-observer-running-diagnostic', { directory, store });
@@ -769,7 +909,7 @@ try {
     });
     assert.equal(diagnosticLease.diagnosticExecutionId, accepted.operationId);
     await prepareSharedAuthorityCutover({
-      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
+      store, coordinator, admissionGate, authorityFloor, reportDirectory: path.join(directory, 'reports'), input,
     });
     const observed = await captureSharedAuthorityDrainObservation({
       store, coordinator, admissionGate, launchOperationStore, cutoverId: input.cutoverId,
@@ -779,19 +919,19 @@ try {
       `shared-preactivation:${runId}:${workItemId}:diagnostic:${accepted.operationId}:${diagnosticLease.token}`,
     ], 'running diagnostic execution must block activation as an unfenced preactivation lease');
     await expectCode('CUTOVER_LEASES_UNFENCED', () => activateSharedAuthorityCutover({
-      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
+      store, coordinator, admissionGate, authorityFloor, reportDirectory: path.join(directory, 'reports'), input,
       drainObservation: observed,
     }));
   }
 
   {
     const {
-      directory, store, admissionGate, coordinator, launchOperationStore,
+      directory, store, admissionGate, authorityFloor, coordinator, launchOperationStore,
       legacyComparativeRoot, legacySingleSiteQueueRoot,
     } = await fixture('production-observer-active-legacy');
     const input = await request('cutover-production-observer-active-legacy', { directory, store });
     await prepareSharedAuthorityCutover({
-      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
+      store, coordinator, admissionGate, authorityFloor, reportDirectory: path.join(directory, 'reports'), input,
     });
     const activeDirectory = path.join(legacyComparativeRoot, 'active-legacy-run');
     await mkdir(path.join(activeDirectory, 'logs'), { recursive: true });
@@ -802,19 +942,19 @@ try {
     });
     assert.deepEqual(observed.activeLegacyAuthoritativeRunIds, ['comparative:active-legacy-run']);
     await expectCode('CUTOVER_LEGACY_RUNS_ACTIVE', () => activateSharedAuthorityCutover({
-      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
+      store, coordinator, admissionGate, authorityFloor, reportDirectory: path.join(directory, 'reports'), input,
       drainObservation: observed,
     }));
   }
 
   {
     const {
-      directory, store, admissionGate, coordinator, launchOperationStore,
+      directory, store, admissionGate, authorityFloor, coordinator, launchOperationStore,
       legacyComparativeRoot, legacySingleSiteQueueRoot,
     } = await fixture('production-observer-partial-legacy');
     const input = await request('cutover-production-observer-partial-legacy', { directory, store });
     await prepareSharedAuthorityCutover({
-      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
+      store, coordinator, admissionGate, authorityFloor, reportDirectory: path.join(directory, 'reports'), input,
     });
     const partialDirectory = path.join(legacyComparativeRoot, 'partial-legacy-run');
     await mkdir(partialDirectory, { recursive: true });
@@ -843,28 +983,58 @@ try {
   }
 
   {
-    const { directory, store, admissionGate, coordinator } = await fixture('crash');
+    const { directory, store, admissionGate, authorityFloor, coordinator } = await fixture('crash');
     const input = await request('cutover-crash', { directory, store });
     await assert.rejects(prepareSharedAuthorityCutover({
-      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
+      store, coordinator, admissionGate, authorityFloor, reportDirectory: path.join(directory, 'reports'), input,
       hooks: { afterAdmissionClosed: () => { throw new Error('synthetic crash after admission close'); } },
     }), /synthetic crash/u);
     assert.equal((await admissionGate.read()).state, 'CLOSED');
     const resumed = await prepareSharedAuthorityCutover({
-      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
+      store, coordinator, admissionGate, authorityFloor, reportDirectory: path.join(directory, 'reports'), input,
     });
     assert.equal(resumed.status, 'DRAINING');
     await assert.rejects(activateSharedAuthorityCutover({
-      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
+      store, coordinator, admissionGate, authorityFloor, reportDirectory: path.join(directory, 'reports'), input,
       drainObservation: observation(input.cutoverId, resumed.admissionGate, coordinator),
       hooks: { afterAuthorityActivated: () => { throw new Error('synthetic crash after authority activation'); } },
     }), /synthetic crash/u);
     assert.equal((await readReleaseAuthoritySelector(store)).phase, 'ACTIVE');
+    assert.equal((await authorityFloor.read()).activationEpoch, 0,
+      'a crash after selector activation but before permanent retirement must leave the old external floor');
     const recovered = await activateSharedAuthorityCutover({
-      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
+      store, coordinator, admissionGate, authorityFloor, reportDirectory: path.join(directory, 'reports'), input,
       drainObservation: observation(input.cutoverId, resumed.admissionGate, coordinator),
     });
     assert.equal(recovered.status, 'ACTIVE_ADMISSION_CLOSED');
+    assert.equal((await authorityFloor.read()).activationEpoch, 1,
+      'activation replay must advance the external authority floor before completing');
+  }
+
+  {
+    const {
+      directory, store, admissionGate, legacyAuthorityFence, authorityFloor, coordinator,
+    } = await fixture('authority-floor-crash');
+    const input = await request('cutover-authority-floor-crash', { directory, store });
+    const prepared = await prepareSharedAuthorityCutover({
+      store, coordinator, admissionGate, legacyAuthorityFence,
+      reportDirectory: path.join(directory, 'reports'), input,
+    });
+    await assert.rejects(activateSharedAuthorityCutover({
+      store, coordinator, admissionGate, legacyAuthorityFence, authorityFloor,
+      reportDirectory: path.join(directory, 'reports'), input,
+      drainObservation: observation(input.cutoverId, prepared.admissionGate, coordinator),
+      hooks: { afterAuthorityFloorAdvanced: () => { throw new Error('synthetic crash after authority floor advance'); } },
+    }), /synthetic crash after authority floor advance/u);
+    const advancedFloor = await authorityFloor.read();
+    assert.equal(advancedFloor.activationEpoch, 1);
+    const recovered = await activateSharedAuthorityCutover({
+      store, coordinator, admissionGate, legacyAuthorityFence, authorityFloor,
+      reportDirectory: path.join(directory, 'reports'), input,
+      drainObservation: observation(input.cutoverId, prepared.admissionGate, coordinator),
+    });
+    assert.equal(recovered.authorityFloorAfter.digest, advancedFloor.digest,
+      'activation replay must accept only the exact already-advanced floor successor');
   }
 
   for (const [name, mutate, code] of [
@@ -874,17 +1044,17 @@ try {
     ['lease', (value) => value.unfencedLegacyLeaseIds.push('lease-1'), 'CUTOVER_LEASES_UNFENCED'],
     ['split-writer', (value) => value.canonicalWriterOwnerIds.push('coordinator-other'), 'CUTOVER_WRITER_NOT_SINGLETON'],
   ]) {
-    const { directory, store, admissionGate, coordinator } = await fixture(`reject-${name}`);
+    const { directory, store, admissionGate, authorityFloor, coordinator } = await fixture(`reject-${name}`);
     const input = await request(`cutover-reject-${name}`, { directory, store });
     const prepared = await prepareSharedAuthorityCutover({
-      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
+      store, coordinator, admissionGate, authorityFloor, reportDirectory: path.join(directory, 'reports'), input,
     });
     const observed = observation(input.cutoverId, prepared.admissionGate, coordinator);
     mutate(observed);
     const { digest: _oldDigest, ...observedBody } = observed;
     observed.digest = canonicalDigest(observedBody);
     await expectCode(code, () => activateSharedAuthorityCutover({
-      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
+      store, coordinator, admissionGate, authorityFloor, reportDirectory: path.join(directory, 'reports'), input,
       drainObservation: observed,
     }));
     assert.equal((await readReleaseAuthoritySelector(store)).phase, 'DRAINING');
@@ -948,7 +1118,7 @@ try {
   }
 
   {
-    const { directory, store, admissionGate, coordinator } = await fixture('reject-activation-shadow-rebinding');
+    const { directory, store, admissionGate, authorityFloor, coordinator } = await fixture('reject-activation-shadow-rebinding');
     const input = await request('cutover-reject-activation-shadow-rebinding', { directory, store });
     const prepared = await prepareSharedAuthorityCutover({
       store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
@@ -964,14 +1134,14 @@ try {
     });
     incompleteInput.operatorReview = cutoverReview(incompleteInput);
     await expectCode('CUTOVER_SHADOW_INCOMPLETE', () => activateSharedAuthorityCutover({
-      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'),
+      store, coordinator, admissionGate, authorityFloor, reportDirectory: path.join(directory, 'reports'),
       input: incompleteInput, drainObservation,
     }));
 
     const staleReviewInput = structuredClone(input);
     staleReviewInput.operatorReview.configurationDigest = digest('9');
     await expectCode('CUTOVER_SHADOW_REVIEW_MISMATCH', () => activateSharedAuthorityCutover({
-      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'),
+      store, coordinator, admissionGate, authorityFloor, reportDirectory: path.join(directory, 'reports'),
       input: staleReviewInput, drainObservation,
     }));
     assert.equal((await readReleaseAuthoritySelector(store)).phase, 'DRAINING');
@@ -1071,10 +1241,10 @@ try {
   }
 
   {
-    const { directory, store, admissionGate, coordinator } = await fixture('reject-stale');
+    const { directory, store, admissionGate, authorityFloor, coordinator } = await fixture('reject-stale');
     const input = await request('cutover-reject-stale', { directory, store });
     const prepared = await prepareSharedAuthorityCutover({
-      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
+      store, coordinator, admissionGate, authorityFloor, reportDirectory: path.join(directory, 'reports'), input,
     });
     now += 301_000;
     const stale = observation(input.cutoverId, prepared.admissionGate, coordinator);
@@ -1082,7 +1252,7 @@ try {
     const { digest: _oldDigest, ...staleBody } = stale;
     stale.digest = canonicalDigest(staleBody);
     await expectCode('CUTOVER_OBSERVATION_STALE', () => activateSharedAuthorityCutover({
-      store, coordinator, admissionGate, reportDirectory: path.join(directory, 'reports'), input,
+      store, coordinator, admissionGate, authorityFloor, reportDirectory: path.join(directory, 'reports'), input,
       drainObservation: stale,
     }));
   }

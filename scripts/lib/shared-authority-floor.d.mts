@@ -49,10 +49,10 @@ export interface SharedAuthorityFloorState {
     revision: number;
     activeBuildIdentity: string | null;
     phase: string;
+    activationCutoverDigest: string | null;
+    authorityTransitionDigest: string | null;
   };
   legacyFence: { state: string; activationEpoch: 0 | 1 };
-  activationCutoverDigest: string | null;
-  authorityTransitionDigest: string | null;
 }
 
 export interface SharedAuthorityRestoreForwardPlan {

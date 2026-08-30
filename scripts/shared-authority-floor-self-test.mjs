@@ -53,16 +53,35 @@ function state(storeGeneration, phase = 'ACTIVE', {
     revision: selectorRevision,
     activeBuildIdentity,
     phase,
+    activationCutoverDigest: cutoverDigest,
+    authorityTransitionDigest,
   };
   const legacyFence = {
     state: 'ACTIVATED',
     activationEpoch: 1,
   };
-  return {
-    manifest, selector, legacyFence,
-    activationCutoverDigest: cutoverDigest,
-    authorityTransitionDigest,
+  return { manifest, selector, legacyFence };
+}
+
+function successor(current, update, updatedAt) {
+  const body = {
+    schemaVersion: 1,
+    kind: 'shared-release-authority-floor',
+    revision: current.revision + 1,
+    storeMarkerDigest: current.storeMarkerDigest,
+    minimumStoreGeneration: current.minimumStoreGeneration,
+    minimumSelectorRevision: current.minimumSelectorRevision,
+    activeBuildIdentity: current.activeBuildIdentity,
+    authorityTransitionDigest: current.authorityTransitionDigest,
+    activationEpoch: current.activationEpoch,
+    legacyPermanentlyRetired: current.legacyPermanentlyRetired,
+    activationRevision: current.activationRevision,
+    activationCutoverDigest: current.activationCutoverDigest,
+    previousDigest: current.digest,
+    updatedAt,
+    ...update,
   };
+  return { ...body, digest: canonicalDigest(body) };
 }
 
 function expectCode(code, operation) {
@@ -103,7 +122,16 @@ try {
     ...state(8), legacyFence: { state: 'OPEN', activationEpoch: 0 },
   }));
   await expectCode('AUTHORITY_FLOOR_CUTOVER_MISMATCH', () => floor.assertAuthorityState({
-    ...state(8), activationCutoverDigest: canonicalDigest({ cutover: 'wrong' }),
+    ...state(8),
+    selector: {
+      ...state(8).selector,
+      activationCutoverDigest: canonicalDigest({ cutover: 'wrong' }),
+    },
+  }));
+  await expectCode('AUTHORITY_FLOOR_TRANSITION_MISMATCH', () => floor.assertAuthorityState({
+    ...state(8),
+    authorityTransitionDigest: transitionA,
+    selector: { ...state(8).selector, authorityTransitionDigest: transitionB },
   }));
 
   const tampered = JSON.parse(await readFile(path.join(floorRoot, 'authority-floor.json'), 'utf8'));
@@ -135,18 +163,48 @@ try {
     storeMarkerDigest: canonicalDigest({ marker: 'replacement' }),
   }));
 
-  const previousHead = first;
-  await writeFile(path.join(floorRoot, 'authority-floor.json'), `${canonicalJson(previousHead)}\n`);
+  const journalOnlySuccessor = successor(advanced, {
+    minimumStoreGeneration: advanced.minimumStoreGeneration + 1,
+  }, new Date(clock()).toISOString());
+  const journalOnlyFile = path.join(
+    floorRoot,
+    'revisions',
+    `${String(journalOnlySuccessor.revision).padStart(16, '0')}.json`,
+  );
+  await writeFile(journalOnlyFile, `${canonicalJson(journalOnlySuccessor)}\n`, { flag: 'wx' });
+  const restartedAfterJournalCrash = await openSharedAuthorityFloor({
+    root: floorRoot,
+    protectedRoots: [canonicalStoreRoot, backupRoot],
+    verifyStorage: false,
+    clock,
+  });
+  const recovered = await restartedAfterJournalCrash.read();
+  assert.equal(recovered.digest, journalOnlySuccessor.digest,
+    'a complete journal successor must roll the stale ancestor head forward');
+  assert.deepEqual(
+    JSON.parse(await readFile(path.join(floorRoot, 'authority-floor.json'), 'utf8')),
+    journalOnlySuccessor,
+    'journal recovery must durably repair the head',
+  );
+
+  const nonAncestorBody = {
+    ...recovered,
+    minimumStoreGeneration: recovered.minimumStoreGeneration + 100,
+  };
+  delete nonAncestorBody.digest;
+  const nonAncestorHead = { ...nonAncestorBody, digest: canonicalDigest(nonAncestorBody) };
+  await writeFile(path.join(floorRoot, 'authority-floor.json'), `${canonicalJson(nonAncestorHead)}\n`);
   await expectCode('AUTHORITY_FLOOR_ROLLBACK_DETECTED', () => floor.read());
-  await writeFile(path.join(floorRoot, 'authority-floor.json'), `${canonicalJson(advanced)}\n`);
-  const revisionFile = path.join(floorRoot, 'revisions', `${String(advanced.revision).padStart(16, '0')}.json`);
+  await writeFile(path.join(floorRoot, 'authority-floor.json'), `${canonicalJson(recovered)}\n`);
+
+  const revisionFile = journalOnlyFile;
   const journalRevision = JSON.parse(await readFile(revisionFile, 'utf8'));
   await writeFile(revisionFile, `${canonicalJson({ ...journalRevision, minimumStoreGeneration: 1 })}\n`);
   await expectCode('AUTHORITY_FLOOR_CORRUPT', () => floor.read());
   await writeFile(revisionFile, `${canonicalJson(journalRevision)}\n`);
 
-  const handoff = await floor.compareAndAdvance(advanced.digest, {
-    minimumSelectorRevision: advanced.minimumSelectorRevision + 1,
+  const handoff = await floor.compareAndAdvance(recovered.digest, {
+    minimumSelectorRevision: recovered.minimumSelectorRevision + 1,
     activeBuildIdentity: buildB,
     authorityTransitionDigest: transitionB,
   });

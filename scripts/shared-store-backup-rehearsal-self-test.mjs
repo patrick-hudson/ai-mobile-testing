@@ -13,6 +13,7 @@ import {
 const marker = 'ab'.repeat(32);
 const backupMarker = 'cd'.repeat(32);
 const buildIdentity = 'build:backup-rehearsal-test';
+const pendingBuildIdentity = 'build:backup-rehearsal-next';
 const configurationDigest = canonicalDigest({ fixture: 'backup-rehearsal-configuration' });
 const deploymentIdentity = 'compose-project:backup-rehearsal-test';
 const volumeIdentity = 'named-volume:backup-rehearsal-test';
@@ -21,10 +22,11 @@ function seal(body) {
   return { ...body, digest: canonicalDigest(body) };
 }
 
-function storeDocuments({ active = false } = {}) {
-  const activationRevision = active ? 41 : null;
-  const activationCutoverDigest = active ? canonicalDigest({ cutover: 'backup-rehearsal-active' }) : null;
-  const authorityTransitionDigest = active ? canonicalDigest({ transition: 'backup-rehearsal-active' }) : null;
+function storeDocuments({ active = false, handoffPending = false } = {}) {
+  const activated = active || handoffPending;
+  const activationRevision = activated ? 41 : null;
+  const activationCutoverDigest = activated ? canonicalDigest({ cutover: 'backup-rehearsal-active' }) : null;
+  const authorityTransitionDigest = activated ? canonicalDigest({ transition: 'backup-rehearsal-active' }) : null;
   const manifest = seal({
     schemaVersion: 2,
     kind: 'durable-parent-run-store',
@@ -37,33 +39,40 @@ function storeDocuments({ active = false } = {}) {
     currentWriterProtocol: 'single-coordinator-global-performance-v2',
     minimumWriterProtocol: 'single-coordinator-global-performance-v2',
     coordinatorEpoch: 11,
-    activationEpoch: active ? 1 : 0,
+    activationEpoch: activated ? 1 : 0,
     activationRevision,
     createdAt: '2026-08-29T18:00:00.000Z',
     cutoverRevision: 41,
     backupMarker,
-    prequalifiedRollbackBuilds: [buildIdentity],
+    prequalifiedRollbackBuilds: handoffPending ? [buildIdentity, pendingBuildIdentity] : [buildIdentity],
   });
   const selector = seal({
     schemaVersion: 1,
     kind: 'release-authority-selector',
     storeMarkerDigest: manifest.storeMarkerDigest,
     storeGeneration: manifest.storeGeneration,
-    phase: active ? 'ACTIVE' : 'DRAINING',
-    activationEpoch: active ? 1 : 0,
+    phase: handoffPending ? 'PROMOTION_DISABLED' : activated ? 'ACTIVE' : 'DRAINING',
+    activationEpoch: activated ? 1 : 0,
     activationRevision,
-    activatedAt: active ? '2026-08-29T18:05:00.000Z' : null,
-    activeWriterProtocol: active ? manifest.currentWriterProtocol : null,
+    activatedAt: activated ? '2026-08-29T18:05:00.000Z' : null,
+    activeWriterProtocol: activated ? manifest.currentWriterProtocol : null,
     minimumWriterProtocol: manifest.minimumWriterProtocol,
-    activeBuildIdentity: active ? buildIdentity : null,
+    activeBuildIdentity: activated ? buildIdentity : null,
     authorityTransitionDigest,
     activationCutoverDigest,
     backupMarker,
-    prequalifiedRollbackBuilds: [buildIdentity],
+    prequalifiedRollbackBuilds: handoffPending ? [buildIdentity, pendingBuildIdentity] : [buildIdentity],
     revision: 3,
     previousDigest: canonicalDigest({ selector: 'shadow' }),
     updatedAt: '2026-08-29T18:10:00.000Z',
   });
+  if (handoffPending) {
+    const body = structuredClone(selector);
+    delete body.digest;
+    body.pendingBuildIdentity = pendingBuildIdentity;
+    body.handoffId = 'handoff-backup-rehearsal-0001';
+    return { manifest, selector: seal(body) };
+  }
   return { manifest, selector };
 }
 
@@ -177,6 +186,68 @@ try {
     rehearseSharedStoreBackup(options(activeFixture, paths(root, 'active-tampered'), 'active-tampered')),
     (error) => error?.code === 'BACKUP_BINDING_MISMATCH',
     'tampering with the selector transition identity must invalidate backup qualification',
+  );
+
+  const pendingFixture = await createFixture(
+    root,
+    'handoff-pending-store',
+    storeDocuments({ handoffPending: true }),
+  );
+  const pendingDestinations = paths(root, 'handoff-pending');
+  const pendingReceipt = await rehearseSharedStoreBackup(
+    options(pendingFixture, pendingDestinations, 'handoff-pending'),
+  );
+  assert.equal(pendingReceipt.selectorDigest, pendingFixture.selector.digest,
+    'a rehearsal receipt must bind the pending-handoff authority selector');
+  assert.equal((await verifySharedStoreBackupRehearsal({
+    receipt: pendingReceipt,
+    backupRoot: pendingDestinations.backupRoot,
+    restoreRoot: pendingDestinations.restoreRoot,
+    expectedStore: expectedStore(pendingFixture.manifest),
+    buildIdentity,
+    configurationDigest,
+    backupMarker,
+    limits: options(pendingFixture, pendingDestinations).limits,
+  })).digest, pendingReceipt.digest,
+  'a restored snapshot taken while handoff is pending must retain a valid rehearsal receipt');
+
+  const contradictoryPending = structuredClone(pendingFixture.selector);
+  contradictoryPending.handoffId = null;
+  delete contradictoryPending.digest;
+  await writeFile(
+    path.join(pendingFixture.sourceRoot, 'release-authority-selector.json'),
+    `${canonicalJson(seal(contradictoryPending))}\n`,
+  );
+  await assert.rejects(
+    rehearseSharedStoreBackup(options(
+      pendingFixture,
+      paths(root, 'handoff-pending-contradictory'),
+      'handoff-pending-contradictory',
+    )),
+    (error) => error?.code === 'BACKUP_BINDING_MISMATCH',
+    'a pending build without its handoff identity must remain invalid',
+  );
+
+  const unknownSelectorFixture = await createFixture(
+    root,
+    'handoff-pending-unknown-selector-store',
+    storeDocuments({ handoffPending: true }),
+  );
+  const unknownSelectorBody = structuredClone(unknownSelectorFixture.selector);
+  delete unknownSelectorBody.digest;
+  unknownSelectorBody.unrecognizedHandoffField = 'must-fail-closed';
+  await writeFile(
+    path.join(unknownSelectorFixture.sourceRoot, 'release-authority-selector.json'),
+    `${canonicalJson(seal(unknownSelectorBody))}\n`,
+  );
+  await assert.rejects(
+    rehearseSharedStoreBackup(options(
+      unknownSelectorFixture,
+      paths(root, 'handoff-pending-unknown-selector'),
+      'handoff-pending-unknown-selector',
+    )),
+    (error) => error?.code === 'BACKUP_STORE_INVALID',
+    'unknown pending-handoff selector fields must remain invalid under exact-key validation',
   );
 
   const tamperedReceipt = structuredClone(receipt);

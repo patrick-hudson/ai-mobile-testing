@@ -103,6 +103,7 @@ try {
   });
   await transitionReleaseAuthority(store, supervisor.coordinator(), {
     expectedSelectorDigest: draining.digest, phase: 'ACTIVE', activationRevision: 1, buildIdentity: store.buildIdentity,
+    activationCutoverDigest: digest('c'), authorityTransitionDigest: digest('d'),
   });
   await createParentRun(store, {
     runId, compilationState: 'sealed', subjectCore, executionManifest, finalSubject,

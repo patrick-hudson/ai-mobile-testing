@@ -21,8 +21,15 @@ import {
   probeTargetPreflightSet,
   targetPreflightInputsForSubject,
 } from '../shared/target-preflight-set.mjs';
-import { readTrustedStoreMarker, sharedStoreBuildIdentity, sharedStoreGeneration, sharedStoreRollbackBuilds } from './lib/shared-store-runtime.mjs';
+import {
+  openSharedRuntimeAuthorityFloor,
+  readTrustedStoreMarker,
+  sharedStoreBuildIdentity,
+  sharedStoreGeneration,
+  sharedStoreRollbackBuilds,
+} from './lib/shared-store-runtime.mjs';
 import { maybeCrashAtSharedResilienceBoundary } from './lib/shared-resilience-failpoint.mjs';
+import { openLegacyAuthorityFenceFromEnvironment } from './lib/legacy-authority-fence.mjs';
 
 const required = (name) => {
   const value = process.env[name];
@@ -66,6 +73,8 @@ const port = boundedInteger('AUDIT_SHARED_COORDINATOR_PORT', 4_180, 1_024, 65_53
 const storeMarker = await readTrustedStoreMarker(required('AUDIT_SHARED_STORE_MARKER_FILE'));
 const backupMarker = await readTrustedStoreMarker(required('AUDIT_SHARED_BACKUP_MARKER_FILE'), 'shared backup marker');
 const buildIdentity = sharedStoreBuildIdentity();
+const authorityFloor = await openSharedRuntimeAuthorityFloor(process.env);
+const legacyAuthorityFence = await openLegacyAuthorityFenceFromEnvironment(process.env, { authorityFloor });
 const store = await openParentRunStore({
   root: required('AUDIT_SHARED_STORE_ROOT'),
   deploymentIdentity: required('AUDIT_SHARED_DEPLOYMENT_IDENTITY'),
@@ -76,6 +85,8 @@ const store = await openParentRunStore({
   buildIdentity,
   backupMarker,
   prequalifiedRollbackBuilds: sharedStoreRollbackBuilds(process.env, buildIdentity),
+  authorityFloor,
+  legacyAuthorityFence,
 });
 const controlService = createSharedControlService({
   store,

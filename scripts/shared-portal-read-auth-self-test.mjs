@@ -17,10 +17,12 @@ import {
   listAdoptedAttemptArtifacts,
   openParentRunStore,
   publishAttemptEvidence,
+  readReleaseAuthoritySelector,
   readParentRun,
 } from './lib/parent-run-store.mjs';
 import { initializeCutoverAdmissionGate } from './lib/shared-cutover-orchestrator.mjs';
 import { initializeLegacyAuthorityFence } from './lib/legacy-authority-fence.mjs';
+import { initializeSharedAuthorityFloor } from './lib/shared-authority-floor.mjs';
 
 const root = await mkdtemp(path.join(tmpdir(), 'shared-portal-read-auth-'));
 let portal = null;
@@ -37,6 +39,9 @@ try {
   const finalizations = path.join(root, 'finalizations');
   const baselines = path.join(root, 'baselines');
   const legacyAuthorityFenceRoot = path.join(store, 'legacy-authority');
+  const authorityFloorRoot = path.join(root, 'authority-floor');
+  const backupRoot = path.join(root, 'backups');
+  const restoreRoot = path.join(root, 'restores');
   const sharedStoreMarker = '12'.repeat(32);
   const sharedBackupMarker = '34'.repeat(32);
   const sharedStoreMarkerFile = path.join(store, '.trusted-store-marker');
@@ -72,6 +77,23 @@ try {
     storeMarker: sharedStoreMarker,
     backupMarker: sharedBackupMarker,
     verifyStorage: false,
+  });
+  const initialSelector = await readReleaseAuthoritySelector(sharedStore);
+  await initializeSharedAuthorityFloor({
+    root: authorityFloorRoot,
+    protectedRoots: [store, backupRoot, restoreRoot],
+    verifyStorage: false,
+    initial: {
+      storeMarkerDigest: initialSelector.storeMarkerDigest,
+      minimumStoreGeneration: initialSelector.storeGeneration,
+      minimumSelectorRevision: initialSelector.revision,
+      activeBuildIdentity: null,
+      authorityTransitionDigest: null,
+      activationEpoch: 0,
+      legacyPermanentlyRetired: false,
+      activationRevision: null,
+      activationCutoverDigest: null,
+    },
   });
   await initializeCutoverAdmissionGate({
     root: path.join(sharedStore.root, 'cutover-admission'),
@@ -209,6 +231,9 @@ try {
     PORTAL_VISUAL_BASELINE_ROOT: baselines,
     PORTAL_SHARED_CREDENTIAL_ROOT: credentials,
     AUDIT_SHARED_STORE_ROOT: store,
+    AUDIT_SHARED_AUTHORITY_FLOOR_ROOT: authorityFloorRoot,
+    AUDIT_SHARED_BACKUP_ROOT: backupRoot,
+    AUDIT_SHARED_RESTORE_ROOT: restoreRoot,
     AUDIT_SHARED_STORE_MARKER_FILE: sharedStoreMarkerFile,
     AUDIT_SHARED_BACKUP_MARKER_FILE: sharedBackupMarkerFile,
     AUDIT_SHARED_DEPLOYMENT_IDENTITY: 'self-test:shared-portal',

@@ -29,6 +29,33 @@ try {
   })).root, fence.root);
   assert.equal((await fence.read()).state, 'OPEN');
 
+  let externalFloor = {
+    activationEpoch: 0,
+    legacyPermanentlyRetired: false,
+    digest: '0'.repeat(64),
+  };
+  const floorGuard = { read: async () => structuredClone(externalFloor) };
+  const externallyGuardedFence = await openLegacyAuthorityFence({
+    root: fenceRoot, verifyStorage: false, clock, authorityFloor: floorGuard,
+  });
+  assert.equal(await externallyGuardedFence.withAuthority('single-site-launch', async () => 'accepted'), 'accepted');
+  externalFloor = {
+    activationEpoch: 1,
+    legacyPermanentlyRetired: true,
+    digest: '1'.repeat(64),
+  };
+  await expectCode('LEGACY_AUTHORITY_PERMANENTLY_RETIRED', () => externallyGuardedFence.withAuthority(
+    'single-site-launch', async () => 'must-not-launch-after-floor-advance',
+  ));
+  await expectCode('LEGACY_AUTHORITY_PERMANENTLY_RETIRED', () => openLegacyAuthorityFence({
+    root: fenceRoot, verifyStorage: false, clock, authorityFloor: floorGuard,
+  }));
+  externalFloor = {
+    activationEpoch: 0,
+    legacyPermanentlyRetired: false,
+    digest: '0'.repeat(64),
+  };
+
   let launchEntered;
   const entered = new Promise((resolve) => { launchEntered = resolve; });
   let finishLaunch;

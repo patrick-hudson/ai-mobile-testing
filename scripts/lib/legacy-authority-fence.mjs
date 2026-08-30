@@ -12,6 +12,9 @@ import {
   readBoundedJson,
   withDirectoryLock,
 } from './atomic-filesystem.mjs';
+import path from 'node:path';
+
+import { openSharedAuthorityFloor } from './shared-authority-floor.mjs';
 
 const SAFE_ID = /^[A-Za-z0-9._-]{1,128}$/u;
 
@@ -88,7 +91,7 @@ async function storageFor({ root, filesystem, nonce, verifyStorage = true } = {}
   return openAtomicStorage({ root, filesystem, nonce, verify: verifyStorage });
 }
 
-function handle(storage, clock) {
+function handle(storage, clock, authorityFloor = null) {
   const file = containedPath(storage.root, 'legacy-authority-fence.json');
   const lock = containedPath(storage.root, '.legacy-authority-fence.lock');
 
@@ -148,6 +151,13 @@ function handle(storage, clock) {
       if (typeof operation !== 'function') fail('LEGACY_AUTHORITY_INPUT_INVALID', 'Legacy authority operation is required.');
       return withDirectoryLock(storage, lock, async () => {
         const current = await read();
+        const floor = await authorityFloor?.read();
+        if (floor?.legacyPermanentlyRetired === true) {
+          fail('LEGACY_AUTHORITY_PERMANENTLY_RETIRED', 'Legacy release authority is permanently retired by the external authority floor.', {
+            authorityFloorDigest: floor.digest,
+            activationEpoch: floor.activationEpoch,
+          });
+        }
         const drainingFinalization = current.state === 'CLOSED' && capability.endsWith('-finalization');
         if (current.state !== 'OPEN' && !drainingFinalization) {
           fail('LEGACY_AUTHORITY_FENCED', `Legacy ${capability} is fenced by ${current.cutoverId}.`, {
@@ -181,19 +191,30 @@ export async function initializeLegacyAuthorityFence(options = {}) {
       if (error?.code !== 'ATOMIC_ALREADY_EXISTS') throw error;
     }
   }
-  const fence = handle(storage, clock);
+  const fence = handle(storage, clock, options.authorityFloor ?? null);
   await fence.read();
   return fence;
 }
 
 export async function openLegacyAuthorityFence(options = {}) {
   const clock = options.clock ?? (() => Date.now());
-  const fence = handle(await storageFor(options), clock);
-  await fence.read();
+  const authorityFloor = options.authorityFloor ?? null;
+  if (authorityFloor !== null && typeof authorityFloor.read !== 'function') {
+    fail('LEGACY_AUTHORITY_INPUT_INVALID', 'External authority-floor enforcement requires a readable authority-floor handle.');
+  }
+  const fence = handle(await storageFor(options), clock, authorityFloor);
+  const [current, floor] = await Promise.all([fence.read(), authorityFloor?.read()]);
+  if (floor?.legacyPermanentlyRetired === true
+    && (current.state !== 'ACTIVATED' || current.activationEpoch !== floor.activationEpoch)) {
+    fail('LEGACY_AUTHORITY_PERMANENTLY_RETIRED', 'The external authority floor rejects a restored legacy authority fence.', {
+      authorityFloorDigest: floor.digest,
+      fenceDigest: current.digest,
+    });
+  }
   return fence;
 }
 
-export async function openLegacyAuthorityFenceFromEnvironment(environment = process.env) {
+export async function openLegacyAuthorityFenceFromEnvironment(environment = process.env, options = {}) {
   const root = environment.AUDIT_LEGACY_AUTHORITY_FENCE_ROOT;
   if (typeof root !== 'string' || !root) {
     fail(
@@ -204,5 +225,17 @@ export async function openLegacyAuthorityFenceFromEnvironment(environment = proc
   if (!root.startsWith('/')) {
     fail('LEGACY_AUTHORITY_INPUT_INVALID', 'AUDIT_LEGACY_AUTHORITY_FENCE_ROOT must be absolute.');
   }
-  return openLegacyAuthorityFence({ root });
+  let authorityFloor = options.authorityFloor;
+  if (authorityFloor === undefined && environment.AUDIT_SHARED_AUTHORITY_FLOOR_ROOT) {
+    const floorRoot = environment.AUDIT_SHARED_AUTHORITY_FLOOR_ROOT;
+    if (typeof floorRoot !== 'string' || !path.isAbsolute(floorRoot)) {
+      fail('LEGACY_AUTHORITY_INPUT_INVALID', 'AUDIT_SHARED_AUTHORITY_FLOOR_ROOT must be absolute.');
+    }
+    authorityFloor = await openSharedAuthorityFloor({
+      root: floorRoot,
+      protectedRoots: [path.dirname(root)],
+      verifyStorage: false,
+    });
+  }
+  return openLegacyAuthorityFence({ root, authorityFloor });
 }

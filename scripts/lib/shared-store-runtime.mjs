@@ -1,4 +1,7 @@
 import { constants as fsConstants, promises as fs } from 'node:fs';
+import path from 'node:path';
+
+import { openSharedAuthorityFloor } from './shared-authority-floor.mjs';
 
 const HEX_MARKER = /^[a-f0-9]{64}$/;
 
@@ -38,4 +41,30 @@ export function sharedStoreGeneration(environment = process.env) {
   const value = Number(environment.AUDIT_SHARED_STORE_GENERATION ?? 1);
   if (!Number.isSafeInteger(value) || value < 1) throw new Error('AUDIT_SHARED_STORE_GENERATION is invalid.');
   return value;
+}
+
+function requiredAbsolute(environment, name) {
+  const value = environment[name];
+  if (typeof value !== 'string' || !path.isAbsolute(value)) throw new Error(`${name} must be an absolute path.`);
+  return value;
+}
+
+function optionalAbsolute(environment, name, fallback) {
+  const value = environment[name] ?? fallback;
+  if (typeof value !== 'string' || !path.isAbsolute(value)) throw new Error(`${name} must be an absolute path.`);
+  return value;
+}
+
+export async function openSharedRuntimeAuthorityFloor(environment = process.env, options = {}) {
+  const canonicalRoot = requiredAbsolute(environment, 'AUDIT_SHARED_STORE_ROOT');
+  const floorRoot = requiredAbsolute(environment, 'AUDIT_SHARED_AUTHORITY_FLOOR_ROOT');
+  const sharedRoot = path.dirname(canonicalRoot);
+  const backupRoot = optionalAbsolute(environment, 'AUDIT_SHARED_BACKUP_ROOT', path.join(sharedRoot, 'backups'));
+  const restoreRoot = optionalAbsolute(environment, 'AUDIT_SHARED_RESTORE_ROOT', path.join(sharedRoot, 'restores'));
+  return openSharedAuthorityFloor({
+    root: floorRoot,
+    protectedRoots: [canonicalRoot, backupRoot, restoreRoot],
+    filesystem: options.filesystem,
+    verifyStorage: options.verifyStorage ?? false,
+  });
 }

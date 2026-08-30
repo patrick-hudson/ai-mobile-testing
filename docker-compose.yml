@@ -166,6 +166,7 @@ services:
     environment:
       AUDIT_SHARED_STORE_ROOT: /var/lib/ai-mobile-testing/shared/canonical
       AUDIT_SHARED_AUTHORITY_FLOOR_ROOT: /var/lib/ai-mobile-testing/shared/authority-floor
+      AUDIT_LEGACY_AUTHORITY_FENCE_ROOT: /var/lib/ai-mobile-testing/shared/canonical/legacy-authority
       AUDIT_SHARED_STORE_MARKER_FILE: /var/lib/ai-mobile-testing/shared/trust/store-marker
       AUDIT_SHARED_BACKUP_MARKER_FILE: /var/lib/ai-mobile-testing/shared/trust/backup-marker
       AUDIT_SHARED_EXCHANGE_ROOT: /var/lib/ai-mobile-testing/shared/exchange

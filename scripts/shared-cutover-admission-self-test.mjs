@@ -206,6 +206,8 @@ try {
     phase: 'ACTIVE',
     activationRevision: 1,
     buildIdentity: 'build:admission-activated',
+    activationCutoverDigest: `sha256:${'a'.repeat(64)}`,
+    authorityTransitionDigest: `sha256:${'b'.repeat(64)}`,
   });
   const refused = await runAdmissionInit(activatedRoot);
   assert.notEqual(refused.code, 0, 'an activated store must never recreate a missing admission gate OPEN');

@@ -171,6 +171,53 @@ function cutoverIdentityFromConfig(config, expectedStore) {
   };
 }
 
+export async function beginSharedAuthorityBuildHandoffFromCli({
+  store,
+  coordinator,
+  admissionGate,
+  legacyAuthorityFence,
+  reportDirectory,
+  handoffId,
+  targetBuildIdentity,
+  launchOperationRoot,
+  legacyComparativeRoot,
+  legacySingleSiteQueueRoot,
+  clock = store?.clock ?? (() => Date.now()),
+}) {
+  const selector = await readReleaseAuthoritySelector(store);
+  const resumablePendingHandoff = selector.phase === 'PROMOTION_DISABLED'
+    && selector.handoffId === handoffId
+    && selector.pendingBuildIdentity === targetBuildIdentity;
+  let drainObservation;
+  if (!resumablePendingHandoff) {
+    const launchOperationStore = await openSharedLaunchOperationStore({
+      root: launchOperationRoot,
+      requireExisting: true,
+    });
+    drainObservation = await captureSharedAuthorityDrainObservation({
+      store,
+      coordinator,
+      admissionGate,
+      legacyAuthorityFence,
+      launchOperationStore,
+      cutoverId: handoffId,
+      legacyComparativeRoot,
+      legacySingleSiteQueueRoot,
+      clock,
+    });
+  }
+  return beginSharedAuthorityBuildHandoff({
+    store,
+    coordinator,
+    admissionGate,
+    legacyAuthorityFence,
+    reportDirectory,
+    handoffId,
+    drainObservation,
+    clock,
+  });
+}
+
 export async function runSharedAuthorityCutoverCli(argv, { output = process.stdout } = {}) {
   const { action, configFile } = parseArguments(argv);
   const config = requiredObject(await readBoundedJsonFile(configFile, 'Operator config'), 'Operator config');
@@ -235,8 +282,9 @@ export async function runSharedAuthorityCutoverCli(argv, { output = process.stdo
     legacyAuthorityFence = await initializeLegacyAuthorityFence({ root: legacyFenceRoot });
   }
   const operatorReview = requiredObject(config.operatorReview, 'config.operatorReview');
-  const handoffAction = action.includes('handoff');
-  const authorityFloor = handoffAction ? await openSharedAuthorityFloor({
+  const floorAction = action.includes('handoff') || action === 'activate'
+    || action === 'disable-promotion' || action === 'enable-promotion';
+  const authorityFloor = floorAction ? await openSharedAuthorityFloor({
     root: config.authorityFloorRoot,
     protectedRoots: [store.root, backupRehearsal.backupRoot, backupRehearsal.restoreRoot],
     verifyStorage: config.authorityFloorVerifyStorage !== false,
@@ -271,20 +319,14 @@ export async function runSharedAuthorityCutoverCli(argv, { output = process.stdo
     });
   } else if (action === 'begin-handoff') {
     const legacySources = requiredObject(config.legacySources, 'config.legacySources');
-    const launchOperationStore = await openSharedLaunchOperationStore({
-      root: path.join(store.root, 'launch-operations'), requireExisting: true,
-    });
-    const drainObservation = await captureSharedAuthorityDrainObservation({
-      store, coordinator, admissionGate, legacyAuthorityFence, launchOperationStore,
-      cutoverId: handoff.handoffId,
-      legacyComparativeRoot: legacySources.comparativeRoot,
-      legacySingleSiteQueueRoot: legacySources.singleSiteQueueRoot,
-    });
-    result = await beginSharedAuthorityBuildHandoff({
+    result = await beginSharedAuthorityBuildHandoffFromCli({
       store, coordinator, admissionGate, legacyAuthorityFence,
       reportDirectory: config.reportDirectory,
       handoffId: handoff.handoffId,
-      drainObservation,
+      targetBuildIdentity: handoff.targetBuildIdentity,
+      launchOperationRoot: path.join(store.root, 'launch-operations'),
+      legacyComparativeRoot: legacySources.comparativeRoot,
+      legacySingleSiteQueueRoot: legacySources.singleSiteQueueRoot,
     });
   } else if (action === 'launch-handoff-single-site-canary' || action === 'launch-handoff-comparative-canary') {
     const mode = action.includes('single-site') ? 'single-site' : 'comparative';
@@ -342,7 +384,7 @@ export async function runSharedAuthorityCutoverCli(argv, { output = process.stdo
       legacySingleSiteQueueRoot: legacySources.singleSiteQueueRoot,
     });
     result = await activateSharedAuthorityCutover({
-      store, coordinator, admissionGate, legacyAuthorityFence,
+      store, coordinator, admissionGate, legacyAuthorityFence, authorityFloor,
       reportDirectory: config.reportDirectory, input: commonInput,
       drainObservation,
     });
@@ -394,6 +436,7 @@ export async function runSharedAuthorityCutoverCli(argv, { output = process.stdo
     result = await setSharedPromotionAvailability({
       store,
       coordinator,
+      authorityFloor,
       phase: enable ? 'ACTIVE' : 'PROMOTION_DISABLED',
       buildIdentity: config.store.buildIdentity,
       reportDirectory: config.reportDirectory,

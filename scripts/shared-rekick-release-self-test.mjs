@@ -120,6 +120,8 @@ try {
     phase: 'ACTIVE',
     activationRevision: 1,
     buildIdentity: store.buildIdentity,
+    activationCutoverDigest: digest('c'),
+    authorityTransitionDigest: digest('d'),
   });
   await createParentRun(store, {
     runId,

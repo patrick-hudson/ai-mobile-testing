@@ -8,12 +8,23 @@ import os from 'node:os';
 import path from 'node:path';
 import { openScopedCredentialAuthority } from '../portal/scoped-credential-authority.mjs';
 import { sealWorkItemEvidenceMember } from '../shared/work-item-evidence-index.mjs';
-import { createParentRun, openParentRunStore, readParentRun } from './lib/parent-run-store.mjs';
+import {
+  createParentRun,
+  openParentRunStore,
+  readParentRun,
+  readReleaseAuthoritySelector,
+} from './lib/parent-run-store.mjs';
+import { initializeLegacyAuthorityFence } from './lib/legacy-authority-fence.mjs';
+import { initializeSharedAuthorityFloor } from './lib/shared-authority-floor.mjs';
 
 const root = await fs.mkdtemp(path.join(os.tmpdir(), 'shared-streaming-http-'));
 let coordinator = null;
 try {
   const storeRoot = path.join(root, 'store');
+  const authorityFloorRoot = path.join(root, 'authority-floor');
+  const backupRoot = path.join(root, 'backups');
+  const restoreRoot = path.join(root, 'restores');
+  const legacyAuthorityFenceRoot = path.join(storeRoot, 'legacy-authority');
   const credentialRoot = path.join(root, 'credentials');
   const runId = 'stream-http-run';
   const projectId = 'stream-http-project';
@@ -32,6 +43,24 @@ try {
     backupMarker,
     verifyStorage: false,
   });
+  const initialSelector = await readReleaseAuthoritySelector(store);
+  await initializeSharedAuthorityFloor({
+    root: authorityFloorRoot,
+    protectedRoots: [storeRoot, backupRoot, restoreRoot],
+    verifyStorage: false,
+    initial: {
+      storeMarkerDigest: initialSelector.storeMarkerDigest,
+      minimumStoreGeneration: initialSelector.storeGeneration,
+      minimumSelectorRevision: initialSelector.revision,
+      activeBuildIdentity: null,
+      authorityTransitionDigest: null,
+      activationEpoch: 0,
+      legacyPermanentlyRetired: false,
+      activationRevision: null,
+      activationCutoverDigest: null,
+    },
+  });
+  await initializeLegacyAuthorityFence({ root: legacyAuthorityFenceRoot, verifyStorage: false });
   await createParentRun(store, {
     runId,
     subjectCoreDigest: `sha256:${'a'.repeat(64)}`,
@@ -68,13 +97,17 @@ try {
       ...process.env,
       AUDIT_SHARED_COORDINATOR_PORT: String(port),
       AUDIT_SHARED_STORE_ROOT: storeRoot,
+      AUDIT_SHARED_AUTHORITY_FLOOR_ROOT: authorityFloorRoot,
+      AUDIT_SHARED_BACKUP_ROOT: backupRoot,
+      AUDIT_SHARED_RESTORE_ROOT: restoreRoot,
+      AUDIT_LEGACY_AUTHORITY_FENCE_ROOT: legacyAuthorityFenceRoot,
       AUDIT_SHARED_STORE_MARKER_FILE: storeMarkerFile,
       AUDIT_SHARED_BACKUP_MARKER_FILE: backupMarkerFile,
       AUDIT_SHARED_CREDENTIAL_ROOT: credentialRoot,
       AUDIT_SHARED_DEPLOYMENT_IDENTITY: 'self-test:streaming-http',
       AUDIT_SHARED_VOLUME_IDENTITY: 'named-volume:self-test-streaming-http',
       AUDIT_SHARED_PROJECT_ID: projectId,
-      AUDIT_SHARED_LEASE_MS: '1000',
+      AUDIT_SHARED_LEASE_MS: '5000',
       AUDIT_SHARED_COORDINATOR_LEASE_MS: '5000',
     },
   });

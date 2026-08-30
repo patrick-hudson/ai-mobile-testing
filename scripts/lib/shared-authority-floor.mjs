@@ -333,6 +333,7 @@ function createHandle(storage, clock) {
     }
     if (names.length < 1) fail('AUTHORITY_FLOOR_CORRUPT', 'Authority floor revision journal is empty.');
     let previous = null;
+    const documents = [];
     for (let index = 0; index < names.length; index += 1) {
       const expectedName = revisionName(index + 1);
       if (names[index] !== expectedName) fail('AUTHORITY_FLOOR_CORRUPT', 'Authority floor revision journal is non-contiguous.');
@@ -349,30 +350,42 @@ function createHandle(storage, clock) {
         fail('AUTHORITY_FLOOR_CORRUPT', 'Authority floor revision chain is broken.');
       }
       if (previous) validateMonotonic(previous, document);
+      documents.push(document);
       previous = document;
     }
-    return previous;
+    return documents;
   }
 
-  async function read() {
+  async function readUnlocked() {
+    const journal = await readJournal();
+    const latest = journal.at(-1);
     let head;
     try {
       head = parseSharedAuthorityFloor(await readBoundedJson(storage, headFile, {
         label: 'shared release authority floor', maximumBytes: 64 * 1_024,
       }));
     } catch (error) {
+      if (error?.code === 'ATOMIC_NOT_FOUND') {
+        await atomicWriteJson(storage, headFile, latest);
+        return structuredClone(latest);
+      }
       if (error instanceof SharedAuthorityFloorError) throw error;
       fail('AUTHORITY_FLOOR_CORRUPT', 'Authority floor head is missing, corrupt, or unreadable.', {
         cause: error?.code ?? error?.message,
       });
     }
-    const latest = await readJournal();
-    if (head.digest !== latest.digest) {
+    const ancestor = journal[head.revision - 1];
+    if (!ancestor || ancestor.digest !== head.digest) {
       fail('AUTHORITY_FLOOR_ROLLBACK_DETECTED', 'Authority floor head is not the latest durable monotonic revision.', {
         headRevision: head.revision, journalRevision: latest.revision,
       });
     }
-    return structuredClone(head);
+    if (head.digest !== latest.digest) await atomicWriteJson(storage, headFile, latest);
+    return structuredClone(latest);
+  }
+
+  async function read() {
+    return withDirectoryLock(storage, lockFile, readUnlocked);
   }
 
   async function append(current, candidate) {
@@ -392,7 +405,7 @@ function createHandle(storage, clock) {
     digest(expectedDigest, 'expected authority floor digest', 'AUTHORITY_FLOOR_INPUT_INVALID');
     const normalized = normalizeUpdate(update);
     return withDirectoryLock(storage, lockFile, async () => {
-      const current = await read();
+      const current = await readUnlocked();
       if (current.digest !== expectedDigest) {
         fail('AUTHORITY_FLOOR_CONFLICT', 'Authority floor changed before the monotonic update.');
       }
@@ -439,14 +452,14 @@ function createHandle(storage, clock) {
     if (selector.activeBuildIdentity !== floor.activeBuildIdentity) {
       fail('AUTHORITY_FLOOR_OWNER_MISMATCH', 'Restored selector belongs to a superseded authority build.');
     }
-    if (value.authorityTransitionDigest !== floor.authorityTransitionDigest) {
+    if (selector.authorityTransitionDigest !== floor.authorityTransitionDigest) {
       fail('AUTHORITY_FLOOR_TRANSITION_MISMATCH', 'Restored selector predates the current authority transition.');
     }
     if (floor.legacyPermanentlyRetired
       && (legacyFence.state !== 'ACTIVATED' || legacyFence.activationEpoch !== floor.activationEpoch)) {
       fail('AUTHORITY_FLOOR_LEGACY_RESTORED', 'Legacy release authority remains permanently retired.');
     }
-    if (value.activationCutoverDigest !== floor.activationCutoverDigest) {
+    if (selector.activationCutoverDigest !== floor.activationCutoverDigest) {
       fail('AUTHORITY_FLOOR_CUTOVER_MISMATCH', 'Restored authority state is not bound to the activated cutover.');
     }
     return floor;
@@ -458,7 +471,7 @@ function createHandle(storage, clock) {
     positiveInteger(restoredStoreGeneration, 'restoredStoreGeneration', 'AUTHORITY_RESTORE_PLAN_INVALID');
     positiveInteger(restoredSelectorRevision, 'restoredSelectorRevision', 'AUTHORITY_RESTORE_PLAN_INVALID');
     return withDirectoryLock(storage, lockFile, async () => {
-      const current = await read();
+      const current = await readUnlocked();
       if (current.digest !== expectedDigest) fail('AUTHORITY_FLOOR_CONFLICT', 'Authority floor changed before restore planning.');
       if (current.activationEpoch !== 1 || current.legacyPermanentlyRetired !== true) {
         fail('AUTHORITY_RESTORE_PLAN_INVALID', 'Repair-forward is available only after permanent shared activation.');
@@ -541,8 +554,8 @@ function createHandle(storage, clock) {
       || state.selector.phase !== plan.requiredSelectorPhase
       || state.legacyFence.state !== plan.requiredLegacyFenceState
       || state.legacyFence.activationEpoch !== 1
-      || state.activationCutoverDigest !== plan.activationCutoverDigest
-      || state.authorityTransitionDigest !== plan.nextAuthorityTransitionDigest) {
+      || state.selector.activationCutoverDigest !== plan.activationCutoverDigest
+      || state.selector.authorityTransitionDigest !== plan.nextAuthorityTransitionDigest) {
       fail('AUTHORITY_RESTORE_STATE_INVALID', 'Repair-forward state must advance generation, disable promotion, and preserve permanent legacy retirement.');
     }
     const authorityState = {
@@ -552,10 +565,10 @@ function createHandle(storage, clock) {
       activationRevision: state.manifest.activationRevision,
       selectorRevision: state.selector.revision,
       activeBuildIdentity: state.selector.activeBuildIdentity,
-      authorityTransitionDigest: state.authorityTransitionDigest,
+      authorityTransitionDigest: state.selector.authorityTransitionDigest,
       selectorPhase: state.selector.phase,
       legacyFenceState: state.legacyFence.state,
-      activationCutoverDigest: state.activationCutoverDigest,
+      activationCutoverDigest: state.selector.activationCutoverDigest,
     };
     const authorityStateDigest = canonicalDigest(authorityState);
     const file = containedPath(storage.root, 'restore-receipts', `${plan.planId}.json`);
