@@ -287,12 +287,12 @@ function revisionName(revision) {
   return `${String(revision).padStart(16, '0')}.json`;
 }
 
-async function assertExternalRoot(storage, protectedRoots) {
+function assertExternalRoot(root, protectedRoots) {
   if (!Array.isArray(protectedRoots) || protectedRoots.length < 1
     || protectedRoots.some((entry) => typeof entry !== 'string' || entry.length === 0)) {
     fail('AUTHORITY_FLOOR_INPUT_INVALID', 'At least one canonical or backup protected root is required.');
   }
-  const floorRoot = path.resolve(storage.root);
+  const floorRoot = path.resolve(root);
   for (const entry of protectedRoots) {
     const protectedRoot = path.resolve(entry);
     const floorInsideProtected = floorRoot === protectedRoot || floorRoot.startsWith(`${protectedRoot}${path.sep}`);
@@ -309,11 +309,12 @@ async function storageFor(options) {
   if (typeof options.root !== 'string' || options.root.length === 0) {
     fail('AUTHORITY_FLOOR_INPUT_INVALID', 'Authority floor root is required.');
   }
+  assertExternalRoot(options.root, options.protectedRoots);
   const storage = await openAtomicStorage({
     root: options.root, filesystem: options.filesystem, nonce: options.nonce,
     verify: options.verifyStorage ?? true,
   });
-  await assertExternalRoot(storage, options.protectedRoots);
+  assertExternalRoot(storage.root, options.protectedRoots);
   return storage;
 }
 

@@ -25,9 +25,17 @@ services:
     healthcheck:
       disable: true
     restart: "no"
+    environment:
+      AUDIT_SHARED_AUTHORITY_FLOOR_ROOT: /var/lib/ai-mobile-testing/shared/authority-floor
+      AUDIT_SHARED_STORE_ROOT: /var/lib/ai-mobile-testing/shared/canonical
+      AUDIT_SHARED_STORE_MARKER_FILE: /var/lib/ai-mobile-testing/shared/trust/store-marker
+      AUDIT_SHARED_STORE_GENERATION: ${AUDIT_SHARED_STORE_GENERATION:-1}
+      AUDIT_SHARED_BACKUP_ROOT: /var/lib/ai-mobile-testing/shared/backups
+      AUDIT_SHARED_RESTORE_ROOT: /var/lib/ai-mobile-testing/shared/restores
     volumes:
       - single-site-jobs:/var/lib/ai-mobile-testing/jobs
       - shared-parent-runs:/var/lib/ai-mobile-testing/shared/canonical
+      - shared-authority-floor:/var/lib/ai-mobile-testing/shared/authority-floor
       - shared-store-trust:/var/lib/ai-mobile-testing/shared/trust
       - shared-worker-exchange:/var/lib/ai-mobile-testing/shared/exchange
       - shared-control-identities:/var/lib/ai-mobile-testing/shared/credentials
@@ -63,6 +71,7 @@ services:
       PORTAL_VISUAL_BASELINE_ROOT: /var/lib/ai-mobile-testing/baselines
       PORTAL_SHARED_CREDENTIAL_ROOT: /var/lib/ai-mobile-testing/shared/credentials
       AUDIT_SHARED_STORE_ROOT: /var/lib/ai-mobile-testing/shared/canonical
+      AUDIT_SHARED_AUTHORITY_FLOOR_ROOT: /var/lib/ai-mobile-testing/shared/authority-floor
       AUDIT_SHARED_ADMISSION_ROOT: /var/lib/ai-mobile-testing/shared/canonical/cutover-admission
       AUDIT_LEGACY_AUTHORITY_FENCE_ROOT: /var/lib/ai-mobile-testing/shared/canonical/legacy-authority
       AUDIT_SHARED_STORE_MARKER_FILE: /var/lib/ai-mobile-testing/shared/trust/store-marker
@@ -89,6 +98,7 @@ services:
       - single-site-finalizations:/var/lib/ai-mobile-testing/finalizations
       - single-site-baselines:/var/lib/ai-mobile-testing/baselines
       - shared-parent-runs:/var/lib/ai-mobile-testing/shared/canonical
+      - shared-authority-floor:/var/lib/ai-mobile-testing/shared/authority-floor:ro
       - shared-store-trust:/var/lib/ai-mobile-testing/shared/trust:ro
       - shared-control-identities:/var/lib/ai-mobile-testing/shared/credentials
 
@@ -131,11 +141,13 @@ services:
       AUDIT_QUEUE_POLL_MS: ${AUDIT_QUEUE_POLL_MS:-1000}
       AUDIT_VERBOSE: ${AUDIT_VERBOSE:-1}
       AUDIT_LEGACY_AUTHORITY_FENCE_ROOT: /var/lib/ai-mobile-testing/shared/canonical/legacy-authority
+      AUDIT_SHARED_AUTHORITY_FLOOR_ROOT: /var/lib/ai-mobile-testing/shared/authority-floor
     volumes:
       - single-site-jobs:/var/lib/ai-mobile-testing/jobs
       - single-site-finalizations:/var/lib/ai-mobile-testing/finalizations
       - single-site-baselines:/var/lib/ai-mobile-testing/baselines
       - shared-parent-runs:/var/lib/ai-mobile-testing/shared/canonical
+      - shared-authority-floor:/var/lib/ai-mobile-testing/shared/authority-floor:ro
 
   shared-coordinator:
     <<: *audit-base
@@ -153,6 +165,7 @@ services:
         condition: service_completed_successfully
     environment:
       AUDIT_SHARED_STORE_ROOT: /var/lib/ai-mobile-testing/shared/canonical
+      AUDIT_SHARED_AUTHORITY_FLOOR_ROOT: /var/lib/ai-mobile-testing/shared/authority-floor
       AUDIT_SHARED_STORE_MARKER_FILE: /var/lib/ai-mobile-testing/shared/trust/store-marker
       AUDIT_SHARED_BACKUP_MARKER_FILE: /var/lib/ai-mobile-testing/shared/trust/backup-marker
       AUDIT_SHARED_EXCHANGE_ROOT: /var/lib/ai-mobile-testing/shared/exchange
@@ -172,6 +185,7 @@ services:
       AUDIT_SHARED_CRASH_SENTINEL_ROOT: ${AUDIT_SHARED_CRASH_SENTINEL_ROOT:-}
     volumes:
       - shared-parent-runs:/var/lib/ai-mobile-testing/shared/canonical
+      - shared-authority-floor:/var/lib/ai-mobile-testing/shared/authority-floor
       - shared-store-trust:/var/lib/ai-mobile-testing/shared/trust:ro
       - shared-worker-exchange:/var/lib/ai-mobile-testing/shared/exchange
       - shared-control-identities:/var/lib/ai-mobile-testing/shared/credentials
@@ -210,6 +224,7 @@ services:
     restart: "no"
     environment:
       AUDIT_SHARED_STORE_ROOT: /var/lib/ai-mobile-testing/shared/canonical
+      AUDIT_SHARED_AUTHORITY_FLOOR_ROOT: /var/lib/ai-mobile-testing/shared/authority-floor
       AUDIT_SHARED_STORE_MARKER_FILE: /var/lib/ai-mobile-testing/shared/trust/store-marker
       AUDIT_SHARED_BACKUP_MARKER_FILE: /var/lib/ai-mobile-testing/shared/trust/backup-marker
       AUDIT_SHARED_DEPLOYMENT_IDENTITY: ${AUDIT_SHARED_DEPLOYMENT_IDENTITY:-compose:ai-mobile-testing}
@@ -219,6 +234,7 @@ services:
       AUDIT_SHARED_STORE_GENERATION: ${AUDIT_SHARED_STORE_GENERATION:-1}
     volumes:
       - shared-parent-runs:/var/lib/ai-mobile-testing/shared/canonical
+      - shared-authority-floor:/var/lib/ai-mobile-testing/shared/authority-floor:ro
       - shared-store-trust:/var/lib/ai-mobile-testing/shared/trust:ro
 
   shared-resilience-control-client:
@@ -417,10 +433,12 @@ services:
       CANDIDATE_IGNORE_HTTPS_ERRORS: ${CANDIDATE_IGNORE_HTTPS_ERRORS:-0}
       AUDIT_ARTIFACT_DIR: ${AUDIT_ARTIFACT_DIR:-/work/artifacts/docker-release}
       AUDIT_LEGACY_AUTHORITY_FENCE_ROOT: /var/lib/ai-mobile-testing/shared/canonical/legacy-authority
+      AUDIT_SHARED_AUTHORITY_FLOOR_ROOT: /var/lib/ai-mobile-testing/shared/authority-floor
     volumes:
       - ./artifacts:/work/artifacts
       - ./certs:/work/certs:ro
       - shared-parent-runs:/var/lib/ai-mobile-testing/shared/canonical
+      - shared-authority-floor:/var/lib/ai-mobile-testing/shared/authority-floor:ro
 
   audit-release-shard:
     <<: *audit-base
@@ -479,10 +497,12 @@ services:
       AUDIT_SHARD_TOTAL: ${AUDIT_SHARD_TOTAL:-8}
       AUDIT_ARTIFACT_DIR: /work/artifacts/sharded/${AUDIT_SHARDED_RUN_ID:-manual-sharded-release}
       AUDIT_LEGACY_AUTHORITY_FENCE_ROOT: /var/lib/ai-mobile-testing/shared/canonical/legacy-authority
+      AUDIT_SHARED_AUTHORITY_FLOOR_ROOT: /var/lib/ai-mobile-testing/shared/authority-floor
     volumes:
       - ./artifacts:/work/artifacts
       - ./certs:/work/certs:ro
       - shared-parent-runs:/var/lib/ai-mobile-testing/shared/canonical
+      - shared-authority-floor:/var/lib/ai-mobile-testing/shared/authority-floor:ro
 
   audit-update-visuals:
     <<: *audit-base
@@ -509,6 +529,7 @@ volumes:
   single-site-finalizations:
   single-site-baselines:
   shared-parent-runs:
+  shared-authority-floor:
   shared-store-trust:
   shared-worker-exchange:
   shared-control-identities:

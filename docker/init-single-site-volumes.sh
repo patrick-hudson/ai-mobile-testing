@@ -10,6 +10,7 @@ sensitive_roots=()
 for optional_root in \
   /var/lib/ai-mobile-testing/shared/credentials \
   /var/lib/ai-mobile-testing/shared/trust \
+  /var/lib/ai-mobile-testing/shared/authority-floor \
   /var/lib/ai-mobile-testing/shared/secrets/ordinary-a \
   /var/lib/ai-mobile-testing/shared/secrets/ordinary-b \
   /var/lib/ai-mobile-testing/shared/secrets/performance; do
@@ -62,6 +63,10 @@ if [[ -d /var/lib/ai-mobile-testing/shared/canonical ]]; then
   find /var/lib/ai-mobile-testing/shared/canonical/cutover-admission -xdev -type f -exec chmod 0660 {} +
   find /var/lib/ai-mobile-testing/shared/canonical/legacy-authority -xdev -type d -exec chmod 2770 {} +
   find /var/lib/ai-mobile-testing/shared/canonical/legacy-authority -xdev -type f -exec chmod 0660 {} +
+fi
+
+if [[ -d /var/lib/ai-mobile-testing/shared/authority-floor ]]; then
+  node scripts/init-shared-authority-floor.mjs
 fi
 
 for volume_root in "${sensitive_roots[@]}"; do
