@@ -6,6 +6,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { auditCaseTag } from '../shared/audit-case-identity.mjs';
 import { buildLiveRouteInventory } from '../shared/live-route-inventory.mjs';
 import { preflightQuitting7ohSite } from '../shared/site-preflight.mjs';
+import { runnerRevisionDigest } from '../shared/runner-revision.mjs';
 import { deriveTargetPreflightSetIdentity } from '../shared/target-preflight-set.mjs';
 import { sealSharedGenericRouteExecutionPublication } from '../shared/single-site-route-plan.mjs';
 import { parseWorkExecutionDescriptor } from '../shared/work-execution-descriptor.mjs';
@@ -82,14 +83,14 @@ function safeInheritedEnvironment() {
   )));
 }
 
-function playwrightEnvironment(descriptor, artifactRoot, proxyUrl = null, genericRoutePublication = null) {
+function playwrightEnvironment(descriptor, artifactRoot, runnerRevision, proxyUrl = null, genericRoutePublication = null) {
   const resilienceProof = process.env[SHARED_DOCKER_RESILIENCE_ENV] ?? '0';
   const proofEnabled = validateSharedDockerResilienceBinding(resilienceProof, descriptor.entrySpec);
   const environment = {
     ...safeInheritedEnvironment(),
     CI: '1',
     AUDIT_RUN_MODE: descriptor.mode,
-    AUDIT_RUNNER_REVISION: descriptor.runnerRevision,
+    AUDIT_RUNNER_REVISION: runnerRevision,
     AUDIT_TARGET_IDS: descriptor.targetId,
     AUDIT_ARTIFACT_DIR: artifactRoot,
     AUDIT_PROFILE: 'release',
@@ -122,7 +123,7 @@ function playwrightEnvironment(descriptor, artifactRoot, proxyUrl = null, generi
   return environment;
 }
 
-async function spawnPlaywright(descriptor, artifactRoot, signal) {
+async function spawnPlaywright(descriptor, artifactRoot, runnerRevision, signal) {
   const executable = path.join(repositoryRoot, 'node_modules', '.bin', 'playwright');
   const args = [
     'test', descriptor.entrySpec,
@@ -150,7 +151,7 @@ async function spawnPlaywright(descriptor, artifactRoot, signal) {
     const completion = await new Promise((resolve, reject) => {
       const child = spawn(executable, args, {
         cwd: repositoryRoot,
-        env: playwrightEnvironment(descriptor, artifactRoot, egressProxy?.url ?? null, genericRoutePublication),
+        env: playwrightEnvironment(descriptor, artifactRoot, runnerRevision, egressProxy?.url ?? null, genericRoutePublication),
         shell: false,
         stdio: ['ignore', 'inherit', 'inherit'],
       });
@@ -352,6 +353,10 @@ export function buildSharedWorkerResultManifest({ descriptor, identity, result }
 export async function executeSharedWorkItem({ descriptor, identity, evidenceRoot, signal } = {}) {
   descriptor = parseWorkExecutionDescriptor(descriptor);
   identity = validateIdentity(identity, descriptor);
+  const runnerRevision = required('AUDIT_RUNNER_REVISION');
+  if (runnerRevisionDigest(runnerRevision) !== descriptor.runnerRevision) {
+    throw new Error('The immutable image revision does not match the compiler-issued execution descriptor.');
+  }
   evidenceRoot = exactEvidenceRoot(evidenceRoot);
   await fs.mkdir(evidenceRoot, { recursive: true, mode: 0o700 });
   const artifactDirectory = descriptor.operation === 'inventory' ? 'inventory' : 'playwright';
@@ -359,7 +364,7 @@ export async function executeSharedWorkItem({ descriptor, identity, evidenceRoot
   await fs.mkdir(artifactRoot, { recursive: true, mode: 0o700 });
   const result = descriptor.operation === 'inventory'
     ? await executeInventory(descriptor, artifactRoot)
-    : await spawnPlaywright(descriptor, artifactRoot, signal);
+    : await spawnPlaywright(descriptor, artifactRoot, runnerRevision, signal);
   const manifest = buildSharedWorkerResultManifest({ descriptor, identity, result });
   await fs.writeFile(path.join(evidenceRoot, 'result.json'), `${JSON.stringify(manifest)}\n`, { mode: 0o600 });
   return manifest;

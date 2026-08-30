@@ -44,6 +44,12 @@ export async function maintainSharedWorkerLease({
   }
 
   let currentLease = Object.freeze({ ...lease });
+  const liveLease = Object.freeze(Object.defineProperties({}, Object.fromEntries(
+    Object.keys(currentLease).map((key) => [key, {
+      enumerable: true,
+      get: () => currentLease[key],
+    }]),
+  )));
   let heartbeatFailure = null;
   let reportHeartbeatFailure;
   const heartbeatFailed = new Promise((resolve) => { reportHeartbeatFailure = resolve; });
@@ -79,7 +85,7 @@ export async function maintainSharedWorkerLease({
   })();
 
   const execution = Promise.resolve()
-    .then(() => execute({ signal: executorAbort.signal, lease: currentLease }))
+    .then(() => execute({ signal: executorAbort.signal, lease: liveLease }))
     .then(
       (value) => ({ kind: 'execution-finished', value }),
       (error) => ({ kind: 'execution-failed', error }),

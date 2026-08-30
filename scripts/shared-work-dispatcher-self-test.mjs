@@ -43,25 +43,37 @@ const lease = {
   specAffinity: descriptor.entrySpec, executionDescriptor: descriptor, executionDescriptorDigest: descriptor.digest,
 };
 
-const command = createSharedWorkCommand(lease, '/tmp/shared-dispatcher-evidence', {
+const workerEnvironment = {
   PATH: '/usr/bin', NODE_EXTRA_CA_CERTS: '/work/certs/netskope.pem',
+  AUDIT_RUNNER_REVISION: `image:${descriptor.runnerRevision}`,
   AUDIT_SHARED_WORKER_TOKEN_FILE: '/run/secrets/shared-worker/token',
   ANTHROPIC_API_KEY: 'must-not-cross-the-worker-boundary',
-});
+};
+const command = createSharedWorkCommand(lease, '/tmp/shared-dispatcher-evidence', workerEnvironment);
 assert.equal(command.executable, process.execPath);
 assert.deepEqual(command.args, [sharedWorkExecutorPath]);
 assert.equal(path.basename(command.args[0]), 'execute-shared-work-item.mjs');
 assert.equal(command.environment.NODE_EXTRA_CA_CERTS, '/work/certs/netskope.pem');
+assert.equal(command.environment.AUDIT_RUNNER_REVISION, `image:${descriptor.runnerRevision}`,
+  'The executor must retain the immutable image revision while the lease remains bound to its canonical digest.');
 assert(!('AUDIT_SHARED_WORKER_TOKEN_FILE' in command.environment));
 assert(!('ANTHROPIC_API_KEY' in command.environment));
 assert.equal(JSON.parse(command.environment.AUDIT_SHARED_RESULT_IDENTITY).executionDescriptorDigest, descriptor.digest);
-assert.throws(() => createSharedWorkCommand({ ...lease, targetId: 'production-mobile-chromium' }, '/tmp/evidence'),
+assert.throws(() => createSharedWorkCommand({ ...lease, targetId: 'production-mobile-chromium' }, '/tmp/evidence', workerEnvironment),
   /does not match the active work lease/);
-assert.throws(() => createSharedWorkCommand({ ...lease, executionDescriptor: null }, '/tmp/evidence'),
+assert.throws(() => createSharedWorkCommand({ ...lease, executionDescriptor: null }, '/tmp/evidence', workerEnvironment),
   /lacks a compiler-issued execution descriptor/);
-assert.throws(() => createSharedWorkCommand(lease, '/tmp/evidence', { AUDIT_SHARED_RESILIENCE_PROOF: 'yes' }),
+assert.throws(() => createSharedWorkCommand(lease, '/tmp/evidence', {
+  ...workerEnvironment,
+  AUDIT_RUNNER_REVISION: `image:${digest('c')}`,
+}), /image revision does not match the active work lease/);
+assert.throws(() => createSharedWorkCommand(lease, '/tmp/evidence', {
+  ...workerEnvironment, AUDIT_SHARED_RESILIENCE_PROOF: 'yes',
+}),
   /must be exactly 0 or 1/);
-assert.throws(() => createSharedWorkCommand(lease, '/tmp/evidence', { AUDIT_SHARED_RESILIENCE_PROOF: '1' }),
+assert.throws(() => createSharedWorkCommand(lease, '/tmp/evidence', {
+  ...workerEnvironment, AUDIT_SHARED_RESILIENCE_PROOF: '1',
+}),
   /proof fixture must be used together/);
 const { schemaVersion: _schemaVersion, kind: _kind, digest: _descriptorDigest, ...descriptorInput } = descriptor;
 assert.throws(() => sealWorkExecutionDescriptor({ ...descriptorInput, entrySpec: '../outside.spec.ts' }), /repository-owned spec/);
@@ -116,9 +128,11 @@ const proofLease = {
   executionDescriptorDigest: proofDescriptor.digest,
 };
 assert.equal(createSharedWorkCommand(proofLease, '/tmp/evidence', {
+  AUDIT_RUNNER_REVISION: `image:${proofDescriptor.runnerRevision}`,
   AUDIT_SHARED_RESILIENCE_PROOF: '1',
 }).environment.AUDIT_SHARED_RESILIENCE_PROOF, '1');
-assert.throws(() => createSharedWorkCommand(proofLease, '/tmp/evidence'), /proof fixture must be used together/);
+assert.throws(() => createSharedWorkCommand(proofLease, '/tmp/evidence', workerEnvironment),
+  /proof fixture must be used together/);
 
 function report(statuses, overrides = {}) {
   const activeDescriptor = overrides.descriptor ?? descriptor;

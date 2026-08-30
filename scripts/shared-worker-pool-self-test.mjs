@@ -737,6 +737,7 @@ try {
   let heartbeatCount = 0;
   let heartbeatTurn = 0;
   let finishLongExecution;
+  let longRunningExecutorLease;
   const longExecution = new Promise((resolve) => { finishLongExecution = resolve; });
   const maintained = await maintainSharedWorkerLease({
     lease: longLease,
@@ -764,11 +765,17 @@ try {
       if (heartbeatCount === 3) finishLongExecution('executor-finished');
       return renewed;
     },
-    execute: async () => longExecution,
+    execute: async ({ lease }) => {
+      longRunningExecutorLease = lease;
+      return longExecution;
+    },
   });
   assert.equal(heartbeatCount, 3);
   assert.equal(maintained.value, 'executor-finished');
   assert.equal(maintained.lease.workItemId, 'long-running-item');
+  assert.equal(longRunningExecutorLease.expiresAt, maintained.lease.expiresAt,
+    'the running executor must observe the renewed lease used for result and log publication');
+  assert.notEqual(longRunningExecutorLease.expiresAt, longLease.expiresAt);
   assert.equal((await readParentRun(store, 'heartbeat-run')).workItems['long-running-item'].attempts.length, 0,
     'lease renewal must not create a retry attempt');
   const maintainedInbox = await publishAttemptEvidence(store, 'heartbeat-run', maintained.lease, {

@@ -1,6 +1,7 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseWorkExecutionDescriptor } from '../../shared/work-execution-descriptor.mjs';
+import { runnerRevisionDigest } from '../../shared/runner-revision.mjs';
 import {
   SHARED_DOCKER_RESILIENCE_ENV,
   validateSharedDockerResilienceBinding,
@@ -12,6 +13,7 @@ const PASSTHROUGH_ENVIRONMENT = Object.freeze([
   'PATH', 'HOME', 'USER', 'LOGNAME', 'TMPDIR', 'TEMP', 'TMP', 'LANG', 'LC_ALL', 'TZ',
   'PLAYWRIGHT_BROWSERS_PATH', 'PLAYWRIGHT_FIREFOX_EXECUTABLE_PATH', 'NODE_EXTRA_CA_CERTS',
   'SSL_CERT_FILE', 'SSL_CERT_DIR', 'AUDIT_MSEDGE_AVAILABLE', 'AUDIT_PREVIEW_TLS_BYPASS_ALLOWLIST',
+  'AUDIT_RUNNER_REVISION',
   SHARED_DOCKER_RESILIENCE_ENV,
 ]);
 
@@ -45,6 +47,14 @@ export function createSharedWorkCommand(lease, evidenceRoot, environment = proce
   const childEnvironment = {};
   for (const name of PASSTHROUGH_ENVIRONMENT) {
     if (typeof environment[name] === 'string' && environment[name].length <= 8_192) childEnvironment[name] = environment[name];
+  }
+  try {
+    if (runnerRevisionDigest(childEnvironment.AUDIT_RUNNER_REVISION) !== lease.runnerRevision) {
+      fail('The immutable image revision does not match the active work lease.');
+    }
+  } catch (error) {
+    if (error?.code === 'SHARED_WORK_DESCRIPTOR_INVALID') throw error;
+    fail(`The immutable image revision is invalid: ${error.message}`);
   }
   let proofEnabled;
   try {
