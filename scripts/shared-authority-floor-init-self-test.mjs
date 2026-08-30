@@ -149,6 +149,7 @@ try {
 
   const compose = await readFile(new URL('../docker-compose.yml', import.meta.url), 'utf8');
   const initScript = await readFile(new URL('../docker/init-single-site-volumes.sh', import.meta.url), 'utf8');
+  const resilienceProof = await readFile(new URL('./shared-docker-resilience-self-test.mjs', import.meta.url), 'utf8');
   function serviceBlock(name) {
     return compose.match(new RegExp(`\\n  ${name}:[\\s\\S]*?(?=\\n  [a-z][a-z0-9-]+:|\\nvolumes:)`, 'u'))?.[0] ?? '';
   }
@@ -165,6 +166,8 @@ try {
   const proof = serviceBlock('shared-resilience-driver');
   assert.match(proof, /shared-authority-floor:\/var\/lib\/ai-mobile-testing\/shared\/authority-floor(?!:ro)/u,
     'the proof-only authority activator advances the isolated external floor while holding its durable coordinator fence');
+  assert.match(resilienceProof, /const activation = driver\(project, 'activate-authority', runId\);[\s\S]*?crashEnvironment\(boundary, activatedStoreGeneration\)/u,
+    'post-activation crash-boundary processes must use the activated selector store generation');
   assert.match(initScript, /node scripts\/init-shared-authority-floor\.mjs/u);
   assert.match(compose, /\n  shared-authority-floor:\s*$/mu);
   assert.doesNotMatch(serviceBlock('shared-worker-ordinary-a'), /shared-authority-floor/u);

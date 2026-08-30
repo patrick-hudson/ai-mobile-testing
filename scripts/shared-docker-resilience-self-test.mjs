@@ -588,11 +588,15 @@ async function runCoordinatorCrashBoundary(boundary, referenceInvariant) {
     compose(project, ['run', '--rm', '--no-deps', 'single-site-volume-init']);
     driver(project, 'seed', runId);
     const requiresPublication = ['envelope-fsync', 'head-swap'].includes(boundary);
+    let activatedStoreGeneration = '1';
     if (requiresPublication) {
-      driver(project, 'activate-authority', runId);
+      const activation = driver(project, 'activate-authority', runId);
+      activatedStoreGeneration = String(activation.selector.storeGeneration);
+      assert.match(activatedStoreGeneration, /^[2-9]\d*$/u,
+        'first publication must advance the durable store generation before activated processes start');
       await new Promise((resolve) => setTimeout(resolve, 150));
     }
-    const environment = crashEnvironment(boundary);
+    const environment = crashEnvironment(boundary, activatedStoreGeneration);
     compose(project, ['up', '-d', 'shared-coordinator'], { environment });
     const containerId = compose(project, ['ps', '-aq', 'shared-coordinator'], { environment }).stdout.trim();
     assert.match(containerId, /^[a-f0-9]{12,64}$/u);
