@@ -648,6 +648,19 @@ function validateHandoffCanaryPermit(value, selector, mode = null) {
   return value;
 }
 
+async function requireHandoffRunPermit(store, selector, runId) {
+  if (selector.pendingBuildIdentity === null) return;
+  for (const mode of ['single-site', 'comparative']) {
+    const file = handoffCanaryPermitPath(store, selector.handoffId, mode);
+    if (!await pathExists(store.storage.fs, file)) continue;
+    const permit = validateHandoffCanaryPermit(await readBoundedJson(store.storage, file, {
+      label: 'release-authority handoff canary permit', maximumBytes: 64 * 1_024,
+    }), selector, mode);
+    if (permit.runId === runId) return;
+  }
+  fail('AUTHORITY_HANDOFF_CANARY_REQUIRED', 'Pending target may access only a permitted handoff health canary.');
+}
+
 async function requirePublicationAuthority(store, runId) {
   const selector = await readAuthoritySelectorUnlocked(store);
   if (!['ACTIVE', 'PROMOTION_DISABLED'].includes(selector.phase)) {
@@ -659,18 +672,7 @@ async function requirePublicationAuthority(store, runId) {
     fail('STORE_WRITER_INCOMPATIBLE', 'The active selector does not authorize this build and writer protocol.');
   }
   if (selector.phase === 'PROMOTION_DISABLED' && selector.pendingBuildIdentity !== null) {
-    let permitted = false;
-    for (const mode of ['single-site', 'comparative']) {
-      const file = handoffCanaryPermitPath(store, selector.handoffId, mode);
-      if (!await pathExists(store.storage.fs, file)) continue;
-      const permit = validateHandoffCanaryPermit(await readBoundedJson(store.storage, file, {
-        label: 'release-authority handoff canary permit', maximumBytes: 64 * 1_024,
-      }), selector, mode);
-      if (permit.runId === runId) permitted = true;
-    }
-    if (!permitted) {
-      fail('AUTHORITY_HANDOFF_CANARY_REQUIRED', 'Pending build may publish only a permitted handoff health canary.');
-    }
+    await requireHandoffRunPermit(store, selector, runId);
   }
   return { selector, binding: authorityBinding(store, selector) };
 }
@@ -1278,18 +1280,7 @@ export async function createParentRun(store, input) {
       if (store.buildIdentity !== selector.pendingBuildIdentity) {
         fail('STORE_WRITER_NOT_ACTIVE', 'Only the pending target build may create a handoff health canary.');
       }
-      let permitted = false;
-      for (const mode of ['single-site', 'comparative']) {
-        const file = handoffCanaryPermitPath(store, selector.handoffId, mode);
-        if (!await pathExists(store.storage.fs, file)) continue;
-        const permit = validateHandoffCanaryPermit(await readBoundedJson(store.storage, file, {
-          label: 'release-authority handoff canary permit', maximumBytes: 64 * 1_024,
-        }), selector, mode);
-        if (permit.runId === runId) permitted = true;
-      }
-      if (!permitted) {
-        fail('AUTHORITY_HANDOFF_CANARY_REQUIRED', 'Pending build may create only a pre-authorized handoff health canary.');
-      }
+      await requireHandoffRunPermit(store, selector, runId);
     }
     const directory = runDirectory(store, runId);
     if (await pathExists(store.storage.fs, directory)) fail('RUN_ALREADY_EXISTS', `Parent run ${runId} already exists.`);
@@ -1991,6 +1982,8 @@ export async function requestStorePerformanceDrain(store, coordinator, input) {
   }
   return withDirectoryLock(store.storage, globalLockPath(store), async () => {
     await validateCoordinator(store, coordinator);
+    const authority = await readAuthoritySelectorUnlocked(store);
+    for (const runId of runIds) await requireHandoffRunPermit(store, authority, runId);
     const states = await schedulingStatesUnlocked(store);
     const current = await reconcilePerformanceSchedulerUnlocked(store, coordinator, states);
     if (current.phase === 'running') fail('PERFORMANCE_LEASE_HELD', 'The store-global performance resource is already running.');
@@ -2072,17 +2065,7 @@ export async function claimStoreWorkItem(store, coordinator, input) {
       fail('CUTOVER_WORK_CLAIMS_FENCED', 'Work claims are fenced while shared release authority is draining for cutover.');
     }
     if (authority.pendingBuildIdentity !== null) {
-      const permittedRuns = new Set();
-      for (const mode of ['single-site', 'comparative']) {
-        const file = handoffCanaryPermitPath(store, authority.handoffId, mode);
-        if (!await pathExists(store.storage.fs, file)) continue;
-        permittedRuns.add(validateHandoffCanaryPermit(await readBoundedJson(store.storage, file, {
-          label: 'release-authority handoff canary permit', maximumBytes: 64 * 1_024,
-        }), authority, mode).runId);
-      }
-      if (runIds.some((runId) => !permittedRuns.has(runId))) {
-        fail('AUTHORITY_HANDOFF_CANARY_REQUIRED', 'Pending target workers may claim only permitted handoff health runs.');
-      }
+      for (const runId of runIds) await requireHandoffRunPermit(store, authority, runId);
     }
     const states = await schedulingStatesUnlocked(store);
     const scheduler = await reconcilePerformanceSchedulerUnlocked(store, coordinator, states);
@@ -3423,6 +3406,8 @@ function operationBodyDigest(request) {
 export async function acceptOperation(store, runId, request) {
   safeId(request?.idempotencyKey, 'idempotencyKey');
   return withDirectoryLock(store.storage, globalLockPath(store), () => withDirectoryLock(store.storage, lockPath(store, runId), async () => {
+    const selector = await readAuthoritySelectorUnlocked(store);
+    await requireHandoffRunPermit(store, selector, runId);
     const state = await recoverUnlocked(store, runId);
     const digest = operationBodyDigest(request);
     const expiredCompletedKeys = Object.entries(state.operations)

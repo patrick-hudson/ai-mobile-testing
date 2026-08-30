@@ -8,6 +8,7 @@ import { appendPublicationEnvelope } from '../shared/publication-envelope.mjs';
 import {
   PARENT_RUN_STORE_SCHEMA_VERSION,
   PARENT_RUN_WRITER_PROTOCOL,
+  acceptOperation,
   acquireStoreCoordinator,
   adoptAttemptEvidence,
   claimWorkItem,
@@ -15,6 +16,7 @@ import {
   openParentRunStore,
   publishCurrentEnvelope,
   publishAttemptEvidence,
+  requestStorePerformanceDrain,
   readCurrentEnvelope,
   readParentRun,
   readReleaseAuthoritySelector,
@@ -118,6 +120,12 @@ try {
     activationCutoverDigest: digest,
     authorityTransitionDigest: digest,
   });
+  await createParentRun(source, {
+    runId: 'source-era-run',
+    subjectCoreDigest: digest,
+    runnerRevision: digest,
+    workItems: [{ id: 'source-era-performance', maxAttempts: 1, resourceClass: 'performance', capability: 'performance:lighthouse' }],
+  });
   const authorityFloor = await initializeSharedAuthorityFloor({
     root: floorRoot,
     protectedRoots: [root],
@@ -196,6 +204,14 @@ try {
   const targetCoordinator = await acquireStoreCoordinator(target, {
     ownerId: 'coordinator-target-b', leaseMs: 60_000,
   });
+  await expectCode('AUTHORITY_HANDOFF_CANARY_REQUIRED', () => acceptOperation(target, 'source-era-run', {
+    idempotencyKey: 'source-era-rekick-0001', kind: 'rekick', actor: { id: 'operator:test', kind: 'human' },
+    body: { reason: 'must stay fenced' },
+  }));
+  await expectCode('AUTHORITY_HANDOFF_CANARY_REQUIRED', () => requestStorePerformanceDrain(target, targetCoordinator, {
+    workerId: 'source-era-performance-worker', capabilities: ['performance:lighthouse'],
+    resourceClasses: ['performance'], runIds: ['source-era-run'], leaseMs: 1_000,
+  }));
   await expectCode('AUTHORITY_HANDOFF_HEALTH_REQUIRED', () => transitionReleaseAuthority(target, targetCoordinator, {
     expectedSelectorDigest: pending.digest,
     phase: 'ACTIVE',
