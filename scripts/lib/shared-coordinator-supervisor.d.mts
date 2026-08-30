@@ -11,6 +11,7 @@ export interface SharedCoordinatorStatus {
 }
 export interface SharedCoordinatorSupervisor {
   maintain(): Promise<SharedCoordinatorStatus>;
+  renewCoordinator(): Promise<CoordinatorFence>;
   claim(principal: any, request?: any): Promise<WorkLease>;
   requestPerformanceDrain(principal: any, request?: any): Promise<{ workerId: string; runId: string; workItemId: string; coordinatorEpoch: number; requestedAt: string; expiresAt: string }>;
   status(): SharedCoordinatorStatus;

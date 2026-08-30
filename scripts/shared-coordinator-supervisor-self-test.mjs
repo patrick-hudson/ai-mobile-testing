@@ -9,6 +9,7 @@ import {
   adoptAttemptEvidence, createParentRun, openParentRunStore, publishAttemptEvidence, readParentRun,
 } from './lib/parent-run-store.mjs';
 import { compileSharedLaunchPlan } from '../shared/launch-plan-compiler.mjs';
+import { withDirectoryLock } from './lib/atomic-filesystem.mjs';
 
 const root = await mkdtemp(path.join(tmpdir(), 'shared-coordinator-supervisor-'));
 const digest = (character) => `sha256:${character.repeat(64)}`;
@@ -158,5 +159,186 @@ try {
   assert.equal(expiredInventory.compilationFailure.terminalResultDigest, terminalAttempt.canonicalResultDigest);
 } finally {
   await rm(root, { recursive: true, force: true });
+}
+
+const leaseRoot = await mkdtemp(path.join(tmpdir(), 'shared-coordinator-lease-rollover-'));
+let leaseNow = Date.parse('2026-08-29T13:00:00.000Z');
+let advanceDuringMaintenance = false;
+let advancedMaintenance = false;
+let publicationRacePending = false;
+try {
+  const leaseStore = await openParentRunStore({
+    root: leaseRoot,
+    deploymentIdentity: 'supervisor-lease-rollover-test',
+    volumeIdentity: 'named-volume:supervisor-lease-rollover-test',
+    verifyStorage: false,
+    clock: () => leaseNow,
+  });
+  for (const [runId, suffix] of [['lease-run-a', 'c'], ['lease-run-b', 'd']]) {
+    await createParentRun(leaseStore, {
+      runId,
+      subjectCoreDigest: digest(suffix),
+      compilationState: 'pending',
+      runnerRevision: 'runner-v1',
+      workItems: [{
+        id: `lease-work-${suffix}`, maxAttempts: 3, capability: 'browser:chromium', resourceClass: 'ordinary',
+        targetId: 'single-site-mobile-chromium', specAffinity: 'tests/accessibility.spec.ts',
+      }],
+    });
+  }
+  const leaseSupervisor = createSharedCoordinatorSupervisor({
+    store: leaseStore,
+    controlService: {
+      applyAcceptedOperations: async () => {
+        if (advanceDuringMaintenance && !advancedMaintenance) {
+          advancedMaintenance = true;
+          leaseNow += 60_001;
+        }
+        return [];
+      },
+      publishCurrentProjection: async () => {
+        if (publicationRacePending) {
+          publicationRacePending = false;
+          throw Object.assign(new Error('projection raced a durable heartbeat'), {
+            code: 'PUBLICATION_LEDGER_MISMATCH',
+          });
+        }
+        return null;
+      },
+    },
+    projectId: 'project-1',
+    ownerId: 'coordinator-lease-rollover-test',
+    coordinatorLeaseMs: 60_000,
+    workLeaseMs: 1_000,
+  });
+  assert.deepEqual((await leaseSupervisor.maintain()).errors, []);
+  const leaseWorker = {
+    id: 'lease-worker', kind: 'worker', roles: ['worker'], projectIds: ['project-1'], runIds: ['*'],
+    workerGrant: { capabilities: ['browser:chromium'], resourceClasses: ['ordinary'] },
+  };
+  const oldEpochLease = await leaseSupervisor.claim(leaseWorker);
+  assert.equal(oldEpochLease.runId, 'lease-run-a');
+  advanceDuringMaintenance = true;
+  const crossedLease = await leaseSupervisor.maintain();
+  assert.deepEqual(crossedLease.errors, [],
+    'maintenance must renew or reacquire coordinator authority when a run sweep crosses the lease deadline');
+  assert.equal(crossedLease.epoch, 2,
+    'maintenance must report the coordinator epoch that actually completed the sweep');
+  assert.equal(crossedLease.requeued, 1,
+    'an epoch rollover must revisit prior runs and recover work fenced by the new epoch in the same pass');
+  assert.equal((await readParentRun(leaseStore, 'lease-run-a')).workItems['lease-work-c'].state, 'queued');
+  let releaseMutationLock;
+  let mutationLockAcquired;
+  const mutationLockReady = new Promise((resolve) => { mutationLockAcquired = resolve; });
+  const mutationLockGate = new Promise((resolve) => { releaseMutationLock = resolve; });
+  const heldMutationLock = withDirectoryLock(
+    leaseStore.storage,
+    path.join(leaseRoot, '.coordinator-mutation-lock'),
+    async () => {
+      mutationLockAcquired();
+      await mutationLockGate;
+    },
+  );
+  await mutationLockReady;
+  const renewal = leaseSupervisor.renewCoordinator();
+  const renewalResult = await Promise.race([
+    renewal.then((value) => ({ status: 'renewed', value })),
+    new Promise((resolve) => setTimeout(() => resolve({ status: 'blocked' }), 250)),
+  ]);
+  releaseMutationLock();
+  await heldMutationLock;
+  await renewal;
+  assert.equal(renewalResult.status, 'renewed',
+    'coordinator liveness must renew while a canonical mutation holds the global mutation lock');
+  assert.equal(renewalResult.value.epoch, 2,
+    'isolated coordinator renewal must retain the active fencing epoch');
+  publicationRacePending = true;
+  assert.deepEqual((await leaseSupervisor.maintain()).errors, [],
+    'a projection that races a durable heartbeat must remain pending for the next maintenance pass');
+  leaseNow += 60_001;
+  const competingSupervisor = createSharedCoordinatorSupervisor({
+    store: leaseStore,
+    controlService: { applyAcceptedOperations: async () => [], publishCurrentProjection: async () => null },
+    projectId: 'project-1', ownerId: 'competing-coordinator', coordinatorLeaseMs: 60_000, workLeaseMs: 1_000,
+  });
+  assert.equal((await competingSupervisor.maintain()).state, 'ready');
+  const displacedStatus = await leaseSupervisor.maintain();
+  assert.equal(displacedStatus.state, 'waiting-for-lease',
+    'a supervisor displaced by another coordinator must not publish false-ready health');
+  assert.equal(displacedStatus.epoch, null);
+} finally {
+  await rm(leaseRoot, { recursive: true, force: true });
+}
+
+const scaleRoot = await mkdtemp(path.join(tmpdir(), 'shared-coordinator-production-scale-'));
+let scaleNow = Date.parse('2026-08-29T14:00:00.000Z');
+try {
+  const scaleStore = await openParentRunStore({
+    root: scaleRoot,
+    deploymentIdentity: 'supervisor-production-scale-test',
+    volumeIdentity: 'named-volume:supervisor-production-scale-test',
+    verifyStorage: false,
+    clock: () => scaleNow,
+  });
+  for (const [runId, count, suffix] of [
+    ['scale-comparative', 518, 'e'],
+    ['scale-single-site', 385, 'f'],
+  ]) {
+    await createParentRun(scaleStore, {
+      runId,
+      subjectCoreDigest: digest(suffix),
+      compilationState: 'pending',
+      runnerRevision: 'runner-v1',
+      workItems: Array.from({ length: count }, (_, index) => ({
+        id: `${runId}-work-${String(index).padStart(3, '0')}`,
+        maxAttempts: 3,
+        capability: index === 0 ? 'performance:lighthouse' : 'browser:chromium',
+        resourceClass: index === 0 ? 'performance' : 'ordinary',
+        targetId: 'candidate-mobile-chromium',
+        specAffinity: 'tests/accessibility.spec.ts',
+      })),
+    });
+  }
+  const scaleSupervisor = createSharedCoordinatorSupervisor({
+    store: scaleStore,
+    controlService: {
+      applyAcceptedOperations: async () => [],
+      publishCurrentProjection: async () => null,
+    },
+    projectId: 'project-1',
+    ownerId: 'coordinator-production-scale-test',
+    coordinatorLeaseMs: 60_000,
+    workLeaseMs: 1_000,
+  });
+  assert.deepEqual((await scaleSupervisor.maintain()).errors, []);
+  const scaleWorker = {
+    id: 'scale-worker', kind: 'worker', roles: ['worker'], projectIds: ['project-1'], runIds: ['*'],
+    workerGrant: { capabilities: ['browser:chromium'], resourceClasses: ['ordinary'] },
+  };
+  const scaleClaims = await Promise.all(Array.from({ length: 3 }, () => scaleSupervisor.claim(scaleWorker)));
+  assert.deepEqual(new Set(scaleClaims.map(({ runId }) => runId)),
+    new Set(['scale-comparative', 'scale-single-site']),
+    'concurrent production-sized claims must preserve fairness across both modes');
+  const performanceWorker = {
+    id: 'scale-performance-worker', kind: 'worker', roles: ['worker'], projectIds: ['project-1'], runIds: ['*'],
+    workerGrant: { capabilities: ['performance:lighthouse'], resourceClasses: ['performance'] },
+  };
+  const performanceReservation = await scaleSupervisor.requestPerformanceDrain(performanceWorker);
+  assert.equal(performanceReservation.runId, 'scale-single-site',
+    'performance reservations must honor the same rotated run order as ordinary claims');
+  scaleNow += 1_001;
+  const scaleRecovery = await scaleSupervisor.maintain();
+  assert.deepEqual(scaleRecovery.errors, [], JSON.stringify(scaleRecovery.errors));
+  assert.equal(scaleRecovery.requeued, 3,
+    'one maintenance pass must reclaim every expired lease across simultaneous production-sized runs');
+  assert.equal(scaleRecovery.epoch, 1,
+    'ordinary production-sized recovery must not churn the coordinator epoch');
+  for (const runId of ['scale-comparative', 'scale-single-site']) {
+    const state = await readParentRun(scaleStore, runId);
+    assert.equal(Object.values(state.workItems).filter(({ state: workState }) => workState === 'running').length, 0,
+      `${runId} must not retain expired running work after bounded recovery`);
+  }
+} finally {
+  await rm(scaleRoot, { recursive: true, force: true });
 }
 process.stdout.write('Shared coordinator supervisor self-test passed: store-wide startup, multi-run fairness, and server-issued worker grants are enforced.\n');

@@ -475,6 +475,10 @@ function globalLockPath(store) {
   return containedPath(store.root, '.coordinator-mutation-lock');
 }
 
+function coordinatorLeaseLockPath(store) {
+  return containedPath(store.root, '.coordinator-lease-lock');
+}
+
 function globalCoordinatorPath(store) {
   return containedPath(store.root, 'coordinator.json');
 }
@@ -1642,7 +1646,11 @@ async function acquireWithRunAudit(store, runId, input, takeoverOnly) {
       const state = await recoverUnlocked(store, runId);
       const selector = await readAuthoritySelectorUnlocked(store);
       await requireHandoffRunPermit(store, selector, runId);
-      const coordinator = await acquireStoreCoordinatorUnlocked(store, input, takeoverOnly);
+      const coordinator = await withDirectoryLock(
+        store.storage,
+        coordinatorLeaseLockPath(store),
+        () => acquireStoreCoordinatorUnlocked(store, input, takeoverOnly),
+      );
       await appendMutationUnlocked(store, state, 'mutation', takeoverOnly ? 'coordinator-taken-over' : 'coordinator-acquired', (next) => {
         next.coordinator = coordinator;
       }, { actor: { id: input.ownerId, kind: 'service' }, data: { epoch: coordinator.epoch } });
@@ -1652,14 +1660,18 @@ async function acquireWithRunAudit(store, runId, input, takeoverOnly) {
 }
 
 export function acquireStoreCoordinator(store, input) {
-  return withDirectoryLock(store.storage, globalLockPath(store), async () => (
-    clone(await acquireStoreCoordinatorUnlocked(store, input, false))
+  return withDirectoryLock(store.storage, globalLockPath(store), () => (
+    withDirectoryLock(store.storage, coordinatorLeaseLockPath(store), async () => (
+      clone(await acquireStoreCoordinatorUnlocked(store, input, false))
+    ))
   ));
 }
 
 export function takeOverStoreCoordinator(store, input) {
-  return withDirectoryLock(store.storage, globalLockPath(store), async () => (
-    clone(await acquireStoreCoordinatorUnlocked(store, input, true))
+  return withDirectoryLock(store.storage, globalLockPath(store), () => (
+    withDirectoryLock(store.storage, coordinatorLeaseLockPath(store), async () => (
+      clone(await acquireStoreCoordinatorUnlocked(store, input, true))
+    ))
   ));
 }
 
@@ -2004,7 +2016,7 @@ export async function heartbeatCoordinator(store, coordinator, { leaseMs }) {
   if (!Number.isSafeInteger(leaseMs) || leaseMs < 100 || leaseMs > 3_600_000) {
     fail('STORE_SCHEMA_INVALID', 'Coordinator heartbeat leaseMs must be an integer from 100 through 3600000.');
   }
-  return withDirectoryLock(store.storage, globalLockPath(store), async () => {
+  return withDirectoryLock(store.storage, coordinatorLeaseLockPath(store), async () => {
     const current = await validateCoordinator(store, coordinator);
     const renewed = sealCoordinatorLease({ ...current, expiresAt: new Date(store.clock() + leaseMs).toISOString() });
     await atomicWriteJson(store.storage, globalCoordinatorPath(store), renewed);
@@ -2145,9 +2157,10 @@ export async function requestStorePerformanceDrain(store, coordinator, input) {
       }
       return clone(current.reservation);
     }
-    const authorized = new Set(runIds);
-    const selected = states
-      .filter((state) => authorized.has(state.runId) && state.status === 'active' && state.authorityTombstone === null)
+    const statesByRunId = new Map(states.map((state) => [state.runId, state]));
+    const authorizedStates = runIds.map((runId) => statesByRunId.get(runId)).filter(Boolean);
+    const selected = authorizedStates
+      .filter((state) => state.status === 'active' && state.authorityTombstone === null)
       .flatMap((state) => Object.values(state.workItems).flatMap((item) => [
         ...(item.state === 'queued' ? [{ state, item, diagnostic: null }] : []),
         ...(queuedDiagnostic(item) ? [{ state, item, diagnostic: queuedDiagnostic(item) }] : []),
@@ -2237,7 +2250,11 @@ export async function claimStoreWorkItem(store, coordinator, input) {
       fail('PERFORMANCE_LEASE_HELD', 'The store-global performance resource is already active.');
     }
     const authorized = new Set(runIds);
-    const authorizedStates = states.filter((state) => authorized.has(state.runId));
+    const statesByRunId = new Map(states.map((state) => [state.runId, state]));
+    // The caller orders authorized runs to provide store-wide fairness. Keep
+    // that order when choosing ordinary work instead of falling back to the
+    // canonical directory order used to recover all scheduling state.
+    const authorizedStates = runIds.map((runId) => statesByRunId.get(runId)).filter(Boolean);
     if (authorizedStates.length === 1 && authorizedStates[0].status === 'cancelled') {
       fail('RUN_CANCELLED', `Parent run ${authorizedStates[0].runId} is cancelled.`);
     }
@@ -2265,8 +2282,8 @@ export async function claimStoreWorkItem(store, coordinator, input) {
       }
       selected = { state, item, diagnostic };
     } else {
-      selected = states
-        .filter((state) => authorized.has(state.runId) && state.status === 'active' && state.authorityTombstone === null)
+      selected = authorizedStates
+        .filter((state) => state.status === 'active' && state.authorityTombstone === null)
         .flatMap((state) => Object.values(state.workItems).flatMap((item) => [
           ...(item.state === 'queued' ? [{ state, item, diagnostic: null }] : []),
           ...(queuedDiagnostic(item) ? [{ state, item, diagnostic: queuedDiagnostic(item) }] : []),

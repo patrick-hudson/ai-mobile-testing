@@ -139,10 +139,18 @@ const maintain = () => {
   });
   return maintenance;
 };
-const heartbeat = setInterval(() => {
+const maintenanceTimer = setInterval(() => {
   void maintain();
 }, Math.max(1_000, Math.floor(Math.min(coordinatorLeaseMs, leaseMs) / 3)));
-heartbeat.unref();
+maintenanceTimer.unref();
+const coordinatorHeartbeat = setInterval(() => {
+  void supervisor.renewCoordinator().catch((error) => {
+    process.stderr.write(`${JSON.stringify({
+      event: 'coordinator-heartbeat-failed', code: error?.code, message: error?.message,
+    })}\n`);
+  });
+}, Math.max(1_000, Math.floor(coordinatorLeaseMs / 3)));
+coordinatorHeartbeat.unref();
 
 const server = http.createServer(async (request, response) => {
   try {
@@ -287,7 +295,8 @@ server.listen(port, '0.0.0.0', () => process.stdout.write(`${JSON.stringify({
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.once(signal, () => {
-    clearInterval(heartbeat);
+    clearInterval(maintenanceTimer);
+    clearInterval(coordinatorHeartbeat);
     server.close(() => process.exit());
   });
 }

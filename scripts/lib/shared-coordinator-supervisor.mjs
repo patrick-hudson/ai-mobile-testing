@@ -18,7 +18,16 @@ import {
 } from '../../shared/execution-graph-compiler.mjs';
 import { scheduleCanonicalWorkItems } from '../../shared/launch-plan-compiler.mjs';
 
-const PROJECTION_PENDING_CODES = new Set(['PUBLICATION_UNAVAILABLE', 'SEALED_MANIFEST_MISSING', 'RELEASE_AUTHORITY_INACTIVE']);
+const PROJECTION_PENDING_CODES = new Set([
+  'PUBLICATION_UNAVAILABLE',
+  'SEALED_MANIFEST_MISSING',
+  'RELEASE_AUTHORITY_INACTIVE',
+  // Projection inputs are intentionally assembled outside the canonical
+  // mutation lock. A worker heartbeat can advance the mutation ledger before
+  // the envelope is published; the next maintenance pass rebuilds it from the
+  // new head instead of treating the optimistic race as run corruption.
+  'PUBLICATION_LEDGER_MISMATCH',
+]);
 
 function fail(code, message, statusCode = 503) {
   throw new ControlPlaneError(code, message, statusCode);
@@ -73,6 +82,8 @@ export function createSharedCoordinatorSupervisor({
     throw new TypeError('Shared coordinator supervisor options are invalid.');
   }
   let coordinator = null;
+  let coordinatorAccess = Promise.resolve();
+  let schedulingAccess = Promise.resolve();
   let maintenance = Promise.resolve();
   let cursor = 0;
   let latest = Object.freeze({
@@ -154,8 +165,15 @@ export function createSharedCoordinatorSupervisor({
     return true;
   }
 
-  async function ensureCoordinator() {
+  function coordinatorNeedsRenewal(active) {
+    if (active === null) return true;
+    const renewalWindowMs = Math.min(10_000, Math.max(1_000, Math.floor(coordinatorLeaseMs / 3)));
+    return Date.parse(active.expiresAt) - store.clock() <= renewalWindowMs;
+  }
+
+  async function ensureCoordinatorUnlocked({ forceRenewal = false } = {}) {
     if (coordinator !== null) {
+      if (!forceRenewal && !coordinatorNeedsRenewal(coordinator)) return coordinator;
       try {
         coordinator = await heartbeatCoordinator(store, coordinator, { leaseMs: coordinatorLeaseMs });
         return coordinator;
@@ -176,8 +194,21 @@ export function createSharedCoordinatorSupervisor({
     }
   }
 
+  function ensureCoordinator(options) {
+    const action = () => ensureCoordinatorUnlocked(options);
+    const next = coordinatorAccess.then(action, action);
+    coordinatorAccess = next.catch(() => undefined);
+    return next;
+  }
+
+  async function requireCoordinator(options) {
+    const active = await ensureCoordinator(options);
+    if (active === null) fail('COORDINATOR_UNAVAILABLE', 'No active shared coordinator lease is available.');
+    return active;
+  }
+
   async function maintainOnce() {
-    const active = await ensureCoordinator();
+    let active = await ensureCoordinator();
     if (active === null) {
       latest = Object.freeze({
         state: 'waiting-for-lease', epoch: null, runCount: 0,
@@ -191,8 +222,22 @@ export function createSharedCoordinatorSupervisor({
     let requeued = 0;
     let completedOperations = 0;
     let sealedGraphs = 0;
+    let observedEpoch = active.epoch;
+    const visitedRunIds = [];
+
+    async function recoverPriorEpoch(activeCoordinator) {
+      if (activeCoordinator.epoch === observedEpoch) return;
+      for (const visitedRunId of visitedRunIds) {
+        requeued += await requeueExpiredWork(store, visitedRunId, activeCoordinator);
+      }
+      observedEpoch = activeCoordinator.epoch;
+    }
+
     for (const runId of runIds) {
       try {
+        active = await requireCoordinator();
+        await recoverPriorEpoch(active);
+        visitedRunIds.push(runId);
         let state = await recoverParentRun(store, runId);
         if (state.authorityTombstone !== null) {
           const operations = await controlService.applyAcceptedOperations(active, runId);
@@ -225,6 +270,8 @@ export function createSharedCoordinatorSupervisor({
     }
     let performanceScheduler;
     try {
+      active = await requireCoordinator();
+      await recoverPriorEpoch(active);
       performanceScheduler = schedulerSummary(await reconcileStorePerformanceScheduler(store, active));
     } catch (error) {
       const failure = Object.freeze({
@@ -237,7 +284,9 @@ export function createSharedCoordinatorSupervisor({
       onEvent({ event: 'performance-scheduler-maintenance-failed', ...failure });
     }
     latest = Object.freeze({
-      state: 'ready', epoch: active.epoch, runCount: runIds.length, requeued,
+      state: coordinator === null ? 'waiting-for-lease' : 'ready',
+      epoch: coordinator?.epoch ?? null,
+      runCount: runIds.length, requeued,
       completedOperations, sealedGraphs, performanceScheduler, errors: Object.freeze(errors),
     });
     return latest;
@@ -249,11 +298,20 @@ export function createSharedCoordinatorSupervisor({
     return next;
   }
 
-  async function claim(principal, request = {}) {
+  async function renewCoordinator() {
+    return requireCoordinator({ forceRenewal: true });
+  }
+
+  function withSchedulingAccess(action) {
+    const next = schedulingAccess.then(action, action);
+    schedulingAccess = next.catch(() => undefined);
+    return next;
+  }
+
+  async function claimUnlocked(principal, request = {}) {
     assertPrincipalAuthorized(principal, CONTROL_ACTIONS.WORK_CLAIM, { projectId });
     const scheduling = workerScheduling(principal, request);
-    const active = await ensureCoordinator();
-    if (active === null) fail('COORDINATOR_UNAVAILABLE', 'No active shared coordinator lease is available.');
+    const active = await requireCoordinator();
     const discovered = await listParentRunIds(store, { limit: runLimit });
     const eligible = discovered.filter((runId) => principalCanAccessRun(principal, runId));
     if (eligible.length === 0) fail('NO_AUTHORIZED_RUN', 'Worker has no authorized parent run to claim.', 403);
@@ -271,15 +329,18 @@ export function createSharedCoordinatorSupervisor({
     return lease;
   }
 
-  async function requestPerformanceDrain(principal, request = {}) {
+  function claim(principal, request = {}) {
+    return withSchedulingAccess(() => claimUnlocked(principal, request));
+  }
+
+  async function requestPerformanceDrainUnlocked(principal, request = {}) {
     assertPrincipalAuthorized(principal, CONTROL_ACTIONS.WORK_CLAIM, { projectId });
     const scheduling = workerScheduling(principal, request);
     if (scheduling.resourceClasses[0] !== 'performance'
       || !scheduling.capabilities.includes('performance:lighthouse')) {
       fail('WORKER_CAPABILITY_MISMATCH', 'Only a server-granted Lighthouse worker can request performance drain.', 403);
     }
-    const active = await ensureCoordinator();
-    if (active === null) fail('COORDINATOR_UNAVAILABLE', 'No active shared coordinator lease is available.');
+    const active = await requireCoordinator();
     const discovered = await listParentRunIds(store, { limit: runLimit });
     const eligible = discovered.filter((runId) => principalCanAccessRun(principal, runId));
     if (eligible.length === 0) fail('NO_AUTHORIZED_RUN', 'Worker has no authorized parent run to drain.', 403);
@@ -289,15 +350,20 @@ export function createSharedCoordinatorSupervisor({
       runIds: ordered,
       leaseMs: workLeaseMs,
     });
+    cursor = (eligible.indexOf(reservation.runId) + 1) % eligible.length;
     onEvent({
       event: 'performance-drain-requested', runId: reservation.runId,
       workItemId: reservation.workItemId, workerId: scheduling.workerId,
     });
     return reservation;
   }
+  function requestPerformanceDrain(principal, request = {}) {
+    return withSchedulingAccess(() => requestPerformanceDrainUnlocked(principal, request));
+  }
 
   return Object.freeze({
     maintain,
+    renewCoordinator,
     claim,
     requestPerformanceDrain,
     status: () => latest,
