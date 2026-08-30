@@ -694,19 +694,31 @@ async function runMutationAcceptanceCrashBoundary() {
     compose(project, ['down', '-v', '--remove-orphans'], { allowFailure: true });
     compose(project, ['run', '--rm', '--no-deps', 'single-site-volume-init']);
     driver(project, 'seed', runId);
-    const environment = { ...crashEnvironment(boundary), PORTAL_SHARED_CONTROL: '1', PORTAL_PORT: '0' };
+    const environment = {
+      ...crashEnvironment(boundary),
+      PORTAL_SHARED_CONTROL: '1',
+      PORTAL_ALLOWED_HOSTS: 'portal',
+      PORTAL_PORT: '0',
+    };
     driver(project, 'provision-operator', runId, { environment });
     compose(project, ['up', '-d', 'portal'], { environment });
     const containerId = compose(project, ['ps', '-aq', 'portal'], { environment }).stdout.trim();
     const before = restartCount(containerId);
     const readyDeadline = Date.now() + 60_000;
     let ready = false;
+    let lastProbeFailure = null;
     while (Date.now() < readyDeadline) {
       const probe = driver(project, 'probe-portal', runId, { environment, allowFailure: true });
       if (!probe.failed) { ready = true; break; }
+      lastProbeFailure = {
+        status: probe.status,
+        stdout: probe.stdout.slice(-2_000),
+        stderr: probe.stderr.slice(-2_000),
+      };
       await new Promise((resolve) => setTimeout(resolve, 200));
     }
-    assert.equal(ready, true, 'portal did not become ready before mutation injection');
+    assert.equal(ready, true,
+      `portal did not become ready before mutation injection; last probe: ${JSON.stringify(lastProbeFailure)}`);
     const interrupted = driver(project, 'accept-mutation', runId, {
       environment,
       allowFailure: true,

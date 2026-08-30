@@ -160,6 +160,8 @@ try {
     assert.match(block, /shared-authority-floor:\/var\/lib\/ai-mobile-testing\/shared\/authority-floor:ro/u, `${service} gets only read access to the external floor`);
     assert.match(block, /AUDIT_SHARED_AUTHORITY_FLOOR_ROOT: \/var\/lib\/ai-mobile-testing\/shared\/authority-floor/u);
   }
+  assert.match(serviceBlock('portal'), /PORTAL_ALLOWED_HOSTS: \$\{PORTAL_ALLOWED_HOSTS:-\}/u,
+    'additional portal hosts must remain an explicit deployment input with no permissive default');
   const coordinator = serviceBlock('shared-coordinator');
   assert.match(coordinator, /shared-authority-floor:\/var\/lib\/ai-mobile-testing\/shared\/authority-floor(?!:ro)/u,
     'the singleton coordinator owns future monotonic authority-floor transitions');
@@ -168,6 +170,8 @@ try {
     'the proof-only authority activator advances the isolated external floor while holding its durable coordinator fence');
   assert.match(resilienceProof, /const activation = driver\(project, 'activate-authority', runId\);[\s\S]*?crashEnvironment\(boundary, activatedStoreGeneration\)/u,
     'post-activation crash-boundary processes must use the activated selector store generation');
+  assert.match(resilienceProof, /PORTAL_ALLOWED_HOSTS: 'portal'/u,
+    'only the isolated mutation-boundary proof opts the Docker service hostname into portal requests');
   assert.match(initScript, /node scripts\/init-shared-authority-floor\.mjs/u);
   assert.match(compose, /\n  shared-authority-floor:\s*$/mu);
   assert.doesNotMatch(serviceBlock('shared-worker-ordinary-a'), /shared-authority-floor/u);
