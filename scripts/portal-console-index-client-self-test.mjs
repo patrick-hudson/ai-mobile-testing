@@ -23,6 +23,10 @@ const record = Object.freeze({
 });
 
 function body({ routeId = 'runs', items = [record], hasMore = true, nextCursor = 'cursor_1', complete = true } = {}) {
+  const actionIds = [
+    'stop', 'cancel', 'purge', 'manualEvidence', 'rekick', 'riskAcknowledge',
+    'riskResolve', 'visualDisposition', 'baseline', 'aiReview', 'settings',
+  ];
   return {
     schemaVersion: 1,
     apiVersion: 'v1',
@@ -38,7 +42,9 @@ function body({ routeId = 'runs', items = [record], hasMore = true, nextCursor =
     work: { recordsRead: items.length, sourceFilesRead: 0, sourceBytesRead: 0, elapsedMs: 1, budgetExhausted: false, indexReads: 1, assemblyAttempts: 1 },
     capabilities: { schemaVersion: 1, items: [{
       schemaVersion: 1, identity: { mode: 'comparative', runId: 'run-1' }, contextId: 'comparative-live', authorityRevision: 'revision-1',
-      actions: [{ actionId: 'purge', supported: true, authorized: null, eligible: true, available: false, unavailableReason: 'Authorization is required.' }],
+      actions: actionIds.map((actionId) => ({
+        actionId, supported: true, authorized: null, eligible: true, available: false, unavailableReason: 'Authorization is required.',
+      })),
     }] },
     data: { items, nextCursor, hasMore, omittedRecords: 0, cursorBinding: {} },
   };
@@ -73,6 +79,8 @@ assert.equal(firstUrl.searchParams.has('cursor'), false, 'Cursors are continuati
 assert.equal(first.items.length, 1);
 assert.equal(first.hasMore, true);
 assert.equal(Object.isFrozen(first.items), true);
+assert.equal(first.capabilities.items[0].actions.length, 11,
+  'The browser client must accept the complete action contract emitted by the console API.');
 
 await client.runs({ mode: 'comparative', scope: 'release', sort: 'recent' }, { cursor: first.nextCursor });
 assert.equal(new URL(calls[1].url, 'http://console.local').searchParams.get('cursor'), 'cursor_1', 'Only an explicit continuation request may carry a cursor.');
@@ -120,6 +128,16 @@ const hostile = structuredClone(body({ hasMore: false, nextCursor: null }));
 hostile.data.items[0].fields.detail = 'Authorization: Bearer abcdefghijklmnop';
 const hostileClient = createConsoleIndexClient({ fetch: async () => jsonResponse(hostile) });
 await assert.rejects(() => hostileClient.runs({}), (error) => error instanceof ConsoleIndexClientError && error.code === 'CONSOLE_RESPONSE_INVALID');
+
+const unknownCapabilityAction = structuredClone(body({ hasMore: false, nextCursor: null }));
+unknownCapabilityAction.capabilities.items[0].actions = [{
+  actionId: 'inventedAction', supported: true, authorized: true, eligible: true, available: true, unavailableReason: null,
+}];
+await assert.rejects(
+  () => createConsoleIndexClient({ fetch: async () => jsonResponse(unknownCapabilityAction) }).runs({}),
+  (error) => error instanceof ConsoleIndexClientError && error.code === 'CONSOLE_RESPONSE_INVALID',
+  'The browser client must reject capability actions outside the shared console contract.',
+);
 
 const stale = createConsoleIndexClient({
   fetch: async () => jsonResponse({ schemaVersion: 1, error: { code: 'CONSOLE_CURSOR_STALE', message: 'The console cursor no longer matches this query or source revision.' } }, { status: 409 }),

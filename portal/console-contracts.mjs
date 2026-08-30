@@ -310,6 +310,8 @@ const ACTION_DEFINITIONS = Object.freeze({
   settings: { mutates: true, authorization: 'required', eligibility: 'source-defined' },
 });
 
+export const CONSOLE_ACTION_IDS = Object.freeze(Object.keys(ACTION_DEFINITIONS));
+
 export const CONSOLE_ACTION_POLICIES = deepFreeze(Object.fromEntries(
   Object.entries(capabilityContexts).map(([contextId, context]) => [contextId, Object.fromEntries(
     Object.entries(ACTION_DEFINITIONS).map(([actionId, definition]) => {

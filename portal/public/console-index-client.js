@@ -1,3 +1,5 @@
+import { CONSOLE_ACTION_IDS } from '../console-contracts.mjs';
+
 const API_PREFIX = '/api/console/v1';
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 100;
@@ -9,6 +11,7 @@ const CONTROL_TEXT = /[\u0000-\u001f\u007f]/u;
 const RESIDUAL_ESCAPE = /%[0-9A-Fa-f]{2}/u;
 const SECRET_TEXT = /(?:\bauthorization\s*:|\bbearer\s+[A-Za-z0-9._~+/=-]{8,}|\bsk-(?:ant-)?[A-Za-z0-9_-]{12,}|\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|cookie)\s*[=:]\s*[^\s,;]{4,})/iu;
 const MODES = new Set(['all', 'comparative', 'single-site']);
+const ACTION_IDS = new Set(CONSOLE_ACTION_IDS);
 const ROUTES = Object.freeze({
   overview: Object.freeze({ path: '/overview', routeId: 'overview', sorts: new Set(['attention']), facets: Object.freeze({}) }),
   runs: Object.freeze({ path: '/runs', routeId: 'runs', sorts: new Set(['recent', 'risk', 'duration']), facets: Object.freeze({ state: 'token' }), search: true }),
@@ -358,7 +361,7 @@ function normalizeCapabilities(value) {
   }
   const items = value.items.map((entry) => {
     if (!plainObject(entry) || entry.schemaVersion !== 1 || typeof entry.contextId !== 'string'
-      || typeof entry.authorityRevision !== 'string' || !Array.isArray(entry.actions) || entry.actions.length > 8) {
+      || typeof entry.authorityRevision !== 'string' || !Array.isArray(entry.actions) || entry.actions.length > ACTION_IDS.size) {
       throw fail('CONSOLE_RESPONSE_INVALID', 'A console capability entry is invalid.', 200, true);
     }
     const identity = entry.identity === null ? null : plainObject(entry.identity)
@@ -366,7 +369,7 @@ function normalizeCapabilities(value) {
       ? Object.freeze({ mode: entry.identity.mode, runId: entry.identity.runId }) : null;
     if (entry.identity !== null && identity === null) throw fail('CONSOLE_RESPONSE_INVALID', 'A console capability identity is invalid.', 200, true);
     const actions = entry.actions.map((action) => {
-      if (!plainObject(action) || typeof action.actionId !== 'string' || typeof action.supported !== 'boolean'
+      if (!plainObject(action) || !ACTION_IDS.has(action.actionId) || typeof action.supported !== 'boolean'
         || ![true, false, null].includes(action.authorized) || ![true, false, null].includes(action.eligible)
         || typeof action.available !== 'boolean') {
         throw fail('CONSOLE_RESPONSE_INVALID', 'A console capability action is invalid.', 200, true);
