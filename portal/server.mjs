@@ -35,6 +35,7 @@ import {
   parentRunExists,
   readCurrentEnvelope,
   readParentRun,
+  readStoreCoordinator,
 } from '../scripts/lib/parent-run-store.mjs';
 import { createSharedControlService } from '../scripts/lib/shared-control-service.mjs';
 import { maybeCrashAtSharedResilienceBoundary } from '../scripts/lib/shared-resilience-failpoint.mjs';
@@ -74,6 +75,7 @@ import {
 } from './console-index-records.mjs';
 import {
   projectComparativeTimeline,
+  projectSharedParentTimeline,
   projectSingleSiteTimeline,
 } from './console-run.mjs';
 import {
@@ -321,6 +323,7 @@ const MAX_MEDIA_VALIDATION_OUTPUT_BYTES = 64 * 1024;
 const COMPARATIVE_CONSOLE_SOURCE_ID = 'comparative-runs';
 const SINGLE_SITE_CONSOLE_SOURCE_ID = 'single-site-jobs';
 const SHARED_PARENT_RUN_CONSOLE_SOURCE_ID = 'shared-parent-runs';
+const SHARED_PARENT_RUN_CONSOLE_AUTHORITY_RANK = 100;
 const MAX_SINGLE_SITE_CONSOLE_STATE_BYTES = 1024 * 1024;
 const MAX_SINGLE_SITE_CONSOLE_FINALIZATION_BYTES = 64 * 1024;
 const MAX_COMPARATIVE_CONSOLE_MANIFEST_BYTES = 1024 * 1024;
@@ -1464,13 +1467,29 @@ async function backfillSingleSiteConsoleIndexSlice() {
   });
 }
 
-async function sharedParentRunConsoleIndexRecord(runId) {
-  const parentRun = await readParentRun(sharedParentRunStore, runId);
-  if (!parentRun.currentPublicationDigest) {
-    return sharedParentRunToConsoleIndexRecord({ parentRun, publication: null });
-  }
-  const publication = await readCurrentEnvelope(sharedParentRunStore, runId);
-  return sharedPublicationToConsoleIndexRecord({ parentRun, publication });
+async function sharedParentRunConsoleRecordSet(runId) {
+  const [parentRun, coordinator] = await Promise.all([
+    readParentRun(sharedParentRunStore, runId),
+    readStoreCoordinator(sharedParentRunStore),
+  ]);
+  const observedAt = new Date().toISOString();
+  const record = !parentRun.currentPublicationDigest
+    ? sharedParentRunToConsoleIndexRecord({ parentRun, publication: null, coordinator, observedAt })
+    : sharedPublicationToConsoleIndexRecord({
+        parentRun,
+        publication: await readCurrentEnvelope(sharedParentRunStore, runId),
+        coordinator,
+        observedAt,
+      });
+  const timeline = projectSharedParentTimeline(runId, parentRun, {
+    sourceRevision: record.sourceRevision,
+  }).slice(-MAX_CONSOLE_TIMELINE_RECORDS_PER_RUN).map((entry) => timelineToConsoleIndexRecord(entry, {
+    sourceId: SHARED_PARENT_RUN_CONSOLE_SOURCE_ID,
+    scopeKey: record.scopeKey,
+    sourceUpdatedAt: record.sourceUpdatedAt,
+    complete: record.complete,
+  }));
+  return Object.freeze({ record, timeline });
 }
 
 async function backfillSharedParentRunConsoleIndexSlice() {
@@ -1497,7 +1516,10 @@ async function backfillSharedParentRunConsoleIndexSlice() {
     work = consumed.work;
     consoleSharedParentRunCursor += 1;
     try {
-      upsertConsoleRecordSet(await sharedParentRunConsoleIndexRecord(runId), []);
+      const records = await sharedParentRunConsoleRecordSet(runId);
+      upsertConsoleRecordSet(records.record, records.timeline, {
+        authorityRank: SHARED_PARENT_RUN_CONSOLE_AUTHORITY_RANK,
+      });
     } catch (error) {
       consoleSharedParentRunBackfillLimitation ??= 'source-malformed';
       console.error(`[PORTAL_CONSOLE_BACKFILL_REJECTED] shared parent run ${runId}: ${redactLogValue(error.message)}`);
@@ -1561,7 +1583,10 @@ async function refreshSharedParentRunConsoleIndexSlice() {
       consoleSharedParentRunCursor = (slot + 1) % Math.max(1, consoleSharedParentRunIds.length);
       consoleSharedParentRunSweepVisited += 1;
       try {
-        upsertConsoleRecordSet(await sharedParentRunConsoleIndexRecord(runId), []);
+        const records = await sharedParentRunConsoleRecordSet(runId);
+        upsertConsoleRecordSet(records.record, records.timeline, {
+          authorityRank: SHARED_PARENT_RUN_CONSOLE_AUTHORITY_RANK,
+        });
       } catch (error) {
         if (error?.code !== 'ENOENT') {
           console.error(`[PORTAL_CONSOLE_REFRESH_REJECTED] shared parent run ${runId}: ${redactLogValue(error.message)}`);

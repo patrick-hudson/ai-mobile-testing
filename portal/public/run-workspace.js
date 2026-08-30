@@ -582,6 +582,18 @@ function initializeRunWorkspace(root) {
     return values.length ? values.slice(0, 12).join(', ') : 'Declared scope is bound to the release subject.';
   }
 
+  function sharedExecutionActivity(executions) {
+    const terminalStates = new Set(['completed_pass', 'completed_product_failure', 'incomplete', 'cancelled']);
+    if (executions.length > 0 && executions.every(({ state }) => terminalStates.has(state))) return 'idle';
+    const now = Date.now();
+    if (executions.some(({ state, lease }) => state === 'running' && Date.parse(lease?.expiresAt ?? '') > now)) return 'running';
+    if (executions.some(({ state, attempts }) => state === 'queued'
+      && Array.isArray(attempts) && attempts.some(({ outcome }) => outcome === 'operational_failure'))) return 'recovering';
+    if (executions.some(({ state }) => state === 'running')) return 'recovering';
+    if (executions.some(({ state }) => state === 'queued')) return 'queued';
+    return executions.length === 0 ? 'idle' : 'finalizing';
+  }
+
   function sharedActionButton(label, action, body) {
     const button = textElement(document, 'button', label, { type: 'button', 'data-shared-action': action });
     button.addEventListener('click', () => void executeSharedAction(action, body, button));
@@ -594,6 +606,7 @@ function initializeRunWorkspace(root) {
     const completedStates = new Set(['completed_pass', 'completed_product_failure', 'incomplete', 'cancelled']);
     const terminal = executions.every(({ state }) => completedStates.has(state));
     const completed = executions.filter(({ state }) => completedStates.has(state)).length;
+    const activity = sharedExecutionActivity(executions);
     const sourceRevision = `shared-${publication.runRevision}`;
     const authorityComplete = ['AVAILABLE', 'EMPTY'].includes(sharedWorkspace.riskAvailability);
     summaryBody = {
@@ -603,7 +616,7 @@ function initializeRunWorkspace(root) {
       data: { record: {
         mode: currentMode, runId: currentRunId, sourceRevision, sourceUpdatedAt: null,
         fields: {
-          terminal, executionState: terminal ? 'completed' : 'running', activityState: terminal ? 'idle' : 'normal',
+          terminal, executionState: terminal ? 'completed' : 'running', activityState: activity,
           phase: terminal ? 'release-published' : 'shared-execution', progressTotal: executions.length,
           progressCompleted: completed, outcome: publication.decision.label,
           coverageStatus: publication.decision.grantedAuthority, evidenceAuthorityStatus: 'revision-bound',
@@ -614,7 +627,7 @@ function initializeRunWorkspace(root) {
     };
     detail = {
       id: currentRunId, mode: currentMode, sourceRevision, status: terminal ? 'completed' : 'running',
-      activity: terminal ? 'idle' : 'normal', phase: terminal ? 'release-published' : 'shared-execution',
+      activity, phase: terminal ? 'release-published' : 'shared-execution',
       progress: { total: executions.length, completed }, release: publication.decision,
       pipeline: { status: sharedWorkspace.logs?.truncated ? 'partial' : 'available', reason: 'Bounded shared operation and attempt logs.' },
       scope: { qualifier: publication.decision.grantedAuthority }, finalization: { status: 'complete' },

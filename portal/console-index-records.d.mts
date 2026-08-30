@@ -4,10 +4,14 @@ export function normalizedRunToConsoleIndexRecord(run: unknown, options?: { sour
 export function sharedPublicationToConsoleIndexRecord(input: {
   publication: unknown;
   parentRun: Record<string, unknown>;
+  observedAt?: string;
+  coordinator?: Record<string, unknown> | null;
 }): ConsoleIndexRecord;
 export function sharedParentRunToConsoleIndexRecord(input: {
   publication?: unknown | null;
   parentRun: Record<string, unknown>;
+  observedAt?: string;
+  coordinator?: Record<string, unknown> | null;
 }): ConsoleIndexRecord;
 export function timelineToConsoleIndexRecord(timeline: unknown, options: {
   sourceId: string;

@@ -151,9 +151,9 @@ export function decodeConsoleIndexCursor(value: string): Readonly<ConsoleIndexCu
 export function consoleIndexOrderKey(record: ConsoleIndexRecord, ordering?: ConsoleIndexPageRequest['orderBy']): string;
 
 export interface ConsoleIndex {
-  upsert(record: ConsoleIndexRecord, options?: { sourceComplete?: boolean }): Readonly<{
+  upsert(record: ConsoleIndexRecord, options?: { sourceComplete?: boolean; authorityRank?: number }): Readonly<{
     committed: boolean;
-    reason: 'purged' | null;
+    reason: 'purged' | 'lower-authority' | null;
     record?: Readonly<ConsoleIndexRecord>;
   }>;
   /** Capture this before asynchronous authority work and pass it to commitAsync after the await. */

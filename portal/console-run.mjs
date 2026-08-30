@@ -241,6 +241,40 @@ export function projectSingleSiteTimeline(runId, document, options = {}) {
   return result.sort(chronology);
 }
 
+export function projectSharedParentTimeline(runId, document, options = {}) {
+  const id = safeId(runId);
+  const source = record(document);
+  const mode = source?.subjectCore?.mode;
+  if (!id || !source || !MODES.has(mode)) return [];
+  const result = [];
+  for (const [workItemId, entry] of Object.entries(record(source.workItems) ?? {}).slice(0, 20_000)) {
+    const item = record(entry);
+    const stageId = safeId(item?.id ?? workItemId);
+    if (!item || !stageId) continue;
+    const attempts = Array.isArray(item.attempts) ? item.attempts : [];
+    const latestAttempt = record(attempts.at(-1));
+    const lease = record(item.lease);
+    const attempt = nonNegativeInteger(lease?.attempt ?? latestAttempt?.attempt, 10_000);
+    const operationalReason = item.state === 'queued' && latestAttempt?.outcome === 'operational_failure'
+      ? boundedString(latestAttempt.reason, 120) ?? 'operational-failure'
+      : null;
+    const timeline = normalizeTimelineRecord({
+      mode,
+      runId: id,
+      kind: operationalReason ? 'retry' : 'attempt',
+      identity: `${id}-shared-work-${stageId}`,
+      stageId,
+      attempt,
+      retry: attempt === null ? null : Math.max(0, attempt - (item.state === 'queued' ? 0 : 1)),
+      status: operationalReason ? `recovering:${operationalReason}` : item.state,
+      startedAt: lease?.claimedAt,
+      sourceRevision: options.sourceRevision,
+    });
+    if (timeline) result.push(timeline);
+  }
+  return result.sort(chronology);
+}
+
 export function buildConsoleTimelinePage(records, options = {}) {
   const limit = Math.min(MAX_PAGE_SIZE, Math.max(1, nonNegativeInteger(options.limit, MAX_PAGE_SIZE) ?? 50));
   const binding = boundedString(options.binding, 512) ?? 'unbound';

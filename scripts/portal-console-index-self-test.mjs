@@ -122,6 +122,47 @@ assert.equal(index.read({ mode: 'single-site', runId: 'run-1' }).value.fields.ex
 assert.equal(index.diagnostics().recordsByMode.comparative, 1);
 assert.equal(index.diagnostics().recordsByMode['single-site'], 1);
 
+const partialIndex = createConsoleIndex({
+  sources: [{ sourceId: 'shared-parent-runs', revision: 'shared-1', updatedAt: AT, complete: true }],
+});
+partialIndex.upsert(record({
+  runId: 'run-active-shared',
+  sourceId: 'shared-parent-runs',
+  complete: false,
+  fields: { title: 'Active shared run', status: 'running', terminal: false },
+}));
+const partialRead = partialIndex.read({ mode: 'comparative', runId: 'run-active-shared' });
+assert.equal(partialRead.complete, false);
+assert.equal(partialRead.freshness, 'current',
+  'A current partial publication must not be mislabeled as stale.');
+assert(partialRead.limitations.some(({ code }) => code === 'incomplete-publication'));
+assert.equal(partialIndex.page({
+  mode: 'comparative', scopeKey: 'scope:release', normalizedFilterKey: 'active', cursor: null,
+  limit: 10, recordTypes: ['run'],
+}).freshness, 'current', 'A page of current partial records must not be mislabeled as stale.');
+
+const authorityIndex = createConsoleIndex();
+authorityIndex.upsert(record({ runId: 'run-authority', sourceId: 'comparative-runs' }), { authorityRank: 0 });
+authorityIndex.upsert(record({
+  runId: 'run-authority',
+  sourceId: 'shared-parent-runs',
+  sourceRevision: 'shared-1',
+  fields: { title: 'Durable shared authority', status: 'running', terminal: false },
+}), { authorityRank: 100 });
+const rejectedLegacyOverwrite = authorityIndex.upsert(record({
+  runId: 'run-authority',
+  sourceId: 'comparative-runs',
+  sourceRevision: 'legacy-late',
+  fields: { title: 'Late legacy projection', status: 'running', terminal: false },
+}), { authorityRank: 0 });
+assert.equal(rejectedLegacyOverwrite.committed, false);
+assert.equal(rejectedLegacyOverwrite.reason, 'lower-authority');
+assert.equal(
+  authorityIndex.read({ mode: 'comparative', runId: 'run-authority' }).value.sourceId,
+  'shared-parent-runs',
+  'A legacy projection must not replace the durable shared-run authority.',
+);
+
 for (const [name, hostile] of [
   ['unknown top-level field', { ...record(), credential: 'not-allowed' }],
   ['unknown fields member', record({ fields: { title: 'safe', credentialAvailable: true } })],

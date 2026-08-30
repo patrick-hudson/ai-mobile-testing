@@ -446,6 +446,7 @@ export function createConsoleIndex(options = {}) {
     'single-site': new Map(),
   };
   const orderedPartitions = new Map();
+  const recordAuthorityRanks = new Map();
   const generations = new Map();
   const replacements = new Map();
   const tombstones = new Map();
@@ -550,6 +551,7 @@ export function createConsoleIndex(options = {}) {
     const key = recordKey(record);
     const removed = modeRecords[record.mode].delete(key);
     if (!removed) return false;
+    recordAuthorityRanks.delete(`${record.mode}\u0000${key}`);
     const scopeKeys = scopeRecords[record.mode].get(record.scopeKey);
     scopeKeys?.delete(key);
     if (scopeKeys?.size === 0) scopeRecords[record.mode].delete(record.scopeKey);
@@ -559,11 +561,12 @@ export function createConsoleIndex(options = {}) {
     return true;
   }
 
-  function storeRecord(record, sourceComplete, updateSource = true) {
+  function storeRecord(record, sourceComplete, updateSource = true, authorityRank = 0) {
     const key = recordKey(record);
     const previous = modeRecords[record.mode].get(key);
     if (previous) removeStoredRecord(previous);
     modeRecords[record.mode].set(key, record);
+    recordAuthorityRanks.set(`${record.mode}\u0000${key}`, authorityRank);
     const identity = { mode: record.mode, runId: record.runId };
     const idKey = identityKey(identity);
     const keys = identityRecords.get(idKey) ?? new Set();
@@ -739,16 +742,25 @@ export function createConsoleIndex(options = {}) {
 
   function upsert(value, optionsValue = {}) {
     if (!isRecord(optionsValue)) fail('CONSOLE_INDEX_INVALID', 'Upsert options must be a plain object.');
-    const unknown = Object.keys(optionsValue).filter((key) => key !== 'sourceComplete');
+    const unknown = Object.keys(optionsValue).filter((key) => !['sourceComplete', 'authorityRank'].includes(key));
     if (unknown.length) fail('CONSOLE_INDEX_INVALID', `Upsert options contain unsupported fields: ${unknown.sort().join(', ')}.`);
     if (optionsValue.sourceComplete !== undefined && typeof optionsValue.sourceComplete !== 'boolean') {
       fail('CONSOLE_INDEX_INVALID', 'sourceComplete must be boolean when provided.');
     }
+    const authorityRank = optionsValue.authorityRank === undefined
+      ? 0
+      : safeInteger(optionsValue.authorityRank, 'authorityRank', { maximum: 10_000 });
     const record = validateRecord(value);
     const identity = { mode: record.mode, runId: record.runId };
     if (tombstones.has(identityKey(identity))) return Object.freeze({ committed: false, reason: 'purged' });
+    const key = recordKey(record);
+    const existing = modeRecords[record.mode].get(key);
+    const existingRank = recordAuthorityRanks.get(`${record.mode}\u0000${key}`) ?? 0;
+    if (existing && existing.sourceId !== record.sourceId && existingRank > authorityRank) {
+      return Object.freeze({ committed: false, reason: 'lower-authority', record: existing });
+    }
     advanceGeneration(identity);
-    storeRecord(record, optionsValue.sourceComplete);
+    storeRecord(record, optionsValue.sourceComplete, true, authorityRank);
     bumpRevision();
     return Object.freeze({ committed: true, reason: null, record });
   }
@@ -902,7 +914,9 @@ export function createConsoleIndex(options = {}) {
       value: record,
       sourceVector: vector,
       complete,
-      freshness: complete ? 'current' : record ? 'stale' : 'unknown',
+      freshness: record
+        ? limitations.some(({ code }) => code === 'source-stale') ? 'stale' : 'current'
+        : 'unknown',
       limitations: Object.freeze(limitations),
       work: zeroWork(record ? 1 : 0),
     });
@@ -1003,7 +1017,9 @@ export function createConsoleIndex(options = {}) {
       }),
       sourceVector: vector,
       complete,
-      freshness: complete ? 'current' : records.length > 0 ? 'stale' : 'unknown',
+      freshness: records.length > 0
+        ? limitations.some(({ code }) => code === 'source-stale') ? 'stale' : 'current'
+        : 'unknown',
       limitations: Object.freeze(limitations),
       work: zeroWork(records.length),
     });

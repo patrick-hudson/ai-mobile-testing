@@ -109,13 +109,28 @@ function sharedScopeLabel(decision) {
   return `${authority} · ${features.length} feature${features.length === 1 ? '' : 's'} · ${definitions.length} definition${definitions.length === 1 ? '' : 's'} · ${targets.length} target${targets.length === 1 ? '' : 's'}`;
 }
 
-function sharedExecutionSummary(parentRun) {
+function sharedExecutionSummary(parentRun, { observedAt, coordinator } = {}) {
   const workItems = Object.values(record(parentRun?.workItems) ?? {}).filter((item) => record(item));
   const completed = workItems.filter(({ state }) => TERMINAL_SHARED_WORK_ITEM_STATES.has(state)).length;
+  const observedMilliseconds = Date.parse(observedAt ?? '') || Date.now();
+  const running = workItems.filter(({ state, lease }) => state === 'running'
+    && Date.parse(lease?.expiresAt ?? '') > observedMilliseconds).length;
+  const queued = workItems.filter(({ state }) => state === 'queued').length;
+  const recovering = workItems.filter(({ state, attempts }) => state === 'queued'
+    && Array.isArray(attempts)
+    && attempts.some(({ outcome }) => outcome === 'operational_failure')).length;
+  const coordinatorAvailable = Date.parse(coordinator?.expiresAt ?? '') > observedMilliseconds;
+  const terminal = workItems.length > 0 && completed === workItems.length;
   return Object.freeze({
     total: workItems.length,
     completed,
-    terminal: workItems.length > 0 && completed === workItems.length,
+    terminal,
+    activity: terminal ? 'idle'
+      : running > 0 ? 'running'
+        : !coordinatorAvailable ? 'stalled'
+          : recovering > 0 ? 'recovering'
+            : queued > 0 ? 'queued' : 'finalizing',
+    coordinatorAvailable,
   });
 }
 
@@ -135,7 +150,7 @@ export function sharedParentRunToConsoleIndexRecord(input) {
     }
     const requested = record(parentRun.subjectCore?.requestedAuthority) ?? {};
     const requestedScope = record(requested.scope) ?? {};
-    const execution = sharedExecutionSummary(parentRun);
+    const execution = sharedExecutionSummary(parentRun, source);
     const encodedRunId = encodeURIComponent(parentRun.runId);
     return Object.freeze({
       schemaVersion: 1,
@@ -159,7 +174,7 @@ export function sharedParentRunToConsoleIndexRecord(input) {
         sourceKind: 'shared-parent-run',
         sourceTimestamp: updatedAt,
         executionState: execution.terminal ? 'incomplete' : 'active',
-        activityState: execution.terminal ? 'idle' : 'active',
+        activityState: execution.activity,
         finalizationStatus: 'publication-unavailable',
         evidenceAuthorityStatus: 'unavailable',
         pipelineIntegrityStatus: 'provisional',
@@ -169,7 +184,10 @@ export function sharedParentRunToConsoleIndexRecord(input) {
         targetIds: safeList(requestedScope.targets),
         auditIds: safeList(requestedScope.definitions),
         areas: safeList(requestedScope.features),
-        reasonCodes: ['release-publication-unavailable'],
+        reasonCodes: [
+          'release-publication-unavailable',
+          ...(!execution.terminal && !execution.coordinatorAvailable ? ['shared-coordinator-unavailable'] : []),
+        ],
         destinations: [
           `/run.html?mode=${mode}&run=${encodedRunId}`,
           `/report.html?mode=${mode}&run=${encodedRunId}`,
@@ -193,7 +211,7 @@ export function sharedParentRunToConsoleIndexRecord(input) {
     .filter(({ class: reasonClass }) => reasonClass === 'product-failure').length;
   const blockingIncomplete = decision.blockingReasons.length - blockingFailures;
   const risksComplete = ['AVAILABLE', 'EMPTY'].includes(publication.riskRegister.availability);
-  const execution = sharedExecutionSummary(parentRun);
+  const execution = sharedExecutionSummary(parentRun, source);
   const terminal = execution.terminal;
   const encodedRunId = encodeURIComponent(publication.runId);
   return Object.freeze({
@@ -228,7 +246,7 @@ export function sharedParentRunToConsoleIndexRecord(input) {
         ? decision.ready ? 'completed_pass' : decision.code === 'NOT_READY_TEST_FAILURE'
           ? 'completed_product_failure' : 'incomplete'
         : 'active',
-      activityState: terminal ? 'idle' : 'active',
+      activityState: execution.activity,
       finalizationStatus: 'shared-publication',
       coverageStatus: decision.grantedAuthority ?? 'not-granted',
       evidenceAuthorityStatus: coreBound ? 'core-bound-incomplete' : 'authoritative',

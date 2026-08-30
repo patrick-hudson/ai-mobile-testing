@@ -30,5 +30,6 @@ export interface ConsoleTimelinePage {
 export const CONSOLE_TIMELINE_MAX_PAGE_SIZE: 100;
 export function projectComparativeTimeline(runId: string, document: unknown, options?: { sourceRevision?: string | null }): ConsoleTimelineRecord[];
 export function projectSingleSiteTimeline(runId: string, document: unknown, options?: { sourceRevision?: string | null }): ConsoleTimelineRecord[];
+export function projectSharedParentTimeline(runId: string, document: unknown, options?: { sourceRevision?: string | null }): ConsoleTimelineRecord[];
 export function buildConsoleTimelinePage(records: readonly unknown[], options?: { limit?: number; cursor?: string | null; binding?: string }): ConsoleTimelinePage;
 export function buildConsoleRunSummary(run: unknown, options?: { limitations?: readonly string[] }): Readonly<Record<string, unknown>>;

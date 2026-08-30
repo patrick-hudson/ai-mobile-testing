@@ -22,6 +22,7 @@ import {
   sharedParentRunToConsoleIndexRecord,
   sharedPublicationToConsoleIndexRecord,
 } from '../portal/console-index-records.mjs';
+import { projectSharedParentTimeline } from '../portal/console-run.mjs';
 
 const D1 = `sha256:${'1'.repeat(64)}`;
 const D2 = `sha256:${'2'.repeat(64)}`;
@@ -461,6 +462,11 @@ assert.equal(partialRunRecord.complete, false,
 assert.deepEqual(partialRunRecord.fields.limitations, ['risk-register-partial']);
 const provisionalRunRecord = sharedParentRunToConsoleIndexRecord({
   publication: null,
+  observedAt: '2026-08-28T20:01:10.000Z',
+  coordinator: {
+    ownerId: 'shared-coordinator', epoch: 7,
+    expiresAt: '2026-08-28T20:02:00.000Z',
+  },
   parentRun: {
     runId: 'run-comparative-provisional',
     runRevision: 3,
@@ -470,14 +476,75 @@ const provisionalRunRecord = sharedParentRunToConsoleIndexRecord({
     subjectCoreDigest: comparative.core.digest,
     createdAt: '2026-08-28T20:00:00.000Z',
     updatedAt: '2026-08-28T20:01:00.000Z',
+    workItems: {
+      'work-running': {
+        id: 'work-running', state: 'running', capability: 'browser:chromium',
+        attempts: [], diagnosticExecutions: [],
+        lease: {
+          workerId: 'worker-a', attempt: 1, epoch: 7,
+          claimedAt: '2026-08-28T20:00:30.000Z', expiresAt: '2026-08-28T20:01:40.000Z',
+        },
+      },
+      'work-recovering': {
+        id: 'work-recovering', state: 'queued', capability: 'performance:lighthouse', lease: null,
+        attempts: [{ attempt: 1, workerId: 'worker-performance', outcome: 'operational_failure', reason: 'lease-expired' }],
+        diagnosticExecutions: [],
+      },
+    },
   },
 });
 assert.equal(provisionalRunRecord.mode, 'comparative');
 assert.equal(provisionalRunRecord.complete, false);
 assert.equal(provisionalRunRecord.fields.finalizationStatus, 'publication-unavailable');
+assert.equal(provisionalRunRecord.fields.activityState, 'running');
 assert.deepEqual(provisionalRunRecord.fields.reasonCodes, ['release-publication-unavailable']);
 assert.doesNotMatch(provisionalRunRecord.fields.title, /no risks/iu,
   'An unpublished or unavailable risk projection must never masquerade as an empty register.');
+const stalledRunRecord = sharedParentRunToConsoleIndexRecord({
+  publication: null,
+  observedAt: '2026-08-28T20:05:00.000Z',
+  coordinator: {
+    ownerId: 'shared-coordinator', epoch: 7,
+    expiresAt: '2026-08-28T20:02:00.000Z',
+  },
+  parentRun: {
+    ...provisionalRunRecord,
+    runId: 'run-comparative-stalled',
+    runRevision: 4,
+    status: 'active',
+    compilationState: 'sealed',
+    subjectCore: comparative.core,
+    subjectCoreDigest: comparative.core.digest,
+    createdAt: '2026-08-28T20:00:00.000Z',
+    updatedAt: '2026-08-28T20:01:00.000Z',
+    workItems: {
+      'work-queued': { id: 'work-queued', state: 'queued', capability: 'browser:chromium', lease: null, attempts: [], diagnosticExecutions: [] },
+    },
+  },
+});
+assert.equal(stalledRunRecord.fields.activityState, 'stalled',
+  'queued shared work without a live coordinator must not be presented as running');
+assert.deepEqual(stalledRunRecord.fields.reasonCodes,
+  ['release-publication-unavailable', 'shared-coordinator-unavailable']);
+const sharedTimeline = projectSharedParentTimeline('run-comparative-provisional', {
+  subjectCore: comparative.core,
+  updatedAt: '2026-08-28T20:01:00.000Z',
+  workItems: {
+    'work-running': {
+      id: 'work-running', state: 'running', capability: 'browser:chromium', attempts: [], diagnosticExecutions: [],
+      lease: { workerId: 'worker-a', attempt: 1, claimedAt: '2026-08-28T20:00:30.000Z', expiresAt: '2026-08-28T20:01:40.000Z' },
+    },
+    'work-recovering': {
+      id: 'work-recovering', state: 'queued', capability: 'performance:lighthouse', lease: null,
+      attempts: [{ attempt: 1, workerId: 'worker-performance', outcome: 'operational_failure', reason: 'lease-expired' }],
+      diagnosticExecutions: [],
+    },
+  },
+}, { sourceRevision: 'shared-state-3' });
+assert.deepEqual(sharedTimeline.map(({ stageId, status, attempt, retry }) => ({ stageId, status, attempt, retry })), [
+  { stageId: 'work-recovering', status: 'recovering:lease-expired', attempt: 1, retry: 1 },
+  { stageId: 'work-running', status: 'running', attempt: 1, retry: 0 },
+]);
 const compilationFailure = sealInventoryCompilationFailure({
   schemaVersion: 1,
   subjectCoreDigest: single.core.digest,

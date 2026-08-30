@@ -241,7 +241,10 @@ test.describe('run-workspace', () => {
             })),
           ] } },
           executions: {
-            runId, executions: operationAccepted ? [] : [{ id: 'work-incomplete', state: 'incomplete' }],
+            runId, executions: operationAccepted ? [] : [
+              { id: 'work-incomplete', state: 'incomplete' },
+              { id: 'work-running', state: 'running', lease: { attempt: 1, expiresAt: '2099-08-29T14:30:00.000Z' } },
+            ],
             oracleExecutions: [{ id: 'oracle-visual-1' }],
           },
           logs: { runId, limit: 200, truncated: false, events: [], attemptLogs: [] },
@@ -271,6 +274,7 @@ test.describe('run-workspace', () => {
       await page.locator('input[name="control-credential"]').fill('scoped-browser-credential');
       await page.getByRole('button', { name: 'Authorize this browser session' }).click();
       await expect(page.getByRole('heading', { name: 'FEATURE READY' })).toBeVisible();
+      await expect(page.locator('#run-activity-state')).toHaveText('Running');
       await expect(page.locator('#run-product-risk')).toHaveAttribute('data-risk-availability', 'PARTIAL');
       await expect(page.locator('#run-product-risk')).toContainText('non-blocking');
       await expect(page.locator('#run-product-risk')).toContainText('Pipeline Integrity');
