@@ -581,7 +581,7 @@ async function runCoordinatorCrashBoundary(boundary, referenceInvariant) {
       driver(project, 'activate-authority', runId);
       await new Promise((resolve) => setTimeout(resolve, 150));
     }
-    const environment = crashEnvironment(boundary, requiresPublication ? '2' : '1');
+    const environment = crashEnvironment(boundary);
     compose(project, ['up', '-d', 'shared-coordinator'], { environment });
     const containerId = compose(project, ['ps', '-aq', 'shared-coordinator'], { environment }).stdout.trim();
     assert.match(containerId, /^[a-f0-9]{12,64}$/u);

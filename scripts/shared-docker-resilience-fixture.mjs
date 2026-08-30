@@ -33,7 +33,14 @@ import {
   transitionReleaseAuthority,
 } from './lib/parent-run-store.mjs';
 import { readSharedResilienceCrashSentinel } from './lib/shared-resilience-failpoint.mjs';
-import { readTrustedStoreMarker, sharedStoreBuildIdentity, sharedStoreGeneration, sharedStoreRollbackBuilds } from './lib/shared-store-runtime.mjs';
+import { openLegacyAuthorityFenceFromEnvironment } from './lib/legacy-authority-fence.mjs';
+import {
+  openSharedRuntimeAuthorityFloor,
+  readTrustedStoreMarker,
+  sharedStoreBuildIdentity,
+  sharedStoreGeneration,
+  sharedStoreRollbackBuilds,
+} from './lib/shared-store-runtime.mjs';
 
 const required = (name) => {
   const value = process.env[name];
@@ -254,17 +261,39 @@ if (action === 'seed') {
   }
   process.stdout.write(`${JSON.stringify({ event: 'shared-resilience-stale-fence-probed', runId, outcome, currentEpoch: current.epoch })}\n`);
 } else if (action === 'activate-authority') {
+  const authorityFloor = await openSharedRuntimeAuthorityFloor(process.env);
+  const legacyAuthorityFence = await openLegacyAuthorityFenceFromEnvironment(process.env, { authorityFloor });
+  const floorBefore = await authorityFloor.read();
   const coordinator = await acquireStoreCoordinator(store, { ownerId: 'proof-authority-activator', leaseMs: 5_000 });
   const shadow = await readReleaseAuthoritySelector(store);
+  const activationCutoverDigest = canonicalDigest({ proof: 'shared-resilience-activation-cutover' });
+  const authorityTransitionDigest = canonicalDigest({ proof: 'shared-resilience-activation-transition' });
   const draining = await transitionReleaseAuthority(store, coordinator, {
     expectedSelectorDigest: shadow.digest, phase: 'DRAINING', buildIdentity,
   });
   const active = await transitionReleaseAuthority(store, coordinator, {
     expectedSelectorDigest: draining.digest, phase: 'ACTIVE', activationRevision: 1, buildIdentity,
-    activationCutoverDigest: canonicalDigest({ proof: 'shared-resilience-activation-cutover' }),
-    authorityTransitionDigest: canonicalDigest({ proof: 'shared-resilience-activation-transition' }),
+    activationCutoverDigest,
+    authorityTransitionDigest,
   });
-  process.stdout.write(`${JSON.stringify({ event: 'shared-resilience-authority-activated', runId, selector: active })}\n`);
+  let legacy = await legacyAuthorityFence.read();
+  legacy = await legacyAuthorityFence.close(legacy.digest, runId);
+  legacy = await legacyAuthorityFence.freeze(legacy.digest, runId);
+  legacy = await legacyAuthorityFence.activate(legacy.digest, runId, 1);
+  const floorAfter = await authorityFloor.compareAndAdvance(floorBefore.digest, {
+    storeMarkerDigest: active.storeMarkerDigest,
+    minimumStoreGeneration: active.storeGeneration,
+    minimumSelectorRevision: active.revision,
+    activeBuildIdentity: active.activeBuildIdentity,
+    authorityTransitionDigest: active.authorityTransitionDigest,
+    activationEpoch: active.activationEpoch,
+    legacyPermanentlyRetired: true,
+    activationRevision: active.activationRevision,
+    activationCutoverDigest: active.activationCutoverDigest,
+  });
+  process.stdout.write(`${JSON.stringify({
+    event: 'shared-resilience-authority-activated', runId, selector: active, legacyFence: legacy, authorityFloor: floorAfter,
+  })}\n`);
 } else if (action === 'read-failpoint') {
   const boundary = required('AUDIT_SHARED_CRASH_BOUNDARY');
   const sentinel = await readSharedResilienceCrashSentinel(boundary, {
