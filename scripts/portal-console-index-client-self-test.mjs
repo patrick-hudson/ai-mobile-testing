@@ -157,6 +157,15 @@ await assert.rejects(
 );
 
 const evidenceSource = await readFile(new URL('../portal/public/evidence.js', import.meta.url), 'utf8');
+const sessionBannerSource = await readFile(new URL('../portal/public/console-session-banner.js', import.meta.url), 'utf8');
+const composeSource = await readFile(new URL('../docker-compose.yml', import.meta.url), 'utf8');
+const credentialLookupCommand = "docker compose exec -T portal sh -c 'cat /var/lib/ai-mobile-testing/shared/credentials/local-cutover-operator.credential'";
+assert(sessionBannerSource.includes(`credentialCommand.textContent = ${JSON.stringify(credentialLookupCommand)};`),
+  'The inline session prompt must retain the complete scoped Docker credential lookup command.');
+assert.match(composeSource, /shared-control-identities:\/var\/lib\/ai-mobile-testing\/shared\/credentials/u,
+  'The portal must mount the shared identity volume at the path named by the prompt.');
+assert.match(composeSource, /AUDIT_SHARED_PORTAL_OPERATOR_CREDENTIAL_FILE: \/var\/lib\/ai-mobile-testing\/shared\/credentials\/local-cutover-operator\.credential/u,
+  'Identity provisioning must write the operator credential to the file named by the prompt.');
 assert.equal(/\bfetch\s*\(/u.test(evidenceSource), false, 'Evidence must not bypass the shared bounded index client.');
 assert.match(evidenceSource, /createElement\(['"]img['"]\)/u, 'The selected inspector must support screenshot evidence.');
 assert.match(evidenceSource, /createElement\(['"]video['"]\)/u, 'The selected inspector must support interaction-video evidence.');

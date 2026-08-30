@@ -43,6 +43,16 @@ export function createConsoleSessionBanner({
   input.autocomplete = 'off';
   input.spellcheck = false;
   label.append(input);
+  const credentialHelp = document.createElement('div');
+  credentialHelp.id = 'console-session-credential-help';
+  credentialHelp.className = 'console-session-credential-help';
+  const credentialHelpIntro = document.createElement('p');
+  credentialHelpIntro.textContent = 'From a terminal in the ai-mobile-testing repository, run:';
+  const credentialCommand = document.createElement('code');
+  credentialCommand.textContent = "docker compose exec -T portal sh -c 'cat /var/lib/ai-mobile-testing/shared/credentials/local-cutover-operator.credential'";
+  const credentialHelpDetail = document.createElement('p');
+  credentialHelpDetail.textContent = 'Copy the complete amt. value printed by that command. Use the scoped operator credential, not the /operator/bootstrap token shown in portal logs.';
+  credentialHelp.append(credentialHelpIntro, credentialCommand, credentialHelpDetail);
   const submit = document.createElement('button');
   submit.type = 'submit';
   submit.className = 'console-button console-button-secondary';
@@ -52,9 +62,11 @@ export function createConsoleSessionBanner({
   cancel.className = 'console-button';
   cancel.textContent = 'Cancel';
   const formStatus = document.createElement('span');
+  formStatus.id = 'console-session-form-status';
   formStatus.className = 'console-session-form-status';
   formStatus.setAttribute('role', 'status');
-  form.append(label, submit, cancel, formStatus);
+  input.setAttribute('aria-describedby', `${credentialHelp.id} ${formStatus.id}`);
+  form.append(label, credentialHelp, submit, cancel, formStatus);
   banner.append(summary, authorize, form);
   shell.workspace.insertBefore(banner, shell.header.nextSibling);
 

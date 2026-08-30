@@ -198,6 +198,9 @@ test.describe('bounded console index surfaces', () => {
     await expect(banner).toBeVisible();
     await expect(banner).toContainText('session expired');
     await banner.getByRole('button', { name: 'Authorize' }).click();
+    await expect(banner).toContainText('From a terminal in the ai-mobile-testing repository');
+    await expect(banner.locator('code')).toHaveText("docker compose exec -T portal sh -c 'cat /var/lib/ai-mobile-testing/shared/credentials/local-cutover-operator.credential'");
+    await expect(banner).toContainText('not the /operator/bootstrap token');
     await banner.getByLabel('Operator credential').fill('scoped-operator-credential');
     await banner.getByRole('button', { name: 'Unlock console' }).click();
 

@@ -89,11 +89,23 @@ button, input, select { font: inherit; }
 .console-session-summary { display: grid; gap: 0.15rem; }
 .console-session-summary strong { font-size: 0.84rem; }
 .console-session-summary span { font-size: 0.78rem; line-height: 1.4; }
-.console-session-form { display: flex; grid-column: 1 / -1; gap: 0.6rem; align-items: end; }
+.console-session-form { display: flex; flex-wrap: wrap; grid-column: 1 / -1; gap: 0.6rem; align-items: end; }
 .console-session-form[hidden] { display: none; }
 .console-session-form label { display: grid; flex: 1; gap: 0.2rem; font-size: 0.75rem; font-weight: 750; }
 .console-session-form input { min-height: 2.75rem; border: 1px solid var(--console-rule-strong); padding: 0.55rem 0.65rem; background: var(--console-surface); color: var(--console-ink); }
 .console-session-form-status { align-self: center; max-width: 26rem; color: var(--console-muted); font-size: 0.75rem; }
+.console-session-credential-help { flex-basis: 100%; color: var(--console-muted); font-size: 0.78rem; line-height: 1.45; }
+.console-session-credential-help p { margin: 0.25rem 0; }
+.console-session-credential-help code {
+  display: block;
+  overflow-x: auto;
+  padding: 0.5rem 0.625rem;
+  border: 1px solid var(--console-rule);
+  background: var(--console-surface);
+  color: var(--console-ink);
+  white-space: nowrap;
+  user-select: all;
+}
 
 .console-connection-block { display: grid; gap: 0.1rem; text-align: right; }
 .console-connection-block strong { font-size: 0.8rem; }
