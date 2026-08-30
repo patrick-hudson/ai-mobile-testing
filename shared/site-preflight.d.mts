@@ -68,7 +68,7 @@ export interface SitePreflightOptions extends Omit<OriginBoundFetchOptions, 'ori
 }
 
 export const SITE_PREFLIGHT_SCHEMA_VERSION: 1;
-export const QUITTING7OH_IDENTITY_CONTRACT_REVISION: 'quitting7oh-identity-v1';
+export const QUITTING7OH_IDENTITY_CONTRACT_REVISION: 'quitting7oh-identity-v2';
 export const QUITTING7OH_SENTINEL_PATH: '/start-here/welcome';
 export function preflightQuitting7ohSite(input: SitePreflightInput, options?: SitePreflightOptions): Promise<SitePreflightResult>;
 export const previewSitePreflight: typeof preflightQuitting7ohSite;

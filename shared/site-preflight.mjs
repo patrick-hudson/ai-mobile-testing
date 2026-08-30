@@ -6,12 +6,21 @@ import {
 } from './outbound-url-policy.mjs';
 
 export const SITE_PREFLIGHT_SCHEMA_VERSION = 1;
-export const QUITTING7OH_IDENTITY_CONTRACT_REVISION = 'quitting7oh-identity-v1';
+export const QUITTING7OH_IDENTITY_CONTRACT_REVISION = 'quitting7oh-identity-v2';
 export const QUITTING7OH_SENTINEL_PATH = '/start-here/welcome';
 
+const REVIEWED_HOME_HEADINGS = Object.freeze([
+  'Help quitting 7-OH',
+  'A calm reference for getting off 7-OH and kratom synthetics.',
+]);
 const REQUIRED_MARKERS = Object.freeze([
   Object.freeze({ id: 'root-og-site-name', probe: 'root', expected: 'quitting7oh.org' }),
-  Object.freeze({ id: 'root-home-heading', probe: 'root', expected: 'Help quitting 7-OH' }),
+  Object.freeze({
+    id: 'root-home-heading',
+    probe: 'root',
+    expected: REVIEWED_HOME_HEADINGS.join(' | '),
+    accepted: REVIEWED_HOME_HEADINGS,
+  }),
   Object.freeze({ id: 'manifest-name', probe: 'manifest', expected: 'quitting7oh.org' }),
   Object.freeze({ id: 'manifest-short-name', probe: 'manifest', expected: 'quitting7oh' }),
   Object.freeze({ id: 'sentinel-heading', probe: 'sentinel', expected: 'Welcome' }),
@@ -411,7 +420,9 @@ export async function preflightQuitting7ohSite(input, options = {}) {
     contract.probe,
     contract.expected,
     observed[contract.id],
-    observed[contract.id] === contract.expected,
+    contract.accepted
+      ? contract.accepted.includes(observed[contract.id])
+      : observed[contract.id] === contract.expected,
   ));
   for (const failed of markers.filter(({ passed }) => !passed)) {
     issues.push(preflightIssue(
@@ -422,7 +433,7 @@ export async function preflightQuitting7ohSite(input, options = {}) {
     ));
   }
   // Ensure the heading is actually on the root response rather than only in metadata.
-  if (!rootText.includes('Help quitting 7-OH')) {
+  if (!REVIEWED_HOME_HEADINGS.some((heading) => rootText.includes(heading))) {
     issues.push(preflightIssue('PREFLIGHT_ROOT_CONTENT_INVALID', 'Root page did not contain the reviewed home identity text.', 'url'));
   }
 

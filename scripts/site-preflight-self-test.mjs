@@ -19,6 +19,10 @@ const rootHtml = `<!doctype html>
   <link rel="stylesheet" href="/_astro/site.abc123.css">
   <script type="module" src="/_astro/page.def456.js"></script>
 </head><body><main id="main-content"><h1>Help quitting <span>7-OH</span></h1></main></body></html>`;
+const productionRootHtml = rootHtml.replace(
+  'Help quitting <span>7-OH</span>',
+  'A calm reference for getting off 7-OH and kratom synthetics.',
+);
 const sentinelHtml = `<!doctype html><html><head>
   <meta property="og:site_name" content="quitting7oh.org">
 </head><body><main id="main-content"><h1>Welcome</h1><p><strong>You’re in the right place.</strong></p></main></body></html>`;
@@ -275,6 +279,18 @@ assert.match(acceptedA.deploymentRevision.fingerprint, /^[a-f0-9]{64}$/);
 assert.match(acceptedA.preflightDigest, /^[a-f0-9]{64}$/);
 assert.equal(siteA.calls.length, 3, 'Preview preflight performs only the three bounded, side-effect-free GET probes.');
 assert.equal(siteA.calls.every((call) => call.headers.authorization === undefined && call.headers.cookie === undefined), true);
+
+const productionSite = fakeSite({ rootHtml: productionRootHtml });
+const acceptedProduction = await preflightQuitting7ohSite({
+  url: origin,
+  deploymentRole: 'production',
+  certificatePolicy: 'strict',
+}, { lookup: publicLookup, transport: productionSite.transport, now: fixedNow });
+assert.equal(acceptedProduction.accepted, true,
+  'The reviewed production design must remain a valid quitting7oh identity for Comparative audits.');
+assert.equal(acceptedProduction.markers.every(({ passed }) => passed), true);
+assert.equal(acceptedProduction.identityFingerprint, acceptedA.identityFingerprint,
+  'Reviewed production and redesign headings identify the same application contract.');
 
 const siteASame = fakeSite();
 const acceptedASame = await preflightQuitting7ohSite({
