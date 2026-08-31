@@ -276,6 +276,7 @@ test.describe('run-workspace', () => {
       await page.locator('input[name="control-credential"]').fill('scoped-browser-credential');
       await page.getByRole('button', { name: 'Authorize this browser session' }).click();
       await expect(page.getByRole('heading', { name: 'FEATURE READY' })).toBeVisible();
+      await expect(page.locator('#run-connection-state')).toHaveText('Connected');
       await expect(page.locator('#run-activity-state')).toHaveText('Running');
       await expect(page.locator('#run-product-risk')).toHaveAttribute('data-risk-availability', 'PARTIAL');
       await expect(page.locator('#run-product-risk')).toContainText('non-blocking');

@@ -12,6 +12,7 @@ import { createRunInvalidationBus, publishRunInvalidation } from './console-inva
 import {
   assertSharedWorkspaceProjection,
   createSharedControlBrowserClient,
+  createSharedWorkspacePoller,
   pageSharedRisksForReview,
 } from './shared-control-client.js';
 
@@ -424,8 +425,15 @@ function initializeRunWorkspace(root) {
   sharedCredential.maxLength = 4_096;
   sharedCredential.name = 'control-credential';
   sharedCredentialLabel.append(sharedCredential);
+  const sharedCredentialHelp = document.createElement('div');
+  sharedCredentialHelp.className = 'run-shared-credential-help';
+  sharedCredentialHelp.append(
+    textElement(document, 'p', 'From a terminal in the ai-mobile-testing repository, run:'),
+    textElement(document, 'code', "docker compose exec -T portal sh -c 'cat /var/lib/ai-mobile-testing/shared/credentials/local-cutover-operator.credential'"),
+    textElement(document, 'p', 'Copy the complete amt. value. Use this scoped operator credential, not an /operator/bootstrap token from portal logs.'),
+  );
   const sharedLoginButton = textElement(document, 'button', 'Authorize this browser session', { type: 'submit' });
-  sharedLogin.append(sharedCredentialLabel, sharedLoginButton);
+  sharedLogin.append(sharedCredentialLabel, sharedCredentialHelp, sharedLoginButton);
   sharedSession.append(sharedSessionStatus, sharedLogin);
   shell.inspector.append(sharedSession);
 
@@ -447,6 +455,7 @@ function initializeRunWorkspace(root) {
   let sharedSessionReady = false;
   let sharedAuthorityActive = false;
   let sharedOperationInFlight = null;
+  let sharedWorkspacePoller = null;
   const authorityControllers = new Set();
   const sharedControl = createSharedControlBrowserClient();
 
@@ -635,6 +644,7 @@ function initializeRunWorkspace(root) {
     sharedAuthorityActive = true;
     transport?.destroy();
     transport = null;
+    setConnection('connected', 'Current shared release authority is confirmed.');
     applyAuthority(summaryBody, detail);
     renderView();
   }
@@ -766,30 +776,76 @@ function initializeRunWorkspace(root) {
     productRiskBody.replaceChildren(decisionCard, riskList, recovery, pipeline);
   }
 
+  function renderSharedWorkspaceUnavailable(error, { retrying = false, retryMs = null, retainSnapshot = false } = {}) {
+    setConnection(retrying ? 'reconnecting' : 'offline', error.message);
+    if (retainSnapshot && sharedWorkspace) {
+      productRisk.dataset.riskAvailability = sharedWorkspace.riskAvailability;
+      productRisk.setAttribute('aria-busy', 'false');
+      productRiskStatus.textContent = `Shared Product Risk is stale. The last confirmed revision remains visible${retryMs ? `; retrying in ${Math.ceil(retryMs / 1_000)} seconds` : ''}: ${error.message}`;
+      return;
+    }
+    productRisk.dataset.riskAvailability = 'UNAVAILABLE';
+    productRisk.setAttribute('aria-busy', 'false');
+    productRiskStatus.textContent = `Shared Product Risk unavailable: ${error.message}`;
+    if (error?.status === 401 || error?.status === 403) {
+      sharedSessionReady = false;
+      sharedLogin.hidden = false;
+      sharedSessionStatus.textContent = 'This browser session expired or lacks permission. Enter the scoped operator credential shown by the command below to reconnect.';
+    }
+  }
+
+  function ensureSharedWorkspacePoller() {
+    if (sharedWorkspacePoller) return sharedWorkspacePoller;
+    sharedWorkspacePoller = createSharedWorkspacePoller({
+      async load({ signal }) {
+        const capture = captureWorkspaceIdentity();
+        const next = assertSharedWorkspaceProjection(await sharedControl.readWorkspace(capture.runId, { signal }), {
+          runId: capture.runId,
+          mode: capture.mode,
+        });
+        assertCurrentWorkspace(capture, signal);
+        return next;
+      },
+      onSnapshot(next, { announceResult = false } = {}) {
+        if (destroyed || purged) return;
+        sharedWorkspace = next;
+        renderSharedWorkspace();
+        applySharedWorkspaceAuthority();
+        if (announceResult) announce(`Shared release revision ${next.publication.runRevision} loaded.`);
+        if (routeState?.state?.operation && routeState.state.operation !== sharedOperationInFlight) {
+          void resumeSharedOperation(routeState.state.operation);
+        }
+      },
+      onConfirmed(next, { announceResult = false } = {}) {
+        if (destroyed || purged) return;
+        sharedWorkspace = next;
+        setConnection('connected', 'Current shared release authority is confirmed.');
+        if (announceResult) announce(`Shared release revision ${next.publication.runRevision} confirmed.`);
+      },
+      onUnavailable(error, { retrying = false, retryMs = null } = {}) {
+        if (destroyed || purged) return;
+        renderSharedWorkspaceUnavailable(error, { retrying, retryMs });
+      },
+      onStale(error, { retryMs } = {}) {
+        if (destroyed || purged) return;
+        renderSharedWorkspaceUnavailable(error, { retrying: true, retryMs, retainSnapshot: true });
+      },
+      isTerminal(workspace) {
+        const terminalStates = new Set(['completed_pass', 'completed_product_failure', 'incomplete', 'cancelled']);
+        return !['LOADING', 'PROVISIONAL'].includes(workspace.riskAvailability)
+          && workspace.executions.executions.every(({ state }) => terminalStates.has(state));
+      },
+    });
+    sharedWorkspacePoller.setVisible(!document.hidden);
+    return sharedWorkspacePoller;
+  }
+
   async function loadSharedWorkspace({ announceResult = false } = {}) {
     if (!sharedSessionReady || !currentRunId) return;
     productRisk.dataset.riskAvailability = 'LOADING';
     productRisk.setAttribute('aria-busy', 'true');
     productRiskStatus.textContent = 'Loading current revision-bound release authority…';
-    try {
-      const capture = captureWorkspaceIdentity();
-      const next = assertSharedWorkspaceProjection(await sharedControl.readWorkspace(capture.runId), {
-        runId: capture.runId,
-        mode: capture.mode,
-      });
-      assertCurrentWorkspace(capture);
-      sharedWorkspace = next;
-      renderSharedWorkspace();
-      applySharedWorkspaceAuthority();
-      if (announceResult) announce(`Shared release revision ${next.publication.runRevision} loaded.`);
-      if (routeState?.state?.operation && routeState.state.operation !== sharedOperationInFlight) {
-        void resumeSharedOperation(routeState.state.operation);
-      }
-    } catch (error) {
-      productRisk.dataset.riskAvailability = 'UNAVAILABLE';
-      productRisk.setAttribute('aria-busy', 'false');
-      productRiskStatus.textContent = `Shared Product Risk unavailable: ${error.message}`;
-    }
+    return ensureSharedWorkspacePoller().refresh({ announceResult });
   }
 
   async function executeSharedAction(kind, body, button) {
@@ -1494,6 +1550,8 @@ function initializeRunWorkspace(root) {
     sharedWorkspace = null;
     sharedAuthorityActive = false;
     sharedOperationInFlight = null;
+    sharedWorkspacePoller?.destroy();
+    sharedWorkspacePoller = null;
     logViewer.setMode(currentMode);
     setText('run-mode', humanize(currentMode));
     setText('run-id', currentRunId);
@@ -1540,12 +1598,19 @@ function initializeRunWorkspace(root) {
 
   navigation.addEventListener('click', handleNavigation);
 
+  function handleSharedWorkspaceVisibility() {
+    sharedWorkspacePoller?.setVisible(!document.hidden);
+  }
+
+  document.addEventListener('visibilitychange', handleSharedWorkspaceVisibility);
+
   function destroy() {
     if (destroyed) return;
     destroyed = true;
     workspaceGeneration += 1;
     abortAuthorityRefreshes();
     transport?.destroy();
+    sharedWorkspacePoller?.destroy();
     viewController?.abort();
     actionController.destroy();
     invalidation.destroy();
@@ -1554,6 +1619,7 @@ function initializeRunWorkspace(root) {
     focus.destroy();
     splitter.destroy();
     navigation.removeEventListener('click', handleNavigation);
+    document.removeEventListener('visibilitychange', handleSharedWorkspaceVisibility);
   }
 
   window.addEventListener('pagehide', destroy, { once: true });
