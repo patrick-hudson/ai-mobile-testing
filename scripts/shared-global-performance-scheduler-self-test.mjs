@@ -13,8 +13,10 @@ import {
   openParentRunStore,
   publishAttemptEvidence,
   claimWorkItem,
+  claimStoreWorkItem,
   readParentRun,
   readStorePerformanceScheduler,
+  rekickIncompleteWork,
   requeueExpiredWork,
   requestPerformanceDrain,
 } from './lib/parent-run-store.mjs';
@@ -52,7 +54,7 @@ try {
   for (const [runId, suffix, items] of [
     ['run-active', 'a', [workItem('ordinary-active', 'browser:chromium', 'ordinary', 'candidate-desktop-chromium')]],
     ['run-later', 'b', [workItem('ordinary-later', 'browser:chromium', 'ordinary', 'candidate-desktop-chromium')]],
-    ['run-performance', 'c', [workItem('performance-only', 'performance:lighthouse', 'performance', 'candidate-desktop-chromium')]],
+    ['run-performance', 'c', [workItem('performance-only', 'performance:custom', 'performance', 'candidate-desktop-chromium')]],
   ]) {
     await createParentRun(store, {
       runId,
@@ -73,8 +75,8 @@ try {
   await supervisor.maintain();
 
   const ordinary = principal('worker-ordinary', ['browser:chromium'], 'ordinary');
-  const performance = principal('worker-performance', ['performance:lighthouse'], 'performance');
-  const otherPerformance = principal('worker-performance-other', ['performance:lighthouse'], 'performance');
+  const performance = principal('worker-performance', ['performance:custom', 'performance:lighthouse'], 'performance');
+  const otherPerformance = principal('worker-performance-other', ['performance:custom', 'performance:lighthouse'], 'performance');
 
   const ordinaryLease = await supervisor.claim(ordinary);
   assert.equal(ordinaryLease.runId, 'run-active');
@@ -82,6 +84,33 @@ try {
   const drain = await supervisor.requestPerformanceDrain(performance);
   assert.equal(drain.runId, 'run-performance');
   assert.equal(drain.workerId, performance.id);
+  const drainScheduler = await readStorePerformanceScheduler(store);
+  await assert.rejects(
+    supervisor.requestPerformanceDrain({ ...performance, runIds: ['run-active'] }),
+    (error) => error?.code === 'PERFORMANCE_DRAIN_REQUIRED',
+    'same-worker polling must not return a reservation outside the current authorized run set',
+  );
+  await assert.rejects(
+    supervisor.requestPerformanceDrain(principal(performance.id, ['performance:lighthouse'], 'performance')),
+    (error) => error?.code === 'WORKER_CAPABILITY_MISMATCH',
+    'same-worker polling must not return a reservation its current grant cannot execute',
+  );
+  assert.equal((await readStorePerformanceScheduler(store)).revision, drainScheduler.revision,
+    'rejected same-worker polls must not renew or replace the existing reservation');
+  now += 4_000;
+  const earlyDrainPoll = await supervisor.requestPerformanceDrain(performance);
+  assert.equal(earlyDrainPoll.expiresAt, drain.expiresAt,
+    'same-worker polling before the renewal threshold must preserve the existing lease');
+  assert.equal((await readStorePerformanceScheduler(store)).revision, drainScheduler.revision,
+    'same-worker polling before the renewal threshold must not fsync a scheduler revision');
+  now += 2_000;
+  const renewedDrain = await supervisor.requestPerformanceDrain(performance);
+  assert.equal(renewedDrain.requestedAt, drain.requestedAt,
+    'same-worker drain renewal must preserve the original reservation lineage');
+  assert.ok(Date.parse(renewedDrain.expiresAt) > Date.parse(drain.expiresAt),
+    'same-worker polling must renew the drain lease while ordinary work finishes');
+  assert.equal((await readStorePerformanceScheduler(store)).revision, drainScheduler.revision + 1,
+    'crossing the renewal threshold must persist exactly one scheduler revision');
   await assert.rejects(supervisor.claim(ordinary), (error) => error?.code === 'PERFORMANCE_DRAINING',
     'a drain in one run must pause ordinary claims in every run');
   await assert.rejects(supervisor.claim(performance), (error) => error?.code === 'PERFORMANCE_DRAIN_PENDING',
@@ -197,6 +226,104 @@ try {
   }), (error) => error?.code === 'STORE_CORRUPT',
   'a missing global scheduler must never normalize an active performance lease to idle');
 
+
+  // A scheduler instance must not trust its local relevance cache after a
+  // second process rekicks a known incomplete run or reserves performance work.
+  const externalCacheRoot = path.join(root, 'external-cache-store');
+  const cacheStore = await openParentRunStore({
+    root: externalCacheRoot,
+    deploymentIdentity: 'global-performance-external-cache-test',
+    volumeIdentity: 'named-volume:global-performance-external-cache-test',
+    verifyStorage: false,
+    clock: () => now,
+  });
+  for (const [runId, suffix, items] of [
+    ['cache-ordinary', 'e', [workItem('cache-ordinary-work', 'browser:chromium', 'ordinary', 'candidate')]],
+    ['cache-performance', 'f', [workItem('cache-performance-work', 'performance:lighthouse', 'performance', 'candidate')]],
+    ['cache-performance-other', '0', [workItem('cache-performance-other-work', 'performance:lighthouse', 'performance', 'candidate')]],
+  ]) {
+    await createParentRun(cacheStore, {
+      runId,
+      subjectCoreDigest: digest(suffix),
+      runnerRevision: 'runner-performance-cache-v1',
+      workItems: items.map((item) => ({ ...item, maxAttempts: 1 })),
+    });
+  }
+  const cacheCoordinator = await acquireStoreCoordinator(cacheStore, {
+    ownerId: 'coordinator-external-cache', leaseMs: 60_000,
+  });
+  const ordinaryCacheLease = await claimWorkItem(cacheStore, 'cache-ordinary', cacheCoordinator, {
+    workerId: 'cache-ordinary-first-worker', capabilities: ['browser:chromium'],
+    resourceClasses: ['ordinary'], leaseMs: 10_000,
+  });
+  const ordinaryFailureInbox = await publishAttemptEvidence(cacheStore, 'cache-ordinary', ordinaryCacheLease, {
+    outcome: 'operational_failure', reason: 'synthetic exhausted ordinary failure', artifacts: [],
+  });
+  await adoptAttemptEvidence(cacheStore, 'cache-ordinary', cacheCoordinator, ordinaryFailureInbox);
+
+  await requestPerformanceDrain(cacheStore, 'cache-performance', cacheCoordinator, {
+    workerId: 'cache-performance-first-worker', leaseMs: 30_000,
+  });
+  const performanceCacheLease = await claimWorkItem(cacheStore, 'cache-performance', cacheCoordinator, {
+    workerId: 'cache-performance-first-worker', capabilities: ['performance:lighthouse'],
+    resourceClasses: ['performance'], leaseMs: 10_000,
+  });
+  const performanceFailureInbox = await publishAttemptEvidence(cacheStore, 'cache-performance', performanceCacheLease, {
+    outcome: 'operational_failure', reason: 'synthetic exhausted performance failure', artifacts: [],
+  });
+  await adoptAttemptEvidence(cacheStore, 'cache-performance', cacheCoordinator, performanceFailureInbox);
+
+  const externalCacheStore = await openParentRunStore({
+    root: externalCacheRoot,
+    deploymentIdentity: 'global-performance-external-cache-test',
+    volumeIdentity: 'named-volume:global-performance-external-cache-test',
+    verifyStorage: false,
+    clock: () => now,
+  });
+  const actor = { id: 'external-rekick-operator', kind: 'service' };
+  await rekickIncompleteWork(externalCacheStore, 'cache-ordinary', cacheCoordinator, {
+    actor, workItemIds: ['cache-ordinary-work'],
+  });
+  const externallyRekickedLease = await claimStoreWorkItem(cacheStore, cacheCoordinator, {
+    workerId: 'cache-ordinary-rekick-worker', runIds: ['cache-ordinary'],
+    capabilities: ['browser:chromium'], resourceClasses: ['ordinary'], leaseMs: 10_000,
+  });
+  assert.equal(externallyRekickedLease.attempt, 2,
+    'a global claim must revalidate a requested run that another process rekicked');
+  const ordinaryPassInbox = await publishAttemptEvidence(cacheStore, 'cache-ordinary', externallyRekickedLease, {
+    outcome: 'completed_pass', artifacts: [],
+  });
+  await adoptAttemptEvidence(cacheStore, 'cache-ordinary', cacheCoordinator, ordinaryPassInbox);
+
+  await rekickIncompleteWork(externalCacheStore, 'cache-performance', cacheCoordinator, {
+    actor, workItemIds: ['cache-performance-work'],
+  });
+  const externalReservation = await requestPerformanceDrain(
+    externalCacheStore,
+    'cache-performance',
+    cacheCoordinator,
+    { workerId: 'cache-performance-rekick-worker', leaseMs: 30_000 },
+  );
+  await assert.rejects(
+    claimStoreWorkItem(cacheStore, cacheCoordinator, {
+      workerId: externalReservation.workerId,
+      runIds: ['cache-performance-other'],
+      capabilities: ['performance:lighthouse'], resourceClasses: ['performance'], leaseMs: 10_000,
+    }),
+    (error) => error?.code === 'PERFORMANCE_DRAIN_REQUIRED',
+    'a claim outside the reservation authorization must be rejected without erasing the reservation',
+  );
+  const preservedExternalReservation = await readStorePerformanceScheduler(cacheStore);
+  assert.equal(preservedExternalReservation.phase, 'draining');
+  assert.equal(preservedExternalReservation.reservation.runId, 'cache-performance',
+    'scheduler reconciliation must revalidate the externally reserved run even when it is not requested');
+  const externallyReservedLease = await claimStoreWorkItem(cacheStore, cacheCoordinator, {
+    workerId: externalReservation.workerId,
+    runIds: ['cache-performance'],
+    capabilities: ['performance:lighthouse'], resourceClasses: ['performance'], leaseMs: 10_000,
+  });
+  assert.equal(externallyReservedLease.attempt, 2,
+    'the original process must claim externally rekicked and reserved performance work');
   const corruptRoot = path.join(root, 'corrupt-store');
   const corruptStore = await openParentRunStore({
     root: corruptRoot,

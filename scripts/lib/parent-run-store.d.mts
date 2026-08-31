@@ -8,6 +8,8 @@ export const MAX_ATTEMPT_ARTIFACTS: 64;
 export const MAX_ATTEMPT_ARTIFACT_BYTES: number;
 export const MAX_ATTEMPT_EVIDENCE_BYTES: number;
 export const MAX_DISCOVERED_PARENT_RUNS: 2048;
+export const MAX_PARENT_RUN_RECOVERY_CACHE_ENTRIES: 64;
+export const MAX_PARENT_RUN_RECOVERY_CACHE_BYTES: number;
 export const ARTIFACT_READ_LEASE_MS: number;
 export interface ParentRunStore {
   root: string;
@@ -68,6 +70,11 @@ export function prequalifyReleaseAuthorityBuild(store: ParentRunStore, coordinat
 }): Promise<any>;
 export function beginReleaseAuthorityBuildHandoff(store: ParentRunStore, coordinator: CoordinatorFence, input: {
   expectedSelectorDigest: string; handoffId: string; targetBuildIdentity: string;
+}): Promise<any>;
+export function authorizeCutoverCanaryRunSupersession(store: ParentRunStore, input: {
+  expectedSelectorDigest: string; cutoverId: string; mode: 'single-site' | 'comparative'; runId: string;
+  replacementRevision: number; sourcePermitDigest: string; requestId: string; authorizationDigest: string;
+  supersedeReason: string;
 }): Promise<any>;
 export function registerReleaseAuthorityHandoffCanaryRun(store: ParentRunStore, coordinator: CoordinatorFence | null, input: {
   expectedSelectorDigest: string; handoffId: string; mode: 'single-site' | 'comparative'; runId: string;

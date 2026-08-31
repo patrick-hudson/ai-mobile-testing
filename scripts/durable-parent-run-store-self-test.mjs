@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import * as nativeFilesystem from 'node:fs/promises';
+import { mkdtemp, readFile, rename, rm, unlink, writeFile } from 'node:fs/promises';
+import { join, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
   acceptOperation,
@@ -11,6 +12,7 @@ import {
   adoptAttemptEvidence,
   appendRiskLifecycleEvent,
   cancelParentRun,
+  claimStoreWorkItem,
   claimWorkItem,
   completeOperation,
   createParentRun,
@@ -18,9 +20,11 @@ import {
   heartbeatCoordinator,
   heartbeatWorkItem,
   listParentRunIds,
+  MAX_PARENT_RUN_RECOVERY_CACHE_ENTRIES,
   openParentRunStore,
   publishAttemptEvidence,
   publishCurrentEnvelope,
+  readBoundedAttemptLogs,
   readCurrentEnvelope,
   readParentRun,
   readReleaseAuthoritySelector,
@@ -39,6 +43,7 @@ import { canonicalDigest } from '../shared/canonical-contract.mjs';
 import { sealExecutionManifest } from '../shared/execution-contract.mjs';
 import { sealFinalReleaseSubject, sealReleaseSubjectCore } from '../shared/release-subject.mjs';
 import { atomicWriteJson, openAtomicStorage, withDirectoryLock } from './lib/atomic-filesystem.mjs';
+import { appendLedgerEvent, LEDGER_KINDS } from './lib/durable-ledger.mjs';
 
 const DIGEST = canonicalDigest({ fixture: 'durable-parent-run' });
 const STORE_MARKER = '9a'.repeat(32);
@@ -511,15 +516,30 @@ const originalEvent = await readFile(decisionEvent, 'utf8');
 const corrupted = JSON.parse(originalEvent);
 corrupted.previousDigest = DIGEST;
 await writeFile(decisionEvent, `${JSON.stringify(corrupted)}\n`);
-await expectCode('STORE_CORRUPT', () => recoverParentRun(store, 'run-main'));
+const coldIntegrityStore = await openParentRunStore({
+  root,
+  clock,
+  storeMarker: STORE_MARKER,
+  expectedStoreGeneration: store.manifest.storeGeneration,
+  verifyStorage: false,
+});
+await expectCode('STORE_CORRUPT', () => recoverParentRun(coldIntegrityStore, 'run-main'));
 await writeFile(decisionEvent, originalEvent);
+await expectCode('STORE_CORRUPT', () => recoverParentRun(store, 'run-main'));
+const restoredIntegrityStore = await openParentRunStore({
+  root,
+  clock,
+  storeMarker: STORE_MARKER,
+  expectedStoreGeneration: store.manifest.storeGeneration,
+  verifyStorage: false,
+});
 
 // Completed operation resources expire after the retry window without erasing their append-only audit history.
 now += 24 * 60 * 60 * 1_000 + 1;
-await acceptOperation(store, 'run-main', operationRequest('after-retention-window'));
-await expectCode('OPERATION_NOT_FOUND', () => getOperation(store, 'run-main', 'launch-1'));
+await acceptOperation(restoredIntegrityStore, 'run-main', operationRequest('after-retention-window'));
+await expectCode('OPERATION_NOT_FOUND', () => getOperation(restoredIntegrityStore, 'run-main', 'launch-1'));
 assert.equal(
-  (await readRunHistories(store, 'run-main')).operation.filter(({ type }) => type === 'operation-completed').length,
+  (await readRunHistories(restoredIntegrityStore, 'run-main')).operation.filter(({ type }) => type === 'operation-completed').length,
   1,
   'compacting completed operation resources must retain their append-only audit history',
 );
@@ -538,6 +558,311 @@ await expectCode('STORE_VOLUME_UNSUPPORTED', () => openParentRunStore({
   volumeDriver: 'nfs',
   verifyStorage: false,
 }));
+
+// Recovery keeps append-only history authoritative without rereading the large
+// state snapshot embedded in every immutable event on every warm access.
+const recoveryCacheRoot = await mkdtemp(join(tmpdir(), 'durable-parent-run-recovery-cache-'));
+let ledgerBodyReads = 0;
+let ledgerEventMetadataReads = 0;
+let ledgerDirectoryReads = 0;
+let ledgerDirectoryEntriesRead = 0;
+let totalFilesystemCalls = 0;
+const countingFilesystem = new Proxy(nativeFilesystem, {
+  get(target, property) {
+    const operation = Reflect.get(target, property);
+    if (typeof operation !== 'function') return operation;
+    return async (...args) => {
+      totalFilesystemCalls += 1;
+      const candidate = String(args[0]);
+      const isLedgerEvent = candidate.includes(`${sep}ledgers${sep}`) && /\d{12}\.json$/u.test(candidate);
+      if (property === 'readFile' && isLedgerEvent) {
+        ledgerBodyReads += 1;
+      }
+      if (property === 'lstat' && isLedgerEvent) {
+        ledgerEventMetadataReads += 1;
+      }
+      const result = await operation(...args);
+      if (property === 'readdir' && candidate.includes(`${sep}ledgers${sep}`)) {
+        ledgerDirectoryReads += 1;
+        ledgerDirectoryEntriesRead += result.length;
+      }
+      return result;
+    };
+  },
+});
+try {
+  const cachedStore = await openParentRunStore({
+    root: recoveryCacheRoot,
+    filesystem: countingFilesystem,
+    deploymentIdentity: 'compose-project:recovery-cache',
+    volumeIdentity: 'named-volume:recovery-cache',
+    clock,
+    verifyStorage: false,
+  });
+  await createParentRun(cachedStore, {
+    runId: 'run-cache',
+    subjectCoreDigest: DIGEST,
+    workItems: [{ id: 'work-cache', maxAttempts: 1 }],
+  });
+  ledgerBodyReads = 0;
+  const coldState = await readParentRun(cachedStore, 'run-cache');
+  assert.ok(ledgerBodyReads > 0, 'cold recovery must validate complete immutable event bodies');
+  ledgerBodyReads = 0;
+  assert.equal((await readParentRun(cachedStore, 'run-cache')).runRevision, coldState.runRevision);
+  assert.equal(ledgerBodyReads, 0, 'unchanged warm recovery must not reread immutable event bodies');
+  assert.equal((await readRunHistories(cachedStore, 'run-cache')).mutation.length, 1);
+  assert.equal(ledgerBodyReads, 0, 'warm history projection must reuse verified event summaries');
+
+  const externalStore = await openParentRunStore({
+    root: recoveryCacheRoot,
+    deploymentIdentity: 'compose-project:recovery-cache',
+    volumeIdentity: 'named-volume:recovery-cache',
+    clock,
+    verifyStorage: false,
+  });
+  const staleState = await readFile(join(recoveryCacheRoot, 'runs', 'run-cache', 'state.json'), 'utf8');
+  await acceptOperation(externalStore, 'run-cache', operationRequest('external-suffix'));
+  await writeFile(join(recoveryCacheRoot, 'runs', 'run-cache', 'state.json'), staleState);
+  ledgerBodyReads = 0;
+  await readBoundedAttemptLogs(cachedStore, 'run-cache');
+  assert.equal(ledgerBodyReads, 1, 'repair-disabled recovery must still validate only the new suffix event');
+  assert.equal(
+    JSON.parse(await readFile(join(recoveryCacheRoot, 'runs', 'run-cache', 'state.json'), 'utf8')).runRevision,
+    coldState.runRevision,
+    'repair-disabled recovery must not mutate the derived state cache',
+  );
+  ledgerBodyReads = 0;
+  const suffixState = await readParentRun(cachedStore, 'run-cache');
+  assert.equal(suffixState.runRevision, coldState.runRevision + 1,
+    'a ledger append must remain the commit record when state.json repair was interrupted');
+  assert.equal(ledgerBodyReads, 0, 'later repair must use the already verified suffix without rereading its event body');
+  assert.equal(
+    JSON.parse(await readFile(join(recoveryCacheRoot, 'runs', 'run-cache', 'state.json'), 'utf8')).runRevision,
+    suffixState.runRevision,
+    'suffix recovery must repair a stale derived state cache',
+  );
+
+  // A long immutable history performs O(prefix) metadata authentication on
+  // every warm recovery while avoiding all historical event body reads. Count
+  // directory payload and total calls so the cost model remains explicit.
+  const HIGH_EVENT_APPEND_COUNT = 256;
+  const syntheticState = structuredClone(suffixState);
+  for (let index = 0; index < HIGH_EVENT_APPEND_COUNT; index += 1) {
+    syntheticState.runRevision += 1;
+    syntheticState.ledgerSequences.mutation += 1;
+    syntheticState.updatedAt = new Date(Date.parse(syntheticState.updatedAt) + 1).toISOString();
+    const event = await appendLedgerEvent(
+      cachedStore.storage,
+      join(recoveryCacheRoot, 'runs', 'run-cache'),
+      'mutation',
+      {
+        sequence: syntheticState.ledgerSequences.mutation,
+        runRevision: syntheticState.runRevision,
+        previousDigest: syntheticState.ledgerHeads.mutation,
+        occurredAt: syntheticState.updatedAt,
+        type: 'synthetic-high-event-history',
+        data: { index },
+        stateSnapshot: syntheticState,
+      },
+    );
+    syntheticState.ledgerHeads.mutation = event.digest;
+  }
+  assert.equal(
+    (await readParentRun(cachedStore, 'run-cache')).runRevision,
+    suffixState.runRevision + HIGH_EVENT_APPEND_COUNT,
+  );
+  const WARM_RECOVERY_READS = 10;
+  ledgerBodyReads = 0;
+  ledgerEventMetadataReads = 0;
+  ledgerDirectoryReads = 0;
+  ledgerDirectoryEntriesRead = 0;
+  totalFilesystemCalls = 0;
+  for (let index = 0; index < WARM_RECOVERY_READS; index += 1) {
+    await readParentRun(cachedStore, 'run-cache');
+  }
+  const expectedPrefixMetadataReads = WARM_RECOVERY_READS * syntheticState.runRevision * 3;
+  assert.equal(ledgerBodyReads, 0, 'warm recovery must not reread any high-event history body');
+  assert.equal(
+    ledgerEventMetadataReads,
+    expectedPrefixMetadataReads,
+    'warm recovery must authenticate every cached prefix event across three stable vectors',
+  );
+  assert.equal(
+    ledgerDirectoryReads,
+    WARM_RECOVERY_READS * LEDGER_KINDS.length * 3,
+    'warm recovery must sample three finite name vectors for every ledger',
+  );
+  assert.equal(
+    ledgerDirectoryEntriesRead,
+    expectedPrefixMetadataReads,
+    'warm recovery directory payload must match its authenticated finite prefix vectors',
+  );
+  assert.ok(
+    totalFilesystemCalls <= expectedPrefixMetadataReads + (WARM_RECOVERY_READS * 100),
+    `warm recovery adds only bounded bookkeeping beyond prefix authentication; observed ${totalFilesystemCalls} calls`,
+  );
+
+  // The process accelerator is a bounded LRU. Exceeding its run budget evicts
+  // the oldest entry, whose next access safely performs a complete cold read.
+  const lruRunIds = Array.from(
+    { length: MAX_PARENT_RUN_RECOVERY_CACHE_ENTRIES + 1 },
+    (_, index) => `run-cache-lru-${String(index).padStart(3, '0')}`,
+  );
+  for (const runId of lruRunIds) {
+    await createParentRun(cachedStore, {
+      runId,
+      subjectCoreDigest: DIGEST,
+      workItems: [{ id: `work-${runId}`, maxAttempts: 1 }],
+    });
+    await readParentRun(cachedStore, runId);
+  }
+  ledgerBodyReads = 0;
+  await readParentRun(cachedStore, lruRunIds.at(-1));
+  assert.equal(ledgerBodyReads, 0, 'most-recent recovery entry must remain warm');
+  await readParentRun(cachedStore, lruRunIds[0]);
+  assert.ok(ledgerBodyReads > 0, 'evicted recovery entry must safely repeat cold event validation');
+} finally {
+  await rm(recoveryCacheRoot, { recursive: true, force: true });
+}
+
+// Claims authenticate every explicitly authorized run, including known terminal
+// entries that another process could have rekicked. Cached candidates run first
+// so cold validation is bounded by the amount the authorized set exceeds LRU.
+const schedulerCacheRoot = await mkdtemp(join(tmpdir(), 'durable-parent-run-scheduler-cache-'));
+const schedulerLedgerBodyPaths = [];
+const schedulerCountingFilesystem = new Proxy(nativeFilesystem, {
+  get(target, property) {
+    const operation = Reflect.get(target, property);
+    if (typeof operation !== 'function') return operation;
+    return async (...args) => {
+      const candidate = String(args[0]);
+      if (property === 'readFile'
+        && candidate.includes(`${sep}ledgers${sep}`)
+        && /\d{12}\.json$/u.test(candidate)) {
+        schedulerLedgerBodyPaths.push(candidate);
+      }
+      return operation(...args);
+    };
+  },
+});
+try {
+  const schedulerStore = await openParentRunStore({
+    root: schedulerCacheRoot,
+    filesystem: schedulerCountingFilesystem,
+    deploymentIdentity: 'compose-project:scheduler-cache',
+    volumeIdentity: 'named-volume:scheduler-cache',
+    clock,
+    verifyStorage: false,
+  });
+  const schedulerCoordinator = await acquireStoreCoordinator(schedulerStore, {
+    ownerId: 'scheduler-cache-coordinator',
+    leaseMs: 3_600_000,
+  });
+  const schedulerAuthorizedRunIds = [];
+  for (let index = 0; index < MAX_PARENT_RUN_RECOVERY_CACHE_ENTRIES + 1; index += 1) {
+    const runId = `run-scheduler-terminal-${String(index).padStart(3, '0')}`;
+    schedulerAuthorizedRunIds.push(runId);
+    await createParentRun(schedulerStore, {
+      runId,
+      subjectCoreDigest: DIGEST,
+      workItems: [{ id: `work-terminal-${String(index).padStart(3, '0')}`, maxAttempts: 1 }],
+    });
+    await cancelParentRun(schedulerStore, runId, schedulerCoordinator, {
+      actor: { id: 'scheduler-cache-test', kind: 'service' },
+      reason: 'terminal scheduler-cache fixture',
+    });
+  }
+  const activeRunId = 'run-scheduler-active';
+  await createParentRun(schedulerStore, {
+    runId: activeRunId,
+    subjectCoreDigest: DIGEST,
+    workItems: [
+      { id: 'work-scheduler-active-a', maxAttempts: 1 },
+      { id: 'work-scheduler-active-b', maxAttempts: 1 },
+    ],
+  });
+  schedulerAuthorizedRunIds.push(activeRunId);
+  await claimStoreWorkItem(schedulerStore, schedulerCoordinator, {
+    workerId: 'scheduler-cache-worker-a', runIds: schedulerAuthorizedRunIds, leaseMs: 1_000,
+  });
+  schedulerLedgerBodyPaths.length = 0;
+  await claimStoreWorkItem(schedulerStore, schedulerCoordinator, {
+    workerId: 'scheduler-cache-worker-b', runIds: schedulerAuthorizedRunIds, leaseMs: 1_000,
+  });
+  const coldRunBudget = schedulerAuthorizedRunIds.length - MAX_PARENT_RUN_RECOVERY_CACHE_ENTRIES;
+  assert.equal(
+    schedulerLedgerBodyPaths.length,
+    1 + (coldRunBudget * 2),
+    'a warm claim reads its active suffix plus complete bodies only for authorized runs outside the LRU',
+  );
+  assert.equal(
+    new Set(schedulerLedgerBodyPaths
+      .filter((candidate) => candidate.includes('run-scheduler-terminal-'))
+      .map((candidate) => candidate.match(/run-scheduler-terminal-\d+/u)?.[0])).size,
+    coldRunBudget,
+    'cached-first scheduling bounds terminal cold replay to the recovery-cache excess',
+  );
+} finally {
+  await rm(schedulerCacheRoot, { recursive: true, force: true });
+}
+
+async function assertCachedHistoryFailsClosed(name, mutateHistory) {
+  const fixtureRoot = await mkdtemp(join(tmpdir(), `durable-parent-run-${name}-`));
+  try {
+    const fixtureStore = await openParentRunStore({
+      root: fixtureRoot,
+      deploymentIdentity: `compose-project:${name}`,
+      volumeIdentity: `named-volume:${name}`,
+      clock,
+      verifyStorage: false,
+    });
+    await createParentRun(fixtureStore, {
+      runId: 'run-cache-integrity',
+      subjectCoreDigest: DIGEST,
+      workItems: [{ id: 'work-cache-integrity', maxAttempts: 1 }],
+    });
+    await readParentRun(fixtureStore, 'run-cache-integrity');
+    await mutateHistory(fixtureRoot);
+    await expectCode('STORE_CORRUPT', () => readParentRun(fixtureStore, 'run-cache-integrity'));
+  } finally {
+    await rm(fixtureRoot, { recursive: true, force: true });
+  }
+}
+
+await assertCachedHistoryFailsClosed('fingerprint-change', async (fixtureRoot) => {
+  const eventFile = join(fixtureRoot, 'runs', 'run-cache-integrity', 'ledgers', 'mutation', '000000000001.json');
+  const event = JSON.parse(await readFile(eventFile, 'utf8'));
+  event.type = 'tampered-parent-run-created';
+  await writeFile(eventFile, `${JSON.stringify(event)}\n`);
+});
+await assertCachedHistoryFailsClosed('missing-history', async (fixtureRoot) => {
+  await unlink(join(fixtureRoot, 'runs', 'run-cache-integrity', 'ledgers', 'mutation', '000000000001.json'));
+});
+await assertCachedHistoryFailsClosed('renumbered-history', async (fixtureRoot) => {
+  const directory = join(fixtureRoot, 'runs', 'run-cache-integrity', 'ledgers', 'mutation');
+  await rename(join(directory, '000000000001.json'), join(directory, '000000000002.json'));
+});
+await assertCachedHistoryFailsClosed('run-revision-gap', async (fixtureRoot) => {
+  const secondStore = await openParentRunStore({
+    root: fixtureRoot,
+    deploymentIdentity: 'compose-project:run-revision-gap',
+    volumeIdentity: 'named-volume:run-revision-gap',
+    clock,
+    verifyStorage: false,
+  });
+  const state = await readParentRun(secondStore, 'run-cache-integrity');
+  const invalidSnapshot = structuredClone(state);
+  invalidSnapshot.runRevision += 2;
+  invalidSnapshot.ledgerSequences.operation = 1;
+  await appendLedgerEvent(secondStore.storage, join(fixtureRoot, 'runs', 'run-cache-integrity'), 'operation', {
+    sequence: 1,
+    runRevision: invalidSnapshot.runRevision,
+    previousDigest: null,
+    occurredAt: new Date(now + 1).toISOString(),
+    type: 'synthetic-run-revision-gap',
+    stateSnapshot: invalidSnapshot,
+  });
+});
 
 await rm(root, { recursive: true, force: true });
 console.log('durable parent-run store self-test passed');

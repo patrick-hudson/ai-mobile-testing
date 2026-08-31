@@ -41,7 +41,7 @@ import {
   appendLedgerEvent,
   initializeLedgers,
   LEDGER_KINDS,
-  readAllLedgers,
+  readAllLedgerIncrements,
 } from './durable-ledger.mjs';
 
 export const PARENT_RUN_STORE_SCHEMA_VERSION = 2;
@@ -54,6 +54,7 @@ const WORK_OUTCOMES = new Set([
   'completed_pass', 'completed_product_failure', 'operational_failure', 'cancelled', 'incomplete_unknown',
 ]);
 const DIGEST_PATTERN = /^sha256:[a-f0-9]{64}$/;
+const CUTOVER_REQUEST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{15,127}$/u;
 const CAPABILITY_PATTERN = /^[a-z][a-z0-9.-]*:[a-z][a-z0-9.-]*$/;
 const RESOURCE_CLASSES = new Set(['ordinary', 'performance']);
 export const MAX_ATTEMPT_ARTIFACTS = 64;
@@ -64,12 +65,18 @@ const MAX_OPERATION_RESOURCES = 128;
 const MAX_OPERATION_BODY_BYTES = 16 * 1_024;
 const OPERATION_RETRY_WINDOW_MS = 24 * 60 * 60 * 1_000;
 export const MAX_DISCOVERED_PARENT_RUNS = 2_048;
+export const MAX_PARENT_RUN_RECOVERY_CACHE_ENTRIES = 64;
+export const MAX_PARENT_RUN_RECOVERY_CACHE_BYTES = 64 * 1_048_576;
 const MAX_BUFFERED_ATTEMPT_ARTIFACT_BYTES = 8 * 1_048_576;
 const MAX_BUFFERED_ATTEMPT_EVIDENCE_BYTES = 16 * 1_048_576;
 const ARTIFACT_INTEGRITY_CACHES = new WeakMap();
+const PARENT_RUN_RECOVERY_CACHES = new WeakMap();
+const SCHEDULING_STATE_CACHES = new WeakMap();
 export const ARTIFACT_READ_LEASE_MS = 15_000;
 const ARTIFACT_PURGE_DRAIN_MS = 20_000;
-const MAX_HANDOFF_CANARY_PERMIT_REVISIONS = 3;
+const MAX_HANDOFF_CANARY_FAILURE_ATTEMPTS = 3;
+const MAX_HANDOFF_CANARY_PERMIT_REVISIONS = 64;
+const MAX_CUTOVER_CANARY_SUPERSESSION_REVISIONS = 64;
 
 export class ParentRunStoreError extends Error {
   constructor(code, message, details = undefined) {
@@ -463,6 +470,10 @@ function runStatePath(store, runId) {
   return path.join(runDirectory(store, runId), 'state.json');
 }
 
+function releaseSupersessionFencePath(store, runId) {
+  return path.join(runDirectory(store, runId), 'release-supersession-fence.json');
+}
+
 function lockPath(store, runId) {
   return path.join(runDirectory(store, runId), '.mutation-lock');
 }
@@ -832,6 +843,74 @@ function handoffCanaryPermitHistoryPath(store, permitDigest) {
   return containedPath(store.root, 'authority-handoff-permits', 'history', `${permitDigest.slice('sha256:'.length)}.json`);
 }
 
+function cutoverCanarySupersessionFenceIdentity(value) {
+  return {
+    schemaVersion: 1,
+    kind: 'release-cutover-canary-supersession-fence',
+    runId: value.runId,
+    cutoverId: value.cutoverId,
+    mode: value.mode,
+    replacementRevision: value.replacementRevision,
+    sourcePermitDigest: value.sourcePermitDigest,
+    requestId: value.requestId,
+    authorizationDigest: value.authorizationDigest,
+    authoritySelectorDigest: value.authoritySelectorDigest,
+    supersedeReason: value.supersedeReason,
+  };
+}
+
+function cutoverCanarySupersessionFenceBody(value) {
+  return {
+    ...cutoverCanarySupersessionFenceIdentity(value),
+    fencedAt: value.fencedAt,
+  };
+}
+
+function sealCutoverCanarySupersessionFence(value) {
+  const body = cutoverCanarySupersessionFenceBody(value);
+  return { ...body, digest: canonicalDigest(body) };
+}
+
+function validateCutoverCanarySupersessionFence(value, runId) {
+  const body = cutoverCanarySupersessionFenceBody(value ?? {});
+  exactKeys(value, [...Object.keys(body), 'digest'], 'cutover canary supersession fence');
+  if (value.schemaVersion !== 1 || value.kind !== 'release-cutover-canary-supersession-fence'
+    || value.runId !== runId || !SAFE_ID.test(value.runId) || !SAFE_ID.test(value.cutoverId)
+    || !['single-site', 'comparative'].includes(value.mode)
+    || !Number.isSafeInteger(value.replacementRevision) || value.replacementRevision < 2
+    || value.replacementRevision > MAX_CUTOVER_CANARY_SUPERSESSION_REVISIONS
+    || !DIGEST_PATTERN.test(value.sourcePermitDigest)
+    || !CUTOVER_REQUEST_ID_PATTERN.test(value.requestId) || !DIGEST_PATTERN.test(value.authorizationDigest)
+    || !DIGEST_PATTERN.test(value.authoritySelectorDigest)
+    || typeof value.supersedeReason !== 'string' || !value.supersedeReason.trim()
+    || value.supersedeReason.length > 2_048 || value.supersedeReason.includes('\0')
+    || value.digest !== canonicalDigest(body)) {
+    fail('STORE_CORRUPT', 'Cutover canary supersession fence is invalid or corrupt.');
+  }
+  canonicalTimestamp(value.fencedAt, 'cutover canary supersession fencedAt');
+  return value;
+}
+
+async function readCutoverCanarySupersessionFenceUnlocked(store, runId) {
+  let value;
+  try {
+    value = await readBoundedJson(store.storage, releaseSupersessionFencePath(store, runId), {
+      label: 'cutover canary supersession fence', maximumBytes: 64 * 1_024,
+    });
+  } catch (error) {
+    if (error?.code === 'ATOMIC_NOT_FOUND') return null;
+    fail('STORE_CORRUPT', 'Cutover canary supersession fence is unreadable or corrupt.', {
+      cause: error?.code ?? error?.message,
+    });
+  }
+  return validateCutoverCanarySupersessionFence(value, runId);
+}
+
+function cutoverCanarySupersessionMatches(fence, intended) {
+  return canonicalJson(cutoverCanarySupersessionFenceIdentity(fence))
+    === canonicalJson(cutoverCanarySupersessionFenceIdentity(intended));
+}
+
 function sealHandoffCanaryPermit(value) {
   const body = {
     schemaVersion: 1,
@@ -849,6 +928,7 @@ function sealHandoffCanaryPermit(value) {
     body.previousPermitDigest = value.previousPermitDigest;
     body.supersedesRunId = value.supersedesRunId;
     body.supersedeAuthorizationDigest = value.supersedeAuthorizationDigest;
+    if (Object.hasOwn(value, 'failureAttempts')) body.failureAttempts = value.failureAttempts;
   }
   return { ...body, digest: canonicalDigest(body) };
 }
@@ -874,6 +954,11 @@ function validateHandoffCanaryPermit(value, selector, mode = null) {
       || !SAFE_ID.test(value.supersedesRunId ?? '') || value.supersedesRunId === value.runId
       || !DIGEST_PATTERN.test(value.supersedeAuthorizationDigest ?? ''))))) {
     fail('AUTHORITY_HANDOFF_PERMIT_INVALID', 'Release-authority handoff canary permit lineage is invalid.');
+  }
+  if (modern && Object.hasOwn(value, 'failureAttempts')
+    && (!Number.isSafeInteger(value.failureAttempts) || value.failureAttempts < 0
+      || value.failureAttempts > MAX_HANDOFF_CANARY_FAILURE_ATTEMPTS)) {
+    fail('AUTHORITY_HANDOFF_PERMIT_INVALID', 'Release-authority handoff canary failure-attempt count is invalid.');
   }
   return value;
 }
@@ -908,6 +993,46 @@ async function assertHandoffCanaryPermitReplaceableUnlocked(store, permit) {
       fail('AUTHORITY_HANDOFF_PERMIT_CONFLICT', 'A current ready handoff canary cannot be replaced.');
     }
   }
+  return state;
+}
+
+function handoffRunConsumesFailureBudget(state) {
+  const workItems = Object.values(state.workItems ?? {});
+  if (state.status !== 'cancelled') return true;
+  return workItems.some((item) => (
+    item.state === 'completed_product_failure'
+    || item.state === 'incomplete'
+    || (Array.isArray(item.attempts) && item.attempts.some((attempt) => attempt.outcome === 'completed_product_failure'))
+    || (Array.isArray(item.attempts) && item.attempts.some(
+      (attempt) => ['operational_failure', 'incomplete_unknown'].includes(attempt.outcome),
+    ))
+  ));
+}
+
+async function failureAttemptsAfterHandoffPermit(store, selector, permit, currentState) {
+  if (Object.hasOwn(permit, 'failureAttempts')) {
+    return permit.failureAttempts + (handoffRunConsumesFailureBudget(currentState) ? 1 : 0);
+  }
+  let cursor = permit;
+  let state = currentState;
+  let failures = 0;
+  for (let depth = 0; depth < MAX_HANDOFF_CANARY_PERMIT_REVISIONS; depth += 1) {
+    if (handoffRunConsumesFailureBudget(state)) failures += 1;
+    if (!Object.hasOwn(cursor, 'revision')) return failures;
+    if (cursor.previousPermitDigest === null) return failures;
+    const previous = validateHandoffCanaryPermit(await readBoundedJson(
+      store.storage,
+      handoffCanaryPermitHistoryPath(store, cursor.previousPermitDigest),
+      { label: 'immutable release-authority handoff canary permit', maximumBytes: 64 * 1_024 },
+    ), selector, permit.mode);
+    if (previous.digest !== cursor.previousPermitDigest || previous.revision !== cursor.revision - 1
+      || cursor.supersedesRunId !== previous.runId) {
+      fail('AUTHORITY_HANDOFF_PERMIT_INVALID', 'Release-authority handoff canary permit history is not contiguous.');
+    }
+    cursor = previous;
+    state = await recoverUnlocked(store, cursor.runId);
+  }
+  fail('AUTHORITY_HANDOFF_PERMIT_INVALID', 'Release-authority handoff canary permit history exceeds its bound.');
 }
 
 async function requireHandoffRunPermit(store, selector, runId) {
@@ -1118,29 +1243,150 @@ async function validateCoordinator(store, coordinator, runId = null) {
   return current;
 }
 
-function normalizeRecoveredState(store, snapshot, ledgers) {
+function normalizeRecoveredState(store, snapshot, checkpoints) {
   const next = clone(snapshot);
   next.ledgerSequences = {};
   next.ledgerHeads = {};
   for (const kind of LEDGER_KINDS) {
-    next.ledgerSequences[kind] = ledgers[kind].length;
-    next.ledgerHeads[kind] = ledgers[kind].at(-1)?.digest ?? null;
+    next.ledgerSequences[kind] = checkpoints[kind].count;
+    next.ledgerHeads[kind] = checkpoints[kind].headDigest;
   }
   next.clockNow = store.clock();
   return next;
 }
 
-async function recoverUnlocked(store, runId, { repairCache = true } = {}) {
+function eventSummary(event) {
+  const { stateSnapshot: _stateSnapshot, ...summary } = event;
+  return summary;
+}
+
+function parentRunRecoveryCache(store) {
+  const cache = PARENT_RUN_RECOVERY_CACHES.get(store);
+  if (!cache) fail('STORE_CORRUPT', 'Parent-run recovery cache is unavailable.');
+  return cache;
+}
+
+function recoveryCacheGet(store, runId, { touch = true } = {}) {
+  const cache = parentRunRecoveryCache(store);
+  const entry = cache.entries.get(runId);
+  if (!entry) return null;
+  if (touch) {
+    cache.entries.delete(runId);
+    cache.entries.set(runId, entry);
+  }
+  return entry.value;
+}
+
+function recoveryCacheDelete(store, runId) {
+  const cache = parentRunRecoveryCache(store);
+  const entry = cache.entries.get(runId);
+  if (!entry) return;
+  cache.entries.delete(runId);
+  cache.bytes -= entry.bytes;
+}
+
+function recoveryCacheSet(store, runId, value) {
+  const cache = parentRunRecoveryCache(store);
+  const bytes = Buffer.byteLength(JSON.stringify(value), 'utf8');
+  recoveryCacheDelete(store, runId);
+  // Correctness never depends on retaining an accelerator entry. An unusually
+  // large run is fully validated for each access instead of being allowed to
+  // consume the process-wide cache budget by itself.
+  if (bytes > MAX_PARENT_RUN_RECOVERY_CACHE_BYTES) return false;
+  while (cache.entries.size >= MAX_PARENT_RUN_RECOVERY_CACHE_ENTRIES
+    || cache.bytes + bytes > MAX_PARENT_RUN_RECOVERY_CACHE_BYTES) {
+    // Retained terminal history is the first eviction tier. A large archive
+    // must not repeatedly displace the queued/running state needed by claims.
+    let evictionRunId = null;
+    for (const candidateRunId of cache.entries.keys()) {
+      if (!schedulingStateCache(store).relevantRunIds.has(candidateRunId)) {
+        evictionRunId = candidateRunId;
+        break;
+      }
+    }
+    evictionRunId ??= cache.entries.keys().next().value;
+    if (evictionRunId === undefined) break;
+    recoveryCacheDelete(store, evictionRunId);
+  }
+  cache.entries.set(runId, Object.freeze({ value, bytes }));
+  cache.bytes += bytes;
+  return true;
+}
+
+function isSchedulingRelevantState(state) {
+  if (state.status !== 'active' || state.authorityTombstone !== null) return false;
+  if (state.resourceScheduling.performanceDrain !== null || state.resourceScheduling.exclusiveLease !== null) return true;
+  return Object.values(state.workItems).some((item) => (
+    ['queued', 'running'].includes(item.state)
+    || item.diagnosticExecutions.some((diagnostic) => ['queued', 'running'].includes(diagnostic.state))
+  ));
+}
+
+function schedulingStateCache(store) {
+  const cache = SCHEDULING_STATE_CACHES.get(store);
+  if (!cache) fail('STORE_CORRUPT', 'Parent-run scheduling-state cache is unavailable.');
+  return cache;
+}
+
+function noteSchedulingState(store, state) {
+  const cache = schedulingStateCache(store);
+  cache.knownRunIds.add(state.runId);
+  if (isSchedulingRelevantState(state)) cache.relevantRunIds.add(state.runId);
+  else cache.relevantRunIds.delete(state.runId);
+}
+
+function cachedHistorySummaries(store, runId) {
+  const cached = recoveryCacheGet(store, runId);
+  if (!cached) fail('STORE_CORRUPT', `Parent run ${runId} has no verified recovery cache.`);
+  return structuredClone(cached.histories);
+}
+
+async function repairRecoveredStateCache(store, runId, state) {
+  let cached = null;
+  try { cached = await readBoundedJson(store.storage, runStatePath(store, runId), { label: 'parent-run state' }); } catch {}
+  const comparableState = { ...state };
+  delete comparableState.clockNow;
+  // An unlocked reader may have observed a stable ledger prefix immediately
+  // before another process committed a newer suffix and state cache. Never
+  // regress that newer derived cache; the next recovery will consume its event.
+  if (Number.isSafeInteger(cached?.runRevision) && cached.runRevision > comparableState.runRevision) return false;
+  if (cached === null || canonicalJson(cached) !== canonicalJson(comparableState)) {
+    await atomicWriteJson(store.storage, runStatePath(store, runId), comparableState);
+  }
+  return true;
+}
+
+async function recoverUnlocked(store, runId, { repairCache = true, captureHistories = null } = {}) {
   const directory = runDirectory(store, runId);
   if (!await pathExists(store.storage.fs, directory)) fail('RUN_NOT_FOUND', `Parent run ${runId} was not found.`);
-  let ledgers;
+  const cachedRecovery = recoveryCacheGet(store, runId);
+  let increment;
   try {
-    ledgers = await readAllLedgers(store.storage, directory);
+    increment = await readAllLedgerIncrements(store.storage, directory, cachedRecovery?.checkpoints ?? null);
   } catch (error) {
+    // A changed immutable prefix is an integrity failure for this access. Drop
+    // only the process-local accelerator so a later access must perform the
+    // same complete cold validation used after process startup.
+    recoveryCacheDelete(store, runId);
     fail('STORE_CORRUPT', `Parent run ${runId} has a corrupt append-only history.`, { cause: error?.message });
   }
+  const { ledgers, checkpoints } = increment;
   const events = Object.values(ledgers).flat().sort((left, right) => left.runRevision - right.runRevision);
-  if (events.length === 0 || events.some((event, index) => event.runRevision !== index + 1)) {
+  const priorRevision = cachedRecovery?.state.runRevision ?? 0;
+  if (events.length === 0) {
+    if (!cachedRecovery) fail('STORE_CORRUPT', `Parent run ${runId} has an empty append-only history.`);
+    captureHistories?.(cachedRecovery.histories);
+    if (repairCache && !cachedRecovery.stateCacheVerified) {
+      const stateCacheVerified = await repairRecoveredStateCache(store, runId, cachedRecovery.state);
+      const currentRecovery = recoveryCacheGet(store, runId, { touch: false });
+      if (stateCacheVerified && currentRecovery?.state.runRevision === cachedRecovery.state.runRevision) {
+        recoveryCacheSet(store, runId, Object.freeze({ ...currentRecovery, stateCacheVerified: true }));
+      }
+    }
+    noteSchedulingState(store, cachedRecovery.state);
+    return { ...structuredClone(cachedRecovery.state), clockNow: store.clock() };
+  }
+  if (events.some((event, index) => event.runRevision !== priorRevision + index + 1)) {
     fail('STORE_CORRUPT', `Parent run ${runId} has a missing or duplicate run revision.`);
   }
   const latest = events.at(-1);
@@ -1314,17 +1560,38 @@ async function recoverUnlocked(store, runId, { repairCache = true } = {}) {
   if (snapshot.runRevision !== latest.runRevision) {
     fail('STORE_CORRUPT', `Parent run ${runId} has an invalid recovery snapshot.`);
   }
-  const state = normalizeRecoveredState(store, snapshot, ledgers);
-  if (repairCache) {
-    let cached = null;
-    try { cached = await readBoundedJson(store.storage, runStatePath(store, runId), { label: 'parent-run state' }); } catch {}
-    const comparableState = { ...state };
-    delete comparableState.clockNow;
-    if (cached === null || canonicalJson(cached) !== canonicalJson(comparableState)) {
-      await atomicWriteJson(store.storage, runStatePath(store, runId), comparableState);
-    }
+  if (Object.values(checkpoints).reduce((total, checkpoint) => total + checkpoint.count, 0) !== latest.runRevision) {
+    fail('STORE_CORRUPT', `Parent run ${runId} ledger positions disagree with its recovery revision.`);
   }
+  const state = normalizeRecoveredState(store, snapshot, checkpoints);
+  const repairedStateCache = repairCache && await repairRecoveredStateCache(store, runId, state);
+  const histories = Object.fromEntries(LEDGER_KINDS.map((kind) => [
+    kind,
+    [...(cachedRecovery?.histories[kind] ?? []), ...ledgers[kind].map(eventSummary)],
+  ]));
+  captureHistories?.(histories);
+  const cacheState = structuredClone(state);
+  delete cacheState.clockNow;
+  const currentRecovery = recoveryCacheGet(store, runId, { touch: false });
+  if (!currentRecovery || currentRecovery.state.runRevision <= cacheState.runRevision) {
+    const stateCacheVerified = repairedStateCache
+      || (currentRecovery?.state.runRevision === cacheState.runRevision && currentRecovery.stateCacheVerified);
+    recoveryCacheSet(store, runId, Object.freeze({ state: cacheState, checkpoints, histories, stateCacheVerified }));
+  }
+  noteSchedulingState(store, state);
   return state;
+}
+
+async function recoverWithHistoriesUnlocked(store, runId, options = {}) {
+  let recoveredHistories = null;
+  const state = await recoverUnlocked(store, runId, {
+    ...options,
+    captureHistories: (histories) => { recoveredHistories = histories; },
+  });
+  return {
+    state,
+    histories: recoveredHistories === null ? cachedHistorySummaries(store, runId) : structuredClone(recoveredHistories),
+  };
 }
 
 async function appendMutationUnlocked(store, state, kind, type, apply, { actor = null, data = null } = {}) {
@@ -1347,7 +1614,9 @@ async function appendMutationUnlocked(store, state, kind, type, apply, { actor =
   });
   next.ledgerHeads[kind] = event.digest;
   await atomicWriteJson(store.storage, runStatePath(store, state.runId), next);
-  return { ...next, clockNow: store.clock() };
+  const result = { ...next, clockNow: store.clock() };
+  noteSchedulingState(store, result);
+  return result;
 }
 
 async function mutate(store, runId, { coordinator = null, kind = 'mutation', type, actor = null, data = null }, apply) {
@@ -1429,6 +1698,8 @@ export async function openParentRunStore({
     legacyAuthorityFence,
   };
   ARTIFACT_INTEGRITY_CACHES.set(store, new Map());
+  PARENT_RUN_RECOVERY_CACHES.set(store, { entries: new Map(), bytes: 0 });
+  SCHEDULING_STATE_CACHES.set(store, { initialized: false, knownRunIds: new Set(), relevantRunIds: new Set() });
   await withDirectoryLock(storage, containedPath(storage.root, '.store-initialization.lock'), async () => {
     const existingStore = await pathExists(storage.fs, manifestPath);
     if (existingStore) {
@@ -1623,6 +1894,7 @@ export async function createParentRun(store, input) {
       await input.afterTemporaryPersist?.(temporaryDirectory);
       await store.storage.fs.rename(temporaryDirectory, directory);
       await fsyncDirectory(store.storage.fs, path.dirname(directory));
+      noteSchedulingState(store, state);
       return clone(state);
     } catch (error) {
       await store.storage.fs.rm(temporaryDirectory, { recursive: true, force: true });
@@ -1657,12 +1929,11 @@ export async function listParentRunIds(store, { limit = MAX_DISCOVERED_PARENT_RU
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_DISCOVERED_PARENT_RUNS) {
     fail('STORE_SCHEMA_INVALID', `Parent-run discovery limit must be from 1 through ${MAX_DISCOVERED_PARENT_RUNS}.`);
   }
-  const entries = await store.storage.fs.readdir(containedPath(store.root, 'runs'));
+  const entries = await store.storage.fs.readdir(containedPath(store.root, 'runs'), { withFileTypes: true });
   const runIds = [];
-  for (const entry of entries.filter((name) => SAFE_ID.test(name)).sort()) {
-    const metadata = await store.storage.fs.lstat(containedPath(store.root, 'runs', entry));
-    if (!metadata.isDirectory() || metadata.isSymbolicLink()) continue;
-    runIds.push(entry);
+  for (const entry of entries.filter(({ name }) => SAFE_ID.test(name)).sort((left, right) => left.name.localeCompare(right.name))) {
+    if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+    runIds.push(entry.name);
     if (runIds.length >= limit) break;
   }
   return runIds;
@@ -2154,6 +2425,94 @@ export function beginReleaseAuthorityBuildHandoff(store, coordinator, input = {}
   });
 }
 
+export function authorizeCutoverCanaryRunSupersession(store, input = {}) {
+  const runId = safeId(input.runId, 'cutover canary superseded runId');
+  safeId(input.cutoverId, 'cutoverId');
+  if (!['single-site', 'comparative'].includes(input.mode)
+    || !Number.isSafeInteger(input.replacementRevision) || input.replacementRevision < 2
+    || input.replacementRevision > MAX_CUTOVER_CANARY_SUPERSESSION_REVISIONS
+    || !DIGEST_PATTERN.test(input.sourcePermitDigest ?? '')
+    || !DIGEST_PATTERN.test(input.authorizationDigest ?? '')
+    || !DIGEST_PATTERN.test(input.expectedSelectorDigest ?? '')
+    || !CUTOVER_REQUEST_ID_PATTERN.test(input.requestId ?? '')
+    || typeof input.supersedeReason !== 'string' || !input.supersedeReason.trim()
+    || input.supersedeReason.length > 2_048 || input.supersedeReason.includes('\0')) {
+    fail('STORE_SCHEMA_INVALID', 'Cutover canary supersession authorization is invalid.');
+  }
+  return withDirectoryLock(store.storage, globalLockPath(store), () => (
+    withDirectoryLock(store.storage, lockPath(store, runId), async () => {
+      const selector = await readAuthoritySelectorUnlocked(store);
+      if (selector.phase !== 'ACTIVE' || selector.digest !== input.expectedSelectorDigest
+        || selector.activeBuildIdentity !== store.buildIdentity || selector.pendingBuildIdentity !== null) {
+        fail('CUTOVER_CANARY_REPLACEMENT_BLOCKED',
+          'Cutover canary supersession does not match the active release authority.');
+      }
+      const intended = sealCutoverCanarySupersessionFence({
+        schemaVersion: 1,
+        runId,
+        cutoverId: input.cutoverId,
+        mode: input.mode,
+        replacementRevision: input.replacementRevision,
+        sourcePermitDigest: input.sourcePermitDigest,
+        requestId: input.requestId,
+        authorizationDigest: input.authorizationDigest,
+        authoritySelectorDigest: input.expectedSelectorDigest,
+        supersedeReason: input.supersedeReason,
+        fencedAt: timestamp(store),
+      });
+      const existing = await readCutoverCanarySupersessionFenceUnlocked(store, runId);
+      if (existing !== null) {
+        if (!cutoverCanarySupersessionMatches(existing, intended)) {
+          fail('CUTOVER_CANARY_SUPERSESSION_CONFLICT',
+            'A different replacement already fenced this cutover canary run.');
+        }
+        return clone(existing);
+      }
+
+      const state = await recoverUnlocked(store, runId);
+      if (state.authorityTombstone !== null) {
+        fail('CUTOVER_CANARY_REPLACEMENT_BLOCKED',
+          'A release-authority tombstoned canary cannot be used as replacement evidence.');
+      }
+      if (state.currentPublicationDigest !== null) {
+        const publication = (await readPublicationChain(
+          store,
+          runId,
+          state.currentPublicationDigest,
+        )).at(-1);
+        if (publication.decision?.ready === true) {
+          fail('CUTOVER_CANARY_REPLACEMENT_BLOCKED', 'A current ready canary cannot be replaced.');
+        }
+      }
+      const workItems = Object.values(state.workItems ?? {});
+      if (workItems.length === 0 || workItems.some((item) => (
+        !['completed_pass', 'completed_product_failure', 'cancelled', 'incomplete'].includes(item.state)
+      ))) {
+        fail('CUTOVER_CANARY_REPLACEMENT_BLOCKED',
+          'Canary replacement requires a durable terminal non-ready run.');
+      }
+
+      try {
+        await atomicWriteJson(
+          store.storage,
+          releaseSupersessionFencePath(store, runId),
+          intended,
+          { exclusive: true },
+        );
+      } catch (error) {
+        if (error?.code !== 'ATOMIC_ALREADY_EXISTS') throw error;
+        const raced = await readCutoverCanarySupersessionFenceUnlocked(store, runId);
+        if (raced === null || !cutoverCanarySupersessionMatches(raced, intended)) {
+          fail('CUTOVER_CANARY_SUPERSESSION_CONFLICT',
+            'A different replacement raced this cutover canary supersession.');
+        }
+        return clone(raced);
+      }
+      return clone(intended);
+    })
+  ));
+}
+
 export function registerReleaseAuthorityHandoffCanaryRun(store, coordinator, input = {}) {
   return withDirectoryLock(store.storage, globalLockPath(store), async () => {
     if (coordinator !== null) await validateCoordinator(store, coordinator);
@@ -2182,6 +2541,7 @@ export function registerReleaseAuthorityHandoffCanaryRun(store, coordinator, inp
       previousPermitDigest: null,
       supersedesRunId: null,
       supersedeAuthorizationDigest: null,
+      failureAttempts: 0,
     });
     if (!await pathExists(store.storage.fs, file)) {
       if (input.supersedesRunId !== undefined && input.supersedesRunId !== null
@@ -2202,13 +2562,19 @@ export function registerReleaseAuthorityHandoffCanaryRun(store, coordinator, inp
         fail('AUTHORITY_HANDOFF_PERMIT_CONFLICT', `A different ${input.mode} handoff canary is already registered.`);
       }
       return withDirectoryLock(store.storage, lockPath(store, existing.runId), async () => {
-        await assertHandoffCanaryPermitReplaceableUnlocked(store, existing);
+        const replacedState = await assertHandoffCanaryPermitReplaceableUnlocked(store, existing);
+        const failureAttempts = await failureAttemptsAfterHandoffPermit(store, selector, existing, replacedState);
+        if (failureAttempts >= MAX_HANDOFF_CANARY_FAILURE_ATTEMPTS) {
+          fail('AUTHORITY_HANDOFF_PERMIT_CONFLICT',
+            `The ${input.mode} handoff canary failure-recovery bound is exhausted.`);
+        }
         const replacement = sealHandoffCanaryPermit({
           ...permit,
           revision: (existing.revision ?? 1) + 1,
           previousPermitDigest: existing.digest,
           supersedesRunId: existing.runId,
           supersedeAuthorizationDigest: input.supersedeAuthorizationDigest,
+          failureAttempts,
         });
         await persistImmutableHandoffCanaryPermit(store, existing);
         await persistImmutableHandoffCanaryPermit(store, replacement);
@@ -2340,12 +2706,36 @@ function workerCanRun(item, worker) {
       || worker.capabilities.includes(item.capability));
 }
 
-async function schedulingStatesUnlocked(store) {
+async function schedulingStatesUnlocked(store, { forceRunIds = [] } = {}) {
+  const cache = schedulingStateCache(store);
+  const discoveredRunIds = await listParentRunIds(store);
+  const discovered = new Set(discoveredRunIds);
+  for (const runId of cache.knownRunIds) {
+    if (discovered.has(runId)) continue;
+    cache.knownRunIds.delete(runId);
+    cache.relevantRunIds.delete(runId);
+    recoveryCacheDelete(store, runId);
+  }
+  const forcedRunIds = [...new Set(forceRunIds)].filter((runId) => discovered.has(runId));
+  const cachedForcedRunIds = forcedRunIds.filter((runId) => recoveryCacheGet(store, runId, { touch: false }) !== null);
+  const uncachedForcedRunIds = forcedRunIds.filter((runId) => recoveryCacheGet(store, runId, { touch: false }) === null);
+  // Authenticate already-cached candidates before cold candidates. Otherwise a
+  // cache that is only one entry over budget can evict the next candidate on
+  // every iteration and replay the entire authorized archive.
+  const candidateRunIds = cache.initialized
+    ? new Set([
+      ...cache.relevantRunIds,
+      ...cachedForcedRunIds,
+      ...discoveredRunIds.filter((runId) => !cache.knownRunIds.has(runId)),
+      ...uncachedForcedRunIds,
+    ])
+    : new Set(discoveredRunIds);
   const states = [];
-  for (const runId of await listParentRunIds(store)) {
+  for (const runId of candidateRunIds) {
     const state = await recoverUnlocked(store, runId);
     states.push(state);
   }
+  cache.initialized = true;
   return states;
 }
 
@@ -2359,11 +2749,11 @@ function liveRunningItems(states, store) {
   ]));
 }
 
-async function reconcilePerformanceSchedulerUnlocked(store, coordinator, states = null) {
-  const current = await readPerformanceSchedulerUnlocked(store);
+async function reconcilePerformanceSchedulerUnlocked(store, coordinator, states = null, observed = null) {
+  const current = observed ?? await readPerformanceSchedulerUnlocked(store);
   if (current.phase === 'idle') return current;
-  const allStates = states ?? await schedulingStatesUnlocked(store);
   const reservation = current.reservation;
+  const allStates = states ?? await schedulingStatesUnlocked(store, { forceRunIds: [reservation.runId] });
   const state = allStates.find(({ runId }) => runId === reservation.runId);
   const item = state?.workItems?.[reservation.workItemId];
   const target = reservation.diagnosticExecutionId === null ? item
@@ -2437,14 +2827,45 @@ export async function requestStorePerformanceDrain(store, coordinator, input) {
     await validateCoordinator(store, coordinator);
     const authority = await readAuthoritySelectorUnlocked(store);
     for (const runId of runIds) await requireHandoffRunPermit(store, authority, runId);
-    const states = await schedulingStatesUnlocked(store);
-    const current = await reconcilePerformanceSchedulerUnlocked(store, coordinator, states);
+    const observedScheduler = await readPerformanceSchedulerUnlocked(store);
+    const reservationRunIds = observedScheduler.phase === 'idle' ? [] : [observedScheduler.reservation.runId];
+    const states = await schedulingStatesUnlocked(store, { forceRunIds: [...runIds, ...reservationRunIds] });
+    const current = await reconcilePerformanceSchedulerUnlocked(store, coordinator, states, observedScheduler);
     if (current.phase === 'running') fail('PERFORMANCE_LEASE_HELD', 'The store-global performance resource is already running.');
     if (current.phase === 'draining') {
       if (current.reservation.workerId !== worker.workerId) {
         fail('PERFORMANCE_DRAIN_HELD', 'Another worker holds the store-global performance drain.');
       }
-      return clone(current.reservation);
+      const reservedState = states.find(({ runId }) => runId === current.reservation.runId);
+      const reservedItem = reservedState?.workItems?.[current.reservation.workItemId];
+      const reservedTarget = current.reservation.diagnosticExecutionId === null
+        ? reservedItem
+        : reservedItem?.diagnosticExecutions.find(
+          ({ diagnosticExecutionId }) => diagnosticExecutionId === current.reservation.diagnosticExecutionId,
+        );
+      if (!runIds.includes(current.reservation.runId)
+        || !reservedState || reservedState.status !== 'active' || reservedState.authorityTombstone !== null
+        || !reservedItem || !reservedTarget || reservedTarget.state !== 'queued') {
+        fail('PERFORMANCE_DRAIN_REQUIRED',
+          'The active performance reservation is outside this worker authorization or no longer queued.');
+      }
+      if (!workerCanRun(reservedItem, worker)) {
+        fail('WORKER_CAPABILITY_MISMATCH', `Worker cannot execute ${reservedItem.id}.`);
+      }
+      const remainingLeaseMs = Date.parse(current.reservation.expiresAt) - store.clock();
+      if (remainingLeaseMs > Math.floor(leaseMs / 2)) {
+        return clone(current.reservation);
+      }
+      const renewedExpiresAt = new Date(store.clock() + leaseMs).toISOString();
+      if (Date.parse(renewedExpiresAt) <= Date.parse(current.reservation.expiresAt)) {
+        return clone(current.reservation);
+      }
+      const renewedReservation = {
+        ...current.reservation,
+        expiresAt: renewedExpiresAt,
+      };
+      await writePerformanceSchedulerUnlocked(store, current, 'draining', renewedReservation);
+      return clone(renewedReservation);
     }
     const statesByRunId = new Map(states.map((state) => [state.runId, state]));
     const authorizedStates = runIds.map((runId) => statesByRunId.get(runId)).filter(Boolean);
@@ -2506,7 +2927,7 @@ function queuedDiagnostic(item) {
   return item.diagnosticExecutions?.find(({ state }) => state === 'queued') ?? null;
 }
 
-export async function claimStoreWorkItem(store, coordinator, input) {
+async function claimStoreWorkItemInternal(store, coordinator, input, forceRunIds = []) {
   if (!Number.isSafeInteger(input?.leaseMs) || input.leaseMs < 100 || input.leaseMs > 3_600_000) {
     fail('STORE_SCHEMA_INVALID', 'Work-item leaseMs must be an integer from 100 through 3600000.');
   }
@@ -2521,8 +2942,12 @@ export async function claimStoreWorkItem(store, coordinator, input) {
     if (authority.pendingBuildIdentity !== null) {
       for (const runId of runIds) await requireHandoffRunPermit(store, authority, runId);
     }
-    const states = await schedulingStatesUnlocked(store);
-    const scheduler = await reconcilePerformanceSchedulerUnlocked(store, coordinator, states);
+    const observedScheduler = await readPerformanceSchedulerUnlocked(store);
+    const reservationRunIds = observedScheduler.phase === 'idle' ? [] : [observedScheduler.reservation.runId];
+    const states = await schedulingStatesUnlocked(store, {
+      forceRunIds: [...runIds, ...forceRunIds, ...reservationRunIds],
+    });
+    const scheduler = await reconcilePerformanceSchedulerUnlocked(store, coordinator, states, observedScheduler);
     const wantsPerformance = worker.resourceClasses.includes('performance');
     if (!wantsPerformance && scheduler.phase !== 'idle') {
       fail('PERFORMANCE_DRAINING', 'Ordinary claims are paused for the store-global performance execution.');
@@ -2624,8 +3049,12 @@ export async function claimStoreWorkItem(store, coordinator, input) {
   });
 }
 
+export function claimStoreWorkItem(store, coordinator, input) {
+  return claimStoreWorkItemInternal(store, coordinator, input);
+}
+
 export function claimWorkItem(store, runId, coordinator, input) {
-  return claimStoreWorkItem(store, coordinator, { ...input, runIds: [runId] });
+  return claimStoreWorkItemInternal(store, coordinator, { ...input, runIds: [runId] }, [runId]);
 }
 
 function validateWorkLease(state, lease) {
@@ -4205,8 +4634,7 @@ export async function purgeParentRunEvidence(store, runId) {
 }
 
 export async function readRunHistories(store, runId) {
-  await recoverUnlocked(store, runId);
-  return readAllLedgers(store.storage, runDirectory(store, runId));
+  return (await recoverWithHistoriesUnlocked(store, runId)).histories;
 }
 
 async function readBoundedAttemptLogsUnlocked(store, runId, state, { limit = 200 } = {}) {
@@ -4236,12 +4664,9 @@ export async function readBoundedAttemptLogs(store, runId, { limit = 200 } = {})
 export async function readParentRunWorkspaceSnapshot(store, runId, { logLimit = 200 } = {}) {
   return withDirectoryLock(store.storage, globalLockPath(store), () => withDirectoryLock(store.storage, lockPath(store, runId), async () => {
     const selector = await readAuthoritySelectorUnlocked(store);
-    const state = await recoverUnlocked(store, runId, { repairCache: false });
+    const { state, histories } = await recoverWithHistoriesUnlocked(store, runId, { repairCache: false });
     const publication = await readCurrentEnvelopeUnlocked(store, runId, { selector, state });
-    const [histories, workerLogs] = await Promise.all([
-      readAllLedgers(store.storage, runDirectory(store, runId)),
-      readBoundedAttemptLogsUnlocked(store, runId, state, { limit: logLimit }),
-    ]);
+    const workerLogs = await readBoundedAttemptLogsUnlocked(store, runId, state, { limit: logLimit });
     const snapshotToken = canonicalDigest({
       schemaVersion: 1,
       kind: 'shared-workspace-snapshot',
@@ -4320,6 +4745,12 @@ export async function publishCurrentEnvelope(store, runId, coordinator, envelope
   return withDirectoryLock(store.storage, globalLockPath(store), () => withDirectoryLock(store.storage, lockPath(store, runId), async () => {
     const state = await recoverUnlocked(store, runId);
     await validateCoordinator(store, coordinator, runId);
+    const supersessionFence = await readCutoverCanarySupersessionFenceUnlocked(store, runId);
+    if (supersessionFence !== null) {
+      fail('RELEASE_AUTHORITY_SUPERSEDED',
+        'Parent run release publication is fenced by an authorized cutover canary replacement.',
+        supersessionFence);
+    }
     const { selector, binding } = await requirePublicationAuthority(store, runId);
     if (state.compilationState === 'failed') {
       if (!state.compilationFailure || !Object.hasOwn(envelope, 'subjectCoreDigest')
@@ -4338,15 +4769,14 @@ export async function publishCurrentEnvelope(store, runId, coordinator, envelope
     } else {
       fail('SEALED_MANIFEST_MISSING', 'Release authority is unavailable until compilation is terminal or the parent-run graph is sealed.');
     }
-    const histories = await readAllLedgers(store.storage, runDirectory(store, runId));
     // U1's publication contract names the release projections: observations
     // are canonical graph/mutation history, decisions and risks map directly.
     // Durable operation history remains independently revisioned and is not
     // folded into release evidence.
     const expectedLedgerSequences = {
-      observations: histories.mutation.length,
-      decisions: histories.decision.length + 1,
-      risks: histories.risk.length,
+      observations: state.ledgerSequences.mutation,
+      decisions: state.ledgerSequences.decision + 1,
+      risks: state.ledgerSequences.risk,
     };
     if (canonicalJson(envelope.ledgerSequences) !== canonicalJson(expectedLedgerSequences)) {
       fail('PUBLICATION_LEDGER_MISMATCH', 'Publication envelope does not name the exact durable ledger sequences.');

@@ -119,6 +119,7 @@ export function authorizeSharedCutoverCanaryLaunch(options: {
   supersedeReason?: string | null;
   probeTargetIdentity?: (intent: unknown) => Promise<unknown> | unknown;
   clock?: () => number;
+  hooks?: { afterSupersessionFence?(fence: any): void | Promise<void> };
 }): Promise<any>;
 
 export function captureSharedAuthorityDrainObservation(options: {

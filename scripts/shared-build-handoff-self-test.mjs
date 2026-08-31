@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -11,6 +11,7 @@ import {
   acceptOperation,
   acquireStoreCoordinator,
   adoptAttemptEvidence,
+  beginReleaseAuthorityBuildHandoff,
   cancelParentRun,
   claimWorkItem,
   createParentRun,
@@ -254,7 +255,7 @@ try {
     };
     const requestId = `handoff-${mode}-request-0001`;
     const actor = { id: 'operator:handoff-canary', kind: 'human' };
-    const launchRun = (launchRequestId, launchRunId, operationId) => policy.withLaunchAdmission(
+    const launchRun = (launchRequestId, launchRunId, operationId, maxAttempts = 1) => policy.withLaunchAdmission(
       launchRequestId,
       intent,
       async () => {
@@ -265,7 +266,7 @@ try {
           executionManifestDigest: digest,
           runnerRevision,
           compilationState: 'sealed',
-          workItems: [{ id: `work-${mode}`, maxAttempts: 1 }],
+          workItems: [{ id: `work-${mode}`, maxAttempts }],
         });
         return {
           runId: launchRunId,
@@ -282,6 +283,24 @@ try {
     });
     assert.equal(launchPermit.activeBuildIdentity, targetBuild);
     await launchRun(requestId, runId, mode === 'single-site' ? '1'.repeat(64) : '2'.repeat(64));
+    if (mode === 'single-site') {
+      const permitFile = path.join(root, 'authority-handoff-permits', `${handoffId}-${mode}.json`);
+      const modernPermit = JSON.parse(await readFile(permitFile, 'utf8'));
+      const legacyBody = {
+        schemaVersion: modernPermit.schemaVersion,
+        kind: modernPermit.kind,
+        handoffId: modernPermit.handoffId,
+        mode: modernPermit.mode,
+        runId: modernPermit.runId,
+        targetBuildIdentity: modernPermit.targetBuildIdentity,
+        selectorDigest: modernPermit.selectorDigest,
+        coordinatorEpoch: modernPermit.coordinatorEpoch,
+        registeredAt: modernPermit.registeredAt,
+      };
+      const legacyPermit = { ...legacyBody, digest: canonicalDigest(legacyBody) };
+      await rm(path.join(root, 'authority-handoff-permits', 'history', `${modernPermit.digest.slice(7)}.json`));
+      await writeFile(permitFile, `${JSON.stringify(legacyPermit)}\n`);
+    }
     const unpermittedRunId = `${runId}-unpermitted`;
     await expectCode('AUTHORITY_HANDOFF_CANARY_REQUIRED', () => createParentRun(target, {
       runId: unpermittedRunId,
@@ -331,13 +350,18 @@ try {
         outcome: 'cancelled', reason: 'Synthetic terminal non-ready handoff canary.', artifacts: [],
       });
       await adoptAttemptEvidence(target, runId, targetCoordinator, failedInbox);
+      await cancelParentRun(target, runId, targetCoordinator, {
+        reason: 'Operator explicitly cancelled the first handoff canary.',
+        actor: { id: 'operator:test', kind: 'human' },
+      });
       assert.equal((await readParentRun(target, runId)).workItems[`work-${mode}`].state, 'cancelled');
 
       now += 10;
       const replacementPermit = await authorizeSharedBuildHandoffCanaryLaunch(replacementOptions);
       assert.equal(replacementPermit.revision, 2);
+      assert.equal(replacementPermit.failureAttempts, 0);
       assert.equal(replacementPermit.supersedesRunId, runId);
-      await launchRun(replacementRequestId, replacementRunId, '3'.repeat(64));
+      await launchRun(replacementRequestId, replacementRunId, '3'.repeat(64), 2);
       const storedPermit = JSON.parse(await readFile(
         path.join(root, 'authority-handoff-permits', `${handoffId}-${mode}.json`),
         'utf8',
@@ -348,8 +372,118 @@ try {
       assert.equal(storedPermit.supersedeAuthorizationDigest, replacementPermit.digest);
       assert.equal((await readdir(path.join(root, 'authority-handoff-permits', 'history'))).length, 2,
         'supersession must retain both immutable store permit revisions');
-      acceptedRunId = replacementRunId;
-      completedSingleSiteRunId = replacementRunId;
+
+      const cancelHandoffCanary = async (cancelRunId, suffix, { failureOutcome = null } = {}) => {
+        const cancelledLease = await claimWorkItem(target, cancelRunId, targetCoordinator, {
+          workerId: `worker-${mode}-cancelled-${suffix}`,
+          workItemId: `work-${mode}`,
+          capabilities: ['browser:any'],
+          resourceClasses: ['ordinary'],
+          leaseMs: 1_000,
+        });
+        const cancelledInbox = await publishAttemptEvidence(target, cancelRunId, cancelledLease, {
+          outcome: failureOutcome ?? 'cancelled',
+          reason: failureOutcome !== null
+            ? `Synthetic ${failureOutcome} worker failure for handoff canary ${suffix}.`
+            : `Synthetic cancelled handoff canary ${suffix}.`,
+          artifacts: [],
+        });
+        await adoptAttemptEvidence(target, cancelRunId, targetCoordinator, cancelledInbox);
+        if (failureOutcome !== null) {
+          assert.equal(
+            (await readParentRun(target, cancelRunId)).workItems[`work-${mode}`].state,
+            failureOutcome === 'operational_failure' ? 'queued' : 'incomplete',
+          );
+        }
+        await cancelParentRun(target, cancelRunId, targetCoordinator, {
+          reason: `Operator explicitly cancelled handoff canary ${suffix}.`,
+          actor: { id: 'operator:test', kind: 'human' },
+        });
+        assert.equal((await readParentRun(target, cancelRunId)).workItems[`work-${mode}`].state, 'cancelled');
+      };
+
+      await cancelHandoffCanary(replacementRunId, 'replacement-one', { failureOutcome: 'operational_failure' });
+      now += 10;
+      const replacementTwoRunId = `${runId}-replacement-two`;
+      const replacementTwoRequestId = `handoff-${mode}-request-0003`;
+      const upperPermitFile = path.join(
+        admissionGate.root,
+        `cutover-canary-${handoffId}-${mode}.json`,
+      );
+      const validUpperPermit = JSON.parse(await readFile(upperPermitFile, 'utf8'));
+      const {
+        digest: ignoredUpperDigest,
+        failureAttempts: ignoredUpperFailureAttempts,
+        ...forgedUpperBody
+      } = {
+        ...validUpperPermit,
+        supersedesRunId: 'unrelated-upper-lineage-run',
+      };
+      await writeFile(upperPermitFile, `${JSON.stringify({
+        ...forgedUpperBody,
+        digest: canonicalDigest(forgedUpperBody),
+      })}\n`);
+      await expectCode('CUTOVER_DOCUMENT_INVALID', () => authorizeSharedBuildHandoffCanaryLaunch({
+        ...replacementOptions,
+        requestId: replacementTwoRequestId,
+        runId: replacementTwoRunId,
+        supersedeReason: 'The second canary was explicitly cancelled before completion.',
+      }));
+      await writeFile(upperPermitFile, `${JSON.stringify(validUpperPermit)}\n`);
+      const replacementTwoPermit = await authorizeSharedBuildHandoffCanaryLaunch({
+        ...replacementOptions,
+        requestId: replacementTwoRequestId,
+        runId: replacementTwoRunId,
+        supersedeReason: 'The second canary was explicitly cancelled before completion.',
+      });
+      assert.equal(replacementTwoPermit.revision, 3);
+      assert.equal(replacementTwoPermit.failureAttempts, 1,
+        'handoff cancellation must not erase a preserved operational failure attempt');
+      const lowerPermitFile = path.join(root, 'authority-handoff-permits', `${handoffId}-${mode}.json`);
+      const validLowerPermit = JSON.parse(await readFile(lowerPermitFile, 'utf8'));
+      const {
+        digest: ignoredLowerDigest,
+        failureAttempts: ignoredLowerFailureAttempts,
+        ...forgedLowerBody
+      } = {
+        ...validLowerPermit,
+        supersedesRunId: 'unrelated-lower-lineage-run',
+      };
+      await writeFile(lowerPermitFile, `${JSON.stringify({
+        ...forgedLowerBody,
+        digest: canonicalDigest(forgedLowerBody),
+      })}\n`);
+      await expectCode('AUTHORITY_HANDOFF_PERMIT_INVALID', () => (
+        launchRun(replacementTwoRequestId, replacementTwoRunId, '4'.repeat(64))
+      ));
+      await writeFile(lowerPermitFile, `${JSON.stringify(validLowerPermit)}\n`);
+      await launchRun(replacementTwoRequestId, replacementTwoRunId, '4'.repeat(64));
+
+      await cancelHandoffCanary(replacementTwoRunId, 'replacement-two', { failureOutcome: 'incomplete_unknown' });
+      now += 10;
+      const replacementThreeRunId = `${runId}-replacement-three`;
+      const replacementThreeRequestId = `handoff-${mode}-request-0004`;
+      const replacementThreePermit = await authorizeSharedBuildHandoffCanaryLaunch({
+        ...replacementOptions,
+        requestId: replacementThreeRequestId,
+        runId: replacementThreeRunId,
+        supersedeReason: 'The third canary was explicitly cancelled before completion.',
+      });
+      assert.equal(replacementThreePermit.revision, 4);
+      assert.equal(replacementThreePermit.failureAttempts, 2,
+        'handoff cancellation must not erase a preserved incomplete-unknown attempt');
+      await launchRun(replacementThreeRequestId, replacementThreeRunId, '5'.repeat(64));
+      const fourthStoredPermit = JSON.parse(await readFile(
+        path.join(root, 'authority-handoff-permits', `${handoffId}-${mode}.json`),
+        'utf8',
+      ));
+      assert.equal(fourthStoredPermit.runId, replacementThreeRunId);
+      assert.equal(fourthStoredPermit.revision, 4,
+        'upper and lower handoff permit histories must both accept the fourth cancellation replacement');
+      assert.equal(fourthStoredPermit.failureAttempts, 2);
+      assert.equal((await readdir(path.join(root, 'authority-handoff-permits', 'history'))).length, 4);
+      acceptedRunId = replacementThreeRunId;
+      completedSingleSiteRunId = replacementThreeRunId;
     }
     const lease = await claimWorkItem(target, acceptedRunId, targetCoordinator, {
       workerId: `worker-${mode}`, workItemId: `work-${mode}`, capabilities: ['browser:any'],
@@ -373,7 +507,7 @@ try {
     if (mode === 'single-site') {
       await expectCode('CUTOVER_CANARY_REPLACEMENT_BLOCKED', () => authorizeSharedBuildHandoffCanaryLaunch({
         store: target, admissionGate, reportDirectory, handoffId, mode,
-        requestId: `handoff-${mode}-request-0003`, actor, intent,
+        requestId: `handoff-${mode}-request-0005`, actor, intent,
         runId: `${acceptedRunId}-unsafe-ready-replacement`,
         supersedeReason: 'Ready publications must never be superseded.',
         probeTargetIdentity: async () => targetIdentity, clock,
@@ -451,6 +585,71 @@ try {
     ownerId: 'coordinator-source-after-complete', leaseMs: 60_000,
   }));
   assert.equal((await readReleaseAuthoritySelector(await open(targetBuild, completed.storeGeneration))).digest, completed.digest);
+
+  const failureBoundHandoffId = 'handoff-b-to-a-failure-bound';
+  const failureBoundPending = await beginReleaseAuthorityBuildHandoff(target, targetCoordinator, {
+    expectedSelectorDigest: completed.digest,
+    handoffId: failureBoundHandoffId,
+    targetBuildIdentity: sourceBuild,
+  });
+  const returnSource = await open(sourceBuild, completed.storeGeneration);
+  const returnCoordinator = await acquireStoreCoordinator(returnSource, {
+    ownerId: 'coordinator-return-source', leaseMs: 60_000,
+  });
+  const registerFailureBoundRun = (runId, supersedesRunId = null, ordinal = 1) => (
+    registerReleaseAuthorityHandoffCanaryRun(returnSource, returnCoordinator, {
+      expectedSelectorDigest: failureBoundPending.digest,
+      handoffId: failureBoundHandoffId,
+      mode: 'single-site',
+      runId,
+      ...(supersedesRunId === null ? {} : {
+        supersedesRunId,
+        supersedeAuthorizationDigest: canonicalDigest({ failureBoundHandoffId, ordinal }),
+      }),
+    })
+  );
+  const preserveHandoffProductFailure = async (runId, ordinal) => {
+    await createParentRun(returnSource, {
+      runId,
+      subjectCoreDigest: digest,
+      finalSubjectDigest: digest,
+      executionManifestDigest: digest,
+      runnerRevision,
+      compilationState: 'sealed',
+      workItems: [{ id: `work-failure-bound-${ordinal}`, maxAttempts: 1 }],
+    });
+    const failureLease = await claimWorkItem(returnSource, runId, returnCoordinator, {
+      workerId: `worker-failure-bound-${ordinal}`,
+      capabilities: ['browser:any'],
+      resourceClasses: ['ordinary'],
+      leaseMs: 1_000,
+    });
+    const failureInbox = await publishAttemptEvidence(returnSource, runId, failureLease, {
+      outcome: 'completed_product_failure',
+      reason: `Preserved handoff product failure ${ordinal}.`,
+      artifacts: [],
+    });
+    await adoptAttemptEvidence(returnSource, runId, returnCoordinator, failureInbox);
+  };
+
+  const boundedRunOne = 'handoff-failure-bound-run-1';
+  const boundedRunTwo = 'handoff-failure-bound-run-2';
+  const boundedRunThree = 'handoff-failure-bound-run-3';
+  const boundedRunFour = 'handoff-failure-bound-run-4';
+  const boundedPermitOne = await registerFailureBoundRun(boundedRunOne);
+  assert.equal(boundedPermitOne.revision, 1);
+  await preserveHandoffProductFailure(boundedRunOne, 1);
+  const boundedPermitTwo = await registerFailureBoundRun(boundedRunTwo, boundedRunOne, 2);
+  assert.equal(boundedPermitTwo.revision, 2);
+  assert.equal(boundedPermitTwo.failureAttempts, 1);
+  await preserveHandoffProductFailure(boundedRunTwo, 2);
+  const boundedPermitThree = await registerFailureBoundRun(boundedRunThree, boundedRunTwo, 3);
+  assert.equal(boundedPermitThree.revision, 3);
+  assert.equal(boundedPermitThree.failureAttempts, 2);
+  await preserveHandoffProductFailure(boundedRunThree, 3);
+  await expectCode('AUTHORITY_HANDOFF_PERMIT_CONFLICT', () => (
+    registerFailureBoundRun(boundedRunFour, boundedRunThree, 4)
+  ));
 } finally {
   await rm(root, { recursive: true, force: true });
   await rm(floorRoot, { recursive: true, force: true });

@@ -28,6 +28,7 @@ import {
   withDirectoryLock,
 } from './atomic-filesystem.mjs';
 import {
+  authorizeCutoverCanaryRunSupersession,
   beginReleaseAuthorityBuildHandoff,
   completeReleaseAuthorityBuildHandoffWithPublicationFence,
   listParentRunIds,
@@ -247,7 +248,8 @@ export async function openCutoverAdmissionGate(options = {}) {
 const RELEASE_CHANGING_MUTATIONS = new Set(['cancel', 'rekick', 'visual-disposition', 'purge']);
 
 const CUTOVER_CANARY_MODES = Object.freeze(['single-site', 'comparative']);
-const MAX_CUTOVER_CANARY_PERMITS_PER_MODE = 3;
+const MAX_CUTOVER_CANARY_FAILURE_ATTEMPTS_PER_MODE = 3;
+const MAX_CUTOVER_CANARY_PERMIT_HISTORY = 64;
 
 function requestIdentity(value) {
   if (typeof value !== 'string' || value.length < 16 || value.length > 128
@@ -318,8 +320,13 @@ function canaryLaunchPermitPath(root, cutoverId, mode) {
   return containedPath(root, `cutover-canary-${safeId(cutoverId, 'cutoverId')}-${mode}.json`);
 }
 
+function canaryLaunchPermitHistoryPath(root, permitDigest) {
+  assertDigest(permitDigest, 'Cutover canary permit history digest');
+  return containedPath(root, 'cutover-canary-permits', `${permitDigest.slice('sha256:'.length)}.json`);
+}
+
 function canaryLaunchPermitBody(value) {
-  return {
+  const body = {
     schemaVersion: 1,
     kind: 'release-cutover-canary-launch-permit',
     cutoverId: value.cutoverId,
@@ -347,6 +354,40 @@ function canaryLaunchPermitBody(value) {
     authorizedAt: value.authorizedAt,
     consumedAt: value.consumedAt,
   };
+  if (Object.hasOwn(value, 'failureAttempts')) body.failureAttempts = value.failureAttempts;
+  return body;
+}
+
+function cutoverCanarySupersessionAuthorizationDigest(permit) {
+  return canonicalDigest({
+    schemaVersion: 1,
+    kind: 'release-cutover-canary-supersession-authorization',
+    cutoverId: permit.cutoverId,
+    mode: permit.mode,
+    replacementRevision: permit.revision,
+    sourcePermitDigest: permit.previousPermitDigest,
+    requestId: permit.requestId,
+    actor: permit.actor,
+    intentDigest: permit.intentDigest,
+    authoritySelectorDigest: permit.authoritySelectorDigest,
+    targetIdentity: permit.targetIdentity,
+    supersedeReason: permit.supersedeReason,
+  });
+}
+
+async function ensureOrdinaryCutoverCanarySupersessionFence(store, permit) {
+  if (permit.revision === 1) return null;
+  return authorizeCutoverCanaryRunSupersession(store, {
+    expectedSelectorDigest: permit.authoritySelectorDigest,
+    cutoverId: permit.cutoverId,
+    mode: permit.mode,
+    runId: permit.supersedesRunId,
+    replacementRevision: permit.revision,
+    sourcePermitDigest: permit.previousPermitDigest,
+    requestId: permit.requestId,
+    authorizationDigest: cutoverCanarySupersessionAuthorizationDigest(permit),
+    supersedeReason: permit.supersedeReason,
+  });
 }
 
 function parseCanaryLaunchPermit(value, { cutoverId = null, mode = null } = {}) {
@@ -356,12 +397,17 @@ function parseCanaryLaunchPermit(value, { cutoverId = null, mode = null } = {}) 
     || !CUTOVER_CANARY_MODES.includes(value.mode) || (cutoverId !== null && value.cutoverId !== cutoverId)
     || (mode !== null && value.mode !== mode) || !SAFE_ID.test(value.cutoverId)
     || !Number.isSafeInteger(value.revision) || value.revision < 1
-    || value.revision > MAX_CUTOVER_CANARY_PERMITS_PER_MODE) {
+    || value.revision > MAX_CUTOVER_CANARY_PERMIT_HISTORY) {
     fail('CUTOVER_DOCUMENT_INVALID', 'Cutover canary launch permit identity is invalid.');
   }
   if (value.previousPermitDigest !== null) assertDigest(value.previousPermitDigest, 'Cutover canary previousPermitDigest');
   if ((value.revision === 1) !== (value.previousPermitDigest === null)) {
     fail('CUTOVER_DOCUMENT_INVALID', 'Cutover canary permit revision chain is invalid.');
+  }
+  if (Object.hasOwn(value, 'failureAttempts')
+    && (!Number.isSafeInteger(value.failureAttempts) || value.failureAttempts < 0
+      || value.failureAttempts > MAX_CUTOVER_CANARY_FAILURE_ATTEMPTS_PER_MODE)) {
+    fail('CUTOVER_DOCUMENT_INVALID', 'Cutover canary failure-attempt count is invalid.');
   }
   requestIdentity(value.requestId);
   parseCanaryActor(value.actor);
@@ -418,9 +464,67 @@ async function readCanaryLaunchPermit(admissionGate, cutoverId, mode) {
 async function persistCanaryLaunchPermit(storage, permit) {
   const history = containedPath(storage.root, 'cutover-canary-permits');
   await storage.fs.mkdir(history, { recursive: true, mode: 0o700 });
-  const immutable = containedPath(history, `${permit.digest.slice('sha256:'.length)}.json`);
-  if (!await pathExists(storage.fs, immutable)) await atomicWriteJson(storage, immutable, permit, { exclusive: true });
+  const immutable = canaryLaunchPermitHistoryPath(storage.root, permit.digest);
+  const assertImmutableMatches = async () => {
+    const existing = parseCanaryLaunchPermit(await readBoundedJson(storage, immutable, {
+      label: 'cutover canary permit history', maximumBytes: 256 * 1_024,
+    }), { cutoverId: permit.cutoverId, mode: permit.mode });
+    if (canonicalJson(existing) !== canonicalJson(permit)) {
+      fail('CUTOVER_DOCUMENT_INVALID', 'Immutable cutover canary permit digest was reused with different bytes.');
+    }
+  };
+  if (await pathExists(storage.fs, immutable)) {
+    await assertImmutableMatches();
+  } else {
+    try {
+      await atomicWriteJson(storage, immutable, permit, { exclusive: true });
+    } catch (error) {
+      if (error?.code !== 'ATOMIC_ALREADY_EXISTS') throw error;
+      await assertImmutableMatches();
+    }
+  }
   await atomicWriteJson(storage, canaryLaunchPermitPath(storage.root, permit.cutoverId, permit.mode), permit);
+}
+
+function canaryRunConsumesFailureBudget(state) {
+  const workItems = Object.values(state.workItems ?? {});
+  if (state.status !== 'cancelled') return true;
+  return workItems.some((item) => (
+    item.state === 'completed_product_failure'
+    || item.state === 'incomplete'
+    || (Array.isArray(item.attempts) && item.attempts.some((attempt) => attempt.outcome === 'completed_product_failure'))
+    || (Array.isArray(item.attempts) && item.attempts.some(
+      (attempt) => ['operational_failure', 'incomplete_unknown'].includes(attempt.outcome),
+    ))
+  ));
+}
+
+async function failureAttemptsAfterCanaryPermit(storage, store, permit, currentState) {
+  if (Object.hasOwn(permit, 'failureAttempts')) {
+    return permit.failureAttempts + (canaryRunConsumesFailureBudget(currentState) ? 1 : 0);
+  }
+  let cursor = permit;
+  let state = currentState;
+  let failures = 0;
+  for (let depth = 0; depth < MAX_CUTOVER_CANARY_PERMIT_HISTORY; depth += 1) {
+    if (cursor.state !== 'CONSUMED' || cursor.runId === null) {
+      fail('CUTOVER_DOCUMENT_INVALID', 'Legacy canary permit history contains an unconsumed revision.');
+    }
+    if (canaryRunConsumesFailureBudget(state)) failures += 1;
+    if (cursor.previousPermitDigest === null) return failures;
+    const previous = parseCanaryLaunchPermit(await readBoundedJson(
+      storage,
+      canaryLaunchPermitHistoryPath(storage.root, cursor.previousPermitDigest),
+      { label: 'cutover canary permit history', maximumBytes: 256 * 1_024 },
+    ), { cutoverId: permit.cutoverId, mode: permit.mode });
+    if (previous.digest !== cursor.previousPermitDigest || previous.revision !== cursor.revision - 1
+      || cursor.supersedesRunId !== previous.runId) {
+      fail('CUTOVER_DOCUMENT_INVALID', 'Cutover canary permit history lineage is invalid.');
+    }
+    cursor = previous;
+    state = await readParentRun(store, cursor.runId);
+  }
+  fail('CUTOVER_DOCUMENT_INVALID', 'Cutover canary permit history exceeds the bounded recovery limit.');
 }
 
 async function assertCanaryPermitReplaceable(store, permit) {
@@ -443,6 +547,7 @@ async function assertCanaryPermitReplaceable(store, permit) {
   if (!terminal) {
     fail('CUTOVER_CANARY_REPLACEMENT_BLOCKED', 'Canary replacement requires a terminal non-ready run.');
   }
+  return state;
 }
 
 async function defaultProbeCanaryTargetIdentity(intent) {
@@ -458,6 +563,7 @@ export async function authorizeSharedCutoverCanaryLaunch({
   supersedeReason = null,
   probeTargetIdentity = defaultProbeCanaryTargetIdentity,
   clock = store?.clock ?? (() => Date.now()),
+  hooks = {},
 } = {}) {
   safeId(cutoverId, 'cutoverId');
   if (!CUTOVER_CANARY_MODES.includes(mode)) fail('CUTOVER_INPUT_INVALID', 'Canary mode is invalid.');
@@ -494,15 +600,25 @@ export async function authorizeSharedCutoverCanaryLaunch({
       }), { cutoverId, mode });
       if (existing.requestId === requestId && canonicalJson(existing.actor) === canonicalJson(actor)
         && existing.intentDigest === canonicalDigest(intent)
+        && existing.supersedeReason === (existing.revision === 1 ? null : supersedeReason)
         && canonicalJson(existing.targetIdentity) === canonicalJson(targetIdentity)) {
+        await ensureOrdinaryCutoverCanarySupersessionFence(store, existing);
         return existing;
       }
-      if (existing.state !== 'CONSUMED' || existing.revision >= MAX_CUTOVER_CANARY_PERMITS_PER_MODE) {
-        fail('CUTOVER_CANARY_LAUNCH_CONFLICT', `A different ${mode} canary launch is already authorized or the retry bound is exhausted.`);
+      if (existing.state !== 'CONSUMED') {
+        fail('CUTOVER_CANARY_LAUNCH_CONFLICT', `A different ${mode} canary launch is already authorized.`);
+      }
+      if (existing.revision >= MAX_CUTOVER_CANARY_PERMIT_HISTORY) {
+        fail('CUTOVER_CANARY_LAUNCH_CONFLICT', `The ${mode} canary permit history bound is exhausted.`);
       }
       nonEmptyString(supersedeReason, 'Canary supersedeReason');
-      await assertCanaryPermitReplaceable(store, existing);
-      const replacement = seal(canaryLaunchPermitBody({
+      const replacedRun = await assertCanaryPermitReplaceable(store, existing);
+      const failureAttempts = await failureAttemptsAfterCanaryPermit(storage, store, existing, replacedRun);
+      if (failureAttempts >= MAX_CUTOVER_CANARY_FAILURE_ATTEMPTS_PER_MODE) {
+        fail('CUTOVER_CANARY_LAUNCH_CONFLICT',
+          `The ${mode} canary failure-recovery bound is exhausted; explicitly cancelled canaries do not consume this budget.`);
+      }
+      let replacement = seal(canaryLaunchPermitBody({
         ...existing,
         revision: existing.revision + 1,
         previousPermitDigest: existing.digest,
@@ -512,6 +628,7 @@ export async function authorizeSharedCutoverCanaryLaunch({
         targetIdentity: clone(targetIdentity),
         supersedesRunId: existing.runId,
         supersedeReason,
+        failureAttempts,
         state: 'AUTHORIZED',
         runId: null,
         operationId: null,
@@ -520,6 +637,12 @@ export async function authorizeSharedCutoverCanaryLaunch({
         authorizedAt: timestamp(clock),
         consumedAt: null,
       }));
+      const supersessionFence = await ensureOrdinaryCutoverCanarySupersessionFence(store, replacement);
+      replacement = seal(canaryLaunchPermitBody({
+        ...replacement,
+        authorizedAt: supersessionFence.fencedAt,
+      }));
+      await hooks.afterSupersessionFence?.(clone(supersessionFence));
       await persistCanaryLaunchPermit(storage, replacement);
       return clone(replacement);
     }
@@ -541,6 +664,7 @@ export async function authorizeSharedCutoverCanaryLaunch({
       authorizedRunId: null,
       supersedesRunId: null,
       supersedeReason: null,
+      failureAttempts: 0,
       state: 'AUTHORIZED',
       runId: null,
       operationId: null,
@@ -2379,11 +2503,19 @@ export async function authorizeSharedBuildHandoffCanaryLaunch({
         && canonicalJson(existing.actor) === canonicalJson(actor)
         && existing.authorizedRunId === runId
         && canonicalJson(existing.targetIdentity) === canonicalJson(targetIdentity)) return existing;
-      if (existing.state !== 'CONSUMED' || existing.revision >= MAX_CUTOVER_CANARY_PERMITS_PER_MODE) {
-        fail('CUTOVER_CANARY_LAUNCH_CONFLICT', `The ${mode} handoff canary recovery bound is exhausted or another permit is active.`);
+      if (existing.state !== 'CONSUMED') {
+        fail('CUTOVER_CANARY_LAUNCH_CONFLICT', `A different ${mode} handoff canary launch is already authorized.`);
+      }
+      if (existing.revision >= MAX_CUTOVER_CANARY_PERMIT_HISTORY) {
+        fail('CUTOVER_CANARY_LAUNCH_CONFLICT', `The ${mode} handoff canary permit history bound is exhausted.`);
       }
       nonEmptyString(supersedeReason, 'Handoff canary supersedeReason');
-      await assertCanaryPermitReplaceable(store, existing);
+      const replacedRun = await assertCanaryPermitReplaceable(store, existing);
+      const failureAttempts = await failureAttemptsAfterCanaryPermit(storage, store, existing, replacedRun);
+      if (failureAttempts >= MAX_CUTOVER_CANARY_FAILURE_ATTEMPTS_PER_MODE) {
+        fail('CUTOVER_CANARY_LAUNCH_CONFLICT',
+          `The ${mode} handoff canary failure-recovery bound is exhausted; explicitly cancelled canaries do not consume this budget.`);
+      }
       const replacement = seal(canaryLaunchPermitBody({
         ...existing,
         revision: existing.revision + 1,
@@ -2395,6 +2527,7 @@ export async function authorizeSharedBuildHandoffCanaryLaunch({
         authorizedRunId: runId,
         supersedesRunId: existing.runId,
         supersedeReason,
+        failureAttempts,
         state: 'AUTHORIZED',
         runId: null,
         operationId: null,
@@ -2424,6 +2557,7 @@ export async function authorizeSharedBuildHandoffCanaryLaunch({
       authorizedRunId: runId,
       supersedesRunId: null,
       supersedeReason: null,
+      failureAttempts: 0,
       state: 'AUTHORIZED',
       runId: null,
       operationId: null,

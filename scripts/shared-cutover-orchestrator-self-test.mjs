@@ -5,6 +5,7 @@ import path from 'node:path';
 
 import { canonicalDigest } from '../shared/canonical-contract.mjs';
 import { sealExecutionManifest } from '../shared/execution-contract.mjs';
+import { appendPublicationEnvelope } from '../shared/publication-envelope.mjs';
 import { sealFinalReleaseSubject, sealReleaseSubjectCore } from '../shared/release-subject.mjs';
 import { sealWorkExecutionDescriptor } from '../shared/work-execution-descriptor.mjs';
 import {
@@ -21,10 +22,12 @@ import {
   applyDiagnosticRerunOperation,
   applyRekickOperation,
   acquireStoreCoordinator,
+  cancelParentRun,
   claimWorkItem,
   completeOperation,
   createParentRun,
   openParentRunStore,
+  publishCurrentEnvelope,
   publishAttemptEvidence,
   readParentRun,
   readReleaseAuthoritySelector,
@@ -152,7 +155,7 @@ function cutoverReview(input) {
   };
 }
 
-function sealedRunInput(runId, workItemId) {
+function sealedRunInput(runId, workItemId, maxAttempts = 1) {
   const subjectCore = sealReleaseSubjectCore({
     schemaVersion: 1,
     deploymentIdentity: { kind: 'target-preflight-set', value: digest('7') },
@@ -213,9 +216,50 @@ function sealedRunInput(runId, workItemId) {
       targetId: 'audited',
       specAffinity: 'tests/navigation.spec.ts',
       executionDescriptor,
-      maxAttempts: 1,
+      maxAttempts,
     }],
   };
+}
+
+function readyEnvelopeForState(state) {
+  const decision = {
+    schemaVersion: 1,
+    kind: 'release-decision',
+    runId: state.runId,
+    decisionRevision: state.ledgerSequences.decision + 1,
+    code: 'RELEASE_READY',
+    label: 'RELEASE READY',
+    ready: true,
+    exitCode: 0,
+    executionManifestDigest: state.executionManifestDigest,
+    mode: 'single-site',
+    grantedAuthority: 'FULL',
+    certifiedScope: {
+      features: ['navigation'], definitions: ['NAV-001'], targets: ['audited'], knownLimits: [],
+    },
+    coverageBasis: {
+      selectedDefinitions: ['NAV-001'], selectedTargets: ['audited'], excludedAsNotApplicable: [],
+    },
+    subjectDigest: state.finalSubjectDigest,
+    blockingReasons: [],
+    superseded: false,
+  };
+  decision.digest = canonicalDigest(decision);
+  return appendPublicationEnvelope(null, {
+    schemaVersion: 1,
+    runId: state.runId,
+    runRevision: state.runRevision + 1,
+    decisionRevision: decision.decisionRevision,
+    riskRevision: 1,
+    ledgerSequences: {
+      observations: state.ledgerSequences.mutation,
+      decisions: state.ledgerSequences.decision + 1,
+      risks: state.ledgerSequences.risk,
+    },
+    finalSubjectDigest: state.finalSubjectDigest,
+    decision,
+    riskRegister: { schemaVersion: 1, availability: 'EMPTY', risks: [] },
+  });
 }
 
 function observation(cutoverId, gate, coordinator) {
@@ -851,6 +895,7 @@ try {
     ));
     const evidenceByRun = new Map();
     let singleCanaryRunId = 'canary-single-site';
+    let comparativeCanaryRunId = 'canary-comparative';
     for (const [mode, runId] of [['single-site', 'canary-single-site'], ['comparative', 'canary-comparative']]) {
       const intent = canaryIntent(mode);
       const requestId = `cutover-${mode}-canary-0001`;
@@ -911,7 +956,7 @@ try {
       reportDirectory: path.join(directory, 'reports'),
       cutoverId: input.cutoverId,
       mode: 'single-site',
-      requestId: 'cutover-single-site-canary-0002',
+      requestId: 'cutover:single-site:canary:0002',
       actor: { id: 'operator:cutover-canary', kind: 'human' },
       intent: canaryIntent('single-site'),
       supersedeReason: 'Initial canary has not produced terminal evidence.',
@@ -928,25 +973,89 @@ try {
       executionDescriptorDigest: failedCanaryLease.executionDescriptorDigest,
     });
     await adoptAttemptEvidence(store, singleCanaryRunId, coordinator, failedCanaryInbox);
+    const cancelledFailedCanary = await cancelParentRun(store, singleCanaryRunId, coordinator, {
+      actor: { id: 'operator-cutover-canary', kind: 'user' },
+      reason: 'Operator cancelled after reviewing the preserved product failure.',
+    });
+    assert.equal(cancelledFailedCanary.status, 'cancelled');
+    assert.equal(
+      cancelledFailedCanary.workItems['work-canary-single-site'].state,
+      'completed_product_failure',
+    );
     const retryIntent = canaryIntent('single-site');
-    const retryPermit = await authorizeSharedCutoverCanaryLaunch({
+    const retryAuthorization = {
       store,
       admissionGate,
       reportDirectory: path.join(directory, 'reports'),
       cutoverId: input.cutoverId,
       mode: 'single-site',
-      requestId: 'cutover-single-site-canary-0002',
+      requestId: 'cutover:single-site:canary:0002',
       actor: { id: 'operator:cutover-canary', kind: 'human' },
       intent: retryIntent,
       supersedeReason: 'Initial canary reached a terminal product failure after the deployment was repaired.',
       probeTargetIdentity: async () => targetIdentity,
       clock,
-    });
+    };
+    await assert.rejects(authorizeSharedCutoverCanaryLaunch({
+      ...retryAuthorization,
+      hooks: {
+        afterSupersessionFence: () => {
+          throw new Error('synthetic crash after supersession fence');
+        },
+      },
+    }), /synthetic crash after supersession fence/u);
+    const permitAfterFenceCrash = JSON.parse(await readFile(path.join(
+      admissionGate.root,
+      `cutover-canary-${input.cutoverId}-single-site.json`,
+    ), 'utf8'));
+    assert.equal(permitAfterFenceCrash.revision, 1,
+      'a crash after the parent-store fence must not partially advance external permit lineage');
+    const retryPermit = await authorizeSharedCutoverCanaryLaunch(retryAuthorization);
     assert.equal(retryPermit.revision, 2);
+    assert.equal(retryPermit.failureAttempts, 1);
     assert.equal(retryPermit.supersedesRunId, singleCanaryRunId);
+    const supersededSingleRunId = singleCanaryRunId;
+    const supersessionFenceFile = path.join(
+      directory,
+      'store',
+      'runs',
+      supersededSingleRunId,
+      'release-supersession-fence.json',
+    );
+    const supersessionFence = JSON.parse(await readFile(supersessionFenceFile, 'utf8'));
+    const supersededStateAfterFence = await readParentRun(store, supersededSingleRunId);
+    assert.equal(supersededStateAfterFence.authorityTombstone, null,
+      'supersession must fence future publication without tombstoning the run');
+    assert.equal(supersededStateAfterFence.workItems['work-canary-single-site'].state,
+      'completed_product_failure', 'supersession must retain the old run evidence');
+    const permitHistoryBeforeReplay = (await readdir(path.join(
+      admissionGate.root,
+      'cutover-canary-permits',
+    ))).length;
+    const replayedRetryPermit = await authorizeSharedCutoverCanaryLaunch(retryAuthorization);
+    assert.equal(replayedRetryPermit.digest, retryPermit.digest,
+      'an exact authorization replay must return the existing replacement permit');
+    assert.equal(replayedRetryPermit.revision, 2,
+      'an exact authorization replay must not advance replacement lineage');
+    assert.equal((await readdir(path.join(admissionGate.root, 'cutover-canary-permits'))).length,
+      permitHistoryBeforeReplay, 'an exact authorization replay must not append immutable permit history');
+    await expectCode('RELEASE_AUTHORITY_SUPERSEDED', () => publishCurrentEnvelope(
+      store,
+      supersededSingleRunId,
+      coordinator,
+      readyEnvelopeForState(cancelledFailedCanary),
+    ));
+    await writeFile(supersessionFenceFile, '{"corrupt":true}\n');
+    await expectCode('STORE_CORRUPT', () => publishCurrentEnvelope(
+      store,
+      supersededSingleRunId,
+      coordinator,
+      readyEnvelopeForState(cancelledFailedCanary),
+    ));
+    await writeFile(supersessionFenceFile, `${JSON.stringify(supersessionFence)}\n`);
     singleCanaryRunId = 'canary-single-site-retry';
     const retryEvidence = canaryEvidence({ mode: 'single-site', runId: singleCanaryRunId });
-    await policy.withLaunchAdmission('cutover-single-site-canary-0002', retryIntent, async () => ({
+    await policy.withLaunchAdmission('cutover:single-site:canary:0002', retryIntent, async () => ({
       operationId: digest('e').slice(7),
       actor: { id: 'operator:cutover-canary', kind: 'human' },
       runId: singleCanaryRunId,
@@ -957,6 +1066,89 @@ try {
       } },
     }));
     evidenceByRun.set(singleCanaryRunId, retryEvidence);
+
+    await createParentRun(store, sealedRunInput(singleCanaryRunId, 'work-canary-single-site-retry', 2));
+    const operationalLease = await claimWorkItem(store, singleCanaryRunId, coordinator, {
+      workerId: 'worker-canary-single-site-operational', capabilities: ['browser:chromium'],
+      resourceClasses: ['ordinary'], leaseMs: 30_000,
+    });
+    const operationalInbox = await publishAttemptEvidence(store, singleCanaryRunId, operationalLease, {
+      outcome: 'operational_failure', reason: 'synthetic retryable worker failure', artifacts: [],
+      executionDescriptorDigest: operationalLease.executionDescriptorDigest,
+    });
+    await adoptAttemptEvidence(store, singleCanaryRunId, coordinator, operationalInbox);
+    assert.equal((await readParentRun(store, singleCanaryRunId))
+      .workItems['work-canary-single-site-retry'].state, 'queued');
+    await cancelParentRun(store, singleCanaryRunId, coordinator, {
+      actor: { id: 'operator-cutover-canary', kind: 'user' },
+      reason: 'Operator cancelled the replacement canary after one retryable worker failure.',
+    });
+    const thirdRetryIntent = canaryIntent('single-site');
+    const thirdRetryPermit = await authorizeSharedCutoverCanaryLaunch({
+      store,
+      admissionGate,
+      reportDirectory: path.join(directory, 'reports'),
+      cutoverId: input.cutoverId,
+      mode: 'single-site',
+      requestId: 'cutover-single-site-canary-0003',
+      actor: { id: 'operator:cutover-canary', kind: 'human' },
+      intent: thirdRetryIntent,
+      supersedeReason: 'The replacement canary was explicitly cancelled before completion.',
+      probeTargetIdentity: async () => targetIdentity,
+      clock,
+    });
+    assert.equal(thirdRetryPermit.revision, 3);
+    assert.equal(thirdRetryPermit.failureAttempts, 2,
+      'operator cancellation must not erase a preserved operational failure attempt');
+    singleCanaryRunId = 'canary-single-site-retry-two';
+    const thirdRetryEvidence = canaryEvidence({ mode: 'single-site', runId: singleCanaryRunId });
+    await policy.withLaunchAdmission('cutover-single-site-canary-0003', thirdRetryIntent, async () => ({
+      operationId: digest('f').slice(7),
+      actor: { id: 'operator:cutover-canary', kind: 'human' },
+      runId: singleCanaryRunId,
+      acceptedAt: new Date(now).toISOString(),
+      compiledPlan: { createParentRunInput: {
+        runnerRevision: thirdRetryEvidence.runnerRevision,
+        subjectCore: { revisions: { configuration: thirdRetryEvidence.configurationRevision } },
+      } },
+    }));
+    evidenceByRun.set(singleCanaryRunId, thirdRetryEvidence);
+    await createParentRun(store, sealedRunInput(singleCanaryRunId, 'work-canary-single-site-retry-two'));
+    await cancelParentRun(store, singleCanaryRunId, coordinator, {
+      actor: { id: 'operator-cutover-canary', kind: 'user' },
+      reason: 'Operator cancelled the third canary before completion.',
+    });
+
+    const recoveredIntent = canaryIntent('single-site');
+    const recoveredPermit = await authorizeSharedCutoverCanaryLaunch({
+      store,
+      admissionGate,
+      reportDirectory: path.join(directory, 'reports'),
+      cutoverId: input.cutoverId,
+      mode: 'single-site',
+      requestId: 'cutover-single-site-canary-0004',
+      actor: { id: 'operator:cutover-canary', kind: 'human' },
+      intent: recoveredIntent,
+      supersedeReason: 'The third canary was explicitly cancelled before completion.',
+      probeTargetIdentity: async () => targetIdentity,
+      clock,
+    });
+    assert.equal(recoveredPermit.revision, 4,
+      'explicitly cancelled canaries must not permanently exhaust bounded failure recovery');
+    assert.equal(recoveredPermit.failureAttempts, 2);
+    singleCanaryRunId = 'canary-single-site-recovered';
+    const recoveredEvidence = canaryEvidence({ mode: 'single-site', runId: singleCanaryRunId });
+    await policy.withLaunchAdmission('cutover-single-site-canary-0004', recoveredIntent, async () => ({
+      operationId: digest('0').slice(7),
+      actor: { id: 'operator:cutover-canary', kind: 'human' },
+      runId: singleCanaryRunId,
+      acceptedAt: new Date(now).toISOString(),
+      compiledPlan: { createParentRunInput: {
+        runnerRevision: recoveredEvidence.runnerRevision,
+        subjectCore: { revisions: { configuration: recoveredEvidence.configurationRevision } },
+      } },
+    }));
+    evidenceByRun.set(singleCanaryRunId, recoveredEvidence);
     const readCanaryEvidence = async (_store, runId) => structuredClone(evidenceByRun.get(runId));
     const staleSingle = evidenceByRun.get(singleCanaryRunId);
     evidenceByRun.set(singleCanaryRunId, {
@@ -989,6 +1181,114 @@ try {
       store, admissionGate, reportDirectory: path.join(directory, 'reports'), cutoverId: input.cutoverId,
       mode: 'single-site', runId: singleCanaryRunId, readCanaryEvidence, clock,
     });
+
+    await createParentRun(store, sealedRunInput(
+      singleCanaryRunId,
+      'work-canary-single-site-third-preserved-failure',
+    ));
+    const thirdFailureLease = await claimWorkItem(store, singleCanaryRunId, coordinator, {
+      workerId: 'worker-canary-single-site-third-failure', capabilities: ['browser:chromium'],
+      resourceClasses: ['ordinary'], leaseMs: 30_000,
+    });
+    const thirdFailureInbox = await publishAttemptEvidence(store, singleCanaryRunId, thirdFailureLease, {
+      outcome: 'completed_product_failure', reason: 'third preserved canary failure', artifacts: [],
+      executionDescriptorDigest: thirdFailureLease.executionDescriptorDigest,
+    });
+    await adoptAttemptEvidence(store, singleCanaryRunId, coordinator, thirdFailureInbox);
+    await expectCode('CUTOVER_CANARY_LAUNCH_CONFLICT', () => authorizeSharedCutoverCanaryLaunch({
+      store,
+      admissionGate,
+      reportDirectory: path.join(directory, 'reports'),
+      cutoverId: input.cutoverId,
+      mode: 'single-site',
+      requestId: 'cutover-single-site-canary-0005',
+      actor: { id: 'operator:cutover-canary', kind: 'human' },
+      intent: canaryIntent('single-site'),
+      supersedeReason: 'The fourth canary preserved a third bounded failure.',
+      probeTargetIdentity: async () => targetIdentity,
+      clock,
+    }));
+
+    const comparativeIntent = canaryIntent('comparative');
+    const comparativeActor = { id: 'operator:cutover-canary', kind: 'human' };
+    const comparativeAuthorization = (requestId, supersedeReason) => authorizeSharedCutoverCanaryLaunch({
+      store,
+      admissionGate,
+      reportDirectory: path.join(directory, 'reports'),
+      cutoverId: input.cutoverId,
+      mode: 'comparative',
+      requestId,
+      actor: comparativeActor,
+      intent: comparativeIntent,
+      supersedeReason,
+      probeTargetIdentity: async () => targetIdentity,
+      clock,
+    });
+    const consumeComparativePermit = (requestId, runId, revision) => policy.withLaunchAdmission(
+      requestId,
+      comparativeIntent,
+      async () => ({
+        operationId: canonicalDigest({ comparativeRevision: revision }).slice(7),
+        actor: comparativeActor,
+        runId,
+        acceptedAt: new Date(now).toISOString(),
+        compiledPlan: { createParentRunInput: {
+          runnerRevision: digest('8'),
+          subjectCore: { revisions: { configuration: digest('7') } },
+        } },
+      }),
+    );
+    const cancelComparativeRun = async (runId, revision) => {
+      await createParentRun(store, sealedRunInput(runId, `work-comparative-cancel-${revision}`));
+      await cancelParentRun(store, runId, coordinator, {
+        actor: { id: 'operator-cutover-canary', kind: 'user' },
+        reason: `Pure cancellation for bounded permit revision ${revision}.`,
+      });
+    };
+
+    await cancelComparativeRun(comparativeCanaryRunId, 1);
+    const concurrentCandidates = [
+      { requestId: 'cutover-comparative-race-a-0002', runId: 'canary-comparative-race-a' },
+      { requestId: 'cutover-comparative-race-b-0002', runId: 'canary-comparative-race-b' },
+    ];
+    const concurrentResults = await Promise.allSettled(concurrentCandidates.map(({ requestId }) => (
+      comparativeAuthorization(requestId, 'The initial comparative canary was explicitly cancelled.')
+    )));
+    assert.equal(concurrentResults.filter(({ status }) => status === 'fulfilled').length, 1,
+      'exactly one concurrent replacement authorization may advance the lineage');
+    assert.equal(concurrentResults.filter(({ status, reason }) => (
+      status === 'rejected' && reason?.code === 'CUTOVER_CANARY_LAUNCH_CONFLICT'
+    )).length, 1, 'the losing concurrent replacement must fail closed');
+    const concurrentWinnerIndex = concurrentResults.findIndex(({ status }) => status === 'fulfilled');
+    const concurrentWinner = concurrentCandidates[concurrentWinnerIndex];
+    const concurrentPermit = concurrentResults[concurrentWinnerIndex].value;
+    assert.equal(concurrentPermit.revision, 2);
+    await consumeComparativePermit(concurrentWinner.requestId, concurrentWinner.runId, 2);
+    comparativeCanaryRunId = concurrentWinner.runId;
+    await cancelComparativeRun(comparativeCanaryRunId, 2);
+
+    for (let revision = 3; revision <= 64; revision += 1) {
+      const requestId = `cutover-comparative-revision-${String(revision).padStart(4, '0')}`;
+      const runId = `canary-comparative-revision-${String(revision).padStart(4, '0')}`;
+      const permit = await comparativeAuthorization(
+        requestId,
+        `The comparative canary at revision ${revision - 1} was explicitly cancelled.`,
+      );
+      assert.equal(permit.revision, revision);
+      assert.equal(permit.failureAttempts, 0,
+        'pure cancellations must not consume the failure-recovery budget');
+      await consumeComparativePermit(requestId, runId, revision);
+      comparativeCanaryRunId = runId;
+      if (revision < 64) await cancelComparativeRun(runId, revision);
+    }
+    await expectCode('CUTOVER_CANARY_LAUNCH_CONFLICT', () => comparativeAuthorization(
+      'cutover-comparative-revision-0065',
+      'Revision 65 must remain beyond the immutable permit-history bound.',
+    ));
+    evidenceByRun.set(comparativeCanaryRunId, canaryEvidence({
+      mode: 'comparative', runId: comparativeCanaryRunId,
+    }));
+
     await expectCode('CUTOVER_CANARIES_INCOMPLETE', () => reopenSharedAdmissionAfterCanaries({
       store, admissionGate, reportDirectory: path.join(directory, 'reports'), cutoverId: input.cutoverId,
       readCanaryEvidence, clock,
@@ -996,15 +1296,15 @@ try {
     assert.equal((await admissionGate.read()).state, 'CLOSED');
     await recordSharedCutoverCanary({
       store, admissionGate, reportDirectory: path.join(directory, 'reports'), cutoverId: input.cutoverId,
-      mode: 'comparative', runId: 'canary-comparative', readCanaryEvidence, clock,
+      mode: 'comparative', runId: comparativeCanaryRunId, readCanaryEvidence, clock,
     });
-    evidenceByRun.get('canary-comparative').publicationDigest = `sha256:${'5'.repeat(64)}`;
+    evidenceByRun.get(comparativeCanaryRunId).publicationDigest = `sha256:${'5'.repeat(64)}`;
     await expectCode('CUTOVER_CANARY_STALE', () => reopenSharedAdmissionAfterCanaries({
       store, admissionGate, reportDirectory: path.join(directory, 'reports'), cutoverId: input.cutoverId,
       readCanaryEvidence, clock,
     }));
     assert.equal((await admissionGate.read()).state, 'CLOSED');
-    evidenceByRun.get('canary-comparative').publicationDigest = `sha256:${'4'.repeat(64)}`;
+    evidenceByRun.get(comparativeCanaryRunId).publicationDigest = `sha256:${'4'.repeat(64)}`;
     await assert.rejects(reopenSharedAdmissionAfterCanaries({
       store, admissionGate, reportDirectory: path.join(directory, 'reports'), cutoverId: input.cutoverId,
       readCanaryEvidence, clock,
