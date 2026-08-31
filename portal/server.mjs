@@ -661,6 +661,14 @@ if (process.env.PORTAL_SHARED_CONTROL === '1') {
     expectedOrigin: deployment.publishedOrigin,
     sessionCookiePath: '/',
     admissionPolicy,
+    previewLaunch: async (_principal, { intent }) => {
+      if (intent.runContract.mode !== 'single-site') {
+        throw new ControlPlaneError(
+          'LAUNCH_PREVIEW_UNAVAILABLE', 'Comparative launch does not require a separate preview.', 400,
+        );
+      }
+      return singleSiteLaunch.preview(intent.runContract);
+    },
     afterMutationAccepted: () => maybeCrashAtSharedResilienceBoundary('mutation-acceptance'),
     launch: async (principal, request) => {
       const operation = await sharedLaunchService.accept(principal, request);

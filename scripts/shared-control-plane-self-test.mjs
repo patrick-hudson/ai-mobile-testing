@@ -870,7 +870,19 @@ try {
   const api = createSharedControlApi({
     authority, service: reopenedControl, claimStore, expectedOrigin: 'https://audit.example.test', sessionCookiePath: '/',
     launch: launchService.accept, readLaunchOperation: launchService.read,
+    previewLaunch: async (_principal, { intent }) => ({ accepted: true, runContract: intent.runContract }),
   });
+  const launchPreview = await api.handle({
+    method: 'POST', url: '/api/control/v1/launch-preview',
+    headers: {
+      authorization: `Bearer ${launchOperatorIssued.credential}`,
+      'content-type': 'application/json',
+    },
+    body: launchIntent,
+  });
+  assert.equal(launchPreview.status, 200);
+  assert.equal(launchPreview.body.data.accepted, true);
+  assert.deepEqual(launchPreview.body.data.runContract, launchIntent.runContract);
   const callerAuthoredAuthority = await api.handle({
     method: 'POST', url: '/api/control/v1/runs',
     headers: {

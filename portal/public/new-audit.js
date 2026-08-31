@@ -1,6 +1,8 @@
 import { parseConsoleUrlState, serializeConsoleUrlState } from '/console-contracts.mjs';
 import { CONSOLE_NAVIGATION_ITEMS, createConsoleShell, createFocusManager } from './console-shell.js';
+import { createConsoleSessionBanner } from './console-session-banner.js';
 import { createConsoleUrlState } from './console-url-state.js';
+import { createSharedControlBrowserClient } from './shared-control-client.js';
 
 const root = document.querySelector('#new-audit-console');
 const announcer = document.querySelector('#global-announcer');
@@ -32,23 +34,30 @@ shell.inspector.append(inspectorHeading, inspectorCopy, inspectorDetails);
 
 const state = {
   config: null,
+  operatorAuthorized: false,
   selectedAuditIds: new Set(),
   singleSitePreview: null,
   singleSitePreviewContract: null,
-  singleSiteLaunchAttempt: null,
+  launchAttempt: null,
   singleSitePreflightController: null,
   singleSitePreflightGeneration: 0,
   pending: new Set(),
   urlState: null,
 };
 
+const sharedControl = createSharedControlBrowserClient();
+const sessionBanner = createConsoleSessionBanner({
+  shell,
+  client: sharedControl,
+  onStateChange({ state: sessionState }) {
+    state.operatorAuthorized = sessionState === 'authorized';
+    renderOperatorAuthorization();
+  },
+});
+
 const elements = {
   form: document.querySelector('#launch-form'),
   launchRun: document.querySelector('#launch-run'),
-  operatorAccess: document.querySelector('#operator-access'),
-  operatorUnlockToken: document.querySelector('#operator-unlock-token'),
-  operatorUnlockSubmit: document.querySelector('#operator-unlock-submit'),
-  operatorUnlockStatus: document.querySelector('#operator-unlock-status'),
   catalogSummary: document.querySelector('#catalog-summary'),
   comparativeDepth: document.querySelector('#comparative-depth'),
   comparativeSites: document.querySelector('#comparative-sites'),
@@ -141,12 +150,6 @@ async function init() {
 
 function bindEvents() {
   elements.form.addEventListener('submit', launchRun);
-  elements.operatorUnlockSubmit.addEventListener('click', () => void unlockOperator());
-  elements.operatorUnlockToken.addEventListener('keydown', (event) => {
-    if (event.key !== 'Enter') return;
-    event.preventDefault();
-    void unlockOperator();
-  });
   elements.previewSingleSite.addEventListener('click', () => void previewSingleSite());
   elements.auditFilter.addEventListener('input', renderAudits);
   elements.clearAreas.addEventListener('click', () => {
@@ -193,6 +196,7 @@ function bindEvents() {
     state.singleSitePreflightController = null;
     state.singleSitePreflightGeneration += 1;
     state.urlState?.destroy();
+    sessionBanner.destroy();
     focus.destroy();
   }, { once: true });
 }
@@ -211,31 +215,19 @@ function exactOrigin(value) {
 }
 
 function operatorAuthorized() {
-  return state.config?.operator?.authorized === true;
+  return state.operatorAuthorized;
 }
 
-function renderOperatorAuthorization({ message = '', error = false } = {}) {
+function renderOperatorAuthorization() {
   const authorized = operatorAuthorized();
   connection.textContent = authorized ? 'Operator ready' : 'Operator authorization required';
-  elements.operatorAccess.hidden = authorized;
-  elements.operatorUnlockStatus.classList.toggle('error', error);
-  elements.operatorUnlockStatus.classList.toggle('success', authorized && Boolean(message));
-  elements.operatorUnlockStatus.textContent = message || (authorized
-    ? 'Operator controls are unlocked for this browser session.'
-    : 'Runs, site checks, purge, and credential changes require an operator session.');
   updateLaunchAvailability();
 }
 
-function operatorTokenFromInput(value) {
-  const trimmed = String(value ?? '').trim();
-  if (!trimmed) return '';
-  try {
-    const parsed = new URL(trimmed, window.location.origin);
-    if (parsed.pathname === '/operator/bootstrap') return parsed.searchParams.get('token') ?? '';
-  } catch {
-    // A raw capability token is also accepted.
-  }
-  return trimmed;
+function requireOperatorAuthorization(error = { code: 'AUTHENTICATION_REQUIRED' }) {
+  sessionBanner.requireAuthentication(error);
+  const authorize = sessionBanner.element.querySelector('.console-session-authorize');
+  authorize?.focus();
 }
 
 function canonicalJson(value) {
@@ -249,50 +241,9 @@ function canonicalJson(value) {
   return JSON.stringify(normalize(value));
 }
 
-async function unlockOperator() {
-  if (!beginOperation('operator-unlock')) return;
-  const token = operatorTokenFromInput(elements.operatorUnlockToken.value);
-  elements.operatorUnlockToken.value = '';
-  if (!token) {
-    endOperation('operator-unlock');
-    renderOperatorAuthorization({ message: 'Paste the current operator unlock link or token.', error: true });
-    elements.operatorUnlockToken.focus();
-    return;
-  }
-  setButtonBusy(elements.operatorUnlockSubmit, true, 'Unlocking…');
-  elements.operatorUnlockStatus.classList.remove('error', 'success');
-  elements.operatorUnlockStatus.textContent = 'Exchanging the capability for a private browser session…';
-  announce('Unlocking operator controls.');
-  try {
-    const result = await requestJson('/api/operator/session', {
-      method: 'POST',
-      body: JSON.stringify({ token }),
-    });
-    if (result?.authorized !== true) throw new Error('The portal did not confirm operator authorization.');
-    const config = await requestJson('/api/config');
-    if (config.operator?.authorized !== true) throw new Error('The operator session was not retained by this browser.');
-    state.config = config;
-    renderOperatorAuthorization({ message: 'Operator controls are unlocked for this browser session.' });
-    announce('Operator controls unlocked.');
-    (isSingleSiteMode() ? elements.previewSingleSite : elements.launchRun).focus();
-  } catch (error) {
-    renderOperatorAuthorization({ message: friendlyError(error), error: true });
-    announce(`Operator controls could not be unlocked. ${friendlyError(error)}`);
-    elements.operatorUnlockToken.focus();
-  } finally {
-    setButtonBusy(elements.operatorUnlockSubmit, false);
-    endOperation('operator-unlock');
-    updateLaunchAvailability();
-  }
-}
-
 function handleOperatorAuthorizationFailure(error) {
-  if (error?.status !== 401 || !state.config) return false;
-  state.config = { ...state.config, operator: { authorized: false } };
-  renderOperatorAuthorization({
-    message: 'The operator session ended, usually because the portal restarted. Paste the current unlock link to continue.',
-    error: true,
-  });
+  if (error?.status !== 401) return false;
+  requireOperatorAuthorization(error);
   return true;
 }
 
@@ -371,7 +322,7 @@ function applyAuditMode({ announceChange = true } = {}) {
 }
 
 function invalidateLaunchAttempt() {
-  state.singleSiteLaunchAttempt = null;
+  state.launchAttempt = null;
 }
 
 function invalidateSingleSitePreview({ announceChange = true } = {}) {
@@ -562,8 +513,7 @@ function currentSingleSiteContract() {
 
 async function previewSingleSite() {
   if (!operatorAuthorized()) {
-    renderOperatorAuthorization({ message: 'Unlock operator controls before checking the site.', error: true });
-    elements.operatorUnlockToken.focus();
+    requireOperatorAuthorization();
     return;
   }
   if (!isSingleSiteMode() || !beginOperation('single-site-preview')) return;
@@ -586,15 +536,8 @@ async function previewSingleSite() {
   elements.singleSitePreflightStatus.textContent = 'Fetching reviewed identity markers, deployment revision, and executable coverage. No run has been created.';
   announce('Checking the site and compiling standalone coverage.');
   try {
-    const response = await fetchWithTimeout('/api/single-site/preflight', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(contract),
-      signal: controller.signal,
-    }, 60_000);
-    const value = await response.json().catch(() => ({ error: `Preflight failed (${response.status})` }));
+    const value = await sharedControl.previewLaunch(contract, { signal: controller.signal });
     if (!isCurrentSingleSitePreflight(controller, generation, contractIdentity)) return;
-    if (!response.ok && !value?.preflight) throw httpError(response.status, value);
     if (value?.accepted === true && canonicalJson(value.runContract) !== contractIdentity) {
       throw new Error('The preflight response did not match the submitted launch contract. Check the site again.');
     }
@@ -703,13 +646,12 @@ async function launchRun(event) {
   event.preventDefault();
   if (!state.config || state.pending.has('launch')) return;
   if (!operatorAuthorized()) {
-    renderOperatorAuthorization({ message: 'Unlock operator controls before launching an audit.', error: true });
-    elements.operatorUnlockToken.focus();
+    requireOperatorAuthorization();
     return;
   }
   if (isSingleSiteMode()) return launchSingleSiteRun();
   if (!elements.form.reportValidity() || !beginOperation('launch')) return;
-  let body;
+  let contract;
   try {
     const targeted = elements.form.elements.scope.value === 'targeted';
     const targetIds = checkedValues('targetId');
@@ -717,22 +659,24 @@ async function launchRun(event) {
       elements.advanced.open = true;
       throw focusError('Choose at least one Docker browser or device target.', firstTargetControl());
     }
-    body = {
-      profile: elements.form.elements.profile.value,
-      targetIds,
+    const scope = {
+      qualifier: targeted ? 'TARGETED' : 'FULL',
       pluginIds: targeted ? checkedValues('pluginId') : [],
       areas: targeted ? checkedValues('area') : [],
       auditIds: targeted ? [...state.selectedAuditIds].sort() : [],
+    };
+    contract = {
+      schemaVersion: 1,
+      mode: 'comparative',
+      targetIds,
+      scope,
       productionUrl: validatedOrigin(elements.productionUrl, 'Production URL'),
       candidateUrl: validatedOrigin(elements.candidateUrl, 'Candidate URL'),
-      candidateIgnoreHTTPSErrors: elements.candidateIgnoreTls.checked,
-      aiReview: elements.aiReview.checked,
-      aiModel: elements.aiModel.value,
     };
-    if (body.productionUrl === body.candidateUrl) {
+    if (contract.productionUrl === contract.candidateUrl) {
       throw focusError('Production and candidate must be different origins.', elements.candidateUrl);
     }
-    if (targeted && body.pluginIds.length === 0 && body.areas.length === 0 && body.auditIds.length === 0) {
+    if (targeted && scope.pluginIds.length === 0 && scope.areas.length === 0 && scope.auditIds.length === 0) {
       elements.advanced.open = true;
       throw focusError('Choose at least one installed suite, audit area, or individual check.', elements.plugins.querySelector('input'));
     }
@@ -744,12 +688,11 @@ async function launchRun(event) {
     return;
   }
   setRegionBusy(elements.form, true);
-  setButtonBusy(elements.launchRun, true, 'Launching…');
-  showFormMessage('Starting the audit and preparing its evidence directory…');
-  announce('Starting the audit.');
+  setButtonBusy(elements.launchRun, true, 'Compiling and launching…');
+  showFormMessage('Server-validating the contract and creating a durable shared audit…');
+  announce('Starting the shared comparative audit.');
   try {
-    const run = await requestJson('/api/runs', { method: 'POST', body: JSON.stringify(body), timeoutMs: 45_000 });
-    navigateToRun('comparative', run.id);
+    navigateToRun('comparative', await launchSharedContract(contract));
   } catch (error) {
     handleOperatorAuthorizationFailure(error);
     const message = friendlyError(error);
@@ -780,52 +723,13 @@ async function launchSingleSiteRun() {
     updateLaunchAvailability();
     return;
   }
-  const advisory = elements.aiReview.checked
-    ? { schemaVersion: 1, aiReview: { optedIn: true, model: elements.aiModel.value } }
-    : { schemaVersion: 1, aiReview: { optedIn: false, model: null } };
-  const requestIdentity = JSON.stringify({ contract, previewDigest: state.singleSitePreview.previewDigest, advisory });
-  if (!state.singleSiteLaunchAttempt || state.singleSiteLaunchAttempt.identity !== requestIdentity) {
-    state.singleSiteLaunchAttempt = { identity: requestIdentity, idempotencyKey: `portal-${crypto.randomUUID()}` };
-  }
-  const attempt = state.singleSiteLaunchAttempt;
   setRegionBusy(elements.form, true);
-  setButtonBusy(elements.launchRun, true, 'Rechecking and queueing…');
-  showFormMessage('Rechecking deployment identity and revision, then atomically queueing the Docker audit…');
-  announce('Rechecking the site and queueing the standalone audit.');
+  setButtonBusy(elements.launchRun, true, 'Rechecking and launching…');
+  showFormMessage('Rechecking deployment identity, compiling the exact graph, and creating a durable shared audit…');
+  announce('Rechecking the site and launching the standalone audit.');
   try {
-    const response = await fetchWithTimeout('/api/single-site/runs', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        idempotencyKey: attempt.idempotencyKey,
-        previewDigest: state.singleSitePreview.previewDigest,
-        runContract: contract,
-        advisory,
-      }),
-    }, 90_000);
-    const value = await response.json().catch(() => ({ error: `Launch failed (${response.status})` }));
-    if (!response.ok && !value?.refreshedPreview) throw httpError(response.status, value);
-    if (!value.launched) {
-      state.singleSiteLaunchAttempt = null;
-      if (value.refreshedPreview?.accepted) {
-        acceptSingleSitePreview(value.refreshedPreview);
-      } else if (value.refreshedPreview) {
-        state.singleSitePreview = null;
-        state.singleSitePreviewContract = null;
-        renderSingleSiteRejection(value.refreshedPreview);
-      }
-      const message = value.reason === 'preview-stale'
-        ? 'The deployment or test registry changed after preview. The refreshed coverage is shown; review it and launch again.'
-        : 'The deployment no longer passes preflight. No run was created.';
-      showFormMessage(message, true);
-      if (value.refreshedPreview?.accepted) elements.singleSiteCoverageTitle.focus();
-      announce(message);
-      return;
-    }
-    state.singleSiteLaunchAttempt = null;
-    navigateToRun('single-site', value.job.id);
+    navigateToRun('single-site', await launchSharedContract(contract));
   } catch (error) {
-    if (Number.isInteger(error?.status)) state.singleSiteLaunchAttempt = null;
     handleOperatorAuthorizationFailure(error);
     const message = friendlyError(error);
     showFormMessage(message, true);
@@ -838,6 +742,26 @@ async function launchSingleSiteRun() {
     updateLaunchAvailability();
     renderInspector();
   }
+}
+
+async function launchSharedContract(contract) {
+  const requestIdentity = canonicalJson(contract);
+  if (!state.launchAttempt || state.launchAttempt.identity !== requestIdentity) {
+    state.launchAttempt = {
+      identity: requestIdentity,
+      idempotencyKey: `portal-${crypto.randomUUID()}`,
+    };
+  }
+  const accepted = await sharedControl.launchRun(contract, {
+    requestId: state.launchAttempt.idempotencyKey,
+  });
+  const completed = await sharedControl.waitForLaunchOperation(accepted.statusUrl);
+  if (completed.outcome?.status !== 'succeeded') {
+    state.launchAttempt = null;
+    throw new Error(completed.outcome?.message ?? 'The shared launch operation failed before creating a run.');
+  }
+  state.launchAttempt = null;
+  return completed.outcome.runId ?? completed.runId ?? accepted.runId;
 }
 
 function navigateToRun(mode, runId) {
@@ -887,20 +811,11 @@ function firstTargetControl() {
 }
 
 function updateAiAvailability() {
-  const available = state.config.aiReview.available === true;
-  elements.aiReview.disabled = !available;
-  elements.aiModel.disabled = !available;
-  if (!available) {
-    elements.aiReview.checked = false;
-    elements.aiReviewHelp.textContent = 'Unavailable until an API key is saved with the portal service.';
-    elements.aiReviewCard.title = 'No runtime API key is configured.';
-  } else if (state.config.aiReview.dryRun) {
-    elements.aiReviewHelp.textContent = 'Dry-run mode is active. Evidence selection and reports will run without an API request.';
-    elements.aiReviewCard.title = '';
-  } else {
-    elements.aiReviewHelp.textContent = 'Analyze screenshots, findings, and video metadata. Advisory only; browser results remain authoritative.';
-    elements.aiReviewCard.title = '';
-  }
+  elements.aiReview.checked = false;
+  elements.aiReview.disabled = true;
+  elements.aiModel.disabled = true;
+  elements.aiReviewHelp.textContent = 'AI advisory opt-in is not yet available for shared-control launches. Deterministic browser evidence is unaffected.';
+  elements.aiReviewCard.title = 'Shared-control launches currently run deterministic checks without AI advisory egress.';
 }
 
 function checkedValues(name) {

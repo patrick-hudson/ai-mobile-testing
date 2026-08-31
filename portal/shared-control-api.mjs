@@ -19,7 +19,7 @@ export function createSharedRequestAuthorizer({ authority } = {}) {
 
 export function createSharedControlApi({
   authority, service, claimStore, expectedOrigin, launch = null, readLaunchOperation = null,
-  admissionPolicy = null,
+  admissionPolicy = null, previewLaunch = null,
   afterMutationAccepted = async () => {},
   requestAuthorizer = createSharedRequestAuthorizer({ authority }),
   sessionCookiePath = SHARED_CONTROL_API_PREFIX,
@@ -53,6 +53,15 @@ export function createSharedControlApi({
           return response(200, { schemaVersion: 1, data: { loggedOut: true } }, {
             'set-cookie': `audit_session=; HttpOnly; SameSite=Strict; Path=${sessionCookiePath}; Max-Age=0${new URL(expectedOrigin).protocol === 'https:' ? '; Secure' : ''}`,
           });
+        }
+        if (request.method === 'POST' && url.pathname === `${SHARED_CONTROL_API_PREFIX}/launch-preview`) {
+          mutation(request, authentication, expectedOrigin);
+          const intent = parseLaunchIntent(recordBody(request.body));
+          assertPrincipalAuthorized(principal, CONTROL_ACTIONS.RUN_LAUNCH, { projectId: service.projectId });
+          if (typeof previewLaunch !== 'function') {
+            throw new ControlPlaneError('LAUNCH_PREVIEW_UNAVAILABLE', 'Shared launch preview is unavailable.', 503);
+          }
+          return ok(await previewLaunch(principal, { intent }));
         }
         const runMatch = new RegExp(`^${SHARED_CONTROL_API_PREFIX}/runs/([A-Za-z0-9._-]{1,128})(?:/(.*))?$`).exec(url.pathname);
         if (request.method === 'POST' && url.pathname === `${SHARED_CONTROL_API_PREFIX}/runs`) {

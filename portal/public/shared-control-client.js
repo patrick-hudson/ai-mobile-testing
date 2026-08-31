@@ -285,6 +285,15 @@ export function createSharedControlBrowserClient({
     return { data: document?.data, location: response.headers?.get?.('location') ?? null };
   }
 
+  async function pollOperation(statusUrl, { signal, maxPolls, pollMs, timeoutMessage }) {
+    for (let poll = 0; poll < maxPolls; poll += 1) {
+      const operation = (await request(statusUrl, { signal })).data;
+      if (operation?.outcome || TERMINAL_OPERATION_STATES.has(operation?.state)) return operation;
+      if (poll + 1 < maxPolls) await wait(pollMs);
+    }
+    throw new SharedControlBrowserError(timeoutMessage, { code: 'CONTROL_OPERATION_PENDING' });
+  }
+
   return Object.freeze({
     get session() { return session ? Object.freeze({ ...session }) : null; },
     async login(credential, { signal } = {}) {
@@ -308,6 +317,18 @@ export function createSharedControlBrowserClient({
         if (attempt === authenticationAttempt) session = null;
       }
     },
+    async previewLaunch(runContract, { signal } = {}) {
+      const result = await request(`${PREFIX}/launch-preview`, {
+        method: 'POST', body: { schemaVersion: 1, runContract }, signal,
+      });
+      return Object.freeze({ ...result.data });
+    },
+    async launchRun(runContract, { requestId = crypto.randomUUID(), signal } = {}) {
+      const result = await request(`${PREFIX}/runs`, {
+        method: 'POST', body: { schemaVersion: 1, runContract }, idempotencyKey: requestId, signal,
+      });
+      return Object.freeze({ ...result.data, statusUrl: result.data?.statusUrl ?? result.location });
+    },
     async readWorkspace(runId, { signal, logLimit = 200 } = {}) {
       const root = `${PREFIX}/runs/${encodeURIComponent(runId)}`;
       const snapshot = (await request(`${root}/workspace?logLimit=${Math.min(1000, Math.max(1, logLimit))}`, { signal })).data;
@@ -325,6 +346,16 @@ export function createSharedControlBrowserClient({
       });
       return Object.freeze({ ...result.data, statusUrl: result.data?.statusUrl ?? result.location });
     },
+    async waitForLaunchOperation(statusUrl, { signal, maxPolls = 80, pollMs = 250 } = {}) {
+      const match = typeof statusUrl === 'string'
+        ? statusUrl.match(/^\/api\/control\/v1\/launch-operations\/([a-f0-9]{64})$/u)
+        : null;
+      if (!match) throw new TypeError('Launch operation status URL is invalid.');
+      return pollOperation(statusUrl, {
+        signal, maxPolls, pollMs,
+        timeoutMessage: 'The durable launch did not finish within the bounded polling window.',
+      });
+    },
     async waitForOperation(statusUrl, { runId, signal, maxPolls = 40, pollMs = 250 } = {}) {
       const match = typeof statusUrl === 'string'
         ? statusUrl.match(/^\/api\/control\/v1\/runs\/([^/]+)\/operations\/([a-f0-9]{64})$/u)
@@ -332,12 +363,10 @@ export function createSharedControlBrowserClient({
       if (!match || (runId !== undefined && decodeURIComponent(match[1]) !== runId)) {
         throw new TypeError('Operation status URL is invalid or belongs to another run.');
       }
-      for (let poll = 0; poll < maxPolls; poll += 1) {
-        const operation = (await request(statusUrl, { signal })).data;
-        if (operation?.outcome || TERMINAL_OPERATION_STATES.has(operation?.state)) return operation;
-        if (poll + 1 < maxPolls) await wait(pollMs);
-      }
-      throw new SharedControlBrowserError('The durable operation did not finish within the bounded polling window.', { code: 'CONTROL_OPERATION_PENDING' });
+      return pollOperation(statusUrl, {
+        signal, maxPolls, pollMs,
+        timeoutMessage: 'The durable operation did not finish within the bounded polling window.',
+      });
     },
   });
 }

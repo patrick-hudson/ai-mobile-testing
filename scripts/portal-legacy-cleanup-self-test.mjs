@@ -90,6 +90,18 @@ for (const controller of ['console-index-page.js', 'run-workspace.js', 'new-audi
   assert.doesNotMatch(source, /navigationItems:\s*\[/, `${controller} embeds a divergent primary navigation model.`);
 }
 
+const newAuditSource = await readPublicAsset('new-audit.js');
+const newAuditDocument = await readPublicAsset('new-audit.html');
+assert.match(newAuditSource, /createConsoleSessionBanner/u,
+  'New Audit must use the scoped shared browser session flow.');
+assert.match(newAuditSource, /createSharedControlBrowserClient/u,
+  'New Audit must submit preflight and launch through the shared control client.');
+for (const retiredPath of ['/api/operator/session', '/api/runs', '/api/single-site/runs']) {
+  assert(!newAuditSource.includes(retiredPath), `New Audit still calls retired legacy mutation ${retiredPath}.`);
+}
+assert.doesNotMatch(newAuditDocument, /operator unlock link|portal service log/iu,
+  'New Audit still tells operators to use the retired bootstrap token.');
+
 const server = await readFile(join(repositoryRoot, 'portal', 'server.mjs'), 'utf8');
 assert.match(server, /pathname === '\/' \? 'index\.html'/);
 assert.doesNotMatch(server, /['"]\/app\.js['"]/);

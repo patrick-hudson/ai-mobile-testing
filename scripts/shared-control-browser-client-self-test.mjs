@@ -8,6 +8,7 @@ import {
 
 const calls = [];
 let operationReads = 0;
+let launchOperationReads = 0;
 const jsonResponse = (status, body) => ({
   ok: status >= 200 && status < 300,
   status,
@@ -19,6 +20,25 @@ const client = createSharedControlBrowserClient({
     calls.push({ url, options });
     if (url === '/api/control/v1/session' && options.method === 'POST') {
       return jsonResponse(200, { schemaVersion: 1, data: { csrfToken: 'csrf-memory-only', principal: { id: 'reviewer-1' } } });
+    }
+    if (url === '/api/control/v1/launch-preview') {
+      const intent = JSON.parse(options.body);
+      return jsonResponse(200, { schemaVersion: 1, data: { accepted: true, runContract: intent.runContract } });
+    }
+    if (url === '/api/control/v1/runs' && options.method === 'POST') {
+      return jsonResponse(202, { schemaVersion: 1, data: {
+        operationId: 'c'.repeat(64),
+        runId: `run-${'d'.repeat(32)}`,
+        state: 'accepted',
+        statusUrl: `/api/control/v1/launch-operations/${'c'.repeat(64)}`,
+      } });
+    }
+    if (String(url).includes('/launch-operations/')) {
+      launchOperationReads += 1;
+      return jsonResponse(200, { schemaVersion: 1, data: launchOperationReads === 1
+        ? { operationId: 'c'.repeat(64), runId: `run-${'d'.repeat(32)}`, state: 'accepted' }
+        : { operationId: 'c'.repeat(64), runId: `run-${'d'.repeat(32)}`, state: 'completed',
+          outcome: { status: 'succeeded', runId: `run-${'d'.repeat(32)}` } } });
     }
     if (String(url).includes('/workspace?')) {
       return jsonResponse(200, { schemaVersion: 1, data: {
@@ -53,6 +73,32 @@ await client.login(credential);
 assert.equal(client.session.csrfToken, 'csrf-memory-only');
 assert.equal(JSON.parse(calls[0].options.body).credential, credential);
 assert.equal(JSON.stringify(client.session).includes(credential), false);
+
+const launchContract = {
+  schemaVersion: 1,
+  mode: 'single-site',
+  url: 'https://beta.example.test',
+  deploymentRole: 'preview',
+  certificatePolicy: 'strict',
+  targetIds: ['single-site-mobile-chromium'],
+  scope: { qualifier: 'FULL', pluginIds: [], auditIds: [], areas: [] },
+};
+const preview = await client.previewLaunch(launchContract);
+assert.equal(preview.accepted, true);
+assert.deepEqual(preview.runContract, launchContract);
+const launched = await client.launchRun(launchContract, { requestId: 'portal-launch-0001' });
+assert.equal(launched.runId, `run-${'d'.repeat(32)}`);
+const launchMutation = calls.find(({ url }) => url === '/api/control/v1/runs');
+assert.equal(launchMutation.options.headers['X-Audit-CSRF'], 'csrf-memory-only');
+assert.equal(launchMutation.options.headers['Idempotency-Key'], 'portal-launch-0001');
+assert.deepEqual(JSON.parse(launchMutation.options.body), { schemaVersion: 1, runContract: launchContract });
+await assert.rejects(
+  client.waitForLaunchOperation('/api/control/v1/launch-operations/not-an-operation'),
+  /invalid/u,
+);
+const completedLaunch = await client.waitForLaunchOperation(launched.statusUrl, { maxPolls: 3, pollMs: 0 });
+assert.equal(completedLaunch.outcome.status, 'succeeded');
+assert.equal(launchOperationReads, 2);
 
 const workspace = await client.readWorkspace('run-1');
 assert.equal(workspace.publication.runRevision, 6);
