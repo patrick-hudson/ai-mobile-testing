@@ -3,9 +3,10 @@ import {
   AUDIT_CASE_ID_ANNOTATION,
   AUDIT_CASE_TAG_PREFIX,
   auditCaseTag,
+  exactAuditCaseTagPattern,
 } from '../shared/audit-case-identity.mjs';
 
-export { AUDIT_CASE_ID_ANNOTATION, AUDIT_CASE_TAG_PREFIX, auditCaseTag };
+export { AUDIT_CASE_ID_ANNOTATION, AUDIT_CASE_TAG_PREFIX, auditCaseTag, exactAuditCaseTagPattern };
 
 export interface ExecutableAuditCaseSelection {
   caseId: string;
@@ -113,5 +114,5 @@ export function resolveDeclaredSingleSiteCaseId(
 
 export function selectedAuditCaseGrep(caseIds: readonly string[]): RegExp {
   if (caseIds.length === 0) throw new Error('An exact Single-site case filter cannot be empty.');
-  return new RegExp(caseIds.map((caseId) => auditCaseTag(caseId).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|'));
+  return new RegExp(caseIds.map(exactAuditCaseTagPattern).join('|'));
 }

@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { auditCaseTag } from '../shared/audit-case-identity.mjs';
+import { exactAuditCaseTagPattern } from '../shared/audit-case-identity.mjs';
 import { buildLiveRouteInventory } from '../shared/live-route-inventory.mjs';
 import { preflightQuitting7ohSite } from '../shared/site-preflight.mjs';
 import { runnerRevisionDigest } from '../shared/runner-revision.mjs';
@@ -123,14 +123,18 @@ function playwrightEnvironment(descriptor, artifactRoot, runnerRevision, proxyUr
   return environment;
 }
 
-async function spawnPlaywright(descriptor, artifactRoot, runnerRevision, signal) {
-  const executable = path.join(repositoryRoot, 'node_modules', '.bin', 'playwright');
-  const args = [
+export function sharedWorkItemPlaywrightArguments(descriptor) {
+  return [
     'test', descriptor.entrySpec,
     `--project=${descriptor.targetId}`,
-    `--grep=${auditCaseTag(descriptor.caseId)}`,
+    `--grep=${exactAuditCaseTagPattern(descriptor.caseId)}`,
     '--workers=1', '--retries=0', '--reporter=json',
   ];
+}
+
+async function spawnPlaywright(descriptor, artifactRoot, runnerRevision, signal) {
+  const executable = path.join(repositoryRoot, 'node_modules', '.bin', 'playwright');
+  const args = sharedWorkItemPlaywrightArguments(descriptor);
   let egressProxy = null;
   let genericRoutePublication = null;
   let genericRoutePublicationArtifact = null;

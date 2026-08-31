@@ -1,14 +1,18 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import http from 'node:http';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { auditCaseTag } from '../shared/audit-case-identity.mjs';
 import { sealOracleResult, sealWorkItemResult } from '../shared/execution-contract.mjs';
 import { sealWorkExecutionDescriptor } from '../shared/work-execution-descriptor.mjs';
 import { createSharedWorkCommand, sharedWorkExecutorPath } from './lib/shared-work-dispatcher.mjs';
-import { collectSharedPlaywrightArtifacts, validateSharedPlaywrightRows } from './lib/shared-playwright-work-item.mjs';
+import {
+  collectSharedPlaywrightArtifacts,
+  readContainedPlaywrightAttachment,
+  validateSharedPlaywrightRows,
+} from './lib/shared-playwright-work-item.mjs';
 import { buildSharedWorkerResultManifest } from './execute-shared-work-item.mjs';
 
 const digest = (character) => `sha256:${character.repeat(64)}`;
@@ -250,6 +254,75 @@ try {
   assert.equal(collected.artifacts[2].path, 'playwright/raw/row-1/state.png');
   assert.equal(JSON.stringify(collected.rows).includes(artifactRoot), false);
   assert.equal(collected.rows[0].attachments.every(({ path: artifactPath }) => !artifactPath.startsWith('/')), true);
+
+  const longDocument = structuredClone(document);
+  const longResultDirectory = 'page-audit--PAGE-MEDICATIO-0073b--a-complete-usable-document-single-site-mobile-chromium';
+  const longAttachmentName = `checkpoint-page-medications-supplements-cannabis-thc-in-recovery-rendered-middle-${'a'.repeat(40)}.png`;
+  const longAttachmentPath = path.join(artifactRoot, 'raw', longResultDirectory, 'attachments', longAttachmentName);
+  const longRelativePath = path.relative(evidenceRoot, longAttachmentPath).split(path.sep).join('/');
+  assert.equal(longRelativePath.length, 241,
+    'the regression fixture must retain the exact path-length boundary from the live page-audit result');
+  await mkdir(path.dirname(longAttachmentPath), { recursive: true });
+  await writeFile(longAttachmentPath, Buffer.from('long-playwright-screenshot'));
+  longDocument.suites[0].specs[0].tests[0].results[0].attachments[2].path = longAttachmentPath;
+  const longCollected = await collectSharedPlaywrightArtifacts({
+    document: longDocument, descriptor, artifactRoot, evidenceRoot,
+  });
+  const boundedScreenshot = longCollected.artifacts.find(({ logicalName }) => logicalName === 'rendered-accessibility-state');
+  assert.match(boundedScreenshot.path,
+    /^playwright\/published\/row-1\/attachment-3-[a-f0-9]{16}\.png$/);
+  assert(boundedScreenshot.path.length <= 240,
+    'an overlong Playwright-owned source path must receive a bounded deterministic publication path');
+  assert.equal(await readFile(path.join(evidenceRoot, ...boundedScreenshot.path.split('/')), 'utf8'),
+    'long-playwright-screenshot');
+
+  const raceDirectory = path.join(artifactRoot, 'raw', 'swap-race');
+  const raceCandidate = path.join(raceDirectory, 'state.png');
+  const openedFile = path.join(raceDirectory, 'state-opened.png');
+  const outsideFile = path.join(evidenceRoot, 'outside-artifact-root.png');
+  await mkdir(raceDirectory, { recursive: true });
+  await writeFile(raceCandidate, Buffer.from('contained-open-file'));
+  await writeFile(outsideFile, Buffer.from('outside-replacement-secret'));
+  const raced = await readContainedPlaywrightAttachment(
+    raceCandidate,
+    await realpath(artifactRoot),
+    { afterOpen: async () => {
+      await rename(raceCandidate, openedFile);
+      await symlink(outsideFile, raceCandidate);
+    } },
+  );
+  assert.equal(raced.bytes.toString(), 'contained-open-file',
+    'a pathname replaced after open must still yield bytes from the validated open file descriptor');
+  assert.notEqual(raced.bytes.toString(), 'outside-replacement-secret',
+    'a swap race must never import bytes from the replacement symlink target');
+  assert.equal(raced.realCandidate, await realpath(openedFile));
+  await assert.rejects(
+    readContainedPlaywrightAttachment(raceCandidate, await realpath(artifactRoot)),
+    /could not be opened safely/,
+    'a symlink present before open must fail closed under O_NOFOLLOW',
+  );
+
+  const duplicateDocument = structuredClone(document);
+  duplicateDocument.suites[0].specs[0].tests[0].results[0].attachments.push({
+    ...duplicateDocument.suites[0].specs[0].tests[0].results[0].attachments[2],
+  });
+  const duplicateCollected = await collectSharedPlaywrightArtifacts({
+    document: duplicateDocument, descriptor, artifactRoot, evidenceRoot,
+  });
+  assert.equal(duplicateCollected.artifacts.filter(({ logicalName }) => logicalName === 'rendered-accessibility-state').length, 1,
+    'an exact repeated Playwright path, metadata, and content tuple must collapse to one evidence member');
+  assert.equal(duplicateCollected.rows[0].attachments.filter(({ name }) => name === 'rendered-accessibility-state').length, 1);
+
+  const conflictingDocument = structuredClone(document);
+  conflictingDocument.suites[0].specs[0].tests[0].results[0].attachments.push({
+    ...conflictingDocument.suites[0].specs[0].tests[0].results[0].attachments[2],
+    name: 'conflicting-rendered-state',
+  });
+  await assert.rejects(
+    collectSharedPlaywrightArtifacts({ document: conflictingDocument, descriptor, artifactRoot, evidenceRoot }),
+    /reuses a canonical file with conflicting metadata or content/,
+    'one canonical file cannot claim conflicting logical evidence identities',
+  );
   const failureFinding = {
     severity: 'P1', title: 'Primary navigation is hidden',
     detail: 'Observed at https://candidate.example/path?run=123456.', blocking: true,
@@ -525,6 +598,12 @@ await rm(discoveryRoot, { recursive: true, force: true });
 const processRoot = await mkdtemp(path.join(tmpdir(), 'shared-worker-process-'));
 const credentialPath = path.join(processRoot, 'worker-token');
 await writeFile(credentialPath, `amt.test.${'a'.repeat(40)}\n`, { mode: 0o600 });
+const invalidEvidenceDescriptor = sealWorkExecutionDescriptor({
+  ...descriptorInput,
+  workItemId: 'work-invalid-executor-evidence',
+  caseId: 'A11Y-001:tests/missing-regression.spec.ts:candidate-chromium-projects',
+  entrySpec: 'tests/missing-regression.spec.ts',
+});
 let claimCount = 0;
 const receivedLogs = [];
 const server = http.createServer(async (request, response) => {
@@ -532,16 +611,33 @@ const server = http.createServer(async (request, response) => {
   for await (const chunk of request) chunks.push(chunk);
   const body = chunks.length === 0 ? {} : JSON.parse(Buffer.concat(chunks).toString('utf8'));
   response.setHeader('content-type', 'application/json');
-  if (request.url === '/v1/claim' && claimCount++ === 0) {
-    response.statusCode = 200;
-    response.end(`${JSON.stringify({
-      runId: 'run-worker-process', workItemId: 'work-invalid-binding', workerId: 'worker-process', attempt: 1,
-      epoch: 1, token: 'lease-invalid-binding', claimedAt: new Date().toISOString(),
-      expiresAt: new Date(Date.now() + 1_000).toISOString(), subjectCoreDigest: digest('a'), runnerRevision: digest('b'),
-      capability: 'browser:chromium', resourceClass: 'ordinary', targetId: 'candidate-mobile-chromium',
-      specAffinity: 'tests/accessibility.spec.ts', executionDescriptor: null, executionDescriptorDigest: null,
-    })}\n`);
-    return;
+  if (request.url === '/v1/claim') {
+    const claimIndex = claimCount++;
+    if (claimIndex === 0) {
+      response.statusCode = 200;
+      response.end(`${JSON.stringify({
+        runId: 'run-worker-process', workItemId: 'work-invalid-binding', workerId: 'worker-process', attempt: 1,
+        epoch: 1, token: 'lease-invalid-binding', claimedAt: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + 1_000).toISOString(), subjectCoreDigest: digest('a'), runnerRevision: digest('b'),
+        capability: 'browser:chromium', resourceClass: 'ordinary', targetId: 'candidate-mobile-chromium',
+        specAffinity: 'tests/accessibility.spec.ts', executionDescriptor: null, executionDescriptorDigest: null,
+      })}\n`);
+      return;
+    }
+    if (claimIndex === 1) {
+      response.statusCode = 200;
+      response.end(`${JSON.stringify({
+        runId: 'run-worker-process', workItemId: invalidEvidenceDescriptor.workItemId,
+        workerId: 'worker-process', attempt: 1, epoch: 1, token: 'lease-invalid-evidence',
+        claimedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 10_000).toISOString(),
+        subjectCoreDigest: invalidEvidenceDescriptor.subjectCoreDigest,
+        runnerRevision: invalidEvidenceDescriptor.runnerRevision,
+        capability: invalidEvidenceDescriptor.capability, resourceClass: invalidEvidenceDescriptor.resourceClass,
+        targetId: invalidEvidenceDescriptor.targetId, specAffinity: invalidEvidenceDescriptor.entrySpec,
+        executionDescriptor: invalidEvidenceDescriptor, executionDescriptorDigest: invalidEvidenceDescriptor.digest,
+      })}\n`);
+      return;
+    }
   }
   if (request.url === '/v1/log') {
     receivedLogs.push(body);
@@ -564,6 +660,7 @@ const worker = spawn(process.execPath, ['scripts/run-shared-worker.mjs'], {
     AUDIT_SHARED_WORKER_CAPABILITIES: 'browser:chromium',
     AUDIT_SHARED_POLL_MS: '100',
     AUDIT_SHARED_RESILIENCE_PROOF: '0',
+    AUDIT_RUNNER_REVISION: `image:${digest('b')}`,
   },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
@@ -583,6 +680,17 @@ try {
   assert.match(receivedLogs[1].message, /operational-recovery: work-descriptor-invalid/);
   await new Promise((resolve) => setTimeout(resolve, 300));
   assert.equal(claimCount, 1, 'the worker must not claim another item before the rejected lease expires');
+  const evidenceDeadline = Date.now() + 10_000;
+  while (receivedLogs.length < 4 && worker.exitCode === null && Date.now() < evidenceDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(worker.exitCode, null, `invalid executor evidence terminated the worker: ${workerStderr}`);
+  assert.deepEqual(receivedLogs.slice(2).map(({ sequence, level }) => ({ sequence, level })), [
+    { sequence: 1, level: 'info' },
+    { sequence: 2, level: 'warn' },
+  ]);
+  assert.match(receivedLogs[3].message, /operational-recovery: executor-evidence-invalid/);
+  assert.match(workerStderr, /lease will expire for bounded recovery/);
 } finally {
   if (worker.exitCode === null && worker.signalCode === null) {
     const closed = new Promise((resolve) => worker.once('close', resolve));

@@ -3,7 +3,7 @@ import { constants as fsConstants } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { collectSharedWorkerAttempt } from './lib/shared-worker-evidence.mjs';
+import { collectSharedWorkerAttempt, sharedWorkerEvidenceRecovery } from './lib/shared-worker-evidence.mjs';
 import {
   maintainSharedWorkerLease,
   sharedWorkHeartbeatInterval,
@@ -229,17 +229,21 @@ while (!stopping) {
       execute,
     });
   } catch (error) {
-    if (error?.code !== 'SHARED_WORK_DESCRIPTOR_INVALID') throw error;
+    const evidenceRecovery = sharedWorkerEvidenceRecovery(error);
+    if (error?.code !== 'SHARED_WORK_DESCRIPTOR_INVALID' && evidenceRecovery === null) throw error;
+    const reason = evidenceRecovery?.reason ?? 'work-descriptor-invalid';
+    const detail = evidenceRecovery?.logMessage
+      ?? `operational-recovery: work-descriptor-invalid; ${String(error.message).replace(/[\r\n\u001b]/g, ' ').slice(0, 384)}`;
     const recoveryLog = await post('/v1/log', {
       lease: claimed.value,
       sequence: 2,
       level: 'warn',
-      message: `operational-recovery: work-descriptor-invalid; ${error.message}`,
+      message: detail,
     }).catch(() => null);
     if (!recoveryLog?.response.ok) {
-      process.stderr.write(`Could not publish descriptor recovery log for ${claimed.value.workItemId}.\n`);
+      process.stderr.write(`Could not publish ${reason} recovery log for ${claimed.value.workItemId}.\n`);
     }
-    process.stderr.write(`Rejected invalid work descriptor for ${claimed.value.workItemId}; lease will expire for bounded recovery.\n`);
+    process.stderr.write(`Rejected ${reason} for ${claimed.value.workItemId}; lease will expire for bounded recovery.\n`);
     const leaseExpiryDelayMs = Math.max(0, Date.parse(claimed.value.expiresAt) - Date.now() + pollMs);
     await new Promise((resolve) => setTimeout(resolve, leaseExpiryDelayMs));
     continue;

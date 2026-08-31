@@ -15,6 +15,14 @@ function safeLogDetail(value) {
   return String(value ?? '').replace(/[\r\n\u001b]/g, ' ').slice(0, 384);
 }
 
+export function sharedWorkerEvidenceRecovery(error) {
+  if (error?.code !== 'SHARED_WORK_EVIDENCE_INVALID') return null;
+  return Object.freeze({
+    reason: 'executor-evidence-invalid',
+    logMessage: `operational-recovery: executor-evidence-invalid; ${safeLogDetail(error.message)}`,
+  });
+}
+
 export async function collectSharedWorkerAttempt(evidenceRoot, completion, lease) {
   try {
     const result = await collectSharedWorkerEvidence(evidenceRoot, completion, lease);

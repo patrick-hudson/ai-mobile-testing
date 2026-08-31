@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import { chromium } from '@playwright/test';
-import { startBrowserEgressProxy } from './lib/browser-egress-proxy.mjs';
+import {
+  startBrowserEgressProxy,
+  trackBrowserEgressSocket,
+} from './lib/browser-egress-proxy.mjs';
 
 const events = [];
 const resolutions = new Map();
@@ -13,6 +17,25 @@ const lookup = async (hostname) => {
   if (hostname === 'metadata.audit.test') return [{ address: '169.254.169.254', family: 4 }];
   return [{ address: '127.0.0.1', family: 4 }];
 };
+
+{
+  const socket = new EventEmitter();
+  socket.destroyed = false;
+  socket.destroy = () => {
+    socket.destroyed = true;
+    socket.emit('close');
+  };
+  const sockets = new Set();
+  trackBrowserEgressSocket(socket, sockets, {
+    emit: (event, detail = {}) => events.push({ event, detail }),
+  });
+  socket.emit('error', Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }));
+  assert.equal(socket.destroyed, true, 'browser-side socket failures are contained by destroying the failed socket');
+  assert.equal(sockets.size, 0, 'failed browser sockets are removed from the tracked shutdown set');
+  assert(events.some(({ event, detail }) => event === 'browser-egress-denied'
+    && detail.code === 'ECONNRESET' && detail.direction === 'browser-to-proxy'),
+  'browser-side socket failures are retained as structured diagnostics instead of crashing the worker');
+}
 
 const proxy = await startBrowserEgressProxy({
   lookup,

@@ -8,6 +8,7 @@ import {
   selectedAuditCaseGrep,
   type ExecutableAuditCaseRegistry,
 } from '../audit/execution-selection.js';
+import { sharedWorkItemPlaywrightArguments } from './execute-shared-work-item.mjs';
 
 const registry = JSON.parse(
   readFileSync(new URL('../audit/plugins.generated.json', import.meta.url), 'utf8'),
@@ -16,6 +17,8 @@ const target = 'candidate-desktop-chromium';
 const homeCase = 'HOME-001:tests/smoke.spec.ts:all-projects';
 const contentCase = 'CONTENT-002:tests/visual-regression.spec.ts:candidate-chromium-projects:single-site:CONTENT-002:standalone-content-primitives';
 const a11yWelcomeCase = 'A11Y-001:tests/accessibility.spec.ts:full-sweep-projects:case:%2Fstart-here%2Fwelcome';
+const performanceHomeCase = 'PERF-001:tests/performance.spec.ts:full-sweep-projects:case:%2F';
+const performanceWelcomeCase = 'PERF-001:tests/performance.spec.ts:full-sweep-projects:case:%2Fstart-here%2Fwelcome';
 
 assert.deepEqual(
   parseSelectedSingleSiteCaseIds(JSON.stringify([homeCase, contentCase]), registry, [target]),
@@ -64,6 +67,31 @@ assert(grep.test(`test title ${auditCaseTag(homeCase)}`));
 assert(grep.test(`test title ${auditCaseTag(contentCase)}`));
 assert(!grep.test(`test title ${auditCaseTag('NAV-005:tests/navigation.spec.ts:candidate-chromium-projects')}`));
 
+const homePerformanceGrep = selectedAuditCaseGrep([performanceHomeCase]);
+assert(homePerformanceGrep.test(`test title ${auditCaseTag(performanceHomeCase)}`));
+assert(!homePerformanceGrep.test(`test title ${auditCaseTag(performanceWelcomeCase)}`),
+  'A route case tag must not select a longer base64url tag that shares its encoded prefix.');
+
+const welcomePerformanceGrep = selectedAuditCaseGrep([performanceWelcomeCase]);
+assert(welcomePerformanceGrep.test(`test title ${auditCaseTag(performanceWelcomeCase)}`),
+  'An explicitly selected longer route tag must remain selectable.');
+assert(!welcomePerformanceGrep.test(`test title ${auditCaseTag(performanceHomeCase)}`));
+
+const combinedPerformanceGrep = selectedAuditCaseGrep([performanceHomeCase, performanceWelcomeCase]);
+assert(combinedPerformanceGrep.test(`test title ${auditCaseTag(performanceHomeCase)}`));
+assert(combinedPerformanceGrep.test(`test title ${auditCaseTag(performanceWelcomeCase)}`));
+
+const workerArguments = sharedWorkItemPlaywrightArguments({
+  entrySpec: 'tests/performance.spec.ts',
+  targetId: 'single-site-mobile-chromium',
+  caseId: performanceHomeCase,
+});
+const workerGrepArgument = workerArguments.find((argument) => argument.startsWith('--grep='));
+assert(workerGrepArgument, 'The fixed shared worker command must include an exact case grep.');
+const workerGrep = new RegExp(workerGrepArgument.slice('--grep='.length));
+assert(workerGrep.test(`test title ${auditCaseTag(performanceHomeCase)}`));
+assert(!workerGrep.test(`test title ${auditCaseTag(performanceWelcomeCase)}`),
+  'The production shared-worker command must not broaden the home route into every performance route.');
 assert.throws(
   () => parseSelectedSingleSiteCaseIds(JSON.stringify(['ENV-003:tests/contracts.spec.ts:candidate-desktop-chromium']), registry, [target]),
   /not executable in Single-site mode/,

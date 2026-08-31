@@ -209,6 +209,32 @@ function declaration(pathname, attachment, row, bytes) {
   };
 }
 
+function attachmentPathMetadata(attachment, row) {
+  return JSON.stringify({
+    name: attachment.name,
+    contentType: attachment.contentType,
+    purpose: attachmentPurpose(attachment, row),
+  });
+}
+
+async function writeImmutableAttachment(destination, bytes) {
+  await fs.mkdir(path.dirname(destination), { recursive: true });
+  try {
+    await fs.writeFile(destination, bytes, { flag: 'wx', mode: 0o600 });
+  } catch (error) {
+    if (error?.code !== 'EEXIST' || !Buffer.from(await fs.readFile(destination)).equals(bytes)) throw error;
+  }
+}
+
+async function boundedPublicationPath({ evidenceRoot, candidate, rowIndex, attachmentIndex, bytes }) {
+  const extension = path.extname(candidate).toLowerCase();
+  const safeExtension = /^\.[a-z0-9]{1,12}$/.test(extension) ? extension : '.bin';
+  const fingerprint = createHash('sha256').update(bytes).digest('hex').slice(0, 16);
+  const relative = `playwright/published/row-${rowIndex + 1}/attachment-${attachmentIndex + 1}-${fingerprint}${safeExtension}`;
+  await writeImmutableAttachment(path.join(evidenceRoot, ...relative.split('/')), bytes);
+  return relative;
+}
+
 function pathIsExactAbsolute(value) {
   return value.startsWith('/') && !value.includes('\0') && !value.includes('\\')
     && !value.split('/').some((segment, index) => index > 0 && (segment === '' || segment === '.' || segment === '..'));
@@ -371,18 +397,45 @@ function exactRoot(value, label) {
   return resolved;
 }
 
-async function boundedAttachmentJson(file, label) {
-  let handle;
+function boundedAttachmentJson(bytes, label) {
+  if (!Buffer.isBuffer(bytes) || bytes.length < 2 || bytes.length > 8 * 1_048_576) {
+    fail('PLAYWRIGHT_STRUCTURED_EVIDENCE_INVALID', `${label} is not a bounded regular JSON file.`);
+  }
   try {
-    handle = await fs.open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-    const stat = await handle.stat();
-    if (!stat.isFile() || stat.size < 2 || stat.size > 8 * 1_048_576) {
-      fail('PLAYWRIGHT_STRUCTURED_EVIDENCE_INVALID', `${label} is not a bounded regular JSON file.`);
-    }
-    return JSON.parse(await handle.readFile('utf8'));
+    return JSON.parse(bytes.toString('utf8'));
   } catch (error) {
     if (error?.code?.startsWith?.('PLAYWRIGHT_')) throw error;
     fail('PLAYWRIGHT_STRUCTURED_EVIDENCE_INVALID', `${label} could not be read safely: ${error.message}`);
+  }
+}
+
+export async function readContainedPlaywrightAttachment(candidate, realArtifactRoot, { afterOpen } = {}) {
+  if (afterOpen !== undefined && typeof afterOpen !== 'function') {
+    throw new TypeError('afterOpen must be a function when provided.');
+  }
+  let handle;
+  try {
+    handle = await fs.open(candidate, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+    await afterOpen?.();
+    const stat = await handle.stat();
+    if (!stat.isFile()) {
+      fail('PLAYWRIGHT_ATTACHMENT_INVALID', 'Playwright attachment is not a regular file.');
+    }
+    // The worker runs in Linux containers. Resolving the already-open file
+    // descriptor binds containment to the opened inode instead of reopening a
+    // pathname that may have been replaced after validation.
+    const realCandidate = await fs.realpath(`/proc/self/fd/${handle.fd}`);
+    if (!realCandidate.startsWith(`${realArtifactRoot}${path.sep}`)) {
+      fail('PLAYWRIGHT_ATTACHMENT_INVALID', 'Playwright attachment escaped its attempt artifact root.');
+    }
+    const bytes = await handle.readFile();
+    if (bytes.length !== stat.size) {
+      fail('PLAYWRIGHT_ATTACHMENT_INVALID', 'Playwright attachment changed while it was collected.');
+    }
+    return Object.freeze({ bytes, realCandidate });
+  } catch (error) {
+    if (error?.code?.startsWith?.('PLAYWRIGHT_')) throw error;
+    fail('PLAYWRIGHT_ATTACHMENT_INVALID', `Playwright attachment could not be opened safely: ${error.message}`);
   } finally {
     await handle?.close();
   }
@@ -428,6 +481,8 @@ export async function collectSharedPlaywrightArtifacts({ document, descriptor, a
   }
   const declarations = [];
   const paths = new Set();
+  const canonicalPathAttachments = new Map();
+  const sourcePathAttachments = new Map();
   const publicRows = [];
   const findingIdentities = [];
   let findingIdentityComplete = true;
@@ -465,12 +520,7 @@ export async function collectSharedPlaywrightArtifacts({ document, descriptor, a
         const fingerprint = createHash('sha256').update(bytes).digest('hex').slice(0, 16);
         const relative = `playwright/inline/row-${rowIndex + 1}/attachment-${attachmentIndex + 1}-${fingerprint}.${suffix}`;
         const destination = path.join(evidenceRoot, ...relative.split('/'));
-        await fs.mkdir(path.dirname(destination), { recursive: true });
-        try {
-          await fs.writeFile(destination, bytes, { flag: 'wx', mode: 0o600 });
-        } catch (error) {
-          if (error?.code !== 'EEXIST' || !Buffer.from(await fs.readFile(destination)).equals(bytes)) throw error;
-        }
+        await writeImmutableAttachment(destination, bytes);
         paths.add(relative);
         declarations.push(declaration(relative, attachment, row, bytes));
         publicAttachments.push({ name: attachment.name, contentType: attachment.contentType, path: relative });
@@ -480,16 +530,41 @@ export async function collectSharedPlaywrightArtifacts({ document, descriptor, a
       if (candidate !== attachment.path || !candidate.startsWith(`${artifactRoot}${path.sep}`)) {
         fail('PLAYWRIGHT_ATTACHMENT_INVALID', `Playwright row ${rowIndex} attachment escaped its attempt artifact root.`);
       }
-      const [stat, realCandidate] = await Promise.all([fs.lstat(candidate), fs.realpath(candidate)]);
-      if (!stat.isFile() || stat.isSymbolicLink() || !realCandidate.startsWith(`${realArtifactRoot}${path.sep}`)) {
-        fail('PLAYWRIGHT_ATTACHMENT_INVALID', `Playwright row ${rowIndex} attachment is not a contained regular file.`);
+      const sourceRelative = path.relative(evidenceRoot, candidate).split(path.sep).join('/');
+      if (!sourceRelative || sourceRelative.startsWith('../')) {
+        fail('PLAYWRIGHT_ATTACHMENT_INVALID', `Playwright row ${rowIndex} attachment path is unpublishable.`);
       }
-      const relative = path.relative(evidenceRoot, candidate).split(path.sep).join('/');
-      if (!relative || relative.startsWith('../') || relative.length > 240 || paths.has(relative)) {
-        fail('PLAYWRIGHT_ATTACHMENT_INVALID', `Playwright row ${rowIndex} attachment path is duplicate or unpublishable.`);
+      const { bytes, realCandidate } = await readContainedPlaywrightAttachment(candidate, realArtifactRoot);
+      const contentDigest = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
+      const metadata = attachmentPathMetadata(attachment, row);
+      const previousAttachments = new Set([
+        canonicalPathAttachments.get(realCandidate),
+        sourcePathAttachments.get(sourceRelative),
+      ].filter(Boolean));
+      if (previousAttachments.size > 0) {
+        if ([...previousAttachments].some((previous) => previous.metadata !== metadata
+          || previous.contentDigest !== contentDigest || previous.sizeBytes !== bytes.length)) {
+          fail('PLAYWRIGHT_ATTACHMENT_INVALID', `Playwright row ${rowIndex} attachment reuses a canonical file with conflicting metadata or content.`);
+        }
+        // Playwright can report the same path attachment more than once. One
+        // exact logical declaration is sufficient; conflicting reuse remains
+        // rejected so a path cannot smuggle two evidence identities.
+        continue;
+      }
+      const relative = sourceRelative.length <= 240
+        ? sourceRelative
+        : await boundedPublicationPath({ evidenceRoot, candidate, rowIndex, attachmentIndex, bytes });
+      if (paths.has(relative)) {
+        fail('PLAYWRIGHT_ATTACHMENT_INVALID', `Playwright row ${rowIndex} attachment publication path is duplicate.`);
       }
       paths.add(relative);
-      const bytes = await fs.readFile(candidate);
+      const pathAttachment = {
+        metadata,
+        contentDigest,
+        sizeBytes: bytes.length,
+      };
+      canonicalPathAttachments.set(realCandidate, pathAttachment);
+      sourcePathAttachments.set(sourceRelative, pathAttachment);
       if (attachment.name === VISUAL_RESULT_ATTACHMENT) {
         visualResultCount += 1;
         try { visualRiskSource = parseVisualRiskSource(JSON.parse(bytes.toString('utf8')), descriptor); } catch {
@@ -500,7 +575,7 @@ export async function collectSharedPlaywrightArtifacts({ document, descriptor, a
       publicAttachments.push({ name: attachment.name, contentType: attachment.contentType, path: relative });
       if (attachment.name === 'audit-result') {
         const record = validateAuditRecord(
-          await boundedAttachmentJson(candidate, `Playwright row ${rowIndex} audit result`), row, descriptor, rowIndex,
+          boundedAttachmentJson(bytes, `Playwright row ${rowIndex} audit result`), row, descriptor, rowIndex,
         );
         for (const finding of record.findings) {
           const identity = findingIdentity(finding, descriptor);

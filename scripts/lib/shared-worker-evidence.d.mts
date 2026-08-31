@@ -4,6 +4,10 @@ import type { ProductFailureSignature } from '../../shared/execution-contract.mj
 export const MAX_WORKER_ARTIFACTS: 64;
 export const MAX_WORKER_ARTIFACT_BYTES: number;
 export const MAX_WORKER_EVIDENCE_BYTES: number;
+export function sharedWorkerEvidenceRecovery(error: unknown): {
+  reason: 'executor-evidence-invalid';
+  logMessage: string;
+} | null;
 export function collectSharedWorkerEvidence(
   evidenceRoot: string,
   completion: { code: number | null; signal?: NodeJS.Signals | null },

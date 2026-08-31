@@ -77,6 +77,16 @@ function proxyError(logger, error, detail = {}) {
   });
 }
 
+export function trackBrowserEgressSocket(socket, sockets, logger) {
+  sockets.add(socket);
+  socket.once('close', () => sockets.delete(socket));
+  socket.on('error', (error) => {
+    proxyError(logger, error, { direction: 'browser-to-proxy' });
+    socket.destroy();
+  });
+  return socket;
+}
+
 async function selectedPublicAddress(hostname, lookup) {
   const addresses = await resolvePublicAddresses(hostname, { lookup });
   if (addresses.length === 0) fail('BROWSER_EGRESS_DNS_EMPTY', `DNS returned no public addresses for ${hostname}.`);
@@ -145,8 +155,7 @@ export async function startBrowserEgressProxy({
     }
   });
   server.on('connection', (socket) => {
-    sockets.add(socket);
-    socket.once('close', () => sockets.delete(socket));
+    trackBrowserEgressSocket(socket, sockets, logger);
   });
   server.on('connect', async (request, browserSocket, head) => {
     try {

@@ -17,6 +17,7 @@ import {
 import {
   collectSharedWorkerAttempt,
   collectSharedWorkerEvidence,
+  sharedWorkerEvidenceRecovery,
 } from './lib/shared-worker-evidence.mjs';
 import {
   acquireCoordinator,
@@ -162,6 +163,16 @@ try {
     { code: 'SHARED_WORK_EVIDENCE_INVALID' },
     'an unclassified executor exit without a structured result must not synthesize canonical product truth',
   );
+  const invalidEvidence = Object.assign(new Error(`missing manifest\n${'x'.repeat(500)}`), {
+    code: 'SHARED_WORK_EVIDENCE_INVALID',
+  });
+  const localRecovery = sharedWorkerEvidenceRecovery(invalidEvidence);
+  assert.equal(localRecovery.reason, 'executor-evidence-invalid');
+  assert.match(localRecovery.logMessage, /^operational-recovery: executor-evidence-invalid; missing manifest /);
+  assert(!localRecovery.logMessage.includes('\n') && localRecovery.logMessage.length < 450,
+    'local evidence recovery diagnostics must remain single-line and bounded');
+  assert.equal(sharedWorkerEvidenceRecovery(Object.assign(new Error('other'), { code: 'OTHER' })), null,
+    'unclassified local errors must still terminate the worker instead of being mislabeled operational');
 
   await fs.writeFile(path.join(executorEvidenceRoot, 'runtime-failure.json'), '{"failureKind":"browser_process_crash"}\n');
   await assert.rejects(
