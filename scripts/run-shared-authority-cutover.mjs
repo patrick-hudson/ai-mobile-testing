@@ -373,6 +373,7 @@ export async function runSharedAuthorityCutoverCli(argv, {
       reportDirectory: config.reportDirectory,
       handoffId: handoff.handoffId,
       targetBuildIdentity: handoff.targetBuildIdentity,
+      adoptClosedAdmissionFromCutoverId: handoff.adoptClosedAdmissionFromCutoverId ?? null,
       operatorReview: requiredObject(handoff.operatorReview, 'config.handoff.operatorReview'),
     });
   } else if (action === 'begin-handoff') {

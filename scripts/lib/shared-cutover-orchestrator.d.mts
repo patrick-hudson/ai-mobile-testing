@@ -25,7 +25,24 @@ export interface CutoverAdmissionGate {
   withState<T>(operation: (gate: CutoverAdmissionGateDocument) => Promise<T> | T): Promise<T>;
   withOpen<T>(operation: (gate: CutoverAdmissionGateDocument) => Promise<T> | T): Promise<T>;
   close(expectedDigest: string, cutoverId: string): Promise<CutoverAdmissionGateDocument>;
+  closeWithTransaction(
+    expectedDigest: string,
+    cutoverId: string,
+    transaction: (
+      gate: CutoverAdmissionGateDocument,
+      commit: () => Promise<CutoverAdmissionGateDocument>,
+    ) => void | Promise<void>,
+  ): Promise<CutoverAdmissionGateDocument>;
   open(expectedDigest: string, cutoverId: string): Promise<CutoverAdmissionGateDocument>;
+  transferClosed(
+    expectedDigest: string,
+    fromCutoverId: string,
+    toCutoverId: string,
+    transaction: (
+      gate: CutoverAdmissionGateDocument,
+      commit: () => Promise<CutoverAdmissionGateDocument>,
+    ) => void | Promise<void>,
+  ): Promise<CutoverAdmissionGateDocument>;
 }
 
 export interface SharedCutoverInput {
@@ -220,9 +237,15 @@ export function prepareSharedAuthorityBuildHandoff(options: {
   reportDirectory: string;
   handoffId: string;
   targetBuildIdentity: string;
+  adoptClosedAdmissionFromCutoverId?: string | null;
   operatorReview: { reviewed: true; actorId: string; reviewedAt: string };
   clock?: () => number;
-  hooks?: { afterAdmissionClosed?(gate: CutoverAdmissionGateDocument): void | Promise<void> };
+  hooks?: {
+    afterAdmissionIntentPersisted?(intent: any): void | Promise<void>;
+    beforeAdmissionTransferCommit?(selector: any): void | Promise<void>;
+    afterAdmissionTransferred?(gate: CutoverAdmissionGateDocument): void | Promise<void>;
+    afterAdmissionClosed?(gate: CutoverAdmissionGateDocument): void | Promise<void>;
+  };
 }): Promise<any>;
 
 export function prequalifySharedAuthorityBuild(options: {

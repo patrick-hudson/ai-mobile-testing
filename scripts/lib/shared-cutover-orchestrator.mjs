@@ -41,6 +41,7 @@ import {
   registerReleaseAuthorityHandoffCanaryRun,
   transitionReleaseAuthority,
   transitionReleaseAuthorityWithPublicationFence,
+  withReleaseAuthoritySelectorFence,
 } from './parent-run-store.mjs';
 import { listRecoverableSharedLaunchOperations } from './shared-launch-operation-store.mjs';
 import { inspectLegacyAuthorityDrainSources } from './legacy-authority-drain-source.mjs';
@@ -185,6 +186,88 @@ function admissionGateHandle(storage, { clock }) {
     });
   }
 
+  async function transferClosed(expectedDigest, fromCutoverId, toCutoverId, transaction) {
+    safeId(fromCutoverId, 'fromCutoverId');
+    safeId(toCutoverId, 'toCutoverId');
+    if (fromCutoverId === toCutoverId) {
+      fail('CUTOVER_INPUT_INVALID', 'Admission transfer requires distinct cutover owners.');
+    }
+    if (typeof transaction !== 'function') {
+      fail('CUTOVER_INPUT_INVALID', 'Admission transfer transaction must be a function.');
+    }
+    return withDirectoryLock(storage, lockPath, async () => {
+      const current = await read();
+      // A process can crash after this durable write but before it checkpoints the
+      // owning handoff. Treat that exact successor as the one safe replay state.
+      if (current.state === 'CLOSED' && current.cutoverId === toCutoverId
+        && current.previousDigest === expectedDigest) return current;
+      if (current.digest !== expectedDigest || current.state !== 'CLOSED'
+        || current.cutoverId !== fromCutoverId) {
+        fail('CUTOVER_ADMISSION_CONFLICT', 'Admission gate changed before closed-owner transfer.');
+      }
+      let committed = null;
+      let transactionActive = true;
+      const commit = async () => {
+        if (!transactionActive) {
+          fail('CUTOVER_ADMISSION_CONFLICT', 'Admission transfer commit escaped its transaction.');
+        }
+        if (committed !== null) return clone(committed);
+        const next = seal(gateBody({
+          state: 'CLOSED',
+          revision: current.revision + 1,
+          cutoverId: toCutoverId,
+          previousDigest: current.digest,
+          updatedAt: timestamp(clock),
+        }));
+        await atomicWriteJson(storage, gatePath, next);
+        committed = next;
+        return clone(next);
+      };
+      try {
+        await transaction(clone(current), commit);
+      } finally {
+        transactionActive = false;
+      }
+      if (committed === null) {
+        fail('CUTOVER_ADMISSION_CONFLICT', 'Admission transfer transaction returned without a durable commit.');
+      }
+      return clone(committed);
+    });
+  }
+
+  async function closeWithTransaction(expectedDigest, cutoverId, transaction) {
+    safeId(cutoverId, 'cutoverId');
+    if (typeof transaction !== 'function') {
+      fail('CUTOVER_INPUT_INVALID', 'Admission close transaction must be a function.');
+    }
+    return withDirectoryLock(storage, lockPath, async () => {
+      const current = await read();
+      if (current.digest !== expectedDigest || current.state !== 'OPEN') {
+        fail('CUTOVER_ADMISSION_CONFLICT', 'Admission gate changed before transactional closure.');
+      }
+      let committed = null;
+      let transactionActive = true;
+      const commit = async () => {
+        if (!transactionActive) fail('CUTOVER_ADMISSION_CONFLICT', 'Admission close commit escaped its transaction.');
+        if (committed !== null) return clone(committed);
+        const next = seal(gateBody({
+          state: 'CLOSED', revision: current.revision + 1, cutoverId,
+          previousDigest: current.digest, updatedAt: timestamp(clock),
+        }));
+        await atomicWriteJson(storage, gatePath, next);
+        committed = next;
+        return clone(next);
+      };
+      try {
+        await transaction(clone(current), commit);
+      } finally {
+        transactionActive = false;
+      }
+      if (committed === null) fail('CUTOVER_ADMISSION_CONFLICT', 'Admission close transaction returned without a durable commit.');
+      return clone(committed);
+    });
+  }
+
   async function withState(operation) {
     if (typeof operation !== 'function') fail('CUTOVER_INPUT_INVALID', 'Admission operation is required.');
     return withDirectoryLock(storage, lockPath, async () => {
@@ -214,7 +297,9 @@ function admissionGateHandle(storage, { clock }) {
     withState,
     withOpen,
     close: (expectedDigest, cutoverId) => transition({ expectedDigest, state: 'CLOSED', cutoverId }),
+    closeWithTransaction,
     open: (expectedDigest, cutoverId) => transition({ expectedDigest, state: 'OPEN', cutoverId }),
+    transferClosed,
   });
 }
 
@@ -2033,8 +2118,8 @@ export async function rollbackSharedAuthorityBeforeActivation({
 }
 
 function handoffIntentBody(value) {
-  return {
-    schemaVersion: 1,
+  const body = {
+    schemaVersion: value.schemaVersion,
     kind: 'release-authority-build-handoff-intent',
     handoffId: value.handoffId,
     sourceBuildIdentity: value.sourceBuildIdentity,
@@ -2047,12 +2132,49 @@ function handoffIntentBody(value) {
     operatorReview: value.operatorReview,
     requestedAt: value.requestedAt,
   };
+  if (value.schemaVersion === 2) body.admissionAcquisition = value.admissionAcquisition;
+  return body;
+}
+
+function admissionAcquisitionBody(value) {
+  return {
+    kind: 'closed-admission-owner-transfer',
+    fromCutoverId: value.fromCutoverId,
+    sourceGate: value.sourceGate,
+    activationReportDigest: value.activationReportDigest,
+    activationSelectorDigest: value.activationSelectorDigest,
+    activationCutoverDigest: value.activationCutoverDigest,
+    activationRevision: value.activationRevision,
+  };
+}
+
+function parseAdmissionAcquisition(value) {
+  if (value === null) return null;
+  if (!isRecord(value)) fail('CUTOVER_DOCUMENT_INVALID', 'Handoff admission acquisition is invalid.');
+  exactKeys(value, Object.keys(admissionAcquisitionBody(value)), 'Handoff admission acquisition');
+  if (value.kind !== 'closed-admission-owner-transfer') {
+    fail('CUTOVER_DOCUMENT_INVALID', 'Handoff admission acquisition kind is invalid.');
+  }
+  safeId(value.fromCutoverId, 'Handoff admission acquisition fromCutoverId');
+  const sourceGate = parseGate(value.sourceGate);
+  if (sourceGate.state !== 'CLOSED' || sourceGate.cutoverId !== value.fromCutoverId) {
+    fail('CUTOVER_DOCUMENT_INVALID', 'Handoff admission acquisition source gate is not owned by the declared activation cutover.');
+  }
+  for (const [key, digest] of Object.entries({
+    activationReportDigest: value.activationReportDigest,
+    activationSelectorDigest: value.activationSelectorDigest,
+    activationCutoverDigest: value.activationCutoverDigest,
+  })) assertDigest(digest, `Handoff admission acquisition ${key}`);
+  if (!Number.isSafeInteger(value.activationRevision) || value.activationRevision < 1) {
+    fail('CUTOVER_DOCUMENT_INVALID', 'Handoff admission acquisition activation revision is invalid.');
+  }
+  return clone({ ...admissionAcquisitionBody(value), sourceGate });
 }
 
 function parseHandoffIntent(value, handoffId = null) {
   parseSealed(value, 'Build handoff intent');
   exactKeys(value, [...Object.keys(handoffIntentBody(value)), 'digest'], 'Build handoff intent');
-  if (value.schemaVersion !== 1 || value.kind !== 'release-authority-build-handoff-intent'
+  if (![1, 2].includes(value.schemaVersion) || value.kind !== 'release-authority-build-handoff-intent'
     || (handoffId !== null && value.handoffId !== handoffId) || !SAFE_ID.test(value.handoffId)) {
     fail('CUTOVER_DOCUMENT_INVALID', 'Build handoff intent identity is invalid.');
   }
@@ -2067,7 +2189,50 @@ function parseHandoffIntent(value, handoffId = null) {
   assertDigest(value.activationCutoverDigest, 'Build handoff activationCutoverDigest');
   parseOperatorReview(value.operatorReview);
   canonicalTimestamp(value.requestedAt, 'Build handoff requestedAt');
-  return clone(value);
+  const admissionAcquisition = value.schemaVersion === 2
+    ? parseAdmissionAcquisition(value.admissionAcquisition)
+    : null;
+  return clone({ ...value, admissionAcquisition });
+}
+
+function parseActivationReportForAdmissionAcquisition(value, acquisition, selector) {
+  const report = parseSealed(value, 'Activated cutover report');
+  const sourceGate = acquisition.sourceGate;
+  const activationSelector = report.selectorAfter;
+  if (report.kind !== 'release-authority-cutover-report'
+    || report.cutoverId !== acquisition.fromCutoverId
+    || report.status !== 'ACTIVE_ADMISSION_CLOSED'
+    || report.digest !== acquisition.activationReportDigest
+    || report.inputDigest !== acquisition.activationCutoverDigest
+    || !isRecord(activationSelector)
+    || activationSelector.digest !== acquisition.activationSelectorDigest
+    || activationSelector.activationEpoch !== 1
+    || activationSelector.activationCutoverDigest !== acquisition.activationCutoverDigest
+    || activationSelector.activationRevision !== acquisition.activationRevision
+    || activationSelector.activeBuildIdentity !== selector.activeBuildIdentity
+    || activationSelector.storeMarkerDigest !== selector.storeMarkerDigest
+    || activationSelector.storeGeneration !== selector.storeGeneration
+    || !Number.isSafeInteger(activationSelector.revision)
+    || selector.activationEpoch !== activationSelector.activationEpoch
+    || selector.activationCutoverDigest !== activationSelector.activationCutoverDigest
+    || selector.activationRevision !== activationSelector.activationRevision
+    || selector.revision < activationSelector.revision
+    || report.admissionGateAfter?.digest !== sourceGate.digest
+    || report.admissionGateAfter?.state !== 'CLOSED'
+    || report.admissionGateAfter?.cutoverId !== acquisition.fromCutoverId) {
+    fail('AUTHORITY_HANDOFF_ADMISSION_TRANSFER_INVALID',
+      'The requested closed-admission owner is not bound to the current activated selector lineage and gate.');
+  }
+  return report;
+}
+
+async function assertAdmissionAcquisitionBinding(storage, acquisition, selector) {
+  const report = await readBoundedJson(
+    storage,
+    reportStoragePath(storage, acquisition.fromCutoverId, '.json'),
+    { label: 'activated cutover report for admission transfer', maximumBytes: 4 * 1_048_576 },
+  );
+  return parseActivationReportForAdmissionAcquisition(report, acquisition, selector);
 }
 
 function handoffCheckpointBody(value) {
@@ -2099,7 +2264,7 @@ function parseHandoffCheckpoint(value, intent) {
     || value.handoffId !== intent.handoffId || value.intentDigest !== intent.digest
     || !Number.isSafeInteger(value.revision) || value.revision < 1
     || ((value.revision === 1) !== (value.previousDigest === null))
-    || !['ADMISSION_CLOSED', 'DRAIN_VERIFIED', 'PENDING_TARGET_HEALTH', 'FAILED_HOLD', 'COMPLETED'].includes(value.status)) {
+    || !['ADMISSION_CLOSED', 'ADMISSION_TRANSFERRED', 'DRAIN_VERIFIED', 'PENDING_TARGET_HEALTH', 'FAILED_HOLD', 'COMPLETED'].includes(value.status)) {
     fail('CUTOVER_CHECKPOINT_CONFLICT', 'Build handoff checkpoint does not match its intent.');
   }
   if (value.previousDigest !== null) assertDigest(value.previousDigest, 'Build handoff checkpoint previousDigest');
@@ -2298,15 +2463,44 @@ async function writeHandoffCheckpoint(storage, value) {
   return clone(checkpoint);
 }
 
+// This also upgrades the small pre-reservation window left by v1 handoffs and
+// older interrupted prepares.  The gate lock is deliberately outermost: every
+// caller that changes both admission and release authority takes gate -> store
+// global, never the inverse.
+async function ensurePreparedHandoffReservation({ admissionGate, coordinator, handoffId, intent, store }) {
+  return admissionGate.withState(async (gate) => {
+    if (gate.state !== 'CLOSED' || gate.cutoverId !== handoffId) {
+      fail('AUTHORITY_HANDOFF_ADMISSION_TRANSFER_INVALID',
+        'Build handoff reservation requires the handoff to own a closed admission gate.');
+    }
+    return withReleaseAuthoritySelectorFence(store, intent.sourceSelectorDigest, async (selector, fence) => {
+      if (selector.phase !== 'ACTIVE' || selector.pendingBuildIdentity !== null
+        || selector.activeBuildIdentity !== intent.sourceBuildIdentity) {
+        fail('AUTHORITY_HANDOFF_INVALID', 'Build handoff source authority changed before reservation recovery.');
+      }
+      return fence.reserveBuildHandoff({
+        handoffId,
+        sourceSelectorDigest: intent.sourceSelectorDigest,
+        targetBuildIdentity: intent.targetBuildIdentity,
+        coordinator,
+      });
+    });
+  });
+}
+
 export async function prepareSharedAuthorityBuildHandoff({
   store, coordinator, admissionGate, legacyAuthorityFence, authorityFloor, reportDirectory,
   handoffId, targetBuildIdentity, operatorReview: rawOperatorReview,
+  adoptClosedAdmissionFromCutoverId = null,
   clock = store?.clock ?? (() => Date.now()),
   hooks = {},
 } = {}) {
   ensureCoordinator(coordinator);
   safeId(handoffId, 'handoffId');
   nonEmptyString(targetBuildIdentity, 'targetBuildIdentity');
+  const requestedAdmissionOwner = adoptClosedAdmissionFromCutoverId === null
+    ? null
+    : safeId(adoptClosedAdmissionFromCutoverId, 'adoptClosedAdmissionFromCutoverId');
   const operatorReview = parseOperatorReview(rawOperatorReview);
   const storage = await openReportStorage(reportDirectory);
   return withCutoverLock(storage, handoffId, async () => {
@@ -2336,14 +2530,19 @@ export async function prepareSharedAuthorityBuildHandoff({
       fail('CUTOVER_LEGACY_FENCE_CONFLICT', 'Post-activation handoff requires the permanently activated legacy fence.');
     }
     const gateBefore = await admissionGate.read();
-    if (gateBefore.state === 'CLOSED' && gateBefore.cutoverId !== handoffId) {
-      fail('CUTOVER_ADMISSION_OWNED', `Admission is already closed by ${gateBefore.cutoverId}.`);
-    }
     const intentFile = handoffPath(storage, handoffId, '.intent.json');
+    let intent;
     if (await pathExists(storage.fs, intentFile)) {
       const existing = parseHandoffIntent(await readBoundedJson(storage, intentFile, {
         label: 'build handoff intent', maximumBytes: 256 * 1_024,
       }), handoffId);
+      if (existing.admissionAcquisition === null && requestedAdmissionOwner !== null) {
+        fail('CUTOVER_CHECKPOINT_CONFLICT', 'Existing handoff intent did not authorize a closed-admission owner transfer.');
+      }
+      if (existing.admissionAcquisition !== null
+        && requestedAdmissionOwner !== existing.admissionAcquisition.fromCutoverId) {
+        fail('CUTOVER_CHECKPOINT_CONFLICT', 'Existing handoff admission acquisition does not match the requested cutover owner.');
+      }
       const expected = handoffIntentBody({
         ...existing,
         handoffId,
@@ -2359,29 +2558,146 @@ export async function prepareSharedAuthorityBuildHandoff({
       if (canonicalJson(handoffIntentBody(existing)) !== canonicalJson(expected)) {
         fail('CUTOVER_CHECKPOINT_CONFLICT', 'Build handoff intent is immutable.');
       }
+      intent = existing;
+    } else {
+      let admissionAcquisition = null;
+      if (gateBefore.state === 'OPEN') {
+        if (requestedAdmissionOwner !== null) {
+          fail('AUTHORITY_HANDOFF_ADMISSION_TRANSFER_INVALID',
+            'A closed-admission owner may be adopted only while admission is closed by that exact activated cutover.');
+        }
+      } else if (gateBefore.cutoverId === handoffId) {
+        fail('CUTOVER_ADMISSION_OWNED', 'Admission is already closed by this handoff without a durable handoff intent.');
+      } else {
+        if (requestedAdmissionOwner === null || requestedAdmissionOwner !== gateBefore.cutoverId) {
+          fail('AUTHORITY_HANDOFF_ADMISSION_TRANSFER_INVALID',
+            `Admission is closed by ${gateBefore.cutoverId}; explicitly name that activated cutover to transfer ownership.`);
+        }
+        if (legacy.cutoverId !== requestedAdmissionOwner) {
+          fail('AUTHORITY_HANDOFF_ADMISSION_TRANSFER_INVALID',
+            'The requested closed-admission owner is not the cutover that permanently activated legacy retirement.');
+        }
+        const report = await readBoundedJson(
+          storage,
+          reportStoragePath(storage, requestedAdmissionOwner, '.json'),
+          { label: 'activated cutover report for admission transfer', maximumBytes: 4 * 1_048_576 },
+        );
+        const parsedReport = parseSealed(report, 'Activated cutover report');
+        admissionAcquisition = parseAdmissionAcquisition({
+          kind: 'closed-admission-owner-transfer',
+          fromCutoverId: requestedAdmissionOwner,
+          sourceGate: gateBefore,
+          activationReportDigest: parsedReport.digest,
+          activationSelectorDigest: parsedReport.selectorAfter?.digest,
+          activationCutoverDigest: parsedReport.selectorAfter?.activationCutoverDigest,
+          activationRevision: parsedReport.selectorAfter?.activationRevision,
+        });
+        parseActivationReportForAdmissionAcquisition(parsedReport, admissionAcquisition, selector);
+      }
+      intent = seal(handoffIntentBody({
+        schemaVersion: 2,
+        handoffId,
+        sourceBuildIdentity: selector.activeBuildIdentity,
+        targetBuildIdentity,
+        sourceSelectorDigest: selector.digest,
+        authorityFloorBeforeDigest: floorBefore.digest,
+        activationCutoverDigest: selector.activationCutoverDigest,
+        activationEpoch: selector.activationEpoch,
+        activationRevision: selector.activationRevision,
+        operatorReview,
+        requestedAt: timestamp(clock),
+        admissionAcquisition,
+      }));
+      await atomicWriteJson(storage, intentFile, intent, { exclusive: true });
+      await hooks.afterAdmissionIntentPersisted?.(clone(intent));
+    }
+
+    let gateAfter;
+    if (intent.admissionAcquisition !== null) {
+      const acquisition = intent.admissionAcquisition;
+      if (legacy.cutoverId !== acquisition.fromCutoverId) {
+        fail('AUTHORITY_HANDOFF_ADMISSION_TRANSFER_INVALID',
+          'The activated legacy fence does not belong to the handoff admission owner.');
+      }
+      const currentSelector = await readReleaseAuthoritySelector(store);
+      if (currentSelector.digest !== intent.sourceSelectorDigest
+        || currentSelector.activeBuildIdentity !== intent.sourceBuildIdentity) {
+        fail('AUTHORITY_HANDOFF_INVALID', 'Active authority changed before admission-owner transfer.');
+      }
+      await assertAdmissionAcquisitionBinding(storage, acquisition, currentSelector);
+      gateAfter = await admissionGate.transferClosed(
+        acquisition.sourceGate.digest,
+        acquisition.fromCutoverId,
+        handoffId,
+        async (currentGate, commit) => {
+          if (canonicalJson(currentGate) !== canonicalJson(acquisition.sourceGate)) {
+            fail('AUTHORITY_HANDOFF_ADMISSION_TRANSFER_INVALID', 'Closed admission gate no longer matches the immutable transfer intent.');
+          }
+          await withReleaseAuthoritySelectorFence(store, intent.sourceSelectorDigest, async (liveSelector, fence) => {
+            if (liveSelector.activeBuildIdentity !== intent.sourceBuildIdentity) {
+              fail('AUTHORITY_HANDOFF_INVALID', 'Active authority changed while transferring admission ownership.');
+            }
+            await assertAdmissionAcquisitionBinding(storage, acquisition, liveSelector);
+            await fence.reserveBuildHandoff({
+              handoffId,
+              sourceSelectorDigest: intent.sourceSelectorDigest,
+              targetBuildIdentity: intent.targetBuildIdentity,
+              coordinator,
+            });
+            await hooks.beforeAdmissionTransferCommit?.(clone(liveSelector));
+            await commit();
+          });
+        },
+      );
+      if (gateAfter.cutoverId !== handoffId
+        || (gateAfter.digest !== acquisition.sourceGate.digest
+          && gateAfter.previousDigest !== acquisition.sourceGate.digest)) {
+        fail('AUTHORITY_HANDOFF_ADMISSION_TRANSFER_INVALID', 'Closed admission transfer did not produce its exact durable successor.');
+      }
+      if (gateBefore.digest !== gateAfter.digest) {
+        await hooks.afterAdmissionTransferred?.(clone(gateAfter));
+      }
+    } else {
+      if (gateBefore.state === 'CLOSED' && gateBefore.cutoverId !== handoffId) {
+        fail('CUTOVER_ADMISSION_OWNED', `Admission is already closed by ${gateBefore.cutoverId}.`);
+      }
+      gateAfter = gateBefore.state === 'OPEN'
+        ? await admissionGate.closeWithTransaction(gateBefore.digest, handoffId, async (_currentGate, commit) => {
+          await withReleaseAuthoritySelectorFence(store, intent.sourceSelectorDigest, async (liveSelector, fence) => {
+            if (liveSelector.activeBuildIdentity !== intent.sourceBuildIdentity) {
+              fail('AUTHORITY_HANDOFF_INVALID', 'Active authority changed while closing admission for build handoff.');
+            }
+            await fence.reserveBuildHandoff({
+              handoffId,
+              sourceSelectorDigest: intent.sourceSelectorDigest,
+              targetBuildIdentity: intent.targetBuildIdentity,
+              coordinator,
+            });
+            await hooks.beforeAdmissionTransferCommit?.(clone(liveSelector));
+            await commit();
+          });
+        })
+        : gateBefore;
+    }
+
+    // Fresh handoffs reach this through their transactional gate write.  This
+    // idempotent check is essential for v1/in-flight recovery: if the process
+    // crashed after closing the gate but before creating a reservation, repair
+    // the durable PREPARED fence before exposing any checkpoint or allowing
+    // beginReleaseAuthorityBuildHandoff to publish pending authority.
+    await ensurePreparedHandoffReservation({ admissionGate, coordinator, handoffId, intent, store });
+
+    const checkpointFile = handoffPath(storage, handoffId, '.state.json');
+    if (await pathExists(storage.fs, checkpointFile)) {
       return (await readHandoffDocuments(storage, handoffId)).checkpoint;
     }
-    const intent = seal(handoffIntentBody({
-      handoffId,
-      sourceBuildIdentity: selector.activeBuildIdentity,
-      targetBuildIdentity,
-      sourceSelectorDigest: selector.digest,
-      authorityFloorBeforeDigest: floorBefore.digest,
-      activationCutoverDigest: selector.activationCutoverDigest,
-      activationEpoch: selector.activationEpoch,
-      activationRevision: selector.activationRevision,
-      operatorReview,
-      requestedAt: timestamp(clock),
-    }));
-    await atomicWriteJson(storage, intentFile, intent, { exclusive: true });
-    const gateAfter = gateBefore.state === 'OPEN' ? await admissionGate.close(gateBefore.digest, handoffId) : gateBefore;
     const checkpoint = await writeHandoffCheckpoint(storage, {
       handoffId,
       intentDigest: intent.digest,
-      status: 'ADMISSION_CLOSED',
+      status: intent.admissionAcquisition === null ? 'ADMISSION_CLOSED' : 'ADMISSION_TRANSFERRED',
       selectorBefore: selector,
       selectorCurrent: selector,
-      admissionBefore: gateBefore,
+      admissionBefore: intent.admissionAcquisition?.sourceGate ?? gateBefore,
       admissionCurrent: gateAfter,
       drainObservation: null,
       canaryHeadDigest: null,
@@ -2392,6 +2708,38 @@ export async function prepareSharedAuthorityBuildHandoff({
     });
     await hooks.afterAdmissionClosed?.(clone(gateAfter));
     return checkpoint;
+  });
+}
+
+async function recoverV1PendingHandoffReservation({
+  admissionGate, checkpoint, coordinator, handoffId, intent, selector, store,
+}) {
+  if (intent.schemaVersion !== 1
+    || !['DRAIN_VERIFIED', 'PENDING_TARGET_HEALTH'].includes(checkpoint.status)
+    || checkpoint.handoffId !== handoffId
+    || checkpoint.intentDigest !== intent.digest
+    || checkpoint.selectorBefore?.digest !== intent.sourceSelectorDigest
+    || checkpoint.selectorCurrent?.digest !== (
+      checkpoint.status === 'DRAIN_VERIFIED' ? intent.sourceSelectorDigest : selector.digest
+    )) {
+    fail('AUTHORITY_HANDOFF_RESERVATION_CONFLICT',
+      'V1 pending reservation recovery requires the exact durable handoff checkpoint.');
+  }
+  return admissionGate.withState(async (gate) => {
+    if (gate.state !== 'CLOSED' || gate.cutoverId !== handoffId
+      || checkpoint.admissionCurrent?.digest !== gate.digest) {
+      fail('AUTHORITY_HANDOFF_RESERVATION_CONFLICT',
+        'V1 pending reservation recovery requires this handoff to own the exact closed admission gate.');
+    }
+    return withReleaseAuthoritySelectorFence(store, selector.digest, async (liveSelector, fence) => (
+      fence.recoverV1PendingBuildHandoff({
+        handoffId,
+        sourceSelectorDigest: intent.sourceSelectorDigest,
+        sourceBuildIdentity: intent.sourceBuildIdentity,
+        targetBuildIdentity: intent.targetBuildIdentity,
+        coordinator,
+      })
+    ));
   });
 }
 
@@ -2413,7 +2761,7 @@ export async function beginSharedAuthorityBuildHandoff({
       fail('CUTOVER_LEGACY_FENCE_CONFLICT', 'Legacy authority must remain permanently activated during build handoff.');
     }
     let selector = await readReleaseAuthoritySelector(store);
-    if (checkpoint.status === 'ADMISSION_CLOSED') {
+    if (['ADMISSION_CLOSED', 'ADMISSION_TRANSFERRED'].includes(checkpoint.status)) {
       const observed = parseDrainObservation(drainObservation, {
         input: { cutoverId: handoffId }, gate, coordinator, clock,
       });
@@ -2435,6 +2783,20 @@ export async function beginSharedAuthorityBuildHandoff({
     } else if (selector.phase !== 'PROMOTION_DISABLED' || selector.handoffId !== handoffId
       || selector.pendingBuildIdentity !== intent.targetBuildIdentity) {
       fail('AUTHORITY_HANDOFF_INVALID', 'Durable selector does not match this resumable build handoff.');
+    } else if (intent.schemaVersion === 1) {
+      await recoverV1PendingHandoffReservation({
+        admissionGate, checkpoint, coordinator, handoffId, intent, selector, store,
+      });
+    } else {
+      // A crash can land after the pending selector is durable but before its
+      // PREPARED reservation is consumed. Re-enter the exact parent-store
+      // handoff operation so this matching pending state consumes it before
+      // any handoff checkpoint is advanced.
+      await beginReleaseAuthorityBuildHandoff(store, coordinator, {
+        expectedSelectorDigest: intent.sourceSelectorDigest,
+        handoffId,
+        targetBuildIdentity: intent.targetBuildIdentity,
+      });
     }
     checkpoint = await writeHandoffCheckpoint(storage, {
       ...checkpoint,

@@ -49,6 +49,25 @@ export function releaseStoreCoordinator(store: ParentRunStore, coordinator: Coor
   buildIdentity: string; ownerId: string; epoch: number; releasedAt: string;
 }>;
 export function readReleaseAuthoritySelector(store: ParentRunStore): Promise<any>;
+export function withReleaseAuthoritySelectorFence<T>(
+  store: ParentRunStore,
+  expectedDigest: string,
+  operation: (selector: any, fence: {
+    reserveBuildHandoff(input: {
+      handoffId: string;
+      sourceSelectorDigest: string;
+      targetBuildIdentity: string;
+      coordinator: CoordinatorFence;
+    }): Promise<any>;
+    recoverV1PendingBuildHandoff(input: {
+      handoffId: string;
+      sourceSelectorDigest: string;
+      sourceBuildIdentity: string;
+      targetBuildIdentity: string;
+      coordinator: CoordinatorFence;
+    }): Promise<any>;
+  }) => T | Promise<T>,
+): Promise<T>;
 export function readReleaseAuthorityContext(store: ParentRunStore, options?: { requireActive?: boolean }): Promise<any>;
 export function transitionReleaseAuthority(store: ParentRunStore, coordinator: CoordinatorFence, input: {
   expectedSelectorDigest: string; phase: 'SHADOW' | 'DRAINING' | 'ACTIVE' | 'PROMOTION_DISABLED';
@@ -70,6 +89,7 @@ export function prequalifyReleaseAuthorityBuild(store: ParentRunStore, coordinat
 }): Promise<any>;
 export function beginReleaseAuthorityBuildHandoff(store: ParentRunStore, coordinator: CoordinatorFence, input: {
   expectedSelectorDigest: string; handoffId: string; targetBuildIdentity: string;
+  hooks?: { afterPendingSelectorWritten?(selector: any): void | Promise<void> };
 }): Promise<any>;
 export function authorizeCutoverCanaryRunSupersession(store: ParentRunStore, input: {
   expectedSelectorDigest: string; cutoverId: string; mode: 'single-site' | 'comparative'; runId: string;

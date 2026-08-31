@@ -77,6 +77,7 @@ const ARTIFACT_PURGE_DRAIN_MS = 20_000;
 const MAX_HANDOFF_CANARY_FAILURE_ATTEMPTS = 3;
 const MAX_HANDOFF_CANARY_PERMIT_REVISIONS = 64;
 const MAX_CUTOVER_CANARY_SUPERSESSION_REVISIONS = 64;
+const MAX_AUTHORITY_HANDOFF_RESERVATION_REVISIONS = 256;
 
 export class ParentRunStoreError extends Error {
   constructor(code, message, details = undefined) {
@@ -2110,6 +2111,343 @@ export async function readReleaseAuthoritySelector(store) {
   return clone(await readAuthoritySelectorUnlocked(store));
 }
 
+function authorityHandoffReservationPath(store) {
+  return containedPath(store.root, 'release-authority-handoff-reservation.json');
+}
+
+function authorityHandoffReservationHistoryPath(store, digest) {
+  if (!DIGEST_PATTERN.test(digest ?? '')) fail('AUTHORITY_HANDOFF_RESERVATION_INVALID', 'Handoff reservation digest is invalid.');
+  return containedPath(store.root, 'release-authority-handoff-reservations', `${digest.slice('sha256:'.length)}.json`);
+}
+
+function authorityHandoffReservationBody(value) {
+  return {
+    schemaVersion: 1,
+    kind: 'release-authority-handoff-reservation',
+    revision: value.revision,
+    previousDigest: value.previousDigest,
+    state: value.state,
+    handoffId: value.handoffId,
+    sourceSelectorDigest: value.sourceSelectorDigest,
+    targetBuildIdentity: value.targetBuildIdentity,
+    preparedAt: value.preparedAt,
+    consumedAt: value.consumedAt,
+    pendingSelectorDigest: value.pendingSelectorDigest,
+  };
+}
+
+function parseAuthorityHandoffReservation(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    fail('AUTHORITY_HANDOFF_RESERVATION_INVALID', 'Handoff reservation is invalid.');
+  }
+  const { digest, ...body } = value;
+  const expectedKeys = [...Object.keys(authorityHandoffReservationBody(value)), 'digest'];
+  if (Object.keys(value).length !== expectedKeys.length || expectedKeys.some((key) => !Object.hasOwn(value, key))
+    || !DIGEST_PATTERN.test(digest ?? '') || digest !== canonicalDigest(body)
+    || value.schemaVersion !== 1 || value.kind !== 'release-authority-handoff-reservation'
+    || !Number.isSafeInteger(value.revision) || value.revision < 1
+    || value.revision > MAX_AUTHORITY_HANDOFF_RESERVATION_REVISIONS
+    || (value.previousDigest !== null && !DIGEST_PATTERN.test(value.previousDigest))
+    || ((value.revision === 1) !== (value.previousDigest === null))
+    || !['PREPARED', 'CONSUMED'].includes(value.state)) {
+    fail('AUTHORITY_HANDOFF_RESERVATION_INVALID', 'Handoff reservation is corrupt or unsupported.');
+  }
+  safeId(value.handoffId, 'handoff reservation handoffId');
+  if (!DIGEST_PATTERN.test(value.sourceSelectorDigest ?? '') || typeof value.targetBuildIdentity !== 'string' || !value.targetBuildIdentity
+    || !canonicalTimestamp(value.preparedAt, 'handoff reservation preparedAt')) {
+    fail('AUTHORITY_HANDOFF_RESERVATION_INVALID', 'Handoff reservation binding is invalid.');
+  }
+  if (value.state === 'PREPARED') {
+    if (value.consumedAt !== null || value.pendingSelectorDigest !== null) {
+      fail('AUTHORITY_HANDOFF_RESERVATION_INVALID', 'Prepared handoff reservation is contradictory.');
+    }
+  } else if (!canonicalTimestamp(value.consumedAt, 'handoff reservation consumedAt')
+    || !DIGEST_PATTERN.test(value.pendingSelectorDigest ?? '')) {
+    fail('AUTHORITY_HANDOFF_RESERVATION_INVALID', 'Consumed handoff reservation is contradictory.');
+  }
+  return clone(value);
+}
+
+async function readAuthorityHandoffReservationPointerUnlocked(store) {
+  const bytes = await readBoundedFile(store.storage, authorityHandoffReservationPath(store), {
+    label: 'release-authority handoff reservation', maximumBytes: 128 * 1_024,
+  });
+  let parsed;
+  try { parsed = JSON.parse(bytes.toString('utf8')); } catch {
+    fail('AUTHORITY_HANDOFF_RESERVATION_INVALID', 'Handoff reservation pointer is not JSON.');
+  }
+  const reservation = parseAuthorityHandoffReservation(parsed);
+  if (bytes.toString('utf8') !== `${canonicalJson(reservation)}\n`) {
+    fail('AUTHORITY_HANDOFF_RESERVATION_INVALID', 'Handoff reservation pointer bytes do not exactly match its sealed digest.');
+  }
+  return reservation;
+}
+
+async function authorityHandoffReservationHistoryHasEntriesUnlocked(store) {
+  const history = containedPath(store.root, 'release-authority-handoff-reservations');
+  try {
+    return (await store.storage.fs.readdir(history)).length > 0;
+  } catch (error) {
+    if (error?.code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
+async function readAuthorityHandoffReservationUnlocked(store) {
+  let reservation;
+  try {
+    reservation = await readAuthorityHandoffReservationPointerUnlocked(store);
+  } catch (error) {
+    if (error?.code === 'ATOMIC_NOT_FOUND') {
+      if (await authorityHandoffReservationHistoryHasEntriesUnlocked(store)) {
+        fail('AUTHORITY_HANDOFF_RESERVATION_INVALID',
+          'Handoff reservation pointer is missing while immutable reservation history exists.');
+      }
+      return null;
+    }
+    throw error;
+  }
+  const head = authorityHandoffReservationHistoryPath(store, reservation.digest);
+  if (!await pathExists(store.storage.fs, head)) {
+    // Pointer-first persistence can crash after publishing the exact sealed
+    // pointer but before linking its immutable head.  Only this exact current
+    // head may be reconstructed; every ancestor must already be immutable.
+    await verifyAuthorityHandoffReservationAncestorsUnlocked(store, reservation);
+    await persistImmutableAuthorityHandoffReservationUnlocked(store, reservation);
+  }
+  await verifyAuthorityHandoffReservationHistoryUnlocked(store, reservation);
+  return reservation;
+}
+
+async function readImmutableAuthorityHandoffReservation(store, digest) {
+  const file = authorityHandoffReservationHistoryPath(store, digest);
+  const bytes = await readBoundedFile(store.storage, file, {
+    label: 'immutable release-authority handoff reservation', maximumBytes: 128 * 1_024,
+  });
+  let parsed;
+  try { parsed = JSON.parse(bytes.toString('utf8')); } catch {
+    fail('AUTHORITY_HANDOFF_RESERVATION_INVALID', 'Immutable handoff reservation is not JSON.');
+  }
+  const reservation = parseAuthorityHandoffReservation(parsed);
+  if (reservation.digest !== digest || bytes.toString('utf8') !== `${canonicalJson(reservation)}\n`) {
+    fail('AUTHORITY_HANDOFF_RESERVATION_INVALID', 'Immutable handoff reservation bytes do not exactly match their sealed digest.');
+  }
+  return reservation;
+}
+
+async function verifyAuthorityHandoffReservationAncestorsUnlocked(store, pointer) {
+  let current = pointer;
+  for (let depth = 0; depth < MAX_AUTHORITY_HANDOFF_RESERVATION_REVISIONS; depth += 1) {
+    if (current.previousDigest === null) return;
+    const previous = await readImmutableAuthorityHandoffReservation(store, current.previousDigest);
+    if (previous.revision !== current.revision - 1) {
+      fail('AUTHORITY_HANDOFF_RESERVATION_INVALID', 'Handoff reservation revision history is discontinuous.');
+    }
+    current = previous;
+  }
+  fail('AUTHORITY_HANDOFF_RESERVATION_INVALID', 'Handoff reservation history exceeds its bounded depth.');
+}
+
+async function verifyAuthorityHandoffReservationHistoryUnlocked(store, pointer) {
+  let current = pointer;
+  for (let depth = 0; depth < MAX_AUTHORITY_HANDOFF_RESERVATION_REVISIONS; depth += 1) {
+    const immutable = await readImmutableAuthorityHandoffReservation(store, current.digest);
+    if (canonicalJson(immutable) !== canonicalJson(current)) {
+      fail('AUTHORITY_HANDOFF_RESERVATION_INVALID', 'Handoff reservation pointer does not match its immutable history member.');
+    }
+    if (current.previousDigest === null) return;
+    const previous = await readImmutableAuthorityHandoffReservation(store, current.previousDigest);
+    if (previous.revision !== current.revision - 1) {
+      fail('AUTHORITY_HANDOFF_RESERVATION_INVALID', 'Handoff reservation revision history is discontinuous.');
+    }
+    current = previous;
+  }
+  fail('AUTHORITY_HANDOFF_RESERVATION_INVALID', 'Handoff reservation history exceeds its bounded depth.');
+}
+
+async function persistImmutableAuthorityHandoffReservationUnlocked(store, reservation) {
+  const history = containedPath(store.root, 'release-authority-handoff-reservations');
+  await store.storage.fs.mkdir(history, { recursive: true, mode: 0o700 });
+  const immutable = authorityHandoffReservationHistoryPath(store, reservation.digest);
+  if (await pathExists(store.storage.fs, immutable)) {
+    const existing = await readImmutableAuthorityHandoffReservation(store, reservation.digest);
+    if (canonicalJson(existing) !== canonicalJson(reservation)) {
+      fail('AUTHORITY_HANDOFF_RESERVATION_INVALID', 'Immutable handoff reservation digest was reused with different bytes.');
+    }
+  } else {
+    try { await atomicWriteJson(store.storage, immutable, reservation, { exclusive: true }); } catch (error) {
+      if (error?.code !== 'ATOMIC_ALREADY_EXISTS') throw error;
+      const existing = await readImmutableAuthorityHandoffReservation(store, reservation.digest);
+      if (canonicalJson(existing) !== canonicalJson(reservation)) {
+        fail('AUTHORITY_HANDOFF_RESERVATION_INVALID', 'Concurrent immutable handoff reservation differs from this digest.');
+      }
+    }
+  }
+}
+
+async function persistAuthorityHandoffReservationUnlocked(store, value) {
+  if (!Number.isSafeInteger(value.revision) || value.revision < 1
+    || value.revision > MAX_AUTHORITY_HANDOFF_RESERVATION_REVISIONS) {
+    fail('AUTHORITY_HANDOFF_RESERVATION_LIMIT',
+      `Handoff reservation revision cannot exceed ${MAX_AUTHORITY_HANDOFF_RESERVATION_REVISIONS}.`);
+  }
+  const document = { ...authorityHandoffReservationBody(value) };
+  const reservation = { ...document, digest: canonicalDigest(document) };
+  if (reservation.previousDigest !== null) {
+    const predecessor = await readImmutableAuthorityHandoffReservation(store, reservation.previousDigest);
+    if (predecessor.revision !== reservation.revision - 1) {
+      fail('AUTHORITY_HANDOFF_RESERVATION_INVALID', 'Handoff reservation predecessor is not the immediately prior revision.');
+    }
+    await verifyAuthorityHandoffReservationHistoryUnlocked(store, predecessor);
+  }
+  // Publish the recoverable current pointer first.  Readers under the global
+  // selector lock can recreate only its exact immutable head if a crash lands
+  // between these two writes; immutable ancestry is never synthesized.
+  await atomicWriteJson(store.storage, authorityHandoffReservationPath(store), reservation);
+  await persistImmutableAuthorityHandoffReservationUnlocked(store, reservation);
+  await verifyAuthorityHandoffReservationHistoryUnlocked(store, reservation);
+  return clone(reservation);
+}
+
+function reservationMatches(reservation, { handoffId, sourceSelectorDigest, targetBuildIdentity }) {
+  return reservation.handoffId === handoffId
+    && reservation.sourceSelectorDigest === sourceSelectorDigest
+    && reservation.targetBuildIdentity === targetBuildIdentity;
+}
+
+async function reserveAuthorityHandoffUnlocked(store, selector, input) {
+  safeId(input?.handoffId, 'handoff reservation handoffId');
+  if (!DIGEST_PATTERN.test(input?.sourceSelectorDigest ?? '')
+    || typeof input?.targetBuildIdentity !== 'string' || !input.targetBuildIdentity) {
+    fail('AUTHORITY_HANDOFF_RESERVATION_INVALID', 'Handoff reservation input is invalid.');
+  }
+  await validateCoordinator(store, input.coordinator);
+  if (selector.digest !== input.sourceSelectorDigest || selector.phase !== 'ACTIVE'
+    || selector.pendingBuildIdentity !== null || selector.activeBuildIdentity !== store.buildIdentity) {
+    fail('AUTHORITY_HANDOFF_RESERVATION_CONFLICT', 'Handoff reservation source selector is no longer active and exact.');
+  }
+  const current = await readAuthorityHandoffReservationUnlocked(store);
+  if (current?.state === 'PREPARED') {
+    if (reservationMatches(current, input)) return current;
+    fail('AUTHORITY_HANDOFF_RESERVATION_HELD', `Handoff reservation is already held by ${current.handoffId}.`);
+  }
+  return persistAuthorityHandoffReservationUnlocked(store, {
+    revision: (current?.revision ?? 0) + 1,
+    previousDigest: current?.digest ?? null,
+    state: 'PREPARED',
+    handoffId: input.handoffId,
+    sourceSelectorDigest: input.sourceSelectorDigest,
+    targetBuildIdentity: input.targetBuildIdentity,
+    preparedAt: timestamp(store),
+    consumedAt: null,
+    pendingSelectorDigest: null,
+  });
+}
+
+async function consumeAuthorityHandoffReservationUnlocked(store, selector, input) {
+  const current = await readAuthorityHandoffReservationUnlocked(store);
+  if (!current || !reservationMatches(current, input)) {
+    fail('AUTHORITY_HANDOFF_RESERVATION_REQUIRED', 'Build handoff requires its matching prepared authority reservation.');
+  }
+  if (current.state === 'CONSUMED') {
+    if (current.pendingSelectorDigest !== selector.digest) {
+      fail('AUTHORITY_HANDOFF_RESERVATION_CONFLICT', 'Consumed handoff reservation does not match the pending selector.');
+    }
+    return current;
+  }
+  return persistAuthorityHandoffReservationUnlocked(store, {
+    ...current,
+    revision: current.revision + 1,
+    previousDigest: current.digest,
+    state: 'CONSUMED',
+    consumedAt: timestamp(store),
+    pendingSelectorDigest: selector.digest,
+  });
+}
+
+async function requirePreparedAuthorityHandoffReservationUnlocked(store, input) {
+  const current = await readAuthorityHandoffReservationUnlocked(store);
+  if (!current || !reservationMatches(current, input) || current.state !== 'PREPARED') {
+    fail('AUTHORITY_HANDOFF_RESERVATION_REQUIRED', 'Build handoff requires its matching prepared authority reservation.');
+  }
+  return current;
+}
+
+async function recoverV1PendingAuthorityHandoffReservationUnlocked(store, selector, input) {
+  safeId(input?.handoffId, 'handoff reservation handoffId');
+  if (!DIGEST_PATTERN.test(input?.sourceSelectorDigest ?? '')
+    || typeof input?.sourceBuildIdentity !== 'string' || !input.sourceBuildIdentity
+    || typeof input?.targetBuildIdentity !== 'string' || !input.targetBuildIdentity) {
+    fail('AUTHORITY_HANDOFF_RESERVATION_INVALID', 'V1 pending handoff reservation recovery input is invalid.');
+  }
+  await validateCoordinator(store, input.coordinator);
+  if (store.buildIdentity !== input.targetBuildIdentity
+    || selector.phase !== 'PROMOTION_DISABLED'
+    || selector.handoffId !== input.handoffId
+    || selector.activeBuildIdentity !== input.sourceBuildIdentity
+    || selector.pendingBuildIdentity !== input.targetBuildIdentity
+    || selector.previousDigest !== input.sourceSelectorDigest) {
+    fail('AUTHORITY_HANDOFF_RESERVATION_CONFLICT',
+      'V1 pending handoff reservation recovery does not match the exact pending authority selector.');
+  }
+  const reservationInput = {
+    handoffId: input.handoffId,
+    sourceSelectorDigest: input.sourceSelectorDigest,
+    targetBuildIdentity: input.targetBuildIdentity,
+  };
+  const current = await readAuthorityHandoffReservationUnlocked(store);
+  if (current?.state === 'CONSUMED') {
+    if (!reservationMatches(current, reservationInput) || current.pendingSelectorDigest !== selector.digest) {
+      fail('AUTHORITY_HANDOFF_RESERVATION_CONFLICT',
+        'Existing consumed handoff reservation does not match the exact pending authority selector.');
+    }
+    return current;
+  }
+  let prepared = current;
+  if (prepared?.state === 'PREPARED') {
+    if (!reservationMatches(prepared, reservationInput)) {
+      fail('AUTHORITY_HANDOFF_RESERVATION_HELD',
+        `Handoff reservation is already held by ${prepared.handoffId}.`);
+    }
+  } else {
+    prepared = await persistAuthorityHandoffReservationUnlocked(store, {
+      revision: (current?.revision ?? 0) + 1,
+      previousDigest: current?.digest ?? null,
+      state: 'PREPARED',
+      handoffId: input.handoffId,
+      sourceSelectorDigest: input.sourceSelectorDigest,
+      targetBuildIdentity: input.targetBuildIdentity,
+      preparedAt: timestamp(store),
+      consumedAt: null,
+      pendingSelectorDigest: null,
+    });
+  }
+  return consumeAuthorityHandoffReservationUnlocked(store, selector, reservationInput);
+}
+
+// Callers that need to commit another durable fence against selector identity
+// must take this global lock rather than attempting an unlocked read/commit.
+// The callback deliberately receives only a clone, so selector mutation still
+// has to use the normal authority transition APIs and their coordinator fence.
+export async function withReleaseAuthoritySelectorFence(store, expectedDigest, operation) {
+  if (!DIGEST_PATTERN.test(expectedDigest ?? '')) {
+    fail('AUTHORITY_SELECTOR_CONFLICT', 'Release-authority selector fence requires an exact selector digest.');
+  }
+  if (typeof operation !== 'function') {
+    fail('AUTHORITY_SELECTOR_CONFLICT', 'Release-authority selector fence requires an operation.');
+  }
+  return withDirectoryLock(store.storage, globalLockPath(store), async () => {
+    const selector = await readAuthoritySelectorUnlocked(store);
+    if (selector.digest !== expectedDigest) {
+      fail('AUTHORITY_SELECTOR_CONFLICT', 'Release-authority selector changed before the fenced operation.');
+    }
+    return operation(clone(selector), Object.freeze({
+      reserveBuildHandoff: (input) => reserveAuthorityHandoffUnlocked(store, selector, input),
+      recoverV1PendingBuildHandoff: (input) => recoverV1PendingAuthorityHandoffReservationUnlocked(store, selector, input),
+    }));
+  });
+}
+
 export async function readReleaseAuthorityContext(store, { requireActive = false } = {}) {
   const selector = await readAuthoritySelectorUnlocked(store);
   if (requireActive && selector.phase !== 'ACTIVE') {
@@ -2121,6 +2459,11 @@ export async function readReleaseAuthorityContext(store, { requireActive = false
 async function transitionReleaseAuthorityUnlocked(store, coordinator, input = {}) {
     await validateCoordinator(store, coordinator);
     const current = await readAuthoritySelectorUnlocked(store);
+    const reservation = await readAuthorityHandoffReservationUnlocked(store);
+    if (reservation?.state === 'PREPARED') {
+      fail('AUTHORITY_HANDOFF_RESERVATION_HELD',
+        `Release-authority transition is fenced by prepared handoff ${reservation.handoffId}.`);
+    }
     if (input.expectedSelectorDigest !== current.digest) {
       fail('AUTHORITY_SELECTOR_CONFLICT', 'Release-authority selector changed before the requested transition.');
     }
@@ -2284,6 +2627,11 @@ export function prequalifyReleaseAuthorityBuild(store, coordinator, input = {}) 
   return withDirectoryLock(store.storage, globalLockPath(store), async () => {
     await validateCoordinator(store, coordinator);
     const current = await readAuthoritySelectorUnlocked(store);
+    const reservation = await readAuthorityHandoffReservationUnlocked(store);
+    if (reservation?.state === 'PREPARED') {
+      fail('AUTHORITY_HANDOFF_RESERVATION_HELD',
+        `Build prequalification is fenced by prepared handoff ${reservation.handoffId}.`);
+    }
     const targetBuildIdentity = input.targetBuildIdentity;
     if (current.phase !== 'ACTIVE' || current.activationEpoch !== 1
       || current.pendingBuildIdentity !== null
@@ -2396,21 +2744,56 @@ export function prequalifyReleaseAuthorityBuild(store, coordinator, input = {}) 
 
 export function beginReleaseAuthorityBuildHandoff(store, coordinator, input = {}) {
   return withDirectoryLock(store.storage, globalLockPath(store), async () => {
-    await validateCoordinator(store, coordinator);
     const current = await readAuthoritySelectorUnlocked(store);
+    safeId(input.handoffId, 'handoffId');
+    if (typeof input.targetBuildIdentity !== 'string' || !input.targetBuildIdentity
+      || !DIGEST_PATTERN.test(input.expectedSelectorDigest ?? '')) {
+      fail('AUTHORITY_HANDOFF_TARGET_UNQUALIFIED', 'Build handoff requires a distinct target and exact source selector digest.');
+    }
+    const reservationInput = {
+      handoffId: input.handoffId,
+      sourceSelectorDigest: input.expectedSelectorDigest,
+      targetBuildIdentity: input.targetBuildIdentity,
+    };
+    if (current.phase === 'PROMOTION_DISABLED') {
+      if (current.handoffId !== input.handoffId || current.pendingBuildIdentity !== input.targetBuildIdentity) {
+        fail('AUTHORITY_HANDOFF_INVALID', 'Durable pending authority does not match this build handoff.');
+      }
+      if (current.previousDigest !== input.expectedSelectorDigest) {
+        fail('AUTHORITY_HANDOFF_RESERVATION_CONFLICT',
+          'Durable pending authority does not preserve this handoff source selector.');
+      }
+      const reservation = await readAuthorityHandoffReservationUnlocked(store);
+      if (reservation?.state === 'CONSUMED') {
+        if (!reservationMatches(reservation, reservationInput) || reservation.pendingSelectorDigest !== current.digest) {
+          fail('AUTHORITY_HANDOFF_RESERVATION_CONFLICT',
+            'Consumed handoff reservation does not match the pending authority selector.');
+        }
+        return clone(current);
+      }
+      // Only an exact already-CONSUMED replay may be coordinator-free. A
+      // pending selector that still needs its PREPARED reservation consumed
+      // must be owned by the live pending-target coordinator.
+      await validateCoordinator(store, coordinator);
+      await consumeAuthorityHandoffReservationUnlocked(store, current, reservationInput);
+      return clone(current);
+    }
+    await validateCoordinator(store, coordinator);
     if (current.digest !== input.expectedSelectorDigest) {
       fail('AUTHORITY_SELECTOR_CONFLICT', 'Release-authority selector changed before build handoff.');
     }
-    safeId(input.handoffId, 'handoffId');
     if (current.phase !== 'ACTIVE' || current.activationEpoch !== 1 || current.pendingBuildIdentity !== null
       || store.buildIdentity !== current.activeBuildIdentity) {
       fail('AUTHORITY_HANDOFF_INVALID', 'Build handoff must begin from the active source build.');
     }
-    if (typeof input.targetBuildIdentity !== 'string' || !input.targetBuildIdentity
-      || input.targetBuildIdentity === current.activeBuildIdentity
+    if (input.targetBuildIdentity === current.activeBuildIdentity
       || !current.prequalifiedRollbackBuilds.includes(input.targetBuildIdentity)) {
       fail('AUTHORITY_HANDOFF_TARGET_UNQUALIFIED', 'Build handoff target must be a distinct prequalified build.');
     }
+    // Do not publish a pending selector until the durable PREPARED reservation
+    // has been proven.  This makes an interrupted/legacy prepare fail closed
+    // without stranding authority in PROMOTION_DISABLED.
+    await requirePreparedAuthorityHandoffReservationUnlocked(store, reservationInput);
     const next = sealAuthoritySelector({
       ...current,
       phase: 'PROMOTION_DISABLED',
@@ -2421,6 +2804,8 @@ export function beginReleaseAuthorityBuildHandoff(store, coordinator, input = {}
       updatedAt: nextTimestamp(store, current.updatedAt),
     });
     await atomicWriteJson(store.storage, authoritySelectorPath(store), next);
+    await input.hooks?.afterPendingSelectorWritten?.(clone(next));
+    await consumeAuthorityHandoffReservationUnlocked(store, next, reservationInput);
     return clone(next);
   });
 }
