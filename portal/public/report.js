@@ -23,6 +23,8 @@ const state = {
   detailController: null,
   logController: null,
   aiController: null,
+  sharedFailureController: null,
+  sharedFailureGeneration: 0,
   aiRetryTimer: null,
   aiAdvisory: null,
   retryTimer: null,
@@ -143,6 +145,7 @@ function bindEvents() {
 
 function abortRequests() {
   state.reportController?.abort();
+  state.sharedFailureController?.abort();
   state.auditsController?.abort();
   state.detailController?.abort();
   state.logController?.abort();
@@ -283,6 +286,7 @@ async function loadLegacyReport() {
 async function loadSharedReport({ focus = false } = {}) {
   window.clearTimeout(state.retryTimer);
   state.reportController?.abort();
+  state.sharedFailureController?.abort();
   const controller = new AbortController();
   state.reportController = controller;
   elements.report_content.dataset.authority = 'shared';
@@ -302,6 +306,9 @@ async function loadSharedReport({ focus = false } = {}) {
     }), { runId: state.runId, mode: state.mode });
     if (controller.signal.aborted) return;
     renderSharedReport(workspace);
+    if (state.mode === 'single-site') {
+      void loadSharedProductFailures({ offset: 0, expectedStateRevision: workspace.stateRevision });
+    }
     elements.report_connection.textContent = `Shared run revision ${workspace.publication.runRevision} loaded`;
     announce(`${workspace.publication.decision.label}. Risk Register ${workspace.riskAvailability}. Run revision ${workspace.publication.runRevision}.`);
     if (focus) elements.report_product_risk_title.focus();
@@ -389,6 +396,8 @@ function renderSharedReport(workspace) {
     textNode('p', 'Site Health remains a separate diagnostic truth. It is not inferred from, and cannot replace, the scope-qualified Release Decision.'),
   );
 
+  const failureDetail = state.mode === 'single-site' ? renderSharedFailureShell() : null;
+
   const register = document.createElement('section');
   register.id = 'report-risk-register';
   register.className = 'report-risk-register';
@@ -432,7 +441,293 @@ function renderSharedReport(workspace) {
   elements.context_elapsed.textContent = 'Current revision';
   elements.context_production.closest('.context-wide').hidden = true;
   elements.context_candidate.closest('.context-wide').hidden = true;
-  elements.report_shared_authority.replaceChildren(decisionCard, siteHealth, register, operations, pipeline, actionCopy, actions);
+  elements.report_shared_authority.replaceChildren(
+    decisionCard,
+    siteHealth,
+    ...(failureDetail ? [failureDetail] : []),
+    register,
+    operations,
+    pipeline,
+    actionCopy,
+    actions,
+  );
+}
+
+function renderSharedFailureShell() {
+  const section = document.createElement('section');
+  section.id = 'report-product-failures';
+  section.className = 'report-product-failures';
+  section.setAttribute('aria-busy', 'true');
+  const heading = document.createElement('div');
+  heading.className = 'report-failure-heading';
+  const copy = document.createElement('div');
+  copy.append(
+    textNode('h3', 'Terminal product failures'),
+    textNode('p', 'Canonical failed assertions, affected targets, and bounded evidence links. These failures block the covered feature scope.'),
+  );
+  const status = textNode('span', 'Loading failure detail…');
+  status.className = 'report-failure-status';
+  status.setAttribute('role', 'status');
+  status.setAttribute('aria-live', 'polite');
+  heading.append(copy, status);
+  const body = document.createElement('div');
+  body.className = 'report-failure-list';
+  const loading = textNode('p', 'Reading a bounded page of canonical failure evidence…');
+  loading.className = 'report-failure-loading';
+  body.append(loading);
+  const controls = document.createElement('nav');
+  controls.className = 'report-failure-pagination';
+  controls.setAttribute('aria-label', 'Product failure pages');
+  controls.hidden = true;
+  section.append(heading, body, controls);
+  return section;
+}
+
+async function loadSharedProductFailures({ offset = 0, expectedStateRevision } = {}) {
+  const section = document.querySelector('#report-product-failures');
+  if (!section || state.mode !== 'single-site') return;
+  if (!Number.isSafeInteger(expectedStateRevision) || expectedStateRevision < 1) {
+    throw new Error('The shared report did not provide a valid failure-detail revision fence.');
+  }
+  const status = section.querySelector('.report-failure-status');
+  const body = section.querySelector('.report-failure-list');
+  const controls = section.querySelector('.report-failure-pagination');
+  const currentVisible = Boolean(body.querySelector('.report-failure-card, .report-failure-empty'));
+  const generation = ++state.sharedFailureGeneration;
+  state.sharedFailureController?.abort();
+  const controller = new AbortController();
+  state.sharedFailureController = controller;
+  section.setAttribute('aria-busy', 'true');
+  section.dataset.refreshing = 'true';
+  status.textContent = currentVisible ? 'Loading another bounded page…' : 'Loading failure detail…';
+  controls.querySelectorAll('button').forEach((button) => { button.disabled = true; });
+  if (!currentVisible) {
+    const loading = textNode('p', 'Reading a bounded page of canonical failure evidence…');
+    loading.className = 'report-failure-loading';
+    body.replaceChildren(loading);
+    controls.hidden = true;
+  }
+  try {
+    const query = new URLSearchParams({
+      offset: String(offset),
+      limit: '20',
+      expectedStateRevision: String(expectedStateRevision),
+    });
+    const page = assertSharedFailurePage(await fetchJson(`${apiPath('/report/failures')}?${query}`, {
+      signal: controller.signal,
+      timeoutMs: 30_000,
+    }), { expectedStateRevision });
+    if (controller.signal.aborted || generation !== state.sharedFailureGeneration || !section.isConnected) return;
+    renderSharedProductFailurePage(section, page);
+    announce(page.total === 0
+      ? 'No terminal product failures were published for this run.'
+      : `Loaded product failures ${page.offset + 1} through ${page.offset + page.items.length} of ${page.total}.`);
+  } catch (error) {
+    if (controller.signal.aborted || generation !== state.sharedFailureGeneration || !section.isConnected) return;
+    if (error?.status === 409 && error?.code === 'SINGLE_SITE_REPORT_REVISION_STALE') {
+      status.textContent = 'Run revision changed · reloading the decision, Risk Register, and failures together…';
+      announce('The run changed while failure detail was loading. Reloading the complete shared report at one revision.');
+      void loadSharedReport();
+      return;
+    }
+    const message = `Failure detail unavailable · ${friendlyError(error)}`;
+    status.textContent = message;
+    if (!currentVisible) {
+      const unavailable = textNode('p', 'The release decision and Risk Register remain available, but canonical failed-assertion detail could not be loaded. Retry this page before acting on the failure list.');
+      unavailable.className = 'report-failure-unavailable';
+      body.replaceChildren(unavailable);
+      controls.hidden = true;
+    } else {
+      controls.querySelectorAll('button').forEach((button) => { button.disabled = false; });
+    }
+    announce(message);
+  } finally {
+    if (generation === state.sharedFailureGeneration && section.isConnected) {
+      section.setAttribute('aria-busy', 'false');
+      delete section.dataset.refreshing;
+    }
+    if (state.sharedFailureController === controller) state.sharedFailureController = null;
+  }
+}
+
+function assertSharedFailurePage(value, { expectedStateRevision } = {}) {
+  const valid = value && typeof value === 'object' && !Array.isArray(value)
+    && value.schemaVersion === 1 && value.mode === 'single-site' && value.runId === state.runId
+    && value.stateRevision === expectedStateRevision
+    && Number.isSafeInteger(value.total) && value.total >= 0
+    && Number.isSafeInteger(value.offset) && value.offset >= 0
+    && Number.isSafeInteger(value.limit) && value.limit >= 1 && value.limit <= 25
+    && Array.isArray(value.items) && value.items.length <= value.limit
+    && typeof value.hasMore === 'boolean' && typeof value.hasPrevious === 'boolean';
+  if (!valid) throw new Error('The canonical failure-detail page has an invalid bounded response.');
+  for (const item of value.items) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)
+      || typeof item.workItemId !== 'string' || typeof item.auditId !== 'string'
+      || typeof item.caseId !== 'string' || typeof item.targetId !== 'string'
+      || item.state !== 'completed_product_failure' || item.releaseEffect !== 'blocking'
+      || typeof item.assertionMessage !== 'string' || !Array.isArray(item.findings)
+      || !Number.isSafeInteger(item.findingCount) || item.findingCount < 0
+      || !Number.isSafeInteger(item.findingsShown) || item.findingsShown !== item.findings.length
+      || !Number.isSafeInteger(item.findingsOmitted) || item.findingsOmitted < 0
+      || item.findingCount !== item.findingsShown + item.findingsOmitted
+      || item.findingsTruncated !== (item.findingsOmitted > 0)
+      || !Array.isArray(item.evidence)) {
+      throw new Error('The canonical failure-detail page contains an invalid execution row.');
+    }
+  }
+  return value;
+}
+
+function renderSharedProductFailurePage(section, page) {
+  const status = section.querySelector('.report-failure-status');
+  const body = section.querySelector('.report-failure-list');
+  const controls = section.querySelector('.report-failure-pagination');
+  if (page.items.length === 0) {
+    const empty = textNode('p', 'No terminal product failures are published for this run revision.');
+    empty.className = 'report-failure-empty';
+    body.replaceChildren(empty);
+    status.textContent = `0 failures · run revision ${page.stateRevision}`;
+  } else {
+    body.replaceChildren(...page.items.map(renderSharedProductFailure));
+    status.textContent = `${page.offset + 1}–${page.offset + page.items.length} of ${page.total} failures · run revision ${page.stateRevision}`;
+  }
+  const previous = textNode('button', 'Previous failures');
+  previous.type = 'button';
+  previous.className = 'secondary-button';
+  previous.disabled = !page.hasPrevious;
+  previous.addEventListener('click', () => void loadSharedProductFailures({
+    offset: page.previousOffset,
+    expectedStateRevision: page.stateRevision,
+  }));
+  const showing = textNode('span', page.items.length
+    ? `Showing ${page.offset + 1}–${page.offset + page.items.length} of ${page.total}`
+    : 'No failures');
+  showing.className = 'muted';
+  const next = textNode('button', 'Next failures');
+  next.type = 'button';
+  next.className = 'secondary-button';
+  next.disabled = !page.hasMore;
+  next.addEventListener('click', () => void loadSharedProductFailures({
+    offset: page.nextOffset,
+    expectedStateRevision: page.stateRevision,
+  }));
+  controls.replaceChildren(previous, showing, next);
+  controls.hidden = page.total <= page.limit;
+}
+
+function renderSharedProductFailure(item) {
+  const card = document.createElement('article');
+  card.className = 'report-failure-card';
+  card.dataset.severity = item.severity ?? 'unrated';
+  const heading = document.createElement('div');
+  heading.className = 'report-failure-card-heading';
+  const identity = document.createElement('div');
+  const title = textNode('h4', `${item.auditId} · ${item.auditTitle || item.auditId}`);
+  const ids = textNode('p', `${item.caseId} · ${item.targetId}`);
+  ids.className = 'report-failure-identities';
+  identity.append(title, ids);
+  const risk = textNode('strong', `${item.severity ?? 'UNRATED'} · BLOCKING PRODUCT FAILURE`);
+  risk.className = 'report-failure-risk';
+  heading.append(identity, risk);
+
+  const assertion = document.createElement('section');
+  assertion.className = 'report-failure-assertion';
+  assertion.append(textNode('h5', 'Failed assertion'));
+  const assertionCopy = textNode('pre', item.assertionMessage);
+  assertionCopy.title = item.assertionTruncated ? 'Bounded assertion prefix; open Error context for the complete canonical artifact.' : '';
+  assertion.append(assertionCopy);
+
+  const facts = document.createElement('dl');
+  facts.className = 'report-failure-facts';
+  facts.append(
+    failureFact('Affected URL', reportFailureExternalLink(item.url, 'No exact page URL was published.')),
+    failureFact('Target', `${item.targetId} · ${item.targetRole}`),
+    failureFact('Execution state', humanize(item.state)),
+    failureFact('Evidence policy', item.evidencePolicy
+      ? `${humanize(item.evidencePolicy.mode)} · ${item.evidencePolicy.rationale}`
+      : 'No readable evidence policy was published.'),
+  );
+
+  card.append(heading, assertion, facts);
+  if (item.detailAvailability !== 'complete' && Array.isArray(item.detailLimitations) && item.detailLimitations.length) {
+    const limitation = textNode('p', `Partial detail · ${item.detailLimitations.join(' · ')}`);
+    limitation.className = 'report-failure-limitation';
+    card.append(limitation);
+  }
+  if (item.findings.length) {
+    const findings = document.createElement('section');
+    findings.className = 'report-failure-findings';
+    findings.append(textNode('h5', item.findingsTruncated
+      ? `Recorded findings · showing ${item.findingsShown} of ${item.findingCount} (${item.findingsOmitted} omitted)`
+      : `Recorded findings (${item.findingCount})`));
+    const list = document.createElement('ul');
+    for (const finding of item.findings) {
+      const row = document.createElement('li');
+      row.append(
+        textNode('strong', `${finding.severity ?? 'UNRATED'} · ${finding.title}`),
+        textNode('span', finding.detail),
+      );
+      list.append(row);
+    }
+    findings.append(list);
+    card.append(findings);
+  }
+
+  const links = document.createElement('div');
+  links.className = 'report-failure-evidence';
+  const galleryHref = reportFailurePortalHref(item.galleryUrl, '/gallery.html');
+  if (galleryHref) links.append(reportFailureLink(galleryHref, 'Open matching gallery evidence'));
+  for (const artifact of item.evidence) {
+    const href = reportFailurePortalHref(artifact.url, '/artifacts/');
+    if (!href) continue;
+    const size = artifact.bytes === null ? '' : ` · ${formatBytes(artifact.bytes)}`;
+    links.append(reportFailureLink(href, `${artifact.name}${size}`));
+  }
+  if (links.childElementCount === 0) links.append(textNode('span', 'No canonical evidence links were published.'));
+  card.append(links);
+  return card;
+}
+
+function failureFact(label, value) {
+  const row = document.createElement('div');
+  row.append(textNode('dt', label));
+  const detail = document.createElement('dd');
+  if (value instanceof Node) detail.append(value);
+  else detail.textContent = String(value);
+  row.append(detail);
+  return row;
+}
+
+function reportFailureExternalLink(value, fallback) {
+  if (typeof value !== 'string') return fallback;
+  try {
+    const url = new URL(value);
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return fallback;
+    return reportFailureLink(url.href, url.href);
+  } catch {
+    return fallback;
+  }
+}
+
+function reportFailurePortalHref(value, requiredPrefix) {
+  if (typeof value !== 'string') return null;
+  try {
+    const url = new URL(value, window.location.origin);
+    if (url.origin !== window.location.origin || url.username || url.password || url.hash
+      || !url.pathname.startsWith(requiredPrefix)) return null;
+    return `${url.pathname}${url.search}`;
+  } catch {
+    return null;
+  }
+}
+
+function reportFailureLink(href, label) {
+  const link = document.createElement('a');
+  link.href = href;
+  link.target = '_blank';
+  link.rel = 'noopener';
+  link.textContent = label;
+  return link;
 }
 
 function renderRiskTable(risks) {
@@ -1691,7 +1986,12 @@ async function fetchJson(url, { signal, timeoutMs = 30_000, ...requestOptions } 
       },
     });
     const value = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(value.error ?? `Request failed with HTTP ${response.status}.`);
+    if (!response.ok) {
+      const error = new Error(value.error ?? `Request failed with HTTP ${response.status}.`);
+      error.status = response.status;
+      error.code = typeof value.code === 'string' ? value.code : null;
+      throw error;
+    }
     return value;
   } finally {
     window.clearTimeout(timeout);

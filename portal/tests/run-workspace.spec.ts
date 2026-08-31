@@ -252,7 +252,9 @@ test.describe('run-workspace', () => {
         if (url.pathname === `${root}/rekick` && request.method() === 'POST') {
           expect(request.headers()['x-audit-csrf']).toBe('csrf-fixture');
           expect(request.headers()['idempotency-key']).toBeTruthy();
-          expect((await request.postDataJSON()).workItemIds).toEqual(['work-incomplete']);
+          const body = await request.postDataJSON();
+          expect(body.workItemIds).toEqual(['work-incomplete']);
+          expect(body.expectedRunRevision).toBe(revision + 10);
           operationAccepted = true;
           return route.fulfill({ status: 202, json: { schemaVersion: 1, data: {
             operationId: 'a'.repeat(64), state: 'accepted', statusUrl: `${root}/operations/${'a'.repeat(64)}`,

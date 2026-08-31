@@ -801,7 +801,7 @@ function initializeRunWorkspace(root) {
     productRiskStatus.textContent = 'Submitting a durable shared operation…';
     try {
       const accepted = await sharedControl.mutate(currentRunId, kind, {
-        expectedRunRevision: sharedWorkspace.publication.runRevision, body, requestId,
+        expectedRunRevision: sharedWorkspace.stateRevision, body, requestId,
       });
       if (accepted.statusUrl) {
         const operationId = accepted.operationId ?? accepted.statusUrl.split('/').at(-1);

@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { canonicalDigest } from '../shared/canonical-contract.mjs';
 import { sealReleaseSubjectCore } from '../shared/release-subject.mjs';
+import { sealWorkItemEvidenceMember } from '../shared/work-item-evidence-index.mjs';
 import { openScopedCredentialAuthority } from '../portal/scoped-credential-authority.mjs';
 import {
   acquireCoordinator,
@@ -23,6 +24,16 @@ import {
 import { initializeCutoverAdmissionGate } from './lib/shared-cutover-orchestrator.mjs';
 import { initializeLegacyAuthorityFence } from './lib/legacy-authority-fence.mjs';
 import { initializeSharedAuthorityFloor } from './lib/shared-authority-floor.mjs';
+import { sharedParentExecutionTerminal } from '../portal/shared-single-site-gallery.mjs';
+
+assert.equal(sharedParentExecutionTerminal({
+  status: 'active', compilationState: 'sealed', compilationFailure: null, compilationBarrier: null,
+  workItems: { one: { state: 'completed_pass' }, two: { state: 'completed_product_failure' } },
+}), true, 'an active parent state is execution-terminal once compilation and every work item are terminal');
+assert.equal(sharedParentExecutionTerminal({
+  compilationState: 'sealed', compilationFailure: null, compilationBarrier: null,
+  workItems: { one: { state: 'completed_pass' }, two: { state: 'running' } },
+}), false, 'one non-terminal work item keeps the shared gallery live');
 
 const root = await mkdtemp(path.join(tmpdir(), 'shared-portal-read-auth-'));
 let portal = null;
@@ -152,6 +163,66 @@ try {
     ['Logs/stdout.txt', 'uppercase-directory-log'],
     ['evidence/worker.LOG', 'uppercase-suffix-log'],
   ];
+  const sharedGalleryPng = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+    'base64',
+  );
+  const sharedGalleryVideo = Buffer.from('canonical-playwright-interaction-video');
+  const sharedGalleryCapturePath = 'playwright/raw/hero-state.png';
+  const sharedGalleryVideoPath = 'playwright/raw/video.webm';
+  const sharedGalleryMetadataPath = 'playwright/inline/row-1/gallery-capture.json';
+  const sharedGalleryAuditPath = 'playwright/row-1/audit-result.json';
+  const sharedGalleryRowsPath = 'playwright/work-item-rows.json';
+  const sharedGalleryMetadata = Buffer.from(JSON.stringify({
+    schemaVersion: 1,
+    attachmentName: 'hero-state',
+    attachmentOccurrence: 0,
+    attachmentKey: 'hero-state',
+    capturedAt: timestamp,
+    route: '/release-check',
+    observedState: 'The release-check hero is visible.',
+    rationale: 'Verify the primary release-check layout.',
+    viewport: { width: 1440, height: 900 },
+  }));
+  const sharedGalleryAudit = Buffer.from(JSON.stringify({
+    schemaVersion: 1,
+    auditId: 'SITE-001',
+    caseId: 'SITE-001::hero-state',
+    findings: [],
+    steps: [
+      { kind: 'interaction', description: 'Activate the release-check navigation.' },
+      { kind: 'assertion', description: 'The primary hero rendered.' },
+    ],
+  }));
+  const sharedGalleryRows = Buffer.from(JSON.stringify({
+    schemaVersion: 1,
+    kind: 'shared-work-item-rows',
+    workItemId: 'work-shared-op-0001',
+    executionDescriptorDigest: null,
+    rows: [{
+      row: 1,
+      title: 'Release-check hero renders',
+      projectName: 'audited-desktop',
+      caseId: 'SITE-001::hero-state',
+      entrySpec: 'tests/smoke.spec.ts',
+      status: 'passed',
+      retry: 0,
+      evidencePolicy: {
+        mode: 'interaction-video',
+        rationale: 'Record the release-check navigation action and resulting hero state.',
+      },
+      attachments: [
+        { name: 'hero-state', contentType: 'image/png', path: sharedGalleryCapturePath },
+        { name: 'video', contentType: 'video/webm', path: sharedGalleryVideoPath },
+        {
+          name: 'gallery-capture-metadata-hero-state-0',
+          contentType: 'application/vnd.quitting7oh.gallery-capture+json',
+          path: sharedGalleryMetadataPath,
+        },
+        { name: 'audit-result', contentType: 'application/json', path: sharedGalleryAuditPath },
+      ],
+    }],
+  }));
   const sharedInbox = await publishAttemptEvidence(sharedStore, sharedRunId, sharedLease, {
     outcome: 'completed_pass',
     reason: 'Shared artifact delivery fixture completed.',
@@ -160,6 +231,21 @@ try {
       bufferedArtifact('evidence/active.html', 'text/html', sharedActiveBytes),
       bufferedArtifact('evidence/declared-active.png', 'text/html', sharedDeclaredActiveBytes),
       bufferedArtifact('evidence/suffix-active.html', 'application/octet-stream', sharedSuffixActiveBytes),
+      bufferedArtifact(sharedGalleryCapturePath, 'image/png', sharedGalleryPng),
+      bufferedArtifact(sharedGalleryVideoPath, 'video/webm', sharedGalleryVideo, {
+        workItemId: 'work-shared-op-0001',
+        executionDescriptorDigest: sharedSubjectCore.digest,
+        ordinal: 6,
+        logicalName: 'video',
+        purpose: 'primary',
+      }),
+      bufferedArtifact(
+        sharedGalleryMetadataPath,
+        'application/vnd.quitting7oh.gallery-capture+json',
+        sharedGalleryMetadata,
+      ),
+      bufferedArtifact(sharedGalleryAuditPath, 'application/json', sharedGalleryAudit),
+      bufferedArtifact(sharedGalleryRowsPath, 'application/json', sharedGalleryRows),
       ...sharedRawLogs.map(([name, content]) => bufferedArtifact(name, 'text/plain', Buffer.from(content))),
     ],
   });
@@ -255,10 +341,10 @@ try {
   portal = await startPortal({ environment, origin });
 
   const viewerAllCookie = await browserLogin(origin, viewerAll.credential);
-  await waitForConsoleRun(origin, viewerAllCookie.cookie, sharedRunId);
+  await waitForConsoleRun(origin, viewerAllCookie.cookie, sharedRunId, { portalStderr: portal.stderr });
   const postStartupRunId = 'shared-refresh-zz-new';
   await createConsoleDiscoveryFixture(sharedStore, sharedSubjectCore, postStartupRunId);
-  await waitForConsoleRun(origin, viewerAllCookie.cookie, postStartupRunId);
+  await waitForConsoleRun(origin, viewerAllCookie.cookie, postStartupRunId, { portalStderr: portal.stderr });
 
   const sharedOperatorCookie = await browserLogin(origin, operator.credential);
   for (const { method, pathname } of [
@@ -321,8 +407,8 @@ try {
   });
   const sharedList = await sharedListResponse.json();
   assert.equal(sharedListResponse.status, 200, JSON.stringify(sharedList));
-  assert.equal(sharedList.total, 4);
-  assert.equal(sharedList.files.length, 4);
+  assert.equal(sharedList.total, 9);
+  assert.equal(sharedList.files.length, 9);
   assert.equal(sharedList.files.some(({ relativePath }) => relativePath !== undefined), false,
     'shared artifact listings must not disclose canonical store paths');
   const sharedCanaryUrl = `/artifacts/${sharedRunId}/work-items/work-shared-op-0001/${encodeURIComponent(sharedCanaryDescriptor.artifactKey)}`;
@@ -334,6 +420,79 @@ try {
   assert.equal(sharedSingleSiteListResponse.status, 200, JSON.stringify(sharedSingleSiteList));
   assert.equal(sharedSingleSiteList.files.find(({ memberDigest }) => memberDigest === sharedCanary.memberDigest)?.url,
     sharedCanaryUrl, 'Single-site compatibility reads emit the same mode-neutral canonical URL');
+  const sharedGalleryHeadResponse = await fetch(`${origin}/api/single-site/runs/${sharedRunId}/gallery`, {
+    headers: { Cookie: viewerACookie.cookie },
+  });
+  const sharedGalleryHead = await sharedGalleryHeadResponse.json();
+  assert.equal(sharedGalleryHeadResponse.status, 200, JSON.stringify(sharedGalleryHead));
+  assert.match(sharedGalleryHead.publicationRevision, /^[a-f0-9]{32}$/u);
+  assert.equal(sharedGalleryHead.phase, 'live', 'pending compilation keeps an otherwise completed fixture live');
+  assert.equal(sharedGalleryHead.lifecycle.terminal, false);
+  assert.deepEqual(sharedGalleryHead.primaryCounts, { total: 2, images: 1, videos: 1 });
+  assert.deepEqual(sharedGalleryHead.caseMapping, {
+    known: 2,
+    unknown: 0,
+    source: 'canonical-work-item-identity',
+  });
+  assert.equal(sharedGalleryHead.unmappedCoverageGapCount, 0);
+  const sharedGalleryItemsResponse = await fetch(
+    `${origin}/api/single-site/runs/${sharedRunId}/gallery/items?offset=0&limit=2&revision=${sharedGalleryHead.publicationRevision}`,
+    { headers: { Cookie: viewerACookie.cookie } },
+  );
+  const sharedGalleryItems = await sharedGalleryItemsResponse.json();
+  assert.equal(sharedGalleryItemsResponse.status, 200, JSON.stringify(sharedGalleryItems));
+  assert.equal(sharedGalleryItems.items.length, 2);
+  assert.equal(sharedGalleryItems.offset, 0);
+  assert.equal(sharedGalleryItems.limit, 2);
+  assert.equal(sharedGalleryItems.hasMore, false);
+  assert.equal(sharedGalleryItems.nextOffset, 2);
+  const sharedGalleryItem = sharedGalleryItems.items.find(({ kind }) => kind === 'image');
+  const sharedGalleryVideoItem = sharedGalleryItems.items.find(({ kind }) => kind === 'video');
+  assert.ok(sharedGalleryItem && sharedGalleryVideoItem,
+    'canonical primary Playwright video joins metadata-backed screenshots');
+  assert.equal(sharedGalleryItem.route, '/release-check');
+  assert.equal(sharedGalleryItem.current.sha256, `sha256:${createHash('sha256').update(sharedGalleryPng).digest('hex')}`);
+  assert.equal(sharedGalleryVideoItem.caseId, 'SITE-001::hero-state');
+  assert.equal(sharedGalleryVideoItem.caseIdSource, 'canonical-work-item-row');
+  assert.equal(sharedGalleryVideoItem.targetId, 'audited-desktop');
+  assert.deepEqual(sharedGalleryVideoItem.evidencePolicy, {
+    mode: 'interaction-video',
+    rationale: 'Record the release-check navigation action and resulting hero state.',
+  });
+  assert.equal(sharedGalleryVideoItem.current.sha256,
+    `sha256:${createHash('sha256').update(sharedGalleryVideo).digest('hex')}`);
+  const sharedGalleryDetailResponse = await fetch(
+    `${origin}/api/single-site/runs/${sharedRunId}/gallery/items/${sharedGalleryItem.itemId}?revision=${sharedGalleryHead.publicationRevision}`,
+    { headers: { Cookie: viewerACookie.cookie } },
+  );
+  const sharedGalleryDetail = await sharedGalleryDetailResponse.json();
+  assert.equal(sharedGalleryDetailResponse.status, 200, JSON.stringify(sharedGalleryDetail));
+  assert.equal(sharedGalleryDetail.item.itemId, sharedGalleryItem.itemId);
+  const sharedGalleryMediaResponse = await fetch(
+    `${origin}/api/single-site/runs/${sharedRunId}/gallery/items/${sharedGalleryItem.itemId}/media/current`,
+    { headers: { Cookie: viewerACookie.cookie } },
+  );
+  assert.equal(sharedGalleryMediaResponse.status, 200);
+  assert.deepEqual(Buffer.from(await sharedGalleryMediaResponse.arrayBuffer()), sharedGalleryPng);
+  const sharedGalleryVideoMediaResponse = await fetch(
+    `${origin}/api/single-site/runs/${sharedRunId}/gallery/items/${sharedGalleryVideoItem.itemId}/media/current`,
+    { headers: { Cookie: viewerACookie.cookie } },
+  );
+  assert.equal(sharedGalleryVideoMediaResponse.status, 200);
+  assert.equal(sharedGalleryVideoMediaResponse.headers.get('content-type'), 'video/webm');
+  assert.deepEqual(Buffer.from(await sharedGalleryVideoMediaResponse.arrayBuffer()), sharedGalleryVideo);
+  const sharedGalleryOversizePage = await fetch(
+    `${origin}/api/single-site/runs/${sharedRunId}/gallery/items?offset=0&limit=101`,
+    { headers: { Cookie: viewerACookie.cookie } },
+  );
+  assert.equal(sharedGalleryOversizePage.status, 400, await sharedGalleryOversizePage.text());
+  const sharedGalleryStaleRevisionResponse = await fetch(
+    `${origin}/api/single-site/runs/${sharedRunId}/gallery/items?revision=${'0'.repeat(32)}`,
+    { headers: { Cookie: viewerACookie.cookie } },
+  );
+  const sharedGalleryStaleRevision = await sharedGalleryStaleRevisionResponse.json();
+  assert.equal(sharedGalleryStaleRevisionResponse.status, 409, JSON.stringify(sharedGalleryStaleRevision));
+  assert.equal(sharedGalleryStaleRevision.code, 'SINGLE_SITE_GALLERY_REVISION_STALE');
   const sharedArtifact = await fetch(`${origin}${sharedCanaryUrl}`, { headers: { Cookie: viewerACookie.cookie } });
   const sharedArtifactBody = await sharedArtifact.text();
   assert.equal(sharedArtifact.status, 200, sharedArtifactBody);
@@ -579,13 +738,31 @@ try {
   await rm(root, { recursive: true, force: true });
 }
 
-function bufferedArtifact(name, mediaType, bytes) {
-  return {
+function bufferedArtifact(name, mediaType, bytes, evidence = null) {
+  const artifact = {
     name,
     mediaType,
     sizeBytes: bytes.length,
     digest: `sha256:${createHash('sha256').update(bytes).digest('hex')}`,
     contentBase64: bytes.toString('base64'),
+  };
+  if (evidence === null) return artifact;
+  const member = sealWorkItemEvidenceMember({
+    workItemId: evidence.workItemId,
+    executionDescriptorDigest: evidence.executionDescriptorDigest,
+    ordinal: evidence.ordinal,
+    logicalName: evidence.logicalName,
+    purpose: evidence.purpose,
+    mediaType,
+    sizeBytes: bytes.length,
+    contentDigest: artifact.digest,
+    transportPath: name,
+  });
+  return {
+    ...artifact,
+    logicalName: member.logicalName,
+    purpose: member.purpose,
+    memberDigest: member.memberDigest,
   };
 }
 
@@ -613,7 +790,7 @@ async function createConsoleDiscoveryFixture(store, subjectCore, runId) {
   });
 }
 
-async function waitForConsoleRun(origin, cookie, runId) {
+async function waitForConsoleRun(origin, cookie, runId, { portalStderr = () => '' } = {}) {
   const deadline = Date.now() + 8_000;
   let lastBody = null;
   while (Date.now() < deadline) {
@@ -627,7 +804,15 @@ async function waitForConsoleRun(origin, cookie, runId) {
     if (record) return;
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
-  assert.fail(`Shared run ${runId} did not reach the console index. ${JSON.stringify(lastBody?.limitations ?? [])}`);
+  const backfillDiagnostics = portalStderr().split('\n')
+    .filter((line) => line.includes('[PORTAL_CONSOLE_BACKFILL_REJECTED]'))
+    .slice(-10)
+    .join('\n')
+    .slice(-4_000);
+  assert.fail(
+    `Shared run ${runId} did not reach the console index. ${JSON.stringify(lastBody?.limitations ?? [])}`
+      + (backfillDiagnostics ? '\n' + backfillDiagnostics : ''),
+  );
 }
 
 async function waitForFile(file) {

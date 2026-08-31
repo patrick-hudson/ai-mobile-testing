@@ -45,6 +45,7 @@ import {
 } from '../scripts/lib/shared-cutover-orchestrator.mjs';
 import { openPromotionClaimStore } from '../scripts/lib/promotion-claim-store.mjs';
 import {
+  createSharedStoreFilesystem,
   openSharedRuntimeAuthorityFloor,
   readTrustedStoreMarker,
   sharedStoreBuildIdentity,
@@ -146,6 +147,18 @@ import {
   resolveSingleSiteGalleryMedia,
   singleSiteGalleryHead,
 } from './single-site-gallery.mjs';
+import {
+  isSharedSingleSiteGallerySnapshot,
+  openSharedSingleSiteGallery,
+  pageSharedSingleSiteGalleryItems,
+  readSharedSingleSiteGalleryItem,
+  resolveSharedSingleSiteGalleryMedia,
+  sharedSingleSiteGalleryHead,
+} from './shared-single-site-gallery.mjs';
+import {
+  readSharedSingleSiteFailurePage,
+  SharedSingleSiteReportFailuresError,
+} from './shared-single-site-report-failures.mjs';
 import {
   SingleSiteAiReviewError,
   fenceSingleSiteAiReviewForPurge,
@@ -571,8 +584,10 @@ if (process.env.PORTAL_SHARED_CONTROL === '1') {
   const backupMarker = await readTrustedStoreMarker(process.env.AUDIT_SHARED_BACKUP_MARKER_FILE, 'shared backup marker');
   const buildIdentity = sharedStoreBuildIdentity();
   const authorityFloor = await openSharedRuntimeAuthorityFloor(process.env);
+  const sharedStoreRoot = process.env.AUDIT_SHARED_STORE_ROOT;
   const controlStore = await openParentRunStore({
-    root: process.env.AUDIT_SHARED_STORE_ROOT,
+    root: sharedStoreRoot,
+    filesystem: createSharedStoreFilesystem({ root: sharedStoreRoot }),
     deploymentIdentity: process.env.AUDIT_SHARED_DEPLOYMENT_IDENTITY,
     volumeIdentity: process.env.AUDIT_SHARED_VOLUME_IDENTITY,
     storeMarker,
@@ -2458,6 +2473,37 @@ async function routeRequest(request, response) {
     return sendJson(response, 200, value);
   }
 
+  const sharedSingleSiteFailureReportMatch = pathname.match(/^\/api\/single-site\/runs\/([^/]+)\/report\/failures$/);
+  if (request.method === 'GET' && sharedSingleSiteFailureReportMatch) {
+    const runId = decodeURIComponent(sharedSingleSiteFailureReportMatch[1]);
+    if (!await sharedParentRunExists(runId)) throw httpError(404, 'Canonical shared failure detail was not found.');
+    await request.auditSharedReadGuard?.();
+    return withGalleryRequest(request, response, async (signal) => {
+      try {
+        return sendJson(response, 200, await readSharedSingleSiteFailurePage({
+          store: sharedParentRunStore,
+          runId,
+          auditCatalog: catalog,
+          offset: queryInteger(requestUrl.searchParams.get('offset'), 'offset', 0, 0, 1_000_000),
+          limit: queryInteger(requestUrl.searchParams.get('limit'), 'limit', 20, 1, 25),
+          expectedStateRevision: queryInteger(
+            requestUrl.searchParams.get('expectedStateRevision'),
+            'expectedStateRevision',
+            null,
+            1,
+            Number.MAX_SAFE_INTEGER,
+          ),
+          signal,
+        }));
+      } catch (error) {
+        if (error instanceof SharedSingleSiteReportFailuresError) {
+          throw Object.assign(httpError(error.statusCode, error.message), { code: error.code });
+        }
+        throw error;
+      }
+    });
+  }
+
   const singleSiteReportAuditsMatch = pathname.match(/^\/api\/single-site\/runs\/([^/]+)\/report\/audits$/);
   if (request.method === 'GET' && singleSiteReportAuditsMatch) {
     const jobId = decodeURIComponent(singleSiteReportAuditsMatch[1]);
@@ -2471,7 +2517,7 @@ async function routeRequest(request, response) {
     const jobId = decodeURIComponent(singleSiteGalleryMatch[1]);
     return withGalleryRequest(request, response, async (signal) => {
       const snapshot = await loadPortalSingleSiteGallery(jobId, request, signal);
-      return sendJson(response, 200, singleSiteGalleryHead(snapshot));
+      return sendJson(response, 200, portalSingleSiteGalleryHead(snapshot));
     });
   }
 
@@ -2480,7 +2526,7 @@ async function routeRequest(request, response) {
     const jobId = decodeURIComponent(singleSiteGalleryItemsMatch[1]);
     return withGalleryRequest(request, response, async (signal) => {
       const snapshot = await loadPortalSingleSiteGallery(jobId, request, signal);
-      return sendJson(response, 200, await pageSingleSiteGalleryItems(snapshot, {
+      return sendJson(response, 200, await pagePortalSingleSiteGalleryItems(snapshot, {
         offset: queryInteger(requestUrl.searchParams.get('offset'), 'offset', 0, 0, 10_000),
         limit: queryInteger(requestUrl.searchParams.get('limit'), 'limit', 50, 1, 100),
         revision: requestUrl.searchParams.get('revision') ?? undefined,
@@ -2509,7 +2555,7 @@ async function routeRequest(request, response) {
     const itemId = decodeURIComponent(singleSiteGalleryItemMatch[2]);
     return withGalleryRequest(request, response, async (signal) => {
       const snapshot = await loadPortalSingleSiteGallery(jobId, request, signal);
-      return sendJson(response, 200, await readSingleSiteGalleryItem(snapshot, itemId, {
+      return sendJson(response, 200, await readPortalSingleSiteGalleryItem(snapshot, itemId, {
         revision: requestUrl.searchParams.get('revision') ?? undefined,
         baselineStoreRevision: requestUrl.searchParams.has('baselineStoreRevision')
           ? queryInteger(requestUrl.searchParams.get('baselineStoreRevision'), 'baselineStoreRevision', 0, 0, Number.MAX_SAFE_INTEGER)
@@ -2539,14 +2585,17 @@ async function routeRequest(request, response) {
     const jobId = decodeURIComponent(singleSiteGalleryMediaMatch[1]);
     const itemId = decodeURIComponent(singleSiteGalleryMediaMatch[2]);
     const view = singleSiteGalleryMediaMatch[3];
-    return withRunScopedTransfer('single-site', jobId, response, () =>
+    const shared = await sharedParentRunExists(jobId);
+    return withRunScopedTransfer(shared ? 'shared' : 'single-site', jobId, response, () =>
       withGalleryRequest(request, response, async (signal) => {
         const snapshot = await loadPortalSingleSiteGallery(jobId, request, signal);
-        const media = await resolveSingleSiteGalleryMedia(snapshot, itemId, view, { signal });
+        const media = await resolvePortalSingleSiteGalleryMedia(snapshot, itemId, view, { signal });
         return sendFile(request, response, media.absolutePath, "default-src 'none'; frame-ancestors 'self'", {
           opened: media.opened,
           contentType: media.contentType,
           etag: media.etag,
+          transferLease: media.opened?.transferLease ?? null,
+          integrityFingerprint: media.opened?.integrityFingerprint ?? null,
         });
       }),
     );
@@ -5714,6 +5763,15 @@ async function singleSiteReportRun(jobId) {
 }
 
 async function loadPortalSingleSiteGallery(jobId, request, signal) {
+  if (await sharedParentRunExists(jobId)) {
+    await request.auditSharedReadGuard?.();
+    return openSharedSingleSiteGallery({
+      store: sharedParentRunStore,
+      runId: jobId,
+      auditCatalog: catalog,
+      signal,
+    });
+  }
   const state = await readSingleSiteJob(singleSiteQueue, jobId);
   const finalization = await readSingleSiteFinalizationStatus(SINGLE_SITE_FINALIZATION_ROOT, jobId);
   if (!['complete', 'incomplete'].includes(finalization.status)) {
@@ -5736,6 +5794,30 @@ async function loadPortalSingleSiteGallery(jobId, request, signal) {
     mutationAuthorized: operatorRequestAuthorized(request),
     signal,
   });
+}
+
+function portalSingleSiteGalleryHead(snapshot) {
+  return isSharedSingleSiteGallerySnapshot(snapshot)
+    ? sharedSingleSiteGalleryHead(snapshot)
+    : singleSiteGalleryHead(snapshot);
+}
+
+function pagePortalSingleSiteGalleryItems(snapshot, options) {
+  return isSharedSingleSiteGallerySnapshot(snapshot)
+    ? pageSharedSingleSiteGalleryItems(snapshot, options)
+    : pageSingleSiteGalleryItems(snapshot, options);
+}
+
+function readPortalSingleSiteGalleryItem(snapshot, itemId, options) {
+  return isSharedSingleSiteGallerySnapshot(snapshot)
+    ? readSharedSingleSiteGalleryItem(snapshot, itemId, options)
+    : readSingleSiteGalleryItem(snapshot, itemId, options);
+}
+
+function resolvePortalSingleSiteGalleryMedia(snapshot, itemId, view, options) {
+  return isSharedSingleSiteGallerySnapshot(snapshot)
+    ? resolveSharedSingleSiteGalleryMedia(snapshot, itemId, view, options)
+    : resolveSingleSiteGalleryMedia(snapshot, itemId, view, options);
 }
 
 function singleSiteRequestedReportRevision(run, requestUrl) {
